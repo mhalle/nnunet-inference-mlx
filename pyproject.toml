@@ -1,0 +1,31 @@
+[project]
+name = "nnunet-mlx"
+version = "0.1.0"
+description = "MLX reimplementation of nnU-Net inference for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.22",
+    "numpy",
+    "nibabel",
+    "scipy",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+convert = ["torch"]
+test = ["pytest"]
+
+[project.scripts]
+nnunet-mlx-convert = "nnunet_mlx.weights:convert_weights_cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nnunet_mlx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: heavy benchmarks (deselect with '-m not slow')"]
