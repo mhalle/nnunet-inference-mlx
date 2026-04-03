@@ -114,30 +114,6 @@ class StackedConvBlocks(nn.Module):
         return x
 
 
-class _AvgPool3d(nn.Module):
-    """Simple 3D average pooling (channels-last).
-
-    Assumes kernel_size == stride (non-overlapping), which is always the case
-    in nnU-Net residual blocks.
-    """
-
-    def __init__(self, kernel_size: list[int], stride: list[int]):
-        super().__init__()
-        self.kernel_size = tuple(kernel_size)
-        self.stride = tuple(stride)
-
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        kd, kh, kw = self.kernel_size
-        sd, sh, sw = self.stride
-        D2 = (D // sd) * sd
-        H2 = (H // sh) * sh
-        W2 = (W // sw) * sw
-        x = x[:, :D2, :H2, :W2, :]
-        x = x.reshape(B, D2 // sd, sd, H2 // sh, sh, W2 // sw, sw, C)
-        x = mx.mean(x, axis=(2, 4, 6))
-        return x
-
 
 class BasicBlockD(nn.Module):
     """ResNet-D style basic residual block.
@@ -178,7 +154,7 @@ class BasicBlockD(nn.Module):
         self.skip_pool = None
         self.skip_conv = None
         if has_stride:
-            self.skip_pool = _AvgPool3d(kernel_size=stride, stride=stride)
+            self.skip_pool = nn.AvgPool3d(kernel_size=stride, stride=stride)
         if needs_proj:
             self.skip_conv = ConvNormNonlin(
                 in_channels, out_channels, [1] * ndim, [1] * ndim,

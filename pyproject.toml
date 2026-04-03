@@ -1,12 +1,12 @@
 [project]
 name = "nnunet-mlx"
-version = "0.1.0"
+version = "0.2.0"
 description = "MLX reimplementation of nnU-Net inference for Apple Silicon"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "mlx>=0.22",
+    "mlx>=0.25",
     "numpy",
     "nibabel",
     "scipy",
