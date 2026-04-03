@@ -63,7 +63,7 @@ nnUNetv2_predict_mlx(
 
 ## Benchmarks
 
-Tested on a real abdominal CT (255x178x256, 1.49mm spacing) on an M2 Mac with 17GB RAM:
+Tested on a real abdominal CT (255x178x256, 1.49mm spacing) on an M2 Mac with 16GB RAM:
 
 ### 3mm fast mode (single model, 118 classes)
 
@@ -87,7 +87,7 @@ Results are identical across all backends (verified 100% voxel agreement).
 
 | RAM | Batch size | Est. full-res time |
 |-----|-----------|-------------------|
-| 17GB | 1 | 3.2 min |
+| 16GB | 1 | 3.2 min |
 | 32GB | 2-3 | ~2.0 min |
 | 64GB | 5-6 | ~1.2 min |
 | 96GB+ | 7-8 | ~1 min |
