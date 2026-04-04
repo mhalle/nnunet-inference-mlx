@@ -18,16 +18,20 @@ def compute_gaussian(
     dtype=np.float32,
 ) -> np.ndarray:
     """Compute Gaussian importance map for sliding window aggregation."""
-    from scipy.ndimage import gaussian_filter
-
-    tmp = np.zeros(tile_size)
-    center = [i // 2 for i in tile_size]
-    sigmas = [i * sigma_scale for i in tile_size]
-    tmp[tuple(center)] = 1
-    gaussian_map = gaussian_filter(tmp, sigmas, 0, mode="constant", cval=0)
+    coords = np.meshgrid(
+        *(np.arange(s) for s in tile_size),
+        indexing="ij",
+    )
+    center = [s // 2 for s in tile_size]
+    sigmas = [s * sigma_scale for s in tile_size]
+    gaussian_map = np.exp(-sum(
+        (c - cn) ** 2 / (2 * sg ** 2)
+        for c, cn, sg in zip(coords, center, sigmas)
+    ))
     gaussian_map = gaussian_map / (gaussian_map.max() / value_scaling_factor)
     mask = gaussian_map == 0
-    gaussian_map[mask] = gaussian_map[~mask].min()
+    if mask.any():
+        gaussian_map[mask] = gaussian_map[~mask].min()
     return gaussian_map.astype(dtype)
 
 
