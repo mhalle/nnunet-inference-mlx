@@ -315,7 +315,7 @@ def predict_sliding_window_streaming(
     # Clamp to actual volume size (small volumes don't need the full buffer)
     buf_z = min(buf_z, Z)
 
-    # Rolling buffer and weight accumulator — match full version's dtype
+    # Rolling buffer and weight accumulator — channels-first (K, Z, Y, X)
     accum_dtype = np.float16 if num_classes > 20 else np.float32
     buf_logits = np.zeros((num_classes, buf_z, Y, X), dtype=accum_dtype)
     buf_weights = np.zeros((buf_z, Y, X), dtype=np.float32)
