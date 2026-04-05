@@ -43,15 +43,12 @@ DEFAULT_WEIGHTS_DIR = None  # resolved lazily
 
 
 def _default_weights_dir() -> Path:
-    # nnU-Net's standard env var
     if "nnUNet_results" in os.environ:
         return Path(os.environ["nnUNet_results"])
-    # TotalSegmentator's env var
-    if "TOTALSEG_WEIGHTS_PATH" in os.environ:
-        return Path(os.environ["TOTALSEG_WEIGHTS_PATH"])
-    # TotalSegmentator's default location (where downloaded weights land)
-    home = Path("/tmp") if str(Path.home()) == "/" else Path.home()
-    return home / ".totalsegmentator" / "nnunet" / "results"
+    raise FileNotFoundError(
+        "No weights directory specified. Either pass weights_dir= "
+        "or set the nnUNet_results environment variable."
+    )
 
 
 def _find_model_folder(task_id: int, weights_dir: Path) -> Path:
