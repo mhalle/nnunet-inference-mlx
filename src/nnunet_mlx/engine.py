@@ -1,16 +1,19 @@
 """
-InferenceEngine — streamlined in-memory inference for nnU-Net models.
+ModelBundle + InferenceEngine — clean separation of I/O and computation.
 
-No file I/O. Numpy in, numpy out. Model loaded and compiled once.
+ModelBundle handles all file I/O: finding models, converting weights, loading.
+InferenceEngine is pure computation: takes a ModelBundle, returns numpy arrays.
 
-    engine = InferenceEngine(task_id=297)
+    bundle = ModelBundle.from_task(297)
+    engine = InferenceEngine(bundle)
     logits = engine.predict(volume)  # (Z, Y, X) → (K, Z, Y, X)
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -23,10 +26,142 @@ from .inference import (
     predict_sliding_window_streaming,
 )
 from .plans import build_network_from_plans
-from .predict import find_model_folder
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
-from .weights import fuzzy_load_weights, load_model_weights
+from .weights import (
+    convert_model_folder,
+    fuzzy_load_weights,
+    load_model_weights,
+    load_weights_safetensors,
+)
 
+
+# ---------------------------------------------------------------------------
+# ModelBundle — all I/O lives here
+# ---------------------------------------------------------------------------
+
+DEFAULT_WEIGHTS_DIR = None  # resolved lazily
+
+
+def _default_weights_dir() -> Path:
+    if "TOTALSEG_WEIGHTS_PATH" in os.environ:
+        return Path(os.environ["TOTALSEG_WEIGHTS_PATH"])
+    home = Path("/tmp") if str(Path.home()) == "/" else Path.home()
+    return home / ".totalsegmentator" / "nnunet" / "results"
+
+
+def _find_model_folder(task_id: int, weights_dir: Path) -> Path:
+    """Resolve task_id to a model folder path."""
+    matches = sorted(weights_dir.glob(f"Dataset{task_id}_*"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No model found for task {task_id} in {weights_dir}. "
+            f"Download weights first (e.g. totalseg_download_weights)."
+        )
+    dataset_dir = matches[0]
+    # Find the single trainer subfolder
+    trainer_dirs = sorted(dataset_dir.glob("*__*__*"))
+    if not trainer_dirs:
+        raise FileNotFoundError(
+            f"No trainer folder found in {dataset_dir}."
+        )
+    return trainer_dirs[0]
+
+
+class ModelBundle:
+    """Model weights, architecture plans, and dataset metadata.
+
+    All file I/O happens here. InferenceEngine receives a ModelBundle
+    and never touches the filesystem.
+
+    Attributes
+    ----------
+    plans : dict
+        Parsed plans.json (architecture, patch size, normalization).
+    dataset : dict
+        Parsed dataset.json (labels, channel names).
+    weights : dict[str, mx.array]
+        Model parameters keyed by name, ready for load_weights().
+    """
+
+    def __init__(self, plans: dict, dataset: dict, weights: dict[str, mx.array]):
+        self.plans = plans
+        self.dataset = dataset
+        self.weights = weights
+
+    @staticmethod
+    def from_folder(path: str | Path, fold: int = 0) -> ModelBundle:
+        """Load from a local model folder.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the model folder containing plans.json, dataset.json,
+            and fold_N/ with weights. Can be either the trainer folder
+            (e.g. .../nnUNetTrainer__nnUNetPlans__3d_fullres) or the
+            dataset folder (e.g. .../Dataset297_...).
+        fold : int
+            Which fold's weights to load.
+        """
+        path = Path(path).expanduser()
+
+        # If pointed at a dataset folder, find the trainer subfolder
+        if not (path / "plans.json").exists():
+            trainer_dirs = sorted(path.glob("*__*__*"))
+            if trainer_dirs:
+                path = trainer_dirs[0]
+
+        plans = json.loads((path / "plans.json").read_text())
+        dataset = json.loads((path / "dataset.json").read_text())
+        weights = load_model_weights(path, fold=fold)
+
+        return ModelBundle(plans=plans, dataset=dataset, weights=weights)
+
+    @staticmethod
+    def from_task(
+        task_id: int,
+        fold: int = 0,
+        weights_dir: str | Path | None = None,
+        auto_convert: bool = True,
+    ) -> ModelBundle:
+        """Load by task ID from the weights directory.
+
+        Finds the model folder, converts .pth to .safetensors if needed
+        (requires torch, one-time), then loads.
+
+        Parameters
+        ----------
+        task_id : int
+            nnU-Net dataset/task ID (e.g. 297 for TotalSegmentator fast).
+        fold : int
+            Which fold's weights to load.
+        weights_dir : str or Path, optional
+            Where to look for models. Defaults to ~/.totalsegmentator/nnunet/results
+            or $TOTALSEG_WEIGHTS_PATH.
+        auto_convert : bool
+            If True, convert .pth to .safetensors automatically when
+            safetensors are not found. Requires torch.
+        """
+        if weights_dir is None:
+            weights_dir = _default_weights_dir()
+        weights_dir = Path(weights_dir).expanduser()
+
+        model_folder = _find_model_folder(task_id, weights_dir)
+
+        # Auto-convert if needed
+        if auto_convert:
+            fold_dir = model_folder / f"fold_{fold}"
+            has_safetensors = any(fold_dir.glob("*_mlx.safetensors"))
+            has_pth = any(fold_dir.glob("*.pth"))
+            if not has_safetensors and has_pth:
+                print(f"Converting weights to safetensors (one-time, requires torch)...")
+                convert_model_folder(model_folder)
+
+        return ModelBundle.from_folder(model_folder, fold=fold)
+
+
+# ---------------------------------------------------------------------------
+# ShapeContext — precomputed per-shape state
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ShapeContext:
@@ -41,20 +176,20 @@ class ShapeContext:
     n_patches: int
 
 
+# ---------------------------------------------------------------------------
+# InferenceEngine — pure computation, no I/O
+# ---------------------------------------------------------------------------
+
 class InferenceEngine:
     """In-memory nnU-Net inference engine.
 
-    Loads the model once on init. Takes numpy arrays, returns numpy arrays.
-    No NIfTI, no file I/O.
+    Takes a ModelBundle (pre-loaded weights and config). Does pure computation.
+    No file I/O, no downloads, no path resolution.
 
     Parameters
     ----------
-    task_id : int
-        nnU-Net dataset/task ID (e.g. 297 for TotalSegmentator fast).
-    fold : int
-        Which fold's weights to load.
-    trainer : str
-        nnU-Net trainer name.
+    bundle : ModelBundle
+        Pre-loaded model weights, plans, and dataset metadata.
     step_size : float
         Sliding window overlap (0.5 = 50% overlap).
     compile : bool
@@ -66,16 +201,14 @@ class InferenceEngine:
 
     Example
     -------
-    >>> engine = InferenceEngine(task_id=297)
-    >>> volume = np.random.randn(167, 167, 236).astype(np.float32)
-    >>> logits = engine.predict(volume)  # (118, 167, 167, 236)
+    >>> bundle = ModelBundle.from_task(297)
+    >>> engine = InferenceEngine(bundle)
+    >>> logits = engine.predict(volume)  # (Z, Y, X) → (K, Z, Y, X)
     """
 
     def __init__(
         self,
-        task_id: int = 297,
-        fold: int = 0,
-        trainer: str = "nnUNetTrainer_4000epochs_NoMirroring",
+        bundle: ModelBundle,
         step_size: float = 0.5,
         compile: bool = True,
         batch_size: int | None = None,
@@ -84,10 +217,8 @@ class InferenceEngine:
         self.step_size = step_size
         self.verbose = verbose
 
-        # Locate model and load plans
-        model_folder = find_model_folder(task_id, trainer=trainer)
-        plans = json.loads((model_folder / "plans.json").read_text())
-        dataset = json.loads((model_folder / "dataset.json").read_text())
+        plans = bundle.plans
+        dataset = bundle.dataset
 
         config = plans["configurations"]["3d_fullres"]
         self.patch_size = tuple(config["patch_size"])
@@ -105,7 +236,7 @@ class InferenceEngine:
             if scheme == "CTNormalization":
                 self._norm_params[ch] = get_normalization_params(plans, ch)
 
-        # Build network
+        # Build network and load weights
         network = build_network_from_plans(
             plans,
             "3d_fullres",
@@ -114,12 +245,10 @@ class InferenceEngine:
             deep_supervision=False,
         )
 
-        # Load weights
-        weights = load_model_weights(model_folder, fold=fold)
         try:
-            network.load_weights(list(weights.items()))
+            network.load_weights(list(bundle.weights.items()))
         except Exception:
-            fuzzy_load_weights(network, weights, verbose=verbose)
+            fuzzy_load_weights(network, bundle.weights, verbose=verbose)
 
         # Compile
         if compile:
@@ -154,7 +283,7 @@ class InferenceEngine:
 
         if verbose:
             print(
-                f"InferenceEngine ready: task={task_id}, "
+                f"InferenceEngine ready: "
                 f"patch={self.patch_size}, classes={self.num_classes}, "
                 f"batch={self._batch_size}"
             )
@@ -174,7 +303,6 @@ class InferenceEngine:
         """
         data = volume.astype(np.float32)
 
-        # Single-channel: apply the first channel's normalization
         ch = 0
         scheme = (
             self._norm_schemes[ch]
@@ -193,7 +321,6 @@ class InferenceEngine:
             )
         elif scheme == "ZScoreNormalization":
             data = zscore_normalization(data)
-        # NoNormalization: already float32
 
         return data
 
@@ -213,7 +340,6 @@ class InferenceEngine:
         if shape in self._shape_cache:
             return self._shape_cache[shape]
 
-        # Padding
         pad_widths = []
         for s, p in zip(shape, self.patch_size):
             total = max(0, p - s)
@@ -227,7 +353,6 @@ class InferenceEngine:
         else:
             padded_shape = shape
 
-        # Sliding window positions
         steps = compute_sliding_window_steps(
             padded_shape, self.patch_size, self.step_size
         )
@@ -238,7 +363,6 @@ class InferenceEngine:
             for sx in steps[2]
         ]
 
-        # Crop slices to undo padding
         crop_slices = tuple(
             slice(a, s - b) if (a > 0 or b > 0) else slice(None)
             for s, (a, b) in zip(padded_shape, pad_widths)
@@ -278,8 +402,7 @@ class InferenceEngine:
         else:
             volume = volume.astype(np.float32)
 
-        # Add channel dim: (Z, Y, X) → (1, Z, Y, X) for sliding window
-        input_image = volume[np.newaxis]
+        input_image = volume[np.newaxis]  # (1, Z, Y, X)
 
         logits = predict_sliding_window_streaming(
             network=self._net,
