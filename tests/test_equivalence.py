@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import mlx.core as mx
 
-from nnunet_mlx import PlainConvUNet
+from nnunet_inference_mlx import PlainConvUNet
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

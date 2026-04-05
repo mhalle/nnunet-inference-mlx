@@ -1,15 +1,13 @@
 [project]
-name = "nnunet-mlx"
-version = "0.2.0"
-description = "MLX reimplementation of nnU-Net inference for Apple Silicon"
+name = "nnunet-inference-mlx"
+version = "0.3.0"
+description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.25",
     "numpy",
-    "nibabel",
-    "scipy",
     "safetensors",
 ]
 
@@ -18,14 +16,14 @@ convert = ["torch"]
 test = ["pytest"]
 
 [project.scripts]
-nnunet-mlx-convert = "nnunet_mlx.weights:convert_weights_cli"
+nnunet-inference-mlx-convert = "nnunet_inference_mlx.weights:convert_weights_cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nnunet_mlx"]
+packages = ["src/nnunet_inference_mlx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

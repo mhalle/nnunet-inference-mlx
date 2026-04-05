@@ -14,8 +14,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from nnunet_mlx.model import PlainConvUNet
-from nnunet_mlx.inference import (
+from nnunet_inference_mlx.model import PlainConvUNet
+from nnunet_inference_mlx.inference import (
     predict_sliding_window,
     compute_sliding_window_steps,
     choose_batch_size,

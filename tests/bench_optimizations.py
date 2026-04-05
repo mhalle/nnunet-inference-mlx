@@ -7,7 +7,7 @@ Run: python tests/bench_optimizations.py
 import time
 import mlx.core as mx
 import mlx.nn as nn
-from nnunet_mlx.model import PlainConvUNet
+from nnunet_inference_mlx.model import PlainConvUNet
 
 ARCH_LARGE = dict(
     in_channels=1,

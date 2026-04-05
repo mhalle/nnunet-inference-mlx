@@ -9,8 +9,8 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
-from nnunet_mlx.model import PlainConvUNet
-from nnunet_mlx.inference import (
+from nnunet_inference_mlx.model import PlainConvUNet
+from nnunet_inference_mlx.inference import (
     predict_sliding_window_segmentation,
     compute_sliding_window_steps,
 )
