@@ -420,3 +420,23 @@ class InferenceEngine:
         )
 
         return logits  # (K, Z, Y, X)
+
+
+def softmax_inplace(logits: np.ndarray) -> np.ndarray:
+    """Convert logits to probabilities in-place along axis 0.
+
+    Parameters
+    ----------
+    logits : np.ndarray
+        Shape (K, ...), float32. Modified in-place.
+
+    Returns
+    -------
+    np.ndarray
+        The same array, now containing probabilities that sum to 1
+        along axis 0.
+    """
+    logits -= logits.max(axis=0, keepdims=True)
+    np.exp(logits, out=logits)
+    logits /= logits.sum(axis=0, keepdims=True)
+    return logits

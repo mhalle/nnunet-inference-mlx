@@ -1,6 +1,6 @@
 """nnU-Net inference on Apple Silicon via MLX."""
 
-from .engine import InferenceEngine, ModelBundle
+from .engine import InferenceEngine, ModelBundle, softmax_inplace
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
 from .preprocessing import preprocess_volume
@@ -15,6 +15,7 @@ from .weights import (
 __all__ = [
     "InferenceEngine",
     "ModelBundle",
+    "softmax_inplace",
     "PlainConvUNet",
     "ResidualEncoderUNet",
     "build_network_from_plans",
