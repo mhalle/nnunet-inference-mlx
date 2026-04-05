@@ -224,6 +224,225 @@ def predict_sliding_window(
     return predicted_logits
 
 
+def predict_sliding_window_streaming(
+    network,
+    input_image: np.ndarray,
+    patch_size: tuple[int, ...],
+    num_classes: int,
+    tile_step_size: float = 0.5,
+    use_gaussian: bool = True,
+    use_mirroring: bool = False,
+    mirror_axes: tuple[int, ...] | None = None,
+    batch_size: int = 1,
+    use_fp16: bool = True,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Sliding window inference with a rolling Z buffer.
+
+    Same interface and output as predict_sliding_window, but uses a
+    rolling accumulator along the Z (first spatial) axis. This reduces
+    peak memory from O(K * Z * Y * X) to O(K * active_z * Y * X),
+    freeing headroom for larger batch sizes.
+
+    Parameters
+    ----------
+    Same as predict_sliding_window.
+
+    Returns
+    -------
+    np.ndarray
+        Predicted logits, shape (num_classes, D, H, W), float32.
+    """
+    spatial_shape = input_image.shape[1:]
+
+    # Pad if smaller than patch — symmetric padding to match nnU-Net
+    pad_widths = []
+    for s, t in zip(spatial_shape, patch_size):
+        total_pad = max(0, t - s)
+        pad_before = total_pad // 2
+        pad_after = total_pad - pad_before
+        pad_widths.append((pad_before, pad_after))
+    needs_padding = any(p[0] > 0 or p[1] > 0 for p in pad_widths)
+    if needs_padding:
+        full_pad = [(0, 0)] + pad_widths
+        input_image = np.pad(input_image, full_pad, mode="constant", constant_values=0)
+        spatial_shape = input_image.shape[1:]
+
+    Z, Y, X = spatial_shape
+    pZ, pY, pX = patch_size
+
+    # Convert to channels-last: (C, Z, Y, X) -> (Z, Y, X, C)
+    data = input_image.transpose(1, 2, 3, 0)
+
+    # Sliding window positions per axis
+    steps = compute_sliding_window_steps(spatial_shape, patch_size, tile_step_size)
+    z_steps = steps[0]
+    yx_slicers = [
+        (sy, sx) for sy in steps[1] for sx in steps[2]
+    ]
+
+    # Gaussian weighting
+    gaussian_np = (
+        compute_gaussian(patch_size, sigma_scale=1.0 / 8, value_scaling_factor=10)
+        if use_gaussian
+        else np.ones(patch_size, dtype=np.float32)
+    )
+
+    # TTA: precompute axis combinations
+    if use_mirroring and mirror_axes:
+        axes_combos = [
+            tuple(m + 1 for m in c)
+            for k in range(len(mirror_axes))
+            for c in itertools.combinations(mirror_axes, k + 1)
+        ]
+        n_tta = len(axes_combos) + 1
+    else:
+        axes_combos = []
+        n_tta = 1
+
+    # Determine the rolling buffer size: covers from the current z_step
+    # to the end of its patch (current_z + pZ). The buffer must hold all
+    # Z slices that any active patch can write to.
+    # Active range = [z_steps[i], z_steps[i] + pZ) at most.
+    # But patches from the *previous* z_step may still overlap.
+    # The maximum active range is [z_steps[i], z_steps[i+1] + pZ) while
+    # processing z_steps[i+1]. Simplification: buffer = pZ + max_z_gap.
+    if len(z_steps) > 1:
+        max_z_gap = max(z_steps[j] - z_steps[j - 1] for j in range(1, len(z_steps)))
+    else:
+        max_z_gap = 0
+    buf_z = pZ + max_z_gap
+    # Clamp to actual volume size (small volumes don't need the full buffer)
+    buf_z = min(buf_z, Z)
+
+    # Rolling buffer and weight accumulator — channels-first (K, Z, Y, X)
+    accum_dtype = np.float16 if num_classes > 20 else np.float32
+    buf_logits = np.zeros((num_classes, buf_z, Y, X), dtype=accum_dtype)
+    buf_weights = np.zeros((buf_z, Y, X), dtype=np.float32)
+    buf_z_start = 0  # which global Z index does buf[0] correspond to
+
+    # Output — we fill this in as slices finalize (unnormalized)
+    predicted_logits = np.zeros((num_classes, Z, Y, X), dtype=accum_dtype)
+    out_weights = np.zeros((Z, Y, X), dtype=np.float32)
+
+    total_patches = len(z_steps) * len(yx_slicers)
+    total_fwd = int(np.ceil(total_patches / batch_size)) * n_tta
+    if verbose:
+        buf_mb = (buf_logits.nbytes + buf_weights.nbytes) / 1e6
+        full_mb = num_classes * Z * Y * X * 4 / 1e6
+        print(
+            f"Sliding window (streaming): {total_patches} patches, "
+            f"batch_size={batch_size}, tta={n_tta}x, total_fwd={total_fwd}, "
+            f"image={spatial_shape}, patch={patch_size}, "
+            f"buf_z={buf_z} (buffer={buf_mb:.0f}MB vs full={full_mb:.0f}MB), "
+            f"dtype={'fp16' if use_fp16 else 'fp32'}"
+        )
+
+    _t0 = time.perf_counter()
+    _patches_done = 0
+
+    for zi, sz in enumerate(z_steps):
+        # Before processing this z_step, flush any finalized slices
+        # Slices [buf_z_start, sz) are no longer touched by any future patch
+        flush_end = sz
+        if flush_end > buf_z_start:
+            n_flush = flush_end - buf_z_start
+            # Copy raw (unnormalized) accumulated values to output
+            buf_local = slice(0, n_flush)
+            predicted_logits[:, buf_z_start:flush_end] = buf_logits[:, buf_local]
+            out_weights[buf_z_start:flush_end] = buf_weights[buf_local]
+
+            # Shift buffer: move remaining data to front
+            remaining = buf_z - n_flush
+            if remaining > 0:
+                buf_logits[:, :remaining] = buf_logits[:, n_flush:n_flush + remaining]
+                buf_weights[:remaining] = buf_weights[n_flush:n_flush + remaining]
+            # Zero out the freed tail
+            buf_logits[:, remaining:] = 0
+            buf_weights[remaining:] = 0
+            buf_z_start = flush_end
+
+        # Process all YX patches at this Z step
+        all_slicers = [(sz, sy, sx) for sy, sx in yx_slicers]
+
+        for batch_start in range(0, len(all_slicers), batch_size):
+            batch_slicers = all_slicers[batch_start:batch_start + batch_size]
+
+            patches_np = np.stack([
+                data[s0:s0 + pZ, s1:s1 + pY, s2:s2 + pX, :]
+                for s0, s1, s2 in batch_slicers
+            ])
+
+            patches = mx.array(patches_np)
+            if use_fp16:
+                patches = patches.astype(mx.float16)
+
+            pred = network(patches)
+            if isinstance(pred, list):
+                pred = pred[0]
+
+            # TTA mirroring
+            if axes_combos:
+                pred_sum = pred.astype(mx.float32)
+                for axes in axes_combos:
+                    flipped_in = mx.array(
+                        np.flip(patches_np, axis=list(axes)).copy()
+                    )
+                    if use_fp16:
+                        flipped_in = flipped_in.astype(mx.float16)
+                    fp = network(flipped_in)
+                    if isinstance(fp, list):
+                        fp = fp[0]
+                    fp = mx.array(
+                        np.flip(np.array(fp.astype(mx.float32)), axis=list(axes)).copy()
+                    )
+                    pred_sum = pred_sum + fp
+                pred = pred_sum * (1.0 / n_tta)
+
+            mx.eval(pred)
+            pred_np = np.array(pred.astype(mx.float32))
+
+            for i, (s0, s1, s2) in enumerate(batch_slicers):
+                p = pred_np[i].transpose(3, 0, 1, 2)  # (K, pZ, pY, pX)
+                if use_gaussian:
+                    p *= gaussian_np[None]
+
+                # Map global Z to buffer-local Z
+                bz = s0 - buf_z_start
+                buf_logits[:, bz:bz + pZ, s1:s1 + pY, s2:s2 + pX] += p
+                buf_weights[bz:bz + pZ, s1:s1 + pY, s2:s2 + pX] += gaussian_np
+
+            _patches_done += len(batch_slicers)
+            if verbose:
+                elapsed = time.perf_counter() - _t0
+                eta = elapsed / _patches_done * (total_patches - _patches_done)
+                print(f"\r  patch {_patches_done}/{total_patches} "
+                      f"z_step {zi+1}/{len(z_steps)} "
+                      f"({elapsed:.1f}s, ~{eta:.0f}s left)", end="", flush=True)
+
+    if verbose:
+        print()
+
+    # Flush everything remaining in the buffer
+    remaining = Z - buf_z_start
+    if remaining > 0:
+        buf_local = slice(0, remaining)
+        predicted_logits[:, buf_z_start:] = buf_logits[:, buf_local]
+        out_weights[buf_z_start:] = buf_weights[buf_local]
+
+    # Normalize — match full version: cast to fp32 then divide
+    predicted_logits = predicted_logits.astype(np.float32) / out_weights[None]
+
+    if needs_padding:
+        crop = tuple(
+            slice(pb, s - pa) if (pb > 0 or pa > 0) else slice(None)
+            for s, (pb, pa) in zip(predicted_logits.shape[1:], pad_widths)
+        )
+        predicted_logits = predicted_logits[(slice(None), *crop)]
+
+    return predicted_logits
+
+
 def predict_sliding_window_segmentation(
     network,
     input_image: np.ndarray,
