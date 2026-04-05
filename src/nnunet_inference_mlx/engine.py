@@ -252,6 +252,14 @@ class InferenceEngine:
         except Exception:
             fuzzy_load_weights(network, bundle.weights, verbose=verbose)
 
+        # Limit Metal cache to avoid memory pressure on constrained machines.
+        # Without this, MLX caches ~9.5GB of buffers after the first forward
+        # pass, leaving insufficient room for the accumulator and volume data.
+        mem_info = mx.device_info()
+        system_ram = mem_info.get("memory_size", 16 * 1024**3)
+        cache_limit = int(system_ram * 0.3)  # 30% of system RAM
+        mx.set_cache_limit(cache_limit)
+
         # Compile
         if compile:
             self._net = mx.compile(network)
