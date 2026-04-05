@@ -276,10 +276,7 @@ def predict_sliding_window_streaming(
     pZ, pY, pX = patch_size
 
     # Convert to channels-last: (C, Z, Y, X) -> (Z, Y, X, C)
-    # Ensure C-contiguous for efficient patch extraction.
-    # NIfTI data is often Fortran-ordered; without .copy(), patch slicing
-    # walks non-contiguous memory and can be 3x slower.
-    data = np.ascontiguousarray(input_image.transpose(1, 2, 3, 0))
+    data = input_image.transpose(1, 2, 3, 0)
 
     # Sliding window positions per axis
     steps = compute_sliding_window_steps(spatial_shape, patch_size, tile_step_size)
