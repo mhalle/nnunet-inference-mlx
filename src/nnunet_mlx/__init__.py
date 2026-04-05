@@ -1,6 +1,7 @@
 """MLX nnU-Net — Apple Silicon inference for nnU-Net models."""
 
 from .engine import InferenceEngine, ModelBundle
+from .tasks import Task
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
 from .predict import nnUNetv2_predict_mlx
@@ -17,6 +18,7 @@ from .weights import (
 __all__ = [
     "InferenceEngine",
     "ModelBundle",
+    "Task",
     "PlainConvUNet",
     "ResidualEncoderUNet",
     "build_network_from_plans",
