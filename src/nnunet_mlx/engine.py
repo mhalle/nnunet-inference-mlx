@@ -27,7 +27,6 @@ from .inference import (
 )
 from .plans import build_network_from_plans
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
-from .tasks import Task
 from .weights import (
     convert_model_folder,
     fuzzy_load_weights,
@@ -119,7 +118,7 @@ class ModelBundle:
 
     @staticmethod
     def from_task(
-        task_id: int | Task,
+        task_id: int,
         fold: int = 0,
         weights_dir: str | Path | None = None,
         auto_convert: bool = True,
@@ -131,8 +130,8 @@ class ModelBundle:
 
         Parameters
         ----------
-        task_id : int or Task
-            nnU-Net dataset/task ID (e.g. Task.TOTAL_FAST or 297).
+        task_id : int
+            nnU-Net dataset/task ID (e.g. 297).
         fold : int
             Which fold's weights to load.
         weights_dir : str or Path, optional
@@ -142,8 +141,6 @@ class ModelBundle:
             If True, convert .pth to .safetensors automatically when
             safetensors are not found. Requires torch.
         """
-        task_id = int(task_id)
-
         if weights_dir is None:
             weights_dir = _default_weights_dir()
         weights_dir = Path(weights_dir).expanduser()
