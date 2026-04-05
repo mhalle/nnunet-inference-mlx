@@ -56,8 +56,7 @@ def _find_model_folder(task_id: int, weights_dir: Path) -> Path:
     matches = sorted(weights_dir.glob(f"Dataset{task_id}_*"))
     if not matches:
         raise FileNotFoundError(
-            f"No model found for task {task_id} in {weights_dir}. "
-            f"Download weights first (e.g. totalseg_download_weights)."
+            f"No model found for task {task_id} in {weights_dir}."
         )
     dataset_dir = matches[0]
     # Find the single trainer subfolder
@@ -211,6 +210,7 @@ class InferenceEngine:
     def __init__(
         self,
         bundle: ModelBundle,
+        configuration: str = "3d_fullres",
         step_size: float = 0.5,
         compile: bool = True,
         batch_size: int | None = None,
@@ -222,7 +222,7 @@ class InferenceEngine:
         plans = bundle.plans
         dataset = bundle.dataset
 
-        config = plans["configurations"]["3d_fullres"]
+        config = plans["configurations"][configuration]
         self.patch_size = tuple(config["patch_size"])
         self.num_classes = len(dataset["labels"])
         self.num_channels = len(
@@ -241,7 +241,7 @@ class InferenceEngine:
         # Build network and load weights
         network = build_network_from_plans(
             plans,
-            "3d_fullres",
+            configuration,
             self.num_channels,
             self.num_classes,
             deep_supervision=False,
