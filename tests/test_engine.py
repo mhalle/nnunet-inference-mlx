@@ -60,11 +60,10 @@ def test_predict():
     vol = np.random.randn(40, 40, 40).astype(np.float32)
     logits = engine.predict(vol, normalize=True)
 
-    ok = logits.shape == (4, 40, 40, 40) and logits.dtype == np.float32
     print(f"  Output shape: {logits.shape} (expected (4, 40, 40, 40))")
     print(f"  Dtype: {logits.dtype}")
-    print(f"  {'PASS' if ok else 'FAIL'}")
-    return ok
+    assert logits.shape == (4, 40, 40, 40)
+    assert logits.dtype == np.float32
 
 
 def test_normalize_separate():
@@ -81,10 +80,8 @@ def test_normalize_separate():
     normalized = engine.normalize(vol)
     logits_b = engine.predict(normalized, normalize=False)
 
-    ok = np.array_equal(logits_a, logits_b)
-    print(f"  Exact match: {ok}")
-    print(f"  {'PASS' if ok else 'FAIL'}")
-    return ok
+    print(f"  Exact match: {np.array_equal(logits_a, logits_b)}")
+    assert np.array_equal(logits_a, logits_b)
 
 
 def test_prepare_cache():
@@ -98,11 +95,9 @@ def test_prepare_cache():
 
     ctx1 = engine.prepare((40, 40, 40))
     ctx2 = engine.prepare((40, 40, 40))
-    ok = ctx1 is ctx2
-    print(f"  Same object: {ok}")
+    print(f"  Same object: {ctx1 is ctx2}")
     print(f"  Patches: {ctx1.n_patches}")
-    print(f"  {'PASS' if ok else 'FAIL'}")
-    return ok
+    assert ctx1 is ctx2
 
 
 def test_deterministic():
@@ -118,26 +113,27 @@ def test_deterministic():
     logits_a = engine.predict(vol, normalize=False)
     logits_b = engine.predict(vol, normalize=False)
 
-    ok = np.array_equal(logits_a, logits_b)
-    print(f"  Exact match: {ok}")
-    print(f"  {'PASS' if ok else 'FAIL'}")
-    return ok
+    print(f"  Exact match: {np.array_equal(logits_a, logits_b)}")
+    assert np.array_equal(logits_a, logits_b)
 
 
 def main():
+    """Script entry point: run each test, catch AssertionError, summarize."""
     np.random.seed(42)
-    results = [
-        test_predict(),
-        test_normalize_separate(),
-        test_prepare_cache(),
-        test_deterministic(),
-    ]
+    tests = [test_predict, test_normalize_separate, test_prepare_cache, test_deterministic]
+    failures = []
+    for fn in tests:
+        try:
+            fn()
+        except AssertionError as e:
+            failures.append((fn.__name__, e))
+            print(f"  FAIL: {e}")
 
     print("\n" + "=" * 60)
-    if all(results):
+    if not failures:
         print("All tests PASSED")
     else:
-        print("Some tests FAILED")
+        print(f"{len(failures)} tests FAILED: {[name for name, _ in failures]}")
     print("=" * 60)
 
 
