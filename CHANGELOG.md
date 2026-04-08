@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1] - 2026-04-07
+
+### Added
+- `progress: bool = False` parameter on `InferenceEngine` and on the three sliding-window functions (`predict_sliding_window`, `predict_sliding_window_streaming`, `predict_sliding_window_segmentation`). When `True`, a tqdm progress bar is shown for each patch processed during inference. Mirrors the equivalent bar that nnUNetPredictor shows on the PyTorch path.
+- `tqdm` is now a runtime dependency (small, pure Python).
+
+### Fixed
+- The MLX inference path was missing a per-patch progress bar that the PyTorch/MPS path through `nnUNetPredictor` has always shown. Long inference runs now have visible progress feedback when the caller passes `progress=True`. The corresponding `mlx_predict.py` wrapper in TotalSegmentator now passes `progress=not quiet` to enable the bar by default.
+
 ## [0.3.0] - 2026-04-07
 
 ### Added

@@ -9,6 +9,7 @@ import time
 
 import mlx.core as mx
 import numpy as np
+from tqdm import tqdm
 
 
 def compute_gaussian(
@@ -72,6 +73,7 @@ def predict_sliding_window(
     batch_size: int = 1,
     use_fp16: bool = True,
     verbose: bool = False,
+    progress: bool = False,
 ) -> np.ndarray:
     """Run batched sliding window inference over a 3D volume.
 
@@ -162,6 +164,8 @@ def predict_sliding_window(
             f"dtype={'fp16' if use_fp16 else 'fp32'}"
         )
 
+    pbar = tqdm(total=len(slicers), desc="MLX inference",
+                disable=not progress, unit="patch")
     for batch_start in range(0, len(slicers), batch_size):
         batch_slicers = slicers[batch_start:batch_start + batch_size]
 
@@ -215,6 +219,9 @@ def predict_sliding_window(
                 sz:sz + patch_size[2],
             ] += gaussian_np
 
+        pbar.update(len(batch_slicers))
+    pbar.close()
+
     # Normalize — cast to fp32 for the division to avoid fp16 precision issues
     predicted_logits = predicted_logits.astype(np.float32) / n_predictions[None]
 
@@ -240,6 +247,7 @@ def predict_sliding_window_streaming(
     batch_size: int = 1,
     use_fp16: bool = True,
     verbose: bool = False,
+    progress: bool = False,
 ) -> np.ndarray:
     """Sliding window inference with a rolling Z buffer.
 
@@ -351,6 +359,8 @@ def predict_sliding_window_streaming(
     _t0 = time.perf_counter()
     _patches_done = 0
 
+    pbar = tqdm(total=total_patches, desc="MLX inference",
+                disable=not progress, unit="patch")
     for zi, sz in enumerate(z_steps):
         # Rolling buffer: flush finalized slices before processing this z_step
         if use_rolling:
@@ -423,14 +433,16 @@ def predict_sliding_window_streaming(
                     n_predictions[s0:s0 + pZ, s1:s1 + pY, s2:s2 + pX] += gaussian_np
 
             _patches_done += len(batch_slicers)
-            if verbose:
+            pbar.update(len(batch_slicers))
+            if verbose and not progress:
                 elapsed = time.perf_counter() - _t0
                 eta = elapsed / _patches_done * (total_patches - _patches_done)
                 print(f"\r  patch {_patches_done}/{total_patches} "
                       f"z_step {zi+1}/{len(z_steps)} "
                       f"({elapsed:.1f}s, ~{eta:.0f}s left)", end="", flush=True)
 
-    if verbose:
+    pbar.close()
+    if verbose and not progress:
         print()
 
     # Flush remaining rolling buffer
@@ -466,6 +478,7 @@ def predict_sliding_window_segmentation(
     batch_size: int = 1,
     use_fp16: bool = True,
     verbose: bool = False,
+    progress: bool = False,
 ) -> np.ndarray:
     """Sliding window inference that returns segmentation directly.
 
@@ -534,8 +547,10 @@ def predict_sliding_window_segmentation(
         )
 
     _t0 = time.perf_counter()
+    pbar = tqdm(total=len(slicers), desc="MLX inference (seg)",
+                disable=not progress, unit="patch")
     for batch_idx, batch_start in enumerate(range(0, len(slicers), batch_size)):
-        if verbose and batch_idx > 0:
+        if verbose and not progress and batch_idx > 0:
             elapsed = time.perf_counter() - _t0
             eta = elapsed / batch_idx * (total_batches - batch_idx)
             print(f"\r  {batch_idx}/{total_batches} "
@@ -610,7 +625,9 @@ def predict_sliding_window_segmentation(
                     better, top3_scores[..., k], top_scores[sd, sh, sw, k])
             n_predictions[sd, sh, sw] += gaussian_np
 
-    if verbose:
+        pbar.update(len(batch_slicers))
+    pbar.close()
+    if verbose and not progress:
         print()
 
     if needs_padding:

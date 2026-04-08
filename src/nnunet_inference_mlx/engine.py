@@ -218,9 +218,11 @@ class InferenceEngine:
         compile: bool = True,
         batch_size: int | None = None,
         verbose: bool = False,
+        progress: bool = False,
     ):
         self.step_size = step_size
         self.verbose = verbose
+        self.progress = progress
 
         plans = bundle.plans
         dataset = bundle.dataset
@@ -428,6 +430,7 @@ class InferenceEngine:
             batch_size=self._batch_size,
             use_fp16=False,
             verbose=self.verbose,
+            progress=self.progress,
         )
 
         return logits  # (K, Z, Y, X)
