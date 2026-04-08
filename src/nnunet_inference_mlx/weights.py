@@ -130,18 +130,69 @@ def fuzzy_load_weights(network, mlx_weights: dict, verbose: bool = False):
 # Safetensors I/O
 # ---------------------------------------------------------------------------
 
+WEIGHT_LAYOUT_MLX = "mlx_ndhwc"
+WEIGHT_LAYOUT_TORCH = "torch_ncdhw"
+
+
 def save_weights_safetensors(mlx_weights: dict[str, mx.array], path: str | Path):
-    """Save MLX weights to safetensors format."""
+    """Save MLX-layout weights to safetensors format.
+
+    Stamps ``weight_layout=mlx_ndhwc`` into the safetensors metadata header so
+    future loaders (this one or any other) can decide unambiguously whether
+    the on-disk tensors need transposing.
+    """
     from safetensors.numpy import save_file
     np_weights = {k: np.array(v) for k, v in mlx_weights.items()}
-    save_file(np_weights, str(path))
+    save_file(
+        np_weights,
+        str(path),
+        metadata={
+            "weight_layout": WEIGHT_LAYOUT_MLX,
+            "format_version": "1",
+        },
+    )
 
 
-def load_weights_safetensors(path: str | Path) -> dict[str, mx.array]:
-    """Load MLX weights from safetensors format. No torch needed."""
+def load_weights_safetensors(
+    path: str | Path,
+    source_layout: str = WEIGHT_LAYOUT_MLX,
+) -> dict[str, mx.array]:
+    """Load weights from a safetensors file, transposing if necessary.
+
+    Reads the ``weight_layout`` entry from the safetensors metadata header
+    and chooses the load path:
+
+    * ``mlx_ndhwc`` — file already holds MLX-layout tensors, load as-is.
+    * ``torch_ncdhw`` — file holds PyTorch-layout tensors (e.g. written by
+      ``nnUNetTrainer`` directly), transpose conv weights to MLX layout.
+
+    If the file has no ``weight_layout`` entry (e.g. legacy MLX files written
+    before this convention, or torch files written by older nnU-Net), the
+    caller's ``source_layout`` hint is used. Defaults to ``mlx_ndhwc`` so
+    pre-existing MLX-converted files keep loading without changes.
+
+    Loading goes through ``safetensors.numpy``, never through torch — works
+    on Apple Silicon with no PyTorch installed.
+    """
+    from safetensors import safe_open
     from safetensors.numpy import load_file
-    np_weights = load_file(str(path))
-    return {k: mx.array(v) for k, v in np_weights.items()}
+
+    with safe_open(str(path), framework="numpy") as f:
+        meta = f.metadata() or {}
+    layout = meta.get("weight_layout", source_layout)
+
+    np_state_dict = load_file(str(path))
+
+    if layout == WEIGHT_LAYOUT_MLX:
+        return {k: mx.array(v) for k, v in np_state_dict.items()}
+    if layout == WEIGHT_LAYOUT_TORCH:
+        # convert_pytorch_weights handles the transpose, key remapping, and
+        # filtering. Its tensor branch accepts numpy arrays via np.asarray.
+        return convert_pytorch_weights(np_state_dict)
+    raise ValueError(
+        f"Unknown weight_layout {layout!r} in {path}. "
+        f"Expected one of: {WEIGHT_LAYOUT_MLX!r}, {WEIGHT_LAYOUT_TORCH!r}."
+    )
 
 
 def convert_model_folder(model_folder: str | Path, checkpoint_name: str = "checkpoint_final.pth"):
@@ -180,17 +231,35 @@ def load_model_weights(
 ) -> dict[str, mx.array]:
     """Load weights for a model fold, preferring safetensors over .pth.
 
-    Returns MLX weight dict ready for model.load_weights().
+    File resolution order, from most to least preferred:
+
+    1. ``<base>.safetensors`` — the canonical layout written by nnUNetTrainer
+       (PyTorch-layout tensors with a ``weight_layout=torch_ncdhw`` metadata
+       header). Models trained with new nnU-Net land here directly with no
+       conversion step. The loader transposes on load via the metadata tag.
+    2. ``<base>_mlx.safetensors`` — the legacy MLX-pre-transposed format
+       written by this package's own ``nnunet-inference-mlx-convert`` CLI on
+       prior releases. Loaded as-is.
+    3. ``<base>.pth`` — legacy PyTorch pickle. Loaded via ``torch.load``
+       (one-time torch dependency at conversion time only).
+
+    Returns an MLX weight dict ready for ``network.load_weights``.
     """
     model_folder = Path(model_folder)
     fold_dir = model_folder / f"fold_{fold}"
+    base = checkpoint_name.replace(".pth", "")
 
-    # Prefer pre-converted safetensors
-    safetensors_path = fold_dir / checkpoint_name.replace(".pth", "_mlx.safetensors")
-    if safetensors_path.exists():
-        return load_weights_safetensors(safetensors_path)
+    # 1. Canonical nnUNet safetensors layout (torch-layout tensors).
+    nnunet_path = fold_dir / f"{base}.safetensors"
+    if nnunet_path.exists():
+        return load_weights_safetensors(nnunet_path, source_layout=WEIGHT_LAYOUT_TORCH)
 
-    # Fall back to .pth (requires torch)
+    # 2. Legacy MLX-pre-transposed safetensors.
+    legacy_path = fold_dir / f"{base}_mlx.safetensors"
+    if legacy_path.exists():
+        return load_weights_safetensors(legacy_path, source_layout=WEIGHT_LAYOUT_MLX)
+
+    # 3. Last resort: .pth (requires torch).
     pth_path = fold_dir / checkpoint_name
     if pth_path.exists():
         import torch
@@ -199,7 +268,7 @@ def load_model_weights(
 
     raise FileNotFoundError(
         f"No weights found in {fold_dir}. "
-        f"Expected {safetensors_path.name} or {checkpoint_name}"
+        f"Expected one of: {nnunet_path.name}, {legacy_path.name}, {checkpoint_name}"
     )
 
 
