@@ -148,12 +148,15 @@ class ModelBundle:
 
         model_folder = _find_model_folder(task_id, weights_dir)
 
-        # Auto-convert if needed
+        # Auto-convert if needed: any .pth without a sibling .safetensors gets
+        # converted once via torch. After conversion the runtime is torch-free.
         if auto_convert:
             fold_dir = model_folder / f"fold_{fold}"
-            has_safetensors = any(fold_dir.glob("*_mlx.safetensors"))
-            has_pth = any(fold_dir.glob("*.pth"))
-            if not has_safetensors and has_pth:
+            needs_convert = any(
+                p.with_suffix(".safetensors").exists() is False
+                for p in fold_dir.glob("*.pth")
+            )
+            if needs_convert:
                 print(f"Converting weights to safetensors (one-time, requires torch)...")
                 convert_model_folder(model_folder)
 
