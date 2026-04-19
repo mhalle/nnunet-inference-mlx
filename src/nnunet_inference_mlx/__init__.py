@@ -1,6 +1,12 @@
 """nnU-Net inference on Apple Silicon via MLX."""
 
 from .engine import InferenceEngine, ModelBundle, softmax_inplace
+from .io import (
+    load_nifti_zyx,
+    predict_folder,
+    predict_nifti,
+    save_segmentation_zyx,
+)
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
 from .preprocessing import preprocess_volume
@@ -25,4 +31,8 @@ __all__ = [
     "load_model_weights",
     "load_weights_safetensors",
     "preprocess_volume",
+    "load_nifti_zyx",
+    "save_segmentation_zyx",
+    "predict_nifti",
+    "predict_folder",
 ]

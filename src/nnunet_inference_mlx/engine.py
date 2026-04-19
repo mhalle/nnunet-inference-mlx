@@ -435,6 +435,29 @@ class InferenceEngine:
 
         return logits  # (K, Z, Y, X)
 
+    def close(self) -> None:
+        """Release the compiled graph and clear the MLX Metal cache.
+
+        TotalSegmentator full mode invokes inference 5× in one process;
+        without clearing the cache between runs the Metal allocator
+        accumulates buffers and OOMs.
+        """
+        self._net = None
+        self._shape_cache.clear()
+        mx.clear_cache()
+
+    def __enter__(self) -> InferenceEngine:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+
 
 def softmax_inplace(logits: np.ndarray) -> np.ndarray:
     """Convert logits to probabilities in-place along axis 0.
