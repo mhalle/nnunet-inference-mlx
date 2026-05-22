@@ -38,7 +38,7 @@ from .inference import (
     choose_batch_size,
     compute_gaussian,
     compute_sliding_window_steps,
-    predict_sliding_window_streaming,
+    predict_sliding_window,
 )
 from .plans import build_network_from_plans
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
@@ -534,7 +534,7 @@ class SlidingWindowEngine:
             volume = self.normalize(volume)
         else:
             volume = volume.astype(np.float32)
-        return predict_sliding_window_streaming(
+        return predict_sliding_window(
             network=self.predictor._compiled,
             input_image=volume[np.newaxis],
             patch_size=self.patch_size,
