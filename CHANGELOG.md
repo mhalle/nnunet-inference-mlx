@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.1] - 2026-05-22
+
+### Added — nnInteractive enabler set
+
+Two small additive changes that close the last gaps for a third-party port (notably nnInteractive) to use `nnunet-inference-mlx` as its core instead of forking `model.py` / `weights.py`.
+
+- **Nested `cfg["architecture"]` plans block.** `build_network_from_plans` now accepts the form
+  ```json
+  "architecture": {
+    "network_class_name": "...ResidualEncoderUNet",
+    "arch_kwargs":        {...}
+  }
+  ```
+  emitted by modern nnUNetv2 trainers via the `dynamic_network_architectures` configuration manager. The flat `network_arch_init_kwargs` form (TS Dataset29x plans) still works. Lookup order: flat-top-level → flat-in-config → nested-in-config → "old plans" fallback. Pure additive, no behavior change on existing models.
+- **`dtype=` weight cast on load.** `load_model_weights`, `load_checkpoint_with_metadata`, and `ModelBundle.from_folder` / `from_task` gain a `dtype` parameter. Pass `"float16"`, `"bfloat16"`, `"float32"`, or an `mx.Dtype` to cast on load. Default `None` preserves source precision. Verified 2.00× memory reduction on Dataset291 (125 MB → 62 MB). Callers using fp16 weights still need matching activation precision in the forward — this is a weight-cast convenience, not a full mixed-precision pipeline.
+
+### Changed — internal cleanup
+
+- **`predict_sliding_window_streaming` dropped** in favour of the simpler `predict_sliding_window` kernel. The streaming variant's rolling-Z accumulator was optimizing peak memory that isn't where TS's pressure actually sits (the 5-models-in-one-process Metal cache, addressed separately by `engine.close()`). `SlidingWindowEngine.predict` now calls the non-streaming kernel; ~231 lines removed from `inference.py`. Test suite runs ~15% faster on the same volumes. No public-API impact — the variant was never exported.
+
 ## [0.5.0] - 2026-05-22
 
 ### Added — layered inference architecture
