@@ -92,22 +92,13 @@ Results are identical across all backends (verified 100% voxel agreement).
 | 64GB | 5-6 | ~1.2 min |
 | 96GB+ | 7-8 | ~1 min |
 
-## Weight conversion
+## Weights
 
-Models are stored as PyTorch `.pth` checkpoints. Convert them to safetensors for torch-free runtime:
-
-```bash
-# Convert all downloaded TotalSegmentator models (torch needed for conversion only)
-uv run --with torch nnunet-mlx-convert --all .
-
-# Convert a specific model folder
-uv run --with torch nnunet-mlx-convert ~/.totalsegmentator/nnunet/results/Dataset297_*/nnUNet*/
-
-# Convert a single checkpoint
-uv run --with torch nnunet-mlx-convert path/to/checkpoint_final.pth
-```
-
-After conversion, the runtime dependencies are `mlx`, `numpy`, `nibabel`, `scipy`, and `safetensors`. No PyTorch required.
+TotalSegmentator's released `.pth` checkpoints are loaded directly via a
+vendored, restricted-unpickle reader (`src/nnunet_inference_mlx/_torchfree/`).
+No conversion step, no PyTorch — point `load_model_weights` (or
+`ModelBundle.from_task`) at the standard `~/.totalsegmentator/nnunet/results`
+tree and go. Runtime dependencies: `mlx`, `numpy`, `nibabel`, `scipy`.
 
 ## How it works
 

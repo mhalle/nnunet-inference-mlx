@@ -28,10 +28,8 @@ from .inference import (
 from .plans import build_network_from_plans
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
 from .weights import (
-    convert_model_folder,
     fuzzy_load_weights,
     load_model_weights,
-    load_weights_safetensors,
 )
 
 
@@ -122,12 +120,11 @@ class ModelBundle:
         task_id: int,
         fold: int = 0,
         weights_dir: str | Path | None = None,
-        auto_convert: bool = True,
     ) -> ModelBundle:
         """Load by task ID from the weights directory.
 
-        Finds the model folder, converts .pth to .safetensors if needed
-        (requires torch, one-time), then loads.
+        Reads TotalSegmentator release ``.pth`` files directly via the
+        vendored torch-free unpickler.
 
         Parameters
         ----------
@@ -138,28 +135,12 @@ class ModelBundle:
         weights_dir : str or Path, optional
             Where to look for models. Defaults to ~/.totalsegmentator/nnunet/results
             or $TOTALSEG_WEIGHTS_PATH.
-        auto_convert : bool
-            If True, convert .pth to .safetensors automatically when
-            safetensors are not found. Requires torch.
         """
         if weights_dir is None:
             weights_dir = _default_weights_dir()
         weights_dir = Path(weights_dir).expanduser()
 
         model_folder = _find_model_folder(task_id, weights_dir)
-
-        # Auto-convert if needed: any .pth without a sibling .safetensors gets
-        # converted once via torch. After conversion the runtime is torch-free.
-        if auto_convert:
-            fold_dir = model_folder / f"fold_{fold}"
-            needs_convert = any(
-                p.with_suffix(".safetensors").exists() is False
-                for p in fold_dir.glob("*.pth")
-            )
-            if needs_convert:
-                print(f"Converting weights to safetensors (one-time, requires torch)...")
-                convert_model_folder(model_folder)
-
         return ModelBundle.from_folder(model_folder, fold=fold)
 
 

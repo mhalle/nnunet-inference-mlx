@@ -1,10 +1,9 @@
 """
-Weight conversion and loading for MLX nnU-Net.
+Weight loading for MLX nnU-Net.
 
-Supports:
-  - Converting PyTorch .pth checkpoints to .safetensors (one-time, needs torch)
-  - Loading .safetensors at runtime (no torch needed)
-  - Automatic detection: loads safetensors if available, falls back to .pth
+Reads TotalSegmentator release ``.pth`` checkpoints directly via the
+vendored torch-free unpickler. No torch dependency, no on-disk conversion
+step — point :func:`load_model_weights` at the release tree and go.
 """
 
 from __future__ import annotations
@@ -13,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 import mlx.core as mx
+
+from ._torchfree import load_pth
 
 
 def convert_pytorch_weights(
@@ -126,188 +127,19 @@ def fuzzy_load_weights(network, mlx_weights: dict, verbose: bool = False):
     network.load_weights(list(mapped.items()))
 
 
-# ---------------------------------------------------------------------------
-# Safetensors I/O
-# ---------------------------------------------------------------------------
-
-WEIGHT_LAYOUT_TORCH = "torch_ncdhw"
-
-
-def load_weights_safetensors(path: str | Path) -> dict[str, mx.array]:
-    """Load weights from a safetensors file written in the nnU-Net canonical
-    layout (PyTorch ``torch_ncdhw``), transposing conv weights to MLX layout.
-
-    The safetensors metadata header must contain
-    ``weight_layout=torch_ncdhw``. This is what ``nnUNetTrainer`` writes
-    natively (after the safetensors PR) and what
-    :func:`convert_pth_to_safetensors` writes when converting legacy ``.pth``
-    files. Files without the metadata tag are rejected — there is no longer
-    a fallback hint, because the only file format this package writes or
-    reads is the canonical layout.
-
-    Loading goes through ``safetensors.numpy``, never through torch — works
-    on Apple Silicon with no PyTorch installed.
-    """
-    from safetensors import safe_open
-    from safetensors.numpy import load_file
-
-    with safe_open(str(path), framework="numpy") as f:
-        meta = f.metadata() or {}
-    layout = meta.get("weight_layout")
-
-    if layout is None:
-        raise ValueError(
-            f"{path} has no weight_layout metadata entry. "
-            f"This loader requires the nnU-Net canonical layout "
-            f"(weight_layout={WEIGHT_LAYOUT_TORCH!r}). Reconvert the source "
-            f".pth via convert_pth_to_safetensors or nnUNetv2_convert_to_safetensors."
-        )
-    if layout != WEIGHT_LAYOUT_TORCH:
-        raise ValueError(
-            f"Unsupported weight_layout {layout!r} in {path}. "
-            f"This loader only handles {WEIGHT_LAYOUT_TORCH!r}."
-        )
-
-    np_state_dict = load_file(str(path))
-    # convert_pytorch_weights handles the conv transpose, key remapping, and
-    # filtering. Its tensor branch accepts numpy arrays via np.asarray.
-    return convert_pytorch_weights(np_state_dict)
-
-
-def convert_pth_to_safetensors(
-    pth_path: str | Path, safetensors_path: str | Path | None = None
-) -> Path:
-    """Convert a single PyTorch ``.pth`` checkpoint to the canonical nnU-Net
-    safetensors layout. Output file holds the **untransposed** state dict
-    with a ``weight_layout=torch_ncdhw`` metadata header — bit-identical in
-    shape and tagging to what ``nnUNetTrainer`` writes natively.
-
-    Requires torch at conversion time. The runtime loader does not.
-    """
-    import torch
-    from safetensors.numpy import save_file
-
-    pth_path = Path(pth_path)
-    if safetensors_path is None:
-        safetensors_path = pth_path.with_suffix(".safetensors")
-    safetensors_path = Path(safetensors_path)
-
-    ckpt = torch.load(str(pth_path), map_location="cpu", weights_only=False)
-    state_dict = ckpt["network_weights"]
-    np_state_dict = {k: v.cpu().numpy() for k, v in state_dict.items()}
-    save_file(
-        np_state_dict,
-        str(safetensors_path),
-        metadata={
-            "weight_layout": WEIGHT_LAYOUT_TORCH,
-            "format_version": "1",
-        },
-    )
-    return safetensors_path
-
-
-def convert_model_folder(model_folder: str | Path, checkpoint_name: str = "checkpoint_final.pth"):
-    """Convert every fold's ``.pth`` checkpoint in a model folder to
-    canonical safetensors. Skips folds whose ``.safetensors`` already exists.
-
-    Requires torch (one-time conversion).
-    """
-    model_folder = Path(model_folder)
-    converted = 0
-    for fold_dir in sorted(model_folder.glob("fold_*")):
-        pth_path = fold_dir / checkpoint_name
-        if not pth_path.exists():
-            continue
-        safetensors_path = fold_dir / checkpoint_name.replace(".pth", ".safetensors")
-        if safetensors_path.exists():
-            continue
-        convert_pth_to_safetensors(pth_path, safetensors_path)
-        converted += 1
-        print(f"  Converted {fold_dir.name}/{checkpoint_name} -> {safetensors_path.name}")
-    return converted
-
-
 def load_model_weights(
     model_folder: str | Path,
     fold: int = 0,
     checkpoint_name: str = "checkpoint_final.pth",
 ) -> dict[str, mx.array]:
-    """Load weights for a model fold, preferring the canonical safetensors
-    layout. Falls back to a runtime ``.pth`` load (via torch) if no
-    safetensors file is present.
+    """Load weights for a model fold from a TotalSegmentator release ``.pth``.
 
-    File resolution order:
-
-    1. ``<base>.safetensors`` — canonical nnU-Net layout (PyTorch-layout
-       tensors with ``weight_layout=torch_ncdhw`` metadata). Written by
-       ``nnUNetTrainer`` natively, or by :func:`convert_pth_to_safetensors`.
-       Transposed on load.
-    2. ``<base>.pth`` — legacy PyTorch pickle. Loaded in memory via
-       ``torch.load`` (one-time torch dependency per call). For repeated
-       loads, use :func:`convert_pth_to_safetensors` once.
-
-    Returns an MLX weight dict ready for ``network.load_weights``.
+    Reads ``<fold_dir>/<checkpoint_name>`` directly via the vendored
+    torch-free unpickler — no torch, no on-disk conversion. Returns an MLX
+    weight dict ready for ``network.load_weights``.
     """
-    model_folder = Path(model_folder)
-    fold_dir = model_folder / f"fold_{fold}"
-    base = checkpoint_name.replace(".pth", "")
-
-    safetensors_path = fold_dir / f"{base}.safetensors"
-    if safetensors_path.exists():
-        return load_weights_safetensors(safetensors_path)
-
+    fold_dir = Path(model_folder) / f"fold_{fold}"
     pth_path = fold_dir / checkpoint_name
-    if pth_path.exists():
-        import torch
-        ckpt = torch.load(str(pth_path), map_location="cpu", weights_only=False)
-        return convert_pytorch_weights(ckpt["network_weights"])
-
-    raise FileNotFoundError(
-        f"No weights found in {fold_dir}. "
-        f"Expected {safetensors_path.name} or {checkpoint_name}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def convert_weights_cli():
-    """Command-line tool to convert all TotalSegmentator models to safetensors."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Convert PyTorch nnU-Net weights to MLX safetensors format"
-    )
-    parser.add_argument("path",
-                        help="Path to checkpoint_final.pth or model folder")
-    parser.add_argument("-o", "--output",
-                        help="Output path (only for single checkpoint)")
-    parser.add_argument("--all", action="store_true",
-                        help="Convert all models in ~/.totalsegmentator/")
-    args = parser.parse_args()
-
-    if args.all:
-        import os
-        if "TOTALSEG_WEIGHTS_PATH" in os.environ:
-            weights_dir = Path(os.environ["TOTALSEG_WEIGHTS_PATH"])
-        else:
-            weights_dir = Path.home() / ".totalsegmentator" / "nnunet" / "results"
-
-        total = 0
-        for dataset_dir in sorted(weights_dir.glob("Dataset*")):
-            for model_dir in sorted(dataset_dir.glob("*__*__*")):
-                print(f"Converting {model_dir.name}...")
-                total += convert_model_folder(model_dir)
-        print(f"\nConverted {total} checkpoints total.")
-    else:
-        path = Path(args.path)
-        if path.is_file() and path.suffix == ".pth":
-            out_path = Path(args.output) if args.output else path.with_suffix(".safetensors")
-            convert_pth_to_safetensors(path, out_path)
-            print(f"Converted {path} -> {out_path}")
-        elif path.is_dir():
-            n = convert_model_folder(path)
-            print(f"Converted {n} checkpoints.")
-        else:
-            print(f"Error: {path} is not a .pth file or directory")
+    if not pth_path.exists():
+        raise FileNotFoundError(f"No weights at {pth_path}")
+    return convert_pytorch_weights(load_pth(str(pth_path)))

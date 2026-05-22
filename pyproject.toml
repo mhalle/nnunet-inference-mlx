@@ -1,6 +1,6 @@
 [project]
 name = "nnunet-inference-mlx"
-version = "0.3.1"
+version = "0.4.0"
 description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -8,16 +8,13 @@ requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.25",
     "numpy",
-    "safetensors",
     "tqdm",
 ]
 
 [project.optional-dependencies]
-convert = ["torch"]
+# Remote loading of .pth checkpoints over HTTP range requests.
+remote = ["requests", "remotezip"]
 test = ["pytest"]
-
-[project.scripts]
-nnunet-inference-mlx-convert = "nnunet_inference_mlx.weights:convert_weights_cli"
 
 [build-system]
 requires = ["hatchling"]
