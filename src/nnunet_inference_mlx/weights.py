@@ -16,9 +16,29 @@ import mlx.core as mx
 from ._torchfree import load_pth
 
 
+_DTYPE_MAP = {
+    "float32": mx.float32,
+    "float16": mx.float16,
+    "bfloat16": mx.bfloat16,
+}
+
+
+def _resolve_dtype(dtype):
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        if dtype not in _DTYPE_MAP:
+            raise ValueError(
+                f"dtype must be one of {sorted(_DTYPE_MAP)} or an mx.Dtype; got {dtype!r}"
+            )
+        return _DTYPE_MAP[dtype]
+    return dtype  # assume already an mx.Dtype
+
+
 def convert_pytorch_weights(
     pt_state_dict: dict,
     key_map: dict[str, str] | None = None,
+    dtype: str | mx.Dtype | None = None,
 ) -> dict[str, mx.array]:
     """Convert a PyTorch nnU-Net state dict to MLX format.
 
@@ -28,7 +48,10 @@ def convert_pytorch_weights(
       - ConvTranspose3d weights: (in, out, D, H, W) -> (out, D, H, W, in)
       - 1D tensors (bias, norm): no change
       - Key remapping: remove extra .0 from Sequential wrapping
+      - Optional dtype cast (``"float16"``, ``"bfloat16"``, ``"float32"``,
+        or an ``mx.Dtype``). Default keeps the source precision.
     """
+    target_dtype = _resolve_dtype(dtype)
     mlx_weights = {}
 
     for pt_key, tensor in pt_state_dict.items():
@@ -58,7 +81,10 @@ def convert_pytorch_weights(
                 # MLX Conv3d:     (out_ch, D, H, W, in_ch)
                 arr = arr.transpose(0, 2, 3, 4, 1)
 
-        mlx_weights[mlx_key] = mx.array(arr)
+        a = mx.array(arr)
+        if target_dtype is not None and a.dtype != target_dtype:
+            a = a.astype(target_dtype)
+        mlx_weights[mlx_key] = a
 
     return mlx_weights
 
@@ -131,24 +157,30 @@ def load_model_weights(
     model_folder: str | Path,
     fold: int = 0,
     checkpoint_name: str = "checkpoint_final.pth",
+    dtype: str | mx.Dtype | None = None,
 ) -> dict[str, mx.array]:
     """Load weights for a single model fold from a ``.pth``.
 
     Reads ``<fold_dir>/<checkpoint_name>`` directly via the vendored
     torch-free unpickler — no torch, no on-disk conversion. Returns an MLX
     weight dict ready for ``network.load_weights``.
+
+    Pass ``dtype="float16"`` (or ``"bfloat16"``) to cast on load — saves
+    memory at the cost of precision. Callers using fp16 weights must run
+    inference with matching activation dtype.
     """
     fold_dir = Path(model_folder) / f"fold_{fold}"
     pth_path = fold_dir / checkpoint_name
     if not pth_path.exists():
         raise FileNotFoundError(f"No weights at {pth_path}")
-    return convert_pytorch_weights(load_pth(str(pth_path)))
+    return convert_pytorch_weights(load_pth(str(pth_path)), dtype=dtype)
 
 
 def load_checkpoint_with_metadata(
     model_folder: str | Path,
     fold: int,
     checkpoint_name: str = "checkpoint_final.pth",
+    dtype: str | mx.Dtype | None = None,
 ) -> tuple[dict[str, mx.array], dict]:
     """Load weights + the checkpoint's non-weights metadata for one fold.
 
@@ -156,7 +188,8 @@ def load_checkpoint_with_metadata(
     top-level checkpoint entry except ``network_weights`` (e.g. ``init_args``,
     ``trainer_name``, ``inference_allowed_mirroring_axes``). Callers use this
     to auto-detect configuration name, trainer name, or other inference-time
-    hints without a second file read.
+    hints without a second file read. ``dtype`` casts weights on load (see
+    :func:`load_model_weights`).
     """
     fold_dir = Path(model_folder) / f"fold_{fold}"
     pth_path = fold_dir / checkpoint_name
@@ -164,7 +197,7 @@ def load_checkpoint_with_metadata(
         raise FileNotFoundError(f"No weights at {pth_path}")
     full = load_pth(str(pth_path), weights_key=None)
     weights_pt = full.pop("network_weights", {})
-    return convert_pytorch_weights(weights_pt), full
+    return convert_pytorch_weights(weights_pt, dtype=dtype), full
 
 
 def discover_folds(model_folder: str | Path) -> tuple[int, ...]:

@@ -141,6 +141,7 @@ class ModelBundle:
     def from_folder(
         path: str | Path,
         folds: int | Iterable[int] | str = "all",
+        dtype: str | mx.Dtype | None = None,
     ) -> ModelBundle:
         """Load from a local model folder.
 
@@ -160,6 +161,9 @@ class ModelBundle:
             single-fold release builds (e.g. TotalSegmentator) and
             multi-fold trained models (e.g. MOOSE) without the caller
             needing to know upfront.
+        dtype : str or mx.Dtype, optional
+            Cast weights to this precision on load. Pass ``"float16"`` /
+            ``"bfloat16"`` to save memory. None preserves source precision.
 
         Returns
         -------
@@ -175,7 +179,7 @@ class ModelBundle:
         fold_weights: list[dict[str, mx.array]] = []
         metadata: dict = {}
         for i, f in enumerate(fold_ids):
-            w, meta = load_checkpoint_with_metadata(path, fold=f)
+            w, meta = load_checkpoint_with_metadata(path, fold=f, dtype=dtype)
             fold_weights.append(w)
             if i == 0:
                 metadata = meta
@@ -211,10 +215,11 @@ class ModelBundle:
         task_id: int,
         folds: int | Iterable[int] | str = "all",
         weights_dir: str | Path | None = None,
+        dtype: str | mx.Dtype | None = None,
     ) -> ModelBundle:
         """Load by task ID from the weights directory.
 
-        See :meth:`from_folder` for ``folds`` semantics.
+        See :meth:`from_folder` for ``folds`` and ``dtype`` semantics.
 
         Parameters
         ----------
@@ -228,7 +233,7 @@ class ModelBundle:
         weights_dir = Path(weights_dir).expanduser()
 
         model_folder = _find_model_folder(task_id, weights_dir)
-        return ModelBundle.from_folder(model_folder, folds=folds)
+        return ModelBundle.from_folder(model_folder, folds=folds, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------

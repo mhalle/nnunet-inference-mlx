@@ -25,10 +25,16 @@ def build_network_from_plans(
     """
     config = plans["configurations"][configuration]
 
-    # New format: network_arch_init_kwargs at top level or in config
-    arch_kwargs = plans.get(
-        "network_arch_init_kwargs",
-        config.get("network_arch_init_kwargs", None),
+    # Modern format A (flat keys): network_arch_init_kwargs at top level or in
+    # config — used by TotalSegmentator Dataset29x checkpoints.
+    # Modern format B (nested block): config["architecture"]["arch_kwargs"] —
+    # used by nnInteractive and other recent nnUNetv2 trainers that go through
+    # dynamic_network_architectures' configuration manager.
+    nested = config.get("architecture") or {}
+    arch_kwargs = (
+        plans.get("network_arch_init_kwargs")
+        or config.get("network_arch_init_kwargs")
+        or nested.get("arch_kwargs")
     )
 
     if arch_kwargs is not None:
@@ -47,12 +53,12 @@ def _build_from_new_plans(
     deep_supervision: bool,
 ) -> nn.Module:
     """Build from new-style plans (network_arch_init_kwargs)."""
-    arch_class = plans.get(
-        "network_arch_class_name",
-        config.get(
-            "network_arch_class_name",
-            "dynamic_network_architectures.architectures.unet.PlainConvUNet",
-        ),
+    nested = config.get("architecture") or {}
+    arch_class = (
+        plans.get("network_arch_class_name")
+        or config.get("network_arch_class_name")
+        or nested.get("network_class_name")
+        or "dynamic_network_architectures.architectures.unet.PlainConvUNet"
     )
 
     n_stages = arch_kwargs["n_stages"]
