@@ -67,15 +67,29 @@ def predict_nifti(
     engine: "InferenceEngine",
     in_path: str | Path,
     out_path: str | Path,
-    dtype: np.dtype = np.uint8,
+    dtype: "np.dtype | str | None" = None,
 ) -> np.ndarray:
     """Run inference on a single NIfTI file and write the segmentation.
 
-    Returns the segmentation in (Z, Y, X) order for callers that want it.
+    Uses :meth:`InferenceEngine.predict_segmentation` so region-based models
+    (BraTS-style) produce correct labels — a raw ``argmax`` would silently
+    do the wrong thing on independent-sigmoid output heads.
+
+    Parameters
+    ----------
+    dtype : np.dtype, str, or None
+        Output integer dtype. ``None`` (default) auto-picks the smallest
+        unsigned dtype that fits every label value in the dataset
+        (``uint8`` / ``uint16`` / ``uint32``). Pass an explicit dtype
+        (``"uint8"``, ``np.uint16``, etc.) to force a specific width.
+
+    Returns
+    -------
+    np.ndarray
+        Segmentation in (Z, Y, X) order.
     """
     vol_zyx, img = load_nifti_zyx(in_path)
-    logits = engine.predict(vol_zyx)
-    seg_zyx = np.argmax(logits, axis=0).astype(dtype)
+    seg_zyx = engine.predict_segmentation(vol_zyx, dtype=dtype)
     save_segmentation_zyx(seg_zyx, out_path, img)
     return seg_zyx
 

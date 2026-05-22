@@ -40,6 +40,13 @@ from .inference import (
     compute_sliding_window_steps,
     predict_sliding_window,
 )
+from .labels import (
+    convert_logits_to_segmentation,
+    has_regions,
+    label_dtype,
+    regions_class_order,
+    sigmoid_inplace,
+)
 from .plans import build_network_from_plans
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
 from .weights import (
@@ -115,6 +122,27 @@ class ModelBundle:
     fold_weights: list[dict[str, mx.array]]
     metadata: dict = field(default_factory=dict)
     fold_ids: tuple[int, ...] = ()
+
+    @property
+    def has_regions(self) -> bool:
+        """True if this dataset uses region-based labels (BraTS-style).
+
+        Region-based means some label values in ``dataset.json`` are lists of
+        underlying classes rather than single ints. The model emits one
+        sigmoid head per region, not a softmax across classes. Post-
+        processing differs (per-region threshold + paint priority) and the
+        fold-ensemble averaging differs (sigmoid-mean vs softmax-mean).
+        """
+        return has_regions(self.dataset)
+
+    @property
+    def regions_class_order(self) -> tuple[int, ...]:
+        """Paint-priority order for region-based label conversion.
+
+        Empty tuple for standard datasets. For region-based datasets, raises
+        ``ValueError`` if dataset.json is missing ``regions_class_order``.
+        """
+        return regions_class_order(self.dataset)
 
     @property
     def mirroring_axes(self) -> tuple[int, ...]:
@@ -332,7 +360,19 @@ class Predictor:
         config = plans["configurations"][cfg_name]
         self.configuration = cfg_name
         self.patch_size = tuple(config["patch_size"])
-        self.num_classes = len(dataset["labels"])
+        # Number of network output heads. For standard softmax models, that's
+        # one per label (background included as a softmax class). For region-
+        # based models, it's one per foreground region — background is
+        # implicit, and regions of size 1 may be written as bare ints (e.g.
+        # ``"ET": 3``) rather than 1-element lists. Either way they count as
+        # a head. Matches nnUNetv2's LabelManager.num_segmentation_heads.
+        labels = dataset["labels"]
+        if has_regions(dataset):
+            self.num_classes = sum(
+                1 for k in labels if k != "background"
+            )
+        else:
+            self.num_classes = len(labels)
 
         if num_input_channels is None:
             num_input_channels = len(
@@ -564,21 +604,30 @@ class SlidingWindowEngine:
 # ---------------------------------------------------------------------------
 
 class FoldEnsemble:
-    """Softmax-averaging fold ensemble over a Predictor or SlidingWindowEngine.
+    """Probability-averaging fold ensemble over a Predictor or SlidingWindowEngine.
 
     Loops the bundle's ``fold_weights`` via :meth:`Predictor.reload_weights`
     between forwards. Skips the loop entirely when there's only one fold,
     so wrapping a single-fold bundle is a no-op cost.
 
-    Returns averaged probabilities (already softmaxed), not logits — the
-    average-of-softmaxes is the standard nnU-Net ensemble convention. Same
-    shape semantics otherwise; ``argmax(axis=0)`` still yields the segmentation.
+    Averaging math depends on the model's label scheme:
+
+    * Standard N-class models: softmax-then-average (heads are softmax-related).
+    * Region-based models: sigmoid-then-average (each head is independent).
+
+    Pass ``region_based=True`` to force the sigmoid path; defaults to False
+    so the facade can construct it conventionally. Returns averaged
+    probabilities. ``argmax(axis=0)`` still yields the segmentation for
+    standard models; for region-based, use
+    :func:`labels.convert_logits_to_segmentation` (with ``threshold=0.5``,
+    since the output is post-sigmoid).
     """
 
     def __init__(
         self,
         backend: Predictor | SlidingWindowEngine,
         fold_weights: Sequence[dict[str, mx.array]] | None = None,
+        region_based: bool = False,
     ):
         self.backend = backend
         if fold_weights is None:
@@ -587,6 +636,7 @@ class FoldEnsemble:
         self.fold_weights = list(fold_weights)
         if not self.fold_weights:
             raise ValueError("FoldEnsemble needs at least one fold.")
+        self.region_based = region_based
 
     def _predictor(self) -> Predictor:
         if isinstance(self.backend, Predictor):
@@ -594,16 +644,17 @@ class FoldEnsemble:
         return self.backend.predictor
 
     def predict(self, *args, **kwargs) -> np.ndarray:
-        """Run the backend's predict / forward across all folds, average softmax."""
+        """Run the backend's predict / forward across all folds, average probabilities."""
         if len(self.fold_weights) == 1:
             self._predictor().reload_weights(self.fold_weights[0])
             return self._single(*args, **kwargs)
 
+        squash = sigmoid_inplace if self.region_based else softmax_inplace
         acc: np.ndarray | None = None
         for w in self.fold_weights:
             self._predictor().reload_weights(w)
             out = self._single(*args, **kwargs)
-            probs = softmax_inplace(np.asarray(out, dtype=np.float32))
+            probs = squash(np.asarray(out, dtype=np.float32))
             if acc is None:
                 acc = probs
             else:
@@ -675,16 +726,22 @@ class InferenceEngine:
             verbose=verbose,
             progress=progress,
         )
+        self._bundle = bundle
         self._backend = (
-            FoldEnsemble(self._sliding, bundle.fold_weights)
+            FoldEnsemble(
+                self._sliding,
+                bundle.fold_weights,
+                region_based=bundle.has_regions,
+            )
             if len(bundle.fold_weights) > 1
             else self._sliding
         )
         if verbose:
+            scheme = "region-based" if bundle.has_regions else "standard"
             print(
                 f"InferenceEngine ready: patch={self.patch_size}, "
                 f"classes={self.num_classes}, "
-                f"folds={len(bundle.fold_weights)}"
+                f"folds={len(bundle.fold_weights)}, labels={scheme}"
             )
 
     # Expose the layered objects for callers that want them.
@@ -719,8 +776,70 @@ class InferenceEngine:
         return self._sliding.prepare(shape)
 
     def predict(self, volume: np.ndarray, normalize: bool = True) -> np.ndarray:
-        """Run inference. Single-fold → logits; multi-fold → averaged probs."""
+        """Run inference and return per-channel predictions.
+
+        * Standard model, single fold  → raw logits, shape ``(K, Z, Y, X)``.
+        * Standard model, multi fold   → averaged softmax probabilities.
+        * Region-based, single fold    → per-region logits.
+        * Region-based, multi fold     → averaged per-region sigmoid probs.
+
+        Use :meth:`predict_segmentation` to skip the post-processing branch
+        — it handles all four cases and returns integer labels directly.
+        """
         return self._backend.predict(volume, normalize=normalize)
+
+    def predict_segmentation(
+        self,
+        volume: np.ndarray,
+        normalize: bool = True,
+        dtype: str | np.dtype | None = None,
+    ) -> np.ndarray:
+        """Run inference and return an integer segmentation map.
+
+        Wraps :meth:`predict` with the correct post-processing for the
+        bundle's label scheme:
+
+        * Standard datasets → ``argmax(axis=0)`` on the predictor output.
+        * Region-based datasets → per-region threshold + paint priority
+          from ``regions_class_order``. Threshold is at 0 for single-fold
+          (logits) and 0.5 for multi-fold (averaged sigmoid probs).
+
+        Parameters
+        ----------
+        volume : np.ndarray
+            Input shape ``(Z, Y, X)``.
+        normalize : bool
+            Apply the model's per-channel normalization before inference.
+        dtype : str, np.dtype, or None
+            Output integer dtype. ``None`` (default) auto-picks the smallest
+            unsigned dtype that fits every label value in the dataset
+            (``uint8`` / ``uint16`` / ``uint32``). Pass an explicit dtype
+            to override.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(Z, Y, X)``, integer dtype.
+        """
+        pred = self._backend.predict(volume, normalize=normalize)
+        if self._bundle.has_regions and len(self._bundle.fold_weights) > 1:
+            # multi-fold ensemble already applied sigmoid before averaging
+            threshold = 0.5
+        else:
+            # single-fold returns raw logits; argmax doesn't care about scale
+            threshold = 0.0
+        return convert_logits_to_segmentation(
+            pred, self._bundle.dataset, threshold=threshold, dtype=dtype
+        )
+
+    @property
+    def label_dtype(self) -> np.dtype:
+        """Smallest unsigned integer dtype that fits this bundle's labels.
+
+        What :meth:`predict_segmentation` would default to when called
+        without an explicit ``dtype=`` override.
+        """
+        return label_dtype(self._bundle.dataset)
 
     def close(self) -> None:
         """Release the compiled graph and clear the MLX Metal cache."""

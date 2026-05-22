@@ -8,6 +8,13 @@ from .engine import (
     SlidingWindowEngine,
     softmax_inplace,
 )
+from .labels import (
+    convert_logits_to_segmentation,
+    has_regions,
+    label_dtype,
+    regions_class_order,
+    sigmoid_inplace,
+)
 from .io import (
     load_nifti_zyx,
     predict_folder,
@@ -32,6 +39,12 @@ __all__ = [
     "FoldEnsemble",
     "InferenceEngine",          # back-compat facade
     "softmax_inplace",
+    "sigmoid_inplace",
+    # Label-scheme post-processing
+    "convert_logits_to_segmentation",
+    "has_regions",
+    "label_dtype",
+    "regions_class_order",
     # Model + plans + weights
     "PlainConvUNet",
     "ResidualEncoderUNet",
