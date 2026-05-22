@@ -132,7 +132,7 @@ def load_model_weights(
     fold: int = 0,
     checkpoint_name: str = "checkpoint_final.pth",
 ) -> dict[str, mx.array]:
-    """Load weights for a model fold from a TotalSegmentator release ``.pth``.
+    """Load weights for a single model fold from a ``.pth``.
 
     Reads ``<fold_dir>/<checkpoint_name>`` directly via the vendored
     torch-free unpickler — no torch, no on-disk conversion. Returns an MLX
@@ -143,3 +143,37 @@ def load_model_weights(
     if not pth_path.exists():
         raise FileNotFoundError(f"No weights at {pth_path}")
     return convert_pytorch_weights(load_pth(str(pth_path)))
+
+
+def load_checkpoint_with_metadata(
+    model_folder: str | Path,
+    fold: int,
+    checkpoint_name: str = "checkpoint_final.pth",
+) -> tuple[dict[str, mx.array], dict]:
+    """Load weights + the checkpoint's non-weights metadata for one fold.
+
+    Returns ``(mlx_weights, metadata)`` where ``metadata`` contains every
+    top-level checkpoint entry except ``network_weights`` (e.g. ``init_args``,
+    ``trainer_name``, ``inference_allowed_mirroring_axes``). Callers use this
+    to auto-detect configuration name, trainer name, or other inference-time
+    hints without a second file read.
+    """
+    fold_dir = Path(model_folder) / f"fold_{fold}"
+    pth_path = fold_dir / checkpoint_name
+    if not pth_path.exists():
+        raise FileNotFoundError(f"No weights at {pth_path}")
+    full = load_pth(str(pth_path), weights_key=None)
+    weights_pt = full.pop("network_weights", {})
+    return convert_pytorch_weights(weights_pt), full
+
+
+def discover_folds(model_folder: str | Path) -> tuple[int, ...]:
+    """List the integer fold IDs present as ``fold_<N>/`` subdirs."""
+    folds: list[int] = []
+    for entry in sorted(Path(model_folder).iterdir()):
+        if entry.is_dir() and entry.name.startswith("fold_"):
+            try:
+                folds.append(int(entry.name[len("fold_"):]))
+            except ValueError:
+                continue
+    return tuple(folds)

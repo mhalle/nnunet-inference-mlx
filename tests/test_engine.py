@@ -45,7 +45,13 @@ def make_synthetic_bundle(num_classes=4):
     )
 
     weights = dict(nn.utils.tree_flatten(network.parameters()))
-    return ModelBundle(plans=plans, dataset=dataset, weights=weights)
+    return ModelBundle(
+        plans=plans,
+        dataset=dataset,
+        fold_weights=[weights],
+        metadata={},
+        fold_ids=(0,),
+    )
 
 
 def test_predict():
