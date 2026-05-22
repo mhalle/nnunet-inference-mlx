@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.5.2] - 2026-05-22
+
+### Added — region-based label handling (BraTS-style models)
+
+New `labels.py` module brings the LabelManager-equivalent post-processing piece that was the last gap vs `nnUNetPredictor`. Closes a silent-correctness hole: a BraTS-style checkpoint loaded into 0.5.1 and consumed via `np.argmax(engine.predict(vol), axis=0)` would have produced nonsense labels because the model's region heads are independent sigmoids, not a softmax distribution.
+
+- **`labels.has_regions(dataset_json)`** — True if any label value is a list/tuple of underlying classes (the union form).
+- **`labels.regions_class_order(dataset_json)`** — paint-priority tuple, empty for standard datasets.
+- **`labels.label_dtype(dataset_json)`** — smallest unsigned integer dtype that fits every label value across both region member-class lists and `regions_class_order` output values. Returns `uint8` / `uint16` / `uint32` per nnUNetv2's convention.
+- **`labels.convert_logits_to_segmentation(pred, dataset_json, threshold=0.0, dtype=None)`** — uniform post-processing. Standard datasets get `argmax`; region-based get threshold + paint-priority overwrite. Auto-detects scheme from `dataset_json`. `dtype=None` (default) auto-picks via `label_dtype`; pass explicit dtype to override.
+- **`labels.sigmoid_inplace`** — float32-safe in-place sigmoid (matches `softmax_inplace` in style).
+
+`ModelBundle` gains two derived properties:
+
+- **`bundle.has_regions`** — True for BraTS-style datasets.
+- **`bundle.regions_class_order`** — the paint-priority tuple.
+
+### Added — `InferenceEngine.predict_segmentation()`
+
+The one-call high-level path that returns integer labels directly. Handles all four (scheme × fold-count) combinations:
+
+| Scheme | Single fold | Multi fold |
+|---|---|---|
+| Standard | logits → argmax | softmax-avg → argmax |
+| Region-based | per-region logits → threshold + paint | sigmoid-avg → threshold + paint |
+
+```python
+seg = engine.predict_segmentation(volume)        # auto dtype
+seg = engine.predict_segmentation(volume, dtype="uint16")  # explicit dtype
+```
+
+Auto-routes through the right scheme; auto-picks output dtype (the smallest unsigned int that fits every label value). Pass an explicit dtype to force a specific integer width regardless of what the dataset needs.
+
+Also exposed: **`engine.label_dtype`** read-only property for introspecting what auto-detection would pick.
+
+### Fixed — `Predictor.num_classes` for region-based datasets
+
+Previously `Predictor.num_classes = len(dataset["labels"])` — which counts background plus all regions/labels indiscriminately. For region-based datasets this gave the wrong network output channel count (e.g. 4 instead of 3 for BraTS, where background is implicit). Now correctly counts foreground regions (`sum(k != "background")`) for region-based datasets while preserving the standard `len(labels)` rule for softmax datasets. Also handles bare-int size-1 regions like `"ET": 3` correctly — they count as a head, same as `"ET": [3]`.
+
+### Changed — `FoldEnsemble` averaging
+
+The fold-ensemble averaging branches on label scheme:
+
+- **Standard** models (heads are softmax-related): softmax-then-average — unchanged.
+- **Region-based** models (heads are independent sigmoids): sigmoid-then-average. Auto-set from `bundle.has_regions` when the facade builds the ensemble; can be forced via `FoldEnsemble(..., region_based=True)` for direct callers.
+
+### Changed — `predict_nifti` default dtype
+
+The `dtype` parameter on `nnunet_inference_mlx.io.predict_nifti` now defaults to `None` (auto-detect from dataset) instead of hardcoded `np.uint8`. Pass an explicit dtype to force one. Also internally routes through `engine.predict_segmentation` instead of a raw `np.argmax`, so region-based models produce correct labels through the NIfTI helper too.
+
+### Migration
+
+Purely additive; no API removals. Code calling `engine.predict()` + `np.argmax` continues to work unchanged for standard models. Code using region-based models that was silently broken in 0.5.1 (no public consumer that we know of) now works correctly via `engine.predict_segmentation()`.
+
 ## [0.5.1] - 2026-05-22
 
 ### Added — nnInteractive enabler set
