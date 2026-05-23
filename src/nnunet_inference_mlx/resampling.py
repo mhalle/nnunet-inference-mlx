@@ -217,35 +217,6 @@ def _trilinear_sample(
     return _trilinear_from_indices(src, *idx)
 
 
-def _materialize_resample_argmax(
-    logits_target: mx.array,            # (K, Z_t, Y_t, X_t)
-    out_shape_zyx: tuple[int, int, int],
-    target_spacing_zyx: tuple[float, float, float],
-    acq_spacing_zyx: tuple[float, float, float],
-    out_dtype: np.dtype,
-) -> np.ndarray:
-    """Materialize the whole K-channel-at-acquisition array, argmax, return uint*.
-
-    Fast path for when the output is small enough to fit in budget (the
-    downsample / mild-upsample case). Uses MLX's native 3D linear upsample.
-    """
-    K, Z_t, Y_t, X_t = logits_target.shape
-    Z_a, Y_a, X_a = out_shape_zyx
-
-    # MLX's nn.Upsample wants channels-last 5D: (N, D, H, W, C).
-    inp = mx.expand_dims(logits_target.transpose(1, 2, 3, 0), 0)  # (1, Z_t, Y_t, X_t, K)
-    scale = (Z_a / Z_t, Y_a / Y_t, X_a / X_t)
-    up = nn.Upsample(scale_factor=scale, mode="linear")
-    out = up(inp)[0]   # (Z_out, Y_out, X_out, K), where Z_out = int(Z_t * scale_z) etc.
-
-    # The scale factor → int(in * scale) calculation can off-by-one vs
-    # the exact target shape. Crop or pad to land exactly on out_shape.
-    out = _resize_to_exact(out, (Z_a, Y_a, X_a))
-    seg = mx.argmax(out, axis=-1)              # (Z_a, Y_a, X_a) int32
-    mx.eval(seg)
-    return np.asarray(seg).astype(out_dtype, copy=False)
-
-
 def _resize_to_exact(
     arr: mx.array,                  # (Z, Y, X, K) channels-last
     target_zyx: tuple[int, int, int],
@@ -363,34 +334,23 @@ def inverse_resample_argmax(
 ) -> np.ndarray:
     """Resample target-spacing logits to acquisition spacing and argmax.
 
-    Auto-picks between two strategies:
+    Single Z-slab loop with all-K per slab using ``mx.nn.Upsample``.
+    Slab depth is auto-sized from ``peak_working_memory_mb`` so the
+    K-channel acquisition-spacing slab fits the budget. When the whole
+    output fits in one slab, the loop runs once and is equivalent to a
+    materialize pass.
 
-    * **Materialize** (fast path): when the full K-channel acquisition-
-      spacing array fits within ``peak_working_memory_mb``, allocate it
-      and argmax in one shot. Used for downsample / small-upsample cases.
-    * **Slab-stream**: when the materialized array would exceed the
-      budget, process the output in Z slabs, with a channel-inner loop
-      that updates a slab-local running argmax. Used for large upsamples.
-
-    Both strategies produce identical output (linear per-channel interp
-    + argmax). The choice affects memory and launch count, not math.
+    Throughput is determined by MLX's native trilinear-upsample kernel
+    (~11 ns / voxel-K on M2 base, ~3 ns / voxel-K on M1 Max) and does
+    not vary with slab size — ``peak_working_memory_mb`` is purely a
+    memory-bound knob, not a perf knob.
 
     ``peak_working_memory_mb=None`` (default) auto-detects from system
     RAM: 200 MB on < 32 GB Macs, 2000 MB on ≥ 32 GB Macs.
     """
     if peak_working_memory_mb is None:
         peak_working_memory_mb = _auto_memory_budget_mb()
-
     out_dtype = np.dtype(out_dtype)
-    K = logits_target.shape[0]
-    out_voxels = out_shape_zyx[0] * out_shape_zyx[1] * out_shape_zyx[2]
-    materialize_bytes = K * out_voxels * 4   # fp32 K-channel acq array
-
-    if materialize_bytes <= peak_working_memory_mb * 1024 * 1024:
-        return _materialize_resample_argmax(
-            logits_target, out_shape_zyx,
-            target_spacing_zyx, acq_spacing_zyx, out_dtype,
-        )
     return _slab_resample_argmax(
         logits_target, out_shape_zyx,
         target_spacing_zyx, acq_spacing_zyx,
