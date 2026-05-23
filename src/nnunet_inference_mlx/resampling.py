@@ -143,19 +143,17 @@ def _auto_memory_budget_mb() -> int:
     return 200        # 16 GB Macs and similar
 
 
-def _trilinear_sample(
-    src: mx.array,        # (Z, Y, X) float32
-    z_coords: mx.array,   # (S,)   fractional positions in src Z (0..Z-1)
-    y_coords: mx.array,   # (Y_a,)
-    x_coords: mx.array,   # (X_a,)
-) -> mx.array:            # (S, Y_a, X_a)
-    """Trilinear interpolation of one channel at the requested coordinates.
+def _precompute_trilinear_indices(
+    z_coords: mx.array, y_coords: mx.array, x_coords: mx.array,
+    Z: int, Y: int, X: int,
+):
+    """Pre-compute floor/ceil index broadcasts and fractional weights once.
 
-    Coordinates are in *source* voxel space (fractional). Out-of-bounds
-    inputs are clamped to the volume edges (zero-order extrapolation).
+    Used by the slab-streaming inverse resample: index computation is
+    identical across all K channels in a slab, so factoring it out of
+    the channel loop saves K-1 redundant computations and shrinks the
+    compiled-kernel input set to just the per-channel ``src`` array.
     """
-    Z, Y, X = src.shape
-
     z = mx.clip(z_coords, 0.0, Z - 1.0)
     y = mx.clip(y_coords, 0.0, Y - 1.0)
     x = mx.clip(x_coords, 0.0, X - 1.0)
@@ -167,19 +165,22 @@ def _trilinear_sample(
     y1 = mx.minimum(y0 + 1, Y - 1)
     x1 = mx.minimum(x0 + 1, X - 1)
 
-    zf = (z - z0.astype(mx.float32))[:, None, None]    # (S, 1, 1)
-    yf = (y - y0.astype(mx.float32))[None, :, None]    # (1, Y_a, 1)
-    xf = (x - x0.astype(mx.float32))[None, None, :]    # (1, 1, X_a)
+    return (
+        z0[:, None, None], z1[:, None, None],
+        y0[None, :, None], y1[None, :, None],
+        x0[None, None, :], x1[None, None, :],
+        (z - z0.astype(mx.float32))[:, None, None],   # zf
+        (y - y0.astype(mx.float32))[None, :, None],   # yf
+        (x - x0.astype(mx.float32))[None, None, :],   # xf
+    )
 
-    # Broadcast indices to (S, Y_a, X_a)
-    zi0 = z0[:, None, None]
-    zi1 = z1[:, None, None]
-    yi0 = y0[None, :, None]
-    yi1 = y1[None, :, None]
-    xi0 = x0[None, None, :]
-    xi1 = x1[None, None, :]
 
-    # 8-corner gather + blend. Each src[zi, yi, xi] broadcasts to (S, Y_a, X_a).
+def _trilinear_from_indices(
+    src: mx.array,                  # (Z, Y, X)
+    zi0, zi1, yi0, yi1, xi0, xi1,   # broadcast index tensors from _precompute
+    zf, yf, xf,                     # fractional weights
+) -> mx.array:                      # (S, Y_a, X_a)
+    """Trilinear blend using pre-computed indices. Pure tensor ops; fuses."""
     c000 = src[zi0, yi0, xi0]
     c001 = src[zi0, yi0, xi1]
     c010 = src[zi0, yi1, xi0]
@@ -189,7 +190,6 @@ def _trilinear_sample(
     c110 = src[zi1, yi1, xi0]
     c111 = src[zi1, yi1, xi1]
 
-    # Bilinear blend over Y, X for each Z plane, then linear blend in Z.
     c00 = c000 * (1 - xf) + c001 * xf
     c01 = c010 * (1 - xf) + c011 * xf
     c10 = c100 * (1 - xf) + c101 * xf
@@ -197,6 +197,24 @@ def _trilinear_sample(
     c0 = c00 * (1 - yf) + c01 * yf
     c1 = c10 * (1 - yf) + c11 * yf
     return c0 * (1 - zf) + c1 * zf
+
+
+def _trilinear_sample(
+    src: mx.array,        # (Z, Y, X) float32
+    z_coords: mx.array,   # (S,)   fractional positions in src Z (0..Z-1)
+    y_coords: mx.array,   # (Y_a,)
+    x_coords: mx.array,   # (X_a,)
+) -> mx.array:            # (S, Y_a, X_a)
+    """Trilinear interpolation of one channel at the requested coordinates.
+
+    Public single-call entry point. The slab loop uses the more granular
+    :func:`_precompute_trilinear_indices` + :func:`_trilinear_from_indices`
+    pair instead, so it can factor index computation out of the K-channel
+    inner loop and reuse a compiled kernel across channels.
+    """
+    Z, Y, X = src.shape
+    idx = _precompute_trilinear_indices(z_coords, y_coords, x_coords, Z, Y, X)
+    return _trilinear_from_indices(src, *idx)
 
 
 def _materialize_resample_argmax(
@@ -270,60 +288,66 @@ def _slab_resample_argmax(
     """Slab-stream the inverse resample. Bounded working memory.
 
     For each output Z slab:
-      - compute acquisition-grid Z/Y/X positions in target voxel space,
-      - per channel (inner loop): trilinear-sample that channel into the
-        slab and update a slab-local running-max (best_label, best_score),
-      - copy the slab's uint8 result out to the host accumulator.
+      - extract the corresponding target-spacing Z slab (with 1-voxel pad),
+      - K-channel slab × mx.nn.Upsample(mode='linear') → K-channel acq slab,
+      - argmax across K → uint8 slab,
+      - copy to host output buffer.
 
-    Working memory per slab is roughly
-        (best_score fp32) + (best_label uint8) + (current channel fp32)
-      ≈ 9 bytes per slab voxel.
-    Slab depth is chosen from peak_working_memory_mb so that total fits.
+    Working memory per slab is dominated by the K-channel acquisition-
+    spacing slab: ``K * S * Y_a * X_a * 4`` bytes (fp32) plus small input/
+    output buffers. Slab depth is chosen from peak_working_memory_mb so
+    that total fits. The K-channel slab uses MLX's native fused 3D linear
+    upsample — much faster than per-channel Python loops with custom
+    fancy-indexing trilinear (those don't fuse under mx.compile because
+    MLX doesn't fuse gather operations).
     """
     K, Z_t, Y_t, X_t = logits_target.shape
     Z_a, Y_a, X_a = out_shape_zyx
 
-    # Slab depth from budget: 9 B per slab voxel for best_score+best_label+chan
-    bytes_per_slab_voxel = 9
+    # Slab voxel budget: K-channel fp32 slab dominates (K*4 B/voxel).
+    bytes_per_slab_voxel = K * 4
     max_slab_voxels = int(peak_working_memory_mb) * 1024 * 1024 // bytes_per_slab_voxel
     plane_voxels = max(1, Y_a * X_a)
     slab_z = max(1, max_slab_voxels // plane_voxels)
 
-    # Acquisition-grid coordinates in source (target-spacing) voxel space.
+    # Acquisition-grid Z step in target voxels; needed only to compute the
+    # source Z range each slab pulls from.
     s2t_z = acq_spacing_zyx[0] / target_spacing_zyx[0]
-    s2t_y = acq_spacing_zyx[1] / target_spacing_zyx[1]
-    s2t_x = acq_spacing_zyx[2] / target_spacing_zyx[2]
-
-    y_coords = mx.arange(Y_a, dtype=mx.float32) * s2t_y
-    x_coords = mx.arange(X_a, dtype=mx.float32) * s2t_x
 
     out = np.empty(out_shape_zyx, dtype=out_dtype)
 
     for z0 in range(0, Z_a, slab_z):
         z1 = min(z0 + slab_z, Z_a)
         S = z1 - z0
-        z_global = mx.arange(z0, z1, dtype=mx.float32) * s2t_z
 
-        # Target-spacing Z slice needed for this slab (with ±1 voxel pad
-        # so trilinear can clamp without reaching out of bounds).
-        z_lo_f = float(z_global[0])
-        z_hi_f = float(z_global[-1])
-        zt_lo = max(0, int(z_lo_f) - 1)
-        zt_hi = min(Z_t, int(z_hi_f) + 2)
-        slab_src = logits_target[:, zt_lo:zt_hi]   # (K, slab_t_depth, Y_t, X_t)
-        z_local = z_global - zt_lo
+        # Source-Z range that covers this output slab, with 1-voxel pad
+        # so the trilinear interpolation can clamp at boundaries.
+        z_lo_f = z0 * s2t_z
+        z_hi_f = (z1 - 1) * s2t_z
+        zt_lo = max(0, min(Z_t - 1, int(z_lo_f) - 1))
+        zt_hi = max(zt_lo + 1, min(Z_t, int(z_hi_f) + 2))
+        slab_src = logits_target[:, zt_lo:zt_hi]   # (K, slab_t_z, Y_t, X_t)
+        slab_t_z = slab_src.shape[1]
 
-        best_score = mx.full((S, Y_a, X_a), -mx.inf, dtype=mx.float32)
-        best_label = mx.zeros((S, Y_a, X_a), dtype=mx.int32)  # stage as int32 then cast
+        # Compute the scale factor mx.nn.Upsample needs. Note: Upsample's
+        # output Z is int(slab_t_z * scale_z). Y/X scales are global since
+        # the in-plane resampling is the same for every slab.
+        scale_z = S / slab_t_z
+        scale_y = Y_a / Y_t
+        scale_x = X_a / X_t
 
-        for k in range(K):
-            chan = _trilinear_sample(slab_src[k], z_local, y_coords, x_coords)
-            mask = chan > best_score
-            best_score = mx.where(mask, chan, best_score)
-            best_label = mx.where(mask, mx.array(k, dtype=mx.int32), best_label)
-            mx.eval(best_score, best_label)   # release `chan` and `mask` between iters
+        # Channels-last 5D for Upsample.
+        inp = mx.expand_dims(slab_src.transpose(1, 2, 3, 0), 0)   # (1, slab_t_z, Y_t, X_t, K)
+        up = nn.Upsample(scale_factor=(scale_z, scale_y, scale_x), mode="linear")
+        slab_out = up(inp)[0]   # (out_z, out_y, out_x, K), may differ from (S, Y_a, X_a) by ±1
 
-        out[z0:z1] = np.asarray(best_label).astype(out_dtype, copy=False)
+        # Crop/pad to the exact slab output shape.
+        slab_out = _resize_to_exact(slab_out, (S, Y_a, X_a))
+
+        # Argmax across channels — fused single MLX op.
+        seg_slab = mx.argmax(slab_out, axis=-1)   # (S, Y_a, X_a) int32
+        mx.eval(seg_slab)
+        out[z0:z1] = np.asarray(seg_slab).astype(out_dtype, copy=False)
 
     return out
 
