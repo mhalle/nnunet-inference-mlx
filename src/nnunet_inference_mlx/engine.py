@@ -342,7 +342,7 @@ class Predictor:
         num_input_channels: int | None = None,
         compile: bool = True,
         verbose: bool = False,
-        cache_limit_fraction: float = 0.3,
+        cache_limit_fraction: float | None = None,
     ):
         if not bundle.fold_weights:
             raise ValueError("Bundle has no fold_weights.")
@@ -382,8 +382,19 @@ class Predictor:
 
         # Limit Metal cache before any allocation. Without this, MLX caches
         # ~9.5GB of buffers after the first forward pass on constrained Macs.
+        # cache_limit_fraction=None auto-tiers by detected unified-memory
+        # size: small Macs get 0.30 to leave room for accumulators, big Macs
+        # get 0.50 so MLX doesn't keep evicting compiled-graph buffers between
+        # forward passes. Pass an explicit fraction to override.
         mem_info = mx.device_info()
         system_ram = mem_info.get("memory_size", 16 * 1024**3)
+        if cache_limit_fraction is None:
+            ram_gb = system_ram / 1e9
+            if ram_gb >= 32:
+                cache_limit_fraction = 0.50
+            else:
+                cache_limit_fraction = 0.30
+        self.cache_limit_fraction = cache_limit_fraction
         mx.set_cache_limit(int(system_ram * cache_limit_fraction))
 
         self.network = build_network_from_plans(
