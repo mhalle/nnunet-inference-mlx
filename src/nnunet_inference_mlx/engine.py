@@ -145,6 +145,34 @@ class ModelBundle:
         return regions_class_order(self.dataset)
 
     @property
+    def target_spacing(self) -> tuple[float, float, float]:
+        """Voxel spacing (Z, Y, X) in mm the model was trained to expect.
+
+        Callers resample their input to this spacing before
+        ``engine.predict``. nnU-Net's plans.json stores ``spacing`` per
+        configuration in (Z, Y, X) order; we return it as-is.
+
+        If multiple configurations are in plans.json, returns the spacing
+        for the first one. Pass an explicit configuration via the
+        Predictor constructor and consult its plans directly if you need
+        a non-default configuration's spacing.
+        """
+        configs = self.plans.get("configurations", {})
+        if not configs:
+            raise KeyError("plans.json has no configurations.")
+        # Default to the metadata's init_args.configuration if available,
+        # otherwise the first one in the dict.
+        init_cfg = (self.metadata or {}).get("init_args", {}).get("configuration")
+        cfg = configs.get(init_cfg) or next(iter(configs.values()))
+        spacing = cfg.get("spacing")
+        if spacing is None:
+            raise KeyError(
+                "No 'spacing' field in plans configuration; cannot determine "
+                "target spacing."
+            )
+        return tuple(float(s) for s in spacing)
+
+    @property
     def mirroring_axes(self) -> tuple[int, ...]:
         """Spatial axes the trained model allows TTA mirroring along.
 
