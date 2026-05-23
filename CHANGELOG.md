@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.6.0] - 2026-05-23
+
+### Added — spacing-aware resampling subsystem (`resampling.py`)
+
+New module covering the forward + inverse resampling pieces that nnU-Net inference needs around model space. SimpleITK on the way in (CPU, B-spline/linear/nearest), MLX on the way out (Metal, K-channel trilinear with slab streaming). All resampling code is opt-in via the new `[preprocessing]` extra so the core package stays SimpleITK-free.
+
+- **`resample_image_to_target(sitk_image, target_spacing_zyx, *, interpolation='linear')`** — forward resample an acquisition-spacing image to model target spacing via SITK. `interpolation` accepts `'linear'`, `'bspline'`, or `'nearest'`. Preserves geometry; output has the correct origin/spacing/direction.
+
+- **`inverse_resample_argmax(logits_target, out_shape_zyx, target_spacing_zyx, acq_spacing_zyx, *, out_dtype=np.uint8, peak_working_memory_mb=None, cascade_downsample=False, verbose=False)`** — resample target-spacing K-channel logits to acquisition-spacing labels (path B: continuous-logit interpolation + argmax). Single Z-slab loop with explicit-coordinate trilinear over all K channels; slab depth auto-sized from `peak_working_memory_mb` so the K-channel slab fits the budget. When the whole output fits, equivalent to a one-shot materialize.
+
+  `peak_working_memory_mb=None` (default) auto-detects from system RAM: 200 MB on `<32 GB` Macs, 2000 MB on `≥32 GB`.
+
+  `cascade_downsample` (default `False`) enables a multi-step path for aggressive downsampling (source-ratio > 2× in any axis). Each step does a 2× K-channel downsample, preserving the continuous decision surface; final pass slabs to acquisition spacing. Trades more smoothing for less boundary aliasing; **not** a strict win on aggressive downsamples — small-vessel structures can vanish more than single-step preserves them. Documented with the trade-off in the docstring.
+
+- **`predict_with_resampling(engine, image_sitk, *, interpolation='linear', peak_working_memory_mb=None, remove_small_components_mm3=0.0)`** — full path-B pipeline. Caller hands over a SITK image at any acquisition spacing, gets back a SITK image at the same spacing with integer labels. Forward resample on CPU/SITK, inference on Metal, inverse resample on Metal with slab+channel streaming, optional cc3d cleanup. K-channel logits are transient — never materialized at acquisition spacing.
+
+  ```python
+  import SimpleITK as sitk
+  from nnunet_inference_mlx import InferenceEngine, predict_with_resampling
+
+  img = sitk.ReadImage("scan.nii.gz")
+  seg = predict_with_resampling(engine, img)              # default path B
+  seg = predict_with_resampling(engine, img,
+                                remove_small_components_mm3=200.0)  # + cleanup
+  ```
+
+Why path B: nnU-Net's standard inverse resampling is either nearest-neighbor on labels (aliased boundaries) or per-class one-hot resize (memory-prohibitive at K≥100). Trilinear interpolation of the K-channel logits with argmax-at-the-end gives smoother boundaries while remaining feasible on Apple Silicon — we slab-stream the K-channel inverse so the working set is bounded by a tunable budget (default ~200 MB on 16 GB Macs, 2 GB on 32 GB+). On unified memory the logits stay resident across the full pipeline without disk round-trips.
+
+### Added — multi-label connected-component postprocessing (`postprocessing.py`)
+
+New module exposing `remove_small_components` for dropping label islands below a physical-volume threshold. Backed by [cc3d](https://github.com/seung-lab/connected-components-3d) for the multi-label CC pass — two neighboring voxels are connected iff they share the same nonzero label, so disconnected pieces of the same class are filtered independently. Original label IDs are preserved.
+
+- **`remove_small_components(labels, spacing_zyx, *, min_volume_mm3=200.0, connectivity=26, in_place=False)`** — drop components smaller than `min_volume_mm3`. Default threshold matches TotalSegmentator's `--remove_small_blobs` flag. Pass `0` for a no-op. Opt-in via the new `[postprocessing]` extra.
+
+Measured on a 256×178×255 K=117 CT segmentation (`min_volume_mm3=665`):
+
+| Method | Time | Speedup |
+|---|---|---|
+| `cc3d.dust` | **80 ms** | baseline |
+| SITK `ScalarConnectedComponent + RelabelComponent + Mask` | 820 ms | 10× slower |
+| scipy per-label loop (TS-style) | 7800 ms | 90× slower |
+
+Wired into `predict_with_resampling` as a new `remove_small_components_mm3=0.0` keyword arg (off by default; pass `200.0` for TS-equivalent cleanup).
+
+### Added — optional extras
+
+- `[preprocessing]` = `["SimpleITK"]` — required for `resample_image_to_target`, `predict_with_resampling`, and any SITK-image I/O path.
+- `[postprocessing]` = `["connected-components-3d"]` — required for `remove_small_components`.
+
+Both raise a clear `ImportError` pointing users at the right `pip install` invocation when the underlying package is missing.
+
+### Notes
+
+- Path B inverse throughput is dominated by MLX's native trilinear+gather kernels (~11 ns / voxel-K on M2 base, ~3 ns / voxel-K on M1 Max). `peak_working_memory_mb` is a memory-bound knob, not a perf knob — slab size affects what fits, not how fast it runs.
+- Slab boundaries are continuous: explicit-coordinate trilinear ensures interp values across slab borders match the values that would come from a single materialize pass. Earlier per-slab `mx.nn.Upsample` formulation had visible staircase artifacts in non-axial views; the current explicit-coordinate path is artifact-free.
+- Output dtype on `predict_with_resampling` follows the bundle's label scheme: `uint8` for standard `K ≤ 255`, auto-widened for region-based / large-K datasets via `label_dtype`.
+
 ## [0.5.3] - 2026-05-22
 
 ### Changed — auto-tier Metal cache by detected unified memory

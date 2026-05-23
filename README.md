@@ -14,7 +14,17 @@ This package also integrates with [TotalSegmentator](https://github.com/wasserth
 - 6x faster than PyTorch CPU, 1.4x faster than PyTorch MPS on Apple Silicon
 - Memory-efficient segmentation mode for large volumes
 - Auto-scales batch size to available Metal memory
+- Spacing-aware resampling: SimpleITK forward + MLX K-channel trilinear inverse with slab streaming (path B, smoother boundaries than nearest-neighbor on labels)
+- Multi-label connected-component cleanup via `cc3d` (~10× faster than SITK, ~90× faster than scipy)
+- Region-based label models supported (BraTS-style sigmoid heads with paint-priority)
+- Torch-free `.pth` loading
 - Integrates directly with [TotalSegmentator](https://github.com/wasserth/TotalSegmentator)
+
+### Optional extras
+
+- `pip install nnunet-inference-mlx[preprocessing]` — `SimpleITK` for spacing-aware resampling + SITK-image I/O (`predict_with_resampling`)
+- `pip install nnunet-inference-mlx[postprocessing]` — `connected-components-3d` for `remove_small_components`
+- `pip install nnunet-inference-mlx[remote]` — `requests` + `remotezip` for fetching `.pth` checkpoints over HTTP range requests
 
 ## Installation
 
