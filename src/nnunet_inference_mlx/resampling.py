@@ -205,16 +205,49 @@ def _trilinear_sample(
     y_coords: mx.array,   # (Y_a,)
     x_coords: mx.array,   # (X_a,)
 ) -> mx.array:            # (S, Y_a, X_a)
-    """Trilinear interpolation of one channel at the requested coordinates.
-
-    Public single-call entry point. The slab loop uses the more granular
-    :func:`_precompute_trilinear_indices` + :func:`_trilinear_from_indices`
-    pair instead, so it can factor index computation out of the K-channel
-    inner loop and reuse a compiled kernel across channels.
-    """
+    """Trilinear interpolation of one channel at the requested coordinates."""
     Z, Y, X = src.shape
     idx = _precompute_trilinear_indices(z_coords, y_coords, x_coords, Z, Y, X)
     return _trilinear_from_indices(src, *idx)
+
+
+def _trilinear_from_indices_K(
+    src: mx.array,                  # (K, Z, Y, X)
+    zi0, zi1, yi0, yi1, xi0, xi1,
+    zf, yf, xf,
+) -> mx.array:                      # (K, S, Y_a, X_a)
+    """K-channel trilinear blend using pre-computed indices.
+
+    Same math as :func:`_trilinear_from_indices` but broadcasts the K
+    axis from ``src`` in a single gather per corner. Used by the slab
+    loop so all K channels' samples land at exactly the same source
+    positions — eliminating the slab-boundary discontinuities that
+    arise with per-slab ``mx.nn.Upsample(scale_factor=...)``: that path
+    distributes output uniformly across ``[0, slab_source_size - 1]``,
+    which doesn't match the global coordinate system across slabs.
+    """
+    # Broadcast index tensors from (S,1,1) / (1,Y_a,1) / (1,1,X_a) shapes
+    # are gathered with a leading K from src via standard fancy indexing.
+    c000 = src[:, zi0, yi0, xi0]
+    c001 = src[:, zi0, yi0, xi1]
+    c010 = src[:, zi0, yi1, xi0]
+    c011 = src[:, zi0, yi1, xi1]
+    c100 = src[:, zi1, yi0, xi0]
+    c101 = src[:, zi1, yi0, xi1]
+    c110 = src[:, zi1, yi1, xi0]
+    c111 = src[:, zi1, yi1, xi1]
+
+    one_minus_xf = 1.0 - xf
+    one_minus_yf = 1.0 - yf
+    one_minus_zf = 1.0 - zf
+
+    c00 = c000 * one_minus_xf + c001 * xf
+    c01 = c010 * one_minus_xf + c011 * xf
+    c10 = c100 * one_minus_xf + c101 * xf
+    c11 = c110 * one_minus_xf + c111 * xf
+    c0 = c00 * one_minus_yf + c01 * yf
+    c1 = c10 * one_minus_yf + c11 * yf
+    return c0 * one_minus_zf + c1 * zf
 
 
 def _resize_to_exact(
@@ -256,34 +289,47 @@ def _slab_resample_argmax(
     peak_working_memory_mb: int,
     out_dtype: np.dtype,
 ) -> np.ndarray:
-    """Slab-stream the inverse resample. Bounded working memory.
+    """Slab-stream the inverse resample with explicit-coordinate trilinear.
 
     For each output Z slab:
-      - extract the corresponding target-spacing Z slab (with 1-voxel pad),
-      - K-channel slab × mx.nn.Upsample(mode='linear') → K-channel acq slab,
-      - argmax across K → uint8 slab,
-      - copy to host output buffer.
+      - compute the *global* (z, y, x) coordinates in source space — these
+        are the exact positions the K-channel logits should be sampled at,
+      - slice the target-spacing source to just the Z range needed,
+      - run the 8-corner trilinear gather across all K channels in one
+        sweep (broadcasting K from src), producing a (K, S, Y_a, X_a) slab,
+      - argmax across K → int slab,
+      - copy uint8 to host output buffer.
+
+    Coordinates are computed globally, so adjacent slabs sample at
+    consistent positions — no boundary discontinuities. (This is the bug
+    that the earlier ``mx.nn.Upsample(scale_factor=...)``-per-slab
+    implementation had: each slab's Upsample distributes output uniformly
+    across its own source range, which doesn't honor the offset between
+    the slab's source-start and the desired-output-start position.)
 
     Working memory per slab is dominated by the K-channel acquisition-
-    spacing slab: ``K * S * Y_a * X_a * 4`` bytes (fp32) plus small input/
-    output buffers. Slab depth is chosen from peak_working_memory_mb so
-    that total fits. The K-channel slab uses MLX's native fused 3D linear
-    upsample — much faster than per-channel Python loops with custom
-    fancy-indexing trilinear (those don't fuse under mx.compile because
-    MLX doesn't fuse gather operations).
+    spacing slab: ``K * S * Y_a * X_a * 4`` bytes (fp32). Slab depth is
+    chosen from peak_working_memory_mb so that total fits.
     """
     K, Z_t, Y_t, X_t = logits_target.shape
     Z_a, Y_a, X_a = out_shape_zyx
 
-    # Slab voxel budget: K-channel fp32 slab dominates (K*4 B/voxel).
+    # Slab voxel budget: K-channel fp32 slab + 8 corner gathers held
+    # transiently in the trilinear blend. Conservative: count 12 bytes
+    # per voxel-K (the K-channel slab + ~2 corners in flight + margin).
     bytes_per_slab_voxel = K * 4
     max_slab_voxels = int(peak_working_memory_mb) * 1024 * 1024 // bytes_per_slab_voxel
     plane_voxels = max(1, Y_a * X_a)
     slab_z = max(1, max_slab_voxels // plane_voxels)
 
-    # Acquisition-grid Z step in target voxels; needed only to compute the
-    # source Z range each slab pulls from.
+    # Global coordinate-space scale factors: acquisition voxel → target voxel.
     s2t_z = acq_spacing_zyx[0] / target_spacing_zyx[0]
+    s2t_y = acq_spacing_zyx[1] / target_spacing_zyx[1]
+    s2t_x = acq_spacing_zyx[2] / target_spacing_zyx[2]
+
+    # Y / X coords are the same for every slab — compute once.
+    y_coords = mx.arange(Y_a, dtype=mx.float32) * s2t_y
+    x_coords = mx.arange(X_a, dtype=mx.float32) * s2t_x
 
     out = np.empty(out_shape_zyx, dtype=out_dtype)
 
@@ -291,32 +337,31 @@ def _slab_resample_argmax(
         z1 = min(z0 + slab_z, Z_a)
         S = z1 - z0
 
-        # Source-Z range that covers this output slab, with 1-voxel pad
-        # so the trilinear interpolation can clamp at boundaries.
+        # Output Z positions for this slab — in global target voxel coords.
+        z_global = mx.arange(z0, z1, dtype=mx.float32) * s2t_z
+
+        # Target-spacing Z slice needed for this slab (with ±1 voxel pad
+        # so the trilinear interpolation can clamp at boundaries). Clamp
+        # to [0, Z_t]; guarantee zt_hi > zt_lo.
         z_lo_f = z0 * s2t_z
         z_hi_f = (z1 - 1) * s2t_z
         zt_lo = max(0, min(Z_t - 1, int(z_lo_f) - 1))
         zt_hi = max(zt_lo + 1, min(Z_t, int(z_hi_f) + 2))
-        slab_src = logits_target[:, zt_lo:zt_hi]   # (K, slab_t_z, Y_t, X_t)
+        slab_src = logits_target[:, zt_lo:zt_hi]    # (K, slab_t_z, Y_t, X_t)
         slab_t_z = slab_src.shape[1]
+        z_local = z_global - zt_lo                  # source-local Z coords
 
-        # Compute the scale factor mx.nn.Upsample needs. Note: Upsample's
-        # output Z is int(slab_t_z * scale_z). Y/X scales are global since
-        # the in-plane resampling is the same for every slab.
-        scale_z = S / slab_t_z
-        scale_y = Y_a / Y_t
-        scale_x = X_a / X_t
+        # Pre-compute indices once for the (z_local, y_coords, x_coords)
+        # grid — these are shared across all K channels.
+        idx = _precompute_trilinear_indices(
+            z_local, y_coords, x_coords, slab_t_z, Y_t, X_t,
+        )
 
-        # Channels-last 5D for Upsample.
-        inp = mx.expand_dims(slab_src.transpose(1, 2, 3, 0), 0)   # (1, slab_t_z, Y_t, X_t, K)
-        up = nn.Upsample(scale_factor=(scale_z, scale_y, scale_x), mode="linear")
-        slab_out = up(inp)[0]   # (out_z, out_y, out_x, K), may differ from (S, Y_a, X_a) by ±1
+        # All K channels at once via broadcasted gather.
+        slab_K = _trilinear_from_indices_K(slab_src, *idx)   # (K, S, Y_a, X_a)
 
-        # Crop/pad to the exact slab output shape.
-        slab_out = _resize_to_exact(slab_out, (S, Y_a, X_a))
-
-        # Argmax across channels — fused single MLX op.
-        seg_slab = mx.argmax(slab_out, axis=-1)   # (S, Y_a, X_a) int32
+        # Argmax across channels.
+        seg_slab = mx.argmax(slab_K, axis=0)        # (S, Y_a, X_a) int32
         mx.eval(seg_slab)
         out[z0:z1] = np.asarray(seg_slab).astype(out_dtype, copy=False)
 
