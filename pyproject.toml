@@ -16,6 +16,8 @@ dependencies = [
 remote = ["requests", "remotezip"]
 # Spacing-aware resampling helpers + SITK-image I/O for predict_with_resampling.
 preprocessing = ["SimpleITK"]
+# Multi-label connected-component cleanup (remove_small_components).
+postprocessing = ["connected-components-3d"]
 test = ["pytest"]
 
 [build-system]

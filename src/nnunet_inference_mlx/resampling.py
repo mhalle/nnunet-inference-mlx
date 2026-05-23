@@ -559,6 +559,7 @@ def predict_with_resampling(
     *,
     interpolation: str = "linear",
     peak_working_memory_mb: int | None = None,
+    remove_small_components_mm3: float = 0.0,
 ) -> "sitk.Image":
     """Forward-resample input → run inference → inverse-resample logits.
 
@@ -574,6 +575,15 @@ def predict_with_resampling(
 
     Returns labels at acquisition spacing. The K-channel logits are
     transient — never materialized at acquisition spacing.
+
+    Parameters
+    ----------
+    remove_small_components_mm3 :
+        If > 0, drop connected components smaller than this physical
+        volume (mm³) from the output, using multi-label-aware CC. ``0``
+        (default) disables the cleanup. ``200.0`` matches
+        TotalSegmentator's ``--remove_small_blobs`` flag. Requires the
+        ``[postprocessing]`` optional extra (cc3d).
     """
     sitk = _require_sitk()
 
@@ -607,6 +617,14 @@ def predict_with_resampling(
         out_dtype=out_dtype,
         peak_working_memory_mb=peak_working_memory_mb,
     )
+
+    if remove_small_components_mm3 > 0:
+        from .postprocessing import remove_small_components
+        seg_zyx = remove_small_components(
+            seg_zyx, acq_spacing_zyx,
+            min_volume_mm3=remove_small_components_mm3,
+            in_place=True,
+        )
 
     # Wrap as SITK with original geometry
     seg_img = sitk.GetImageFromArray(seg_zyx)

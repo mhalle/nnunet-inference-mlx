@@ -26,6 +26,7 @@ from .resampling import (
     predict_with_resampling,
     resample_image_to_target,
 )
+from .postprocessing import remove_small_components
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
 from .preprocessing import preprocess_volume
@@ -68,4 +69,6 @@ __all__ = [
     "inverse_resample_argmax",
     "predict_with_resampling",
     "resample_image_to_target",
+    # Postprocessing (opt-in via [postprocessing] extra; cc3d backend)
+    "remove_small_components",
 ]
