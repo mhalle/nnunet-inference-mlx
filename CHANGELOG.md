@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.3] - 2026-05-22
+
+### Changed — auto-tier Metal cache by detected unified memory
+
+`Predictor` now accepts `cache_limit_fraction=None` (the new default) and auto-picks based on detected unified memory:
+
+- **< 32 GB RAM**: 0.30 (unchanged from previous behavior; leaves room for sliding-window accumulators on constrained Macs).
+- **≥ 32 GB RAM**: 0.50 (M1 Max / M3 Pro / Studio / Ultra). Maps to ~30 GB+ Metal cache on a 64 GB Mac — well under Apple's recommended GPU working-set size, but enough to keep compiled-graph buffers resident between forward passes instead of evicting and rebuilding for every patch.
+
+Effect: small but consistent latency win on batch / multi-file workloads on big-RAM Macs. No change on 16 GB Macs. `self.cache_limit_fraction` is now a `Predictor` attribute callers can introspect to confirm what auto-detection picked. Explicit fractions still work as a hard override.
+
+Why now: downstream consumers (TotalSegmentator's MLX backend in particular) want to ship engine-caching workflows that hold ≥5 InferenceEngines resident on big-RAM Macs. The previous 0.30 default sized the Metal cache for the constrained case and left ~50 GB unused on 64 GB systems, forcing more buffer churn than necessary in those flows.
+
 ## [0.5.2] - 2026-05-22
 
 ### Added — region-based label handling (BraTS-style models)
