@@ -250,6 +250,101 @@ def _trilinear_from_indices_K(
     return c0 * one_minus_zf + c1 * zf
 
 
+def _kchannel_trilinear_full(
+    src: mx.array,            # (K, Z, Y, X) at src_spacing
+    out_shape: tuple[int, int, int],
+    src_spacing_zyx: tuple[float, float, float],
+    out_spacing_zyx: tuple[float, float, float],
+) -> mx.array:
+    """K-channel trilinear at a coarser output grid, full materialize.
+
+    Used for the intermediate steps in :func:`_cascade_then_slab` — each
+    intermediate is small enough (~K × 1/8 voxels per step) that
+    materializing the K-channel coarser-spacing array is cheap. No
+    argmax: the K dimension carries through as the continuous logit
+    field for the next cascade step.
+    """
+    K, Z, Y, X = src.shape
+    Z_o, Y_o, X_o = out_shape
+    z_ratio = out_spacing_zyx[0] / src_spacing_zyx[0]
+    y_ratio = out_spacing_zyx[1] / src_spacing_zyx[1]
+    x_ratio = out_spacing_zyx[2] / src_spacing_zyx[2]
+    z_coords = mx.arange(Z_o, dtype=mx.float32) * z_ratio
+    y_coords = mx.arange(Y_o, dtype=mx.float32) * y_ratio
+    x_coords = mx.arange(X_o, dtype=mx.float32) * x_ratio
+    idx = _precompute_trilinear_indices(z_coords, y_coords, x_coords, Z, Y, X)
+    out = _trilinear_from_indices_K(src, *idx)
+    mx.eval(out)
+    return out
+
+
+def _cascade_then_slab(
+    logits_target: mx.array,
+    out_shape_zyx: tuple[int, int, int],
+    target_spacing_zyx: tuple[float, float, float],
+    acq_spacing_zyx: tuple[float, float, float],
+    peak_working_memory_mb: int,
+    out_dtype: np.dtype,
+    *,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Cascade 2× K-channel downsamples until source-ratio ≤ 2×; then slab+argmax.
+
+    For aggressive downsampling (source-ratio > 2× in any axis), the
+    standard single-step trilinear is undersampled — kernel support
+    (2³ source voxels = 2 × src_spacing per axis) is smaller than the
+    output voxel's physical footprint. Result: thin structures alias out.
+
+    Cascade fix: build a sequence of intermediate K-channel arrays at
+    progressively coarser spacings, each step a 2× downsample (kernel
+    exactly matches footprint). Final step runs the standard slab argmax
+    from the last intermediate to the requested output grid, where the
+    source-ratio is ≤ 2× by construction.
+
+    The K-channel logits carry the continuous decision surface through
+    the cascade; argmax happens only at the very end.
+
+    Memory at each intermediate is ~1/8 the previous (one 2× downsample
+    per axis), so cascading is cheap — the cascade total stays bounded
+    even for very aggressive downsample ratios.
+    """
+    cur = logits_target
+    cur_spacing = tuple(target_spacing_zyx)
+    cur_shape = cur.shape[1:]
+    step = 0
+    if verbose:
+        print(f"  [cascade] start: K={cur.shape[0]} shape={cur_shape} "
+              f"spacing={tuple(round(s,2) for s in cur_spacing)}")
+
+    while any(o > 2.001 * c for c, o in zip(cur_spacing, acq_spacing_zyx)):
+        next_spacing = tuple(
+            min(2.0 * c, o) for c, o in zip(cur_spacing, acq_spacing_zyx)
+        )
+        next_shape = tuple(
+            max(1, int(round(s * c / n)))
+            for s, c, n in zip(cur_shape, cur_spacing, next_spacing)
+        )
+        step += 1
+        if verbose:
+            print(f"  [cascade] step {step}: shape {next_shape} "
+                  f"spacing {tuple(round(s,2) for s in next_spacing)}")
+        cur = _kchannel_trilinear_full(cur, next_shape, cur_spacing, next_spacing)
+        cur_spacing = next_spacing
+        cur_shape = next_shape
+
+    if verbose:
+        max_ratio = max(o / c for c, o in zip(cur_spacing, acq_spacing_zyx))
+        print(f"  [cascade] final slab+argmax from {cur_shape} "
+              f"@{tuple(round(s,2) for s in cur_spacing)} → "
+              f"{out_shape_zyx} @{tuple(round(s,2) for s in acq_spacing_zyx)} "
+              f"(source-ratio {max_ratio:.2f}×)")
+
+    return _slab_resample_argmax(
+        cur, out_shape_zyx, cur_spacing, acq_spacing_zyx,
+        peak_working_memory_mb, out_dtype,
+    )
+
+
 def _resize_to_exact(
     arr: mx.array,                  # (Z, Y, X, K) channels-last
     target_zyx: tuple[int, int, int],
@@ -376,18 +471,51 @@ def inverse_resample_argmax(
     *,
     out_dtype: np.dtype | str = np.uint8,
     peak_working_memory_mb: int | None = None,
+    cascade_downsample: bool | None = None,
+    verbose: bool = False,
 ) -> np.ndarray:
     """Resample target-spacing logits to acquisition spacing and argmax.
 
-    Single Z-slab loop with all-K per slab using ``mx.nn.Upsample``.
-    Slab depth is auto-sized from ``peak_working_memory_mb`` so the
-    K-channel acquisition-spacing slab fits the budget. When the whole
-    output fits in one slab, the loop runs once and is equivalent to a
-    materialize pass.
+    Strategy: a single Z-slab loop with explicit-coordinate trilinear
+    over all K channels. Slab depth auto-sized from
+    ``peak_working_memory_mb`` so the K-channel acquisition-spacing slab
+    fits the budget. When the whole output fits in one slab, the loop
+    runs once — equivalent to a materialize pass.
 
-    Throughput is determined by MLX's native trilinear-upsample kernel
-    (~11 ns / voxel-K on M2 base, ~3 ns / voxel-K on M1 Max) and does
-    not vary with slab size — ``peak_working_memory_mb`` is purely a
+    For aggressive downsampling (source-ratio > 2× in any axis), the
+    single-step trilinear undersamples — its 2³ kernel covers less than
+    the output voxel's physical footprint. ``cascade_downsample``
+    enables a multi-step path that builds intermediate K-channel arrays
+    at progressively coarser spacings (each step a 2× downsample, the
+    sweet spot for trilinear), preserving thin structures that single-
+    step would alias out.
+
+    ``cascade_downsample``:
+      * ``False`` (default) — single-step trilinear regardless of source ratio.
+      * ``True`` — cascade 2× downsample steps until source-ratio ≤ 2×,
+        then a final argmax pass. Trades more smoothing for less
+        boundary aliasing. *Not* a strict correctness win on
+        aggressive downsamples — the cascade dilutes thin-structure
+        logit peaks more than single-step does, so very thin structures
+        (small vessels, sub-voxel anatomy) can vanish at the cascade
+        stage even though single-step preserved them. Tighter
+        large-structure boundaries can also overshoot the reference.
+      * ``None`` — alias for ``False``. Reserved for future auto-tuning.
+
+    Aggressive downsampling (source-ratio > 2× in any axis) is
+    inherently lossy for thin structures regardless of method. Single-
+    step gives marginally better preservation of small structures;
+    cascade gives marginally smoother large-structure boundaries.
+
+    Note that at large source-ratios many small structures are simply
+    sub-voxel at the output spacing — e.g. an 8× decimate of ~1.5 mm CT
+    yields ~12 mm voxels, which is larger than common-carotid diameter
+    (6–8 mm). No resampling method recovers structures below Nyquist;
+    pick the output spacing first, then expect anatomy thinner than
+    a voxel to disappear regardless of cascade setting.
+
+    Throughput is dominated by MLX's native trilinear+gather kernels
+    (~11 ns / voxel-K on M2 base). ``peak_working_memory_mb`` is a
     memory-bound knob, not a perf knob.
 
     ``peak_working_memory_mb=None`` (default) auto-detects from system
@@ -396,6 +524,24 @@ def inverse_resample_argmax(
     if peak_working_memory_mb is None:
         peak_working_memory_mb = _auto_memory_budget_mb()
     out_dtype = np.dtype(out_dtype)
+
+    max_ratio = max(
+        o / t for t, o in zip(target_spacing_zyx, acq_spacing_zyx)
+    )
+    if cascade_downsample is None:
+        cascade_downsample = False
+    if verbose:
+        print(f"  [inverse_resample_argmax] source-ratio max={max_ratio:.3f}, "
+              f"cascade={'on' if cascade_downsample else 'off'}")
+
+    if cascade_downsample and max_ratio > 2.001:
+        return _cascade_then_slab(
+            logits_target, out_shape_zyx,
+            target_spacing_zyx, acq_spacing_zyx,
+            peak_working_memory_mb, out_dtype,
+            verbose=verbose,
+        )
+
     return _slab_resample_argmax(
         logits_target, out_shape_zyx,
         target_spacing_zyx, acq_spacing_zyx,
