@@ -1,6 +1,6 @@
 [project]
 name = "nnunet-inference-mlx"
-version = "0.5.3"
+version = "0.6.0"
 description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -14,6 +14,10 @@ dependencies = [
 [project.optional-dependencies]
 # Remote loading of .pth checkpoints over HTTP range requests.
 remote = ["requests", "remotezip"]
+# Spacing-aware resampling helpers + SITK-image I/O for predict_with_resampling.
+preprocessing = ["SimpleITK"]
+# Multi-label connected-component cleanup (remove_small_components).
+postprocessing = ["connected-components-3d"]
 test = ["pytest"]
 
 [build-system]
