@@ -1,6 +1,6 @@
 [project]
 name = "nnunet-inference-mlx"
-version = "0.6.0"
+version = "0.7.0"
 description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }

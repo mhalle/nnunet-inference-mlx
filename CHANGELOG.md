@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.7.0] - 2026-05-23
+
+### Added — pluggable weights-folder discovery (`WeightsLayout` + registry)
+
+Different consumers of nnU-Net weights store them in slightly different places (vanilla nnU-Net under `$nnUNet_results`, TotalSegmentator under `$TOTALSEG_WEIGHTS_PATH` or `~/.totalsegmentator/nnunet/results`, MOOSE elsewhere). The `WeightsLayout` dataclass captures a layout as data — env var, default path, preferred trainer/plans/model naming — and a module-level registry walks layouts in order. Two built-in layouts cover nnU-Net and TS; downstream packages register their own.
+
+- **`WeightsLayout`** — frozen dataclass: `name`, `env_var`, `default_path`, `trainer`, `plans`, `model`. `resolve_weights_dir()` returns the dir if the env var points at one, falls back to `default_path` if that exists, returns `None` otherwise.
+- **`register_weights_layout(layout, *, prepend=False)`** — add a layout. Append by default; pass `prepend=True` to put it ahead of the built-ins.
+- **`list_weights_layouts()`** — current lookup order.
+- **`discover_weights()`** — first matching layout wins, returns `(path, layout)`. Raises `FileNotFoundError` with a diagnostic listing of what was tried when nothing resolves.
+
+`ModelBundle.from_task()` now walks the registry when `weights_dir=None` and inherits the resolved layout's trainer preference automatically. New keyword args `trainer` / `plans` / `model` disambiguate Datasets that ship multiple trainer variants — needed for TS's `Dataset291` (both `nnUNetTrainer` and `nnUNetTrainerNoMirroring` under one Dataset folder).
+
+### Added — process-wide engine cache (`engine_cache.py`)
+
+Building an `InferenceEngine` from a model folder takes ~3–5 s on M2 base (read disk + build network + load weights + compile + warmup). For workflows that touch the same model many times — batch inference, multi-stage cascade, interactive UI — keeping the engine alive across calls eliminates that cost.
+
+- **`cached_engine_from_folder(model_folder, *, configuration, folds, step_size, compile, batch_size, use_mirroring, ...)`** — high-level helper: build-and-cache or return-cached, keyed on everything that affects engine state.
+- **`cached_engine_from_task(task_id, *, folds, trainer, plans, model, ...)`** — same, but resolves the folder via the `WeightsLayout` registry first. Drop-in replacement for TS-style `find_model_folder` + build-engine code.
+- **`get_cached_engine(key)`** / **`cache_engine(key, engine)`** — low-level for callers managing custom keys (e.g. nnInteractive's session state).
+- **`cache_enabled()`** — auto-tiers by detected unified memory (≥32 GB on by default; below disabled to avoid memory pressure from holding ~600 MB per cached engine). Override via the `NNUNET_MLX_CACHE_ENGINES` env var.
+- **`clear_engine_cache()`** — release everything and clear Metal buffers; safe on empty cache.
+
+Measured on TS Dataset297 fast task:
+- Cold load: ~4.5 s
+- Cache hit: ~3 ms (**~1500× speedup**)
+
+Verbose / progress flags don't bust the cache; `step_size`, `use_mirroring`, `batch_size`, fold list, configuration, and folder all do.
+
+### Added — multi-stage workflow orchestrator (`workflow.py`)
+
+The MOOSE-style cascade pattern (low-res body detector → high-res organ model) and the generalization of TS's FOV-limited inference, as a first-class primitive. Each stage runs `predict_with_resampling`; between stages, the prior stage's output bbox optionally crops the next stage's input.
+
+- **`Bbox`** — frozen dataclass for `(Z, Y, X)` voxel-coordinate boxes. `shape_zyx` / `slices` / `clamped()` / `dilated()` / `compose()` / `Bbox.full()`.
+- **`compute_fg_bbox(labels, *, classes=None, dilation_mm=0, spacing_zyx=None)`** — find FG bbox of a label volume, optionally restricted to specific classes and dilated by a physical margin. Returns `None` when no FG is found, signalling "skip cropping" to workflow callers.
+- **`crop_image(sitk_image, bbox)`** — extract a sub-volume preserving world-coordinate geometry (origin shifts to track the crop).
+- **`paste_segmentation(small_seg, full_shape_zyx, bbox, *, fill=0)`** — paste a cropped-space label volume back into a full-shape canvas.
+- **`Stage`** — `engine + crop_to_classes + dilation_mm + interpolation + peak_working_memory_mb + remove_small_components_mm3`. Default dilation is 10 mm.
+- **`run_workflow(image_sitk, stages, *, verbose=False)`** — chain stages, crop input between stages where requested, paste-back at the end so output geometry matches input.
+
+Two-stage cascade in user code:
+
+```python
+from nnunet_inference_mlx import Stage, run_workflow, cached_engine_from_task
+
+body  = cached_engine_from_task(298, folds=0)              # low-res body detector
+liver = cached_engine_from_task(291, folds=0,              # high-res organ model
+                                trainer="nnUNetTrainerNoMirroring")
+
+stages = [
+    Stage(engine=body,  crop_to_classes=(BODY_TRUNK,), dilation_mm=10.0),
+    Stage(engine=liver, remove_small_components_mm3=200.0),
+]
+
+seg = run_workflow(image_sitk, stages, verbose=True)
+```
+
+Composes naturally with the engine cache — each `Stage.engine` survives across workflow invocations. nnInteractive-style sub-volume re-runs use the same crop/paste primitives at finer granularity. The geometric primitives are exported as public API so callers building bespoke pipelines (FOV-limited inference, manual region updates) use the same building blocks.
+
+### Fixed
+
+- `compute_fg_bbox`: previously cast user-supplied class IDs to the labels array's dtype, which raised `OverflowError` for IDs outside the dtype's range (asking about class 999 on a `uint8` label volume crashed). Now filters out-of-range values up front and returns `None` when no in-range classes remain.
+
+### Tests
+
+97 new pytest tests across five new files (`test_weights_layout_registry.py`, `test_engine_cache.py`, `test_workflow.py`, `test_postprocessing.py`, `test_resampling.py`), all passing in ~3.7 s with no real weights or CT data required. Backfills coverage for the 0.6.0 resampling + postprocessing modules as well as the new 0.7.0 modules.
+
 ## [0.6.0] - 2026-05-23
 
 ### Added — spacing-aware resampling subsystem (`resampling.py`)
