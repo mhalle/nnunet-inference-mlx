@@ -39,6 +39,14 @@ from .resampling import (
     resample_image_to_target,
 )
 from .postprocessing import remove_small_components
+from .workflow import (
+    Bbox,
+    Stage,
+    compute_fg_bbox,
+    crop_image,
+    paste_segmentation,
+    run_workflow,
+)
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
 from .preprocessing import preprocess_volume
@@ -95,4 +103,11 @@ __all__ = [
     "resample_image_to_target",
     # Postprocessing (opt-in via [postprocessing] extra; cc3d backend)
     "remove_small_components",
+    # Multi-stage workflow + geometric primitives
+    "Bbox",
+    "Stage",
+    "compute_fg_bbox",
+    "crop_image",
+    "paste_segmentation",
+    "run_workflow",
 ]
