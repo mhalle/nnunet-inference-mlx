@@ -202,7 +202,15 @@ def compute_fg_bbox(
     if classes is None:
         fg = labels_zyx > 0
     else:
-        fg = np.isin(labels_zyx, np.asarray(list(classes), dtype=labels_zyx.dtype))
+        # Don't force the classes array to the labels dtype — a user
+        # asking about class 999 on a uint8 label volume should get
+        # "not found", not an OverflowError. Filter out values outside
+        # the labels dtype's range, then build a same-dtype index.
+        info = np.iinfo(labels_zyx.dtype)
+        in_range = [c for c in classes if info.min <= c <= info.max]
+        if not in_range:
+            return None
+        fg = np.isin(labels_zyx, np.asarray(in_range, dtype=labels_zyx.dtype))
 
     if not fg.any():
         return None
