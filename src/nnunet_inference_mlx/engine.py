@@ -64,29 +64,185 @@ from .weights import (
 DEFAULT_WEIGHTS_DIR = None  # resolved lazily
 
 
-def _default_weights_dir() -> Path:
-    if "nnUNet_results" in os.environ:
-        return Path(os.environ["nnUNet_results"])
-    raise FileNotFoundError(
-        "No weights directory specified. Either pass weights_dir= "
-        "or set the nnUNet_results environment variable."
+# ---------------------------------------------------------------------------
+# WeightsLayout — pluggable model-folder discovery
+# ---------------------------------------------------------------------------
+#
+# Different consumers store nnU-Net weights in slightly different places and
+# with slightly different folder conventions. nnU-Net itself uses
+# ``$nnUNet_results/Dataset{id}_*/{trainer}__{plans}__{model}/``.
+# TotalSegmentator uses ``$TOTALSEG_WEIGHTS_PATH`` (or
+# ``~/.totalsegmentator/nnunet/results``) with the same Dataset/trainer
+# structure but a TS-specific trainer (``nnUNetTrainerNoMirroring`` for
+# some models). MOOSE has its own root.
+#
+# Rather than special-case each, a ``WeightsLayout`` captures "where to look
+# + what trainer conventions to assume" as data. Downstream packages can
+# register their own layout via :func:`register_weights_layout`.
+
+
+@dataclass(frozen=True)
+class WeightsLayout:
+    """Specification for an nnU-Net-style weights tree.
+
+    Attributes
+    ----------
+    name :
+        Human-readable identifier (``"nnUNet"``, ``"TotalSegmentator"``, ...).
+    env_var :
+        Optional env var that overrides the default path when set.
+    default_path :
+        Filesystem path checked when ``env_var`` is unset / missing.
+        ``None`` means "no default; this layout requires the env var."
+    trainer, plans, model :
+        Preferred names for the ``{trainer}__{plans}__{model}`` subfolder
+        inside ``Dataset{id}_*``. ``None`` for any field means "auto-pick
+        whatever's there." Layouts with multiple co-installed trainers
+        (e.g. TS ships some Datasets with both ``nnUNetTrainer`` and
+        ``nnUNetTrainerNoMirroring``) should set ``trainer`` to disambiguate.
+    """
+    name: str
+    env_var: str | None = None
+    default_path: Path | None = None
+    trainer: str | None = None
+    plans: str | None = None
+    model: str | None = None
+
+    def resolve_weights_dir(self) -> Path | None:
+        """Return the weights directory if this layout is available, else None."""
+        if self.env_var and self.env_var in os.environ:
+            return Path(os.environ[self.env_var]).expanduser()
+        if self.default_path is not None:
+            p = self.default_path.expanduser()
+            if p.is_dir():
+                return p
+        return None
+
+
+# Built-in layouts, checked in declaration order.
+#
+# nnU-Net standard wins over TS when both env vars are set, on the principle
+# that a user who explicitly set $nnUNet_results meant it.
+_WEIGHTS_LAYOUTS: list[WeightsLayout] = [
+    WeightsLayout(name="nnUNet", env_var="nnUNet_results"),
+    WeightsLayout(
+        name="TotalSegmentator",
+        env_var="TOTALSEG_WEIGHTS_PATH",
+        default_path=Path("~/.totalsegmentator/nnunet/results"),
+    ),
+]
+
+
+def register_weights_layout(layout: WeightsLayout, *, prepend: bool = False) -> None:
+    """Register an additional weights layout.
+
+    Downstream packages (MOOSE, custom clinical installs) can call this at
+    import time to make their weights tree discoverable via :func:`discover_weights`
+    and ``ModelBundle.from_task(..., weights_dir=None)``.
+
+    Parameters
+    ----------
+    layout :
+        The layout to register.
+    prepend :
+        If True, insert at the front of the registry so this layout is checked
+        before the built-ins. Default is to append (built-ins win on collision).
+    """
+    if prepend:
+        _WEIGHTS_LAYOUTS.insert(0, layout)
+    else:
+        _WEIGHTS_LAYOUTS.append(layout)
+
+
+def list_weights_layouts() -> tuple[WeightsLayout, ...]:
+    """Return the registered weights layouts in lookup order."""
+    return tuple(_WEIGHTS_LAYOUTS)
+
+
+def discover_weights() -> tuple[Path, WeightsLayout]:
+    """Find the first registered weights tree that exists.
+
+    Returns
+    -------
+    (weights_dir, layout)
+        The directory that was found, and the layout that produced it.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no registered layout resolves to an existing directory.
+    """
+    tried = []
+    for layout in _WEIGHTS_LAYOUTS:
+        tried.append(layout)
+        path = layout.resolve_weights_dir()
+        if path is not None:
+            return path, layout
+    msg = "No weights directory found. Tried:\n"
+    for L in tried:
+        env_state = (
+            f"{L.env_var}={os.environ.get(L.env_var)!r}"
+            if L.env_var else "no env var"
+        )
+        msg += f"  {L.name}: {env_state}, default={L.default_path}\n"
+    msg += (
+        "Pass weights_dir= explicitly, set the appropriate env var, "
+        "or register a custom WeightsLayout."
     )
+    raise FileNotFoundError(msg)
 
 
-def _find_model_folder(task_id: int, weights_dir: Path) -> Path:
-    """Resolve task_id to a model folder path."""
+def _default_weights_dir() -> Path:
+    """Locate the first available weights directory via the layout registry."""
+    return discover_weights()[0]
+
+
+def _find_model_folder(
+    task_id: int,
+    weights_dir: Path,
+    *,
+    trainer: str | None = None,
+    plans: str | None = None,
+    model: str | None = None,
+) -> Path:
+    """Resolve task_id to a model folder path.
+
+    When ``trainer`` / ``plans`` / ``model`` are given, builds the exact
+    ``{trainer}__{plans}__{model}`` subfolder name (defaulting unspecified
+    fields to ``nnUNetTrainer`` / ``nnUNetPlans`` / ``3d_fullres``). When all
+    three are ``None``, picks the alphabetically first ``*__*__*`` subfolder
+    — correct for the common single-trainer case.
+
+    Explicit trainer disambiguation is needed when a Dataset folder ships
+    multiple trainer variants (e.g. TS's ``Dataset291`` has both
+    ``nnUNetTrainer__nnUNetPlans__3d_fullres`` and
+    ``nnUNetTrainerNoMirroring__nnUNetPlans__3d_fullres``).
+    """
     matches = sorted(weights_dir.glob(f"Dataset{task_id}_*"))
     if not matches:
         raise FileNotFoundError(
             f"No model found for task {task_id} in {weights_dir}."
         )
     dataset_dir = matches[0]
-    # Find the single trainer subfolder
+
+    if trainer is not None or plans is not None or model is not None:
+        trainer_name = trainer or "nnUNetTrainer"
+        plans_name = plans or "nnUNetPlans"
+        model_name = model or "3d_fullres"
+        target = dataset_dir / f"{trainer_name}__{plans_name}__{model_name}"
+        if not target.exists():
+            available = "\n  ".join(
+                p.name for p in sorted(dataset_dir.glob("*__*__*"))
+            ) or "(none)"
+            raise FileNotFoundError(
+                f"Model folder not found: {target}\n"
+                f"Available trainer folders in {dataset_dir}:\n  {available}"
+            )
+        return target
+
     trainer_dirs = sorted(dataset_dir.glob("*__*__*"))
     if not trainer_dirs:
-        raise FileNotFoundError(
-            f"No trainer folder found in {dataset_dir}."
-        )
+        raise FileNotFoundError(f"No trainer folder found in {dataset_dir}.")
     return trainer_dirs[0]
 
 
@@ -272,6 +428,10 @@ class ModelBundle:
         folds: int | Iterable[int] | str = "all",
         weights_dir: str | Path | None = None,
         dtype: str | mx.Dtype | None = None,
+        *,
+        trainer: str | None = None,
+        plans: str | None = None,
+        model: str | None = None,
     ) -> ModelBundle:
         """Load by task ID from the weights directory.
 
@@ -279,16 +439,42 @@ class ModelBundle:
 
         Parameters
         ----------
-        task_id : int
+        task_id :
             nnU-Net dataset/task ID (e.g. 297).
-        weights_dir : str or Path, optional
-            Where to look for models. Defaults to ``$nnUNet_results``.
+        weights_dir :
+            Where to look for models. When ``None`` (default), the
+            :class:`WeightsLayout` registry is walked in declaration order
+            and the first directory that resolves wins — this finds
+            standard ``$nnUNet_results`` installs and TotalSegmentator
+            installs automatically. Pass an explicit path to bypass
+            discovery.
+        trainer, plans, model :
+            Override the trainer / plans / model subfolder names within
+            the resolved Dataset directory. Useful when a Dataset folder
+            contains multiple trainer variants (e.g. TS's ``Dataset291``
+            ships both ``nnUNetTrainer`` and ``nnUNetTrainerNoMirroring``)
+            and the alphabetical first-match picks the wrong one. When
+            all three are ``None``, the trainer-preference from the
+            resolved layout (if any) is used; otherwise the first match
+            on disk is used.
         """
+        layout: WeightsLayout | None = None
         if weights_dir is None:
-            weights_dir = _default_weights_dir()
+            resolved_dir, layout = discover_weights()
+            weights_dir = resolved_dir
         weights_dir = Path(weights_dir).expanduser()
 
-        model_folder = _find_model_folder(task_id, weights_dir)
+        # If the layout had a trainer preference and the caller didn't
+        # override it, apply the layout's preference.
+        if layout is not None:
+            trainer = trainer if trainer is not None else layout.trainer
+            plans = plans if plans is not None else layout.plans
+            model = model if model is not None else layout.model
+
+        model_folder = _find_model_folder(
+            task_id, weights_dir,
+            trainer=trainer, plans=plans, model=model,
+        )
         return ModelBundle.from_folder(model_folder, folds=folds, dtype=dtype)
 
 

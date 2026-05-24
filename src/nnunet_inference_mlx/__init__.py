@@ -6,7 +6,19 @@ from .engine import (
     ModelBundle,
     Predictor,
     SlidingWindowEngine,
+    WeightsLayout,
+    discover_weights,
+    list_weights_layouts,
+    register_weights_layout,
     softmax_inplace,
+)
+from .engine_cache import (
+    cache_enabled,
+    cache_engine,
+    cached_engine_from_folder,
+    cached_engine_from_task,
+    clear_engine_cache,
+    get_cached_engine,
 )
 from .labels import (
     convert_logits_to_segmentation,
@@ -46,6 +58,18 @@ __all__ = [
     "InferenceEngine",          # back-compat facade
     "softmax_inplace",
     "sigmoid_inplace",
+    # Weights layout discovery (nnU-Net + TS by default; downstream extensible)
+    "WeightsLayout",
+    "discover_weights",
+    "list_weights_layouts",
+    "register_weights_layout",
+    # Process-wide engine cache
+    "cache_enabled",
+    "cache_engine",
+    "cached_engine_from_folder",
+    "cached_engine_from_task",
+    "clear_engine_cache",
+    "get_cached_engine",
     # Label-scheme post-processing
     "convert_logits_to_segmentation",
     "has_regions",
