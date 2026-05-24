@@ -140,3 +140,62 @@ def preprocess_volume(
             result[ch] = ct_normalization(data[ch], **params)
 
     return result
+
+
+def resample_volume(
+    vol_zyx: np.ndarray,
+    in_spacing_zyx: tuple[float, float, float],
+    out_spacing_zyx: tuple[float, float, float],
+    *,
+    order: int = 3,
+) -> np.ndarray:
+    """Forward-resample a numpy volume from one spacing to another.
+
+    The pure-numpy sibling of :func:`resampling.resample_image_to_target`
+    (which takes a ``sitk.Image`` and uses SITK's b-spline). This version
+    uses ``scipy.ndimage.zoom``, which gives equivalent quality at
+    ``order=3`` (cubic interpolation, close to b-spline) without adding
+    a SITK dependency.
+
+    Parameters
+    ----------
+    vol_zyx :
+        Input volume in (Z, Y, X) order. Float32 in, float32 out
+        (scipy will up-cast integer dtypes; you typically want float32
+        for the model input anyway).
+    in_spacing_zyx :
+        Voxel spacing in mm of ``vol_zyx``, in the same axis order.
+    out_spacing_zyx :
+        Desired voxel spacing in mm. Output shape is rounded from
+        ``vol_zyx.shape * in_spacing / out_spacing``.
+    order :
+        scipy interpolation order: 0 (nearest), 1 (linear), 3 (cubic /
+        ~b-spline). Default 3 matches nnU-Net's training-time forward
+        resample. Pass 0 for label volumes.
+
+    Returns
+    -------
+    np.ndarray
+        Resampled volume at the new spacing, float32.
+
+    Notes
+    -----
+    This primitive assumes axis-aligned data (no direction matrix). For
+    oblique scans or anything with a non-identity direction, use
+    :func:`resampling.resample_image_to_target` on a ``sitk.Image`` —
+    it preserves world geometry through the resample.
+    """
+    try:
+        from scipy.ndimage import zoom
+    except ImportError as e:
+        raise ImportError(
+            "scipy is required for resample_volume. "
+            "Install with: pip install scipy"
+        ) from e
+
+    zoom_factors = tuple(
+        float(s_in) / float(s_out)
+        for s_in, s_out in zip(in_spacing_zyx, out_spacing_zyx)
+    )
+    return zoom(vol_zyx.astype(np.float32, copy=False), zoom_factors,
+                order=order, mode="nearest")

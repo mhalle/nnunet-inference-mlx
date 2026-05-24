@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.8.0] - 2026-05-23
+
+Small, single-purpose primitive additions that complete the mix-and-match toolkit story. No god-methods, no consolidation. Each addition does one thing and composes with what's already there.
+
+### Added — engine bundle property accessors
+
+Four read-only properties on `InferenceEngine` that surface metadata previously buried in `engine._bundle`:
+
+- **`engine.target_spacing`** — `(Z, Y, X)` voxel spacing in mm the model expects as input. Callers resample to this spacing before predict.
+- **`engine.has_regions`** — `True` for BraTS-style models with independent sigmoid heads, `False` for standard mutually-exclusive classes.
+- **`engine.regions_class_order`** — paint-priority tuple of label values for region-based conversion. Empty for standard datasets.
+- **`engine.bundle`** — the underlying `ModelBundle` (escape hatch for everything else in `dataset` / `plans` / `metadata`).
+
+Pure delegations to `engine._bundle`. The curated names cover the routine cases; `engine.bundle` is for the rare reach-through.
+
+### Added — `engine.predict_logits()` returning `mx.array`
+
+The MLX-native sibling of `engine.predict()`. Returns the per-channel predictions as an `mx.array` in unified memory, ready to feed directly into `inverse_resample_argmax` / `inverse_resample_paint` / multi-model arithmetic without a per-caller `mx.array(...)` wrap. Same underlying data as `predict()`; same per-volume materialization cost (the sliding-window accumulator runs in numpy internally). The win is API ergonomics — the `mx.array(...)` ceremony moves once into the engine rather than every call site.
+
+### Added — `inverse_resample_paint` (region-based scheme-aware inverse resample)
+
+New primitive paired with `inverse_resample_argmax`. Same slab-streaming + K-channel trilinear-gather pass; differs only in the per-slab finishing step: per-region threshold (default 0.0 ↔ raw-logit "sigmoid > 0.5") + paint-priority overwrite from `regions_class_order`. Use for BraTS-style models where argmax across channels is silently wrong (it picks "the region with the highest sigmoid" instead of "all regions above threshold, painted by priority").
+
+```python
+seg = inverse_resample_paint(
+    logits_target,
+    out_shape_zyx=acq_shape,
+    target_spacing_zyx=target_spacing,
+    acq_spacing_zyx=acq_spacing,
+    regions_class_order=engine.regions_class_order,
+    threshold=0.0,   # 0.5 if input is post-sigmoid
+)
+```
+
+Memory shape identical to `inverse_resample_argmax` (slab budget bounds the K-channel acquisition-spacing slab). Output dtype auto-picks from the maximum label value in `regions_class_order` — typically `uint8`.
+
+### Added — `inverse_resample_argmax` accepts `mx.array | np.ndarray`
+
+Polymorphic input. The caller-side `mx.array(numpy_logits)` wrap is internalized; the function accepts whatever logit-shaped tensor you have. Same one-time conversion cost when called with numpy, zero conversion when called with `mx.array`.
+
+### Added — `resample_volume` (numpy forward resample primitive)
+
+Pure-scipy sibling of `resample_image_to_target` (which takes a `sitk.Image`). For users composing numpy-native mix-and-match pipelines without an SITK dependency:
+
+```python
+vol_target = resample_volume(vol_acq, in_spacing_zyx=acq, out_spacing_zyx=target, order=3)
+```
+
+`order=3` (cubic) matches nnU-Net's training-time forward resample quality; pass `order=0` for label volumes. Adds an optional scipy dependency that's already commonly installed.
+
+### Fixed — `predict_with_resampling` scheme dispatch for region-based models
+
+Previously called `inverse_resample_argmax` unconditionally. For region-based models, the sigmoid-averaged ensemble output would get argmax'd — picking "highest sigmoid channel" instead of doing proper threshold + paint priority. Silently wrong at ambiguous voxels.
+
+Now dispatches on `engine.has_regions`:
+
+- Standard scheme → `inverse_resample_argmax`
+- Region-based scheme → `inverse_resample_paint` with `regions_class_order=engine.regions_class_order` and `threshold=0.5` (multi-fold, post-sigmoid mean) or `threshold=0.0` (single-fold, raw logits)
+
+The non-resample path (`engine.predict_segmentation`) already handled this correctly via `convert_logits_to_segmentation`; this brings the resample path into alignment.
+
+### Tests
+
+38 new pytest tests across three new files (`test_predict_logits_and_properties.py`, `test_resample_primitives.py`, `test_predict_with_resampling_scheme.py`), bringing total coverage to 146 tests, all passing.
+
+Notable: `test_predict_with_resampling_scheme.py::test_region_based_dispatch_uses_paint` explicitly verifies the fixed BraTS bug — output labels must come from `regions_class_order` (`{0, 1, 2, 4}` in the test fixture), not channel indices (`{0, 1, 2, 3}` which would indicate argmax was incorrectly applied).
+
+### Migration
+
+`predict_with_resampling` callers don't need to change anything — the scheme dispatch is internal. Direct callers of `inverse_resample_argmax` who were passing region-based logits should switch to `inverse_resample_paint`.
+
+Internal use of `engine._bundle.target_spacing` should migrate to `engine.target_spacing` (the underscore-prefixed access still works but is no longer the recommended pattern).
+
 ## [0.7.0] - 2026-05-23
 
 ### Added — pluggable weights-folder discovery (`WeightsLayout` + registry)
