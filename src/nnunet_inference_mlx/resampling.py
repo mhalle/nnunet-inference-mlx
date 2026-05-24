@@ -376,6 +376,83 @@ def _resize_to_exact(
     return arr
 
 
+def _slab_resample_paint(
+    logits_target: mx.array,            # (K, Z_t, Y_t, X_t)
+    out_shape_zyx: tuple[int, int, int],
+    target_spacing_zyx: tuple[float, float, float],
+    acq_spacing_zyx: tuple[float, float, float],
+    peak_working_memory_mb: int,
+    regions_class_order: tuple[int, ...],
+    threshold: float,
+    out_dtype: np.dtype,
+) -> np.ndarray:
+    """Slab-streamed inverse resample for region-based (BraTS-style) models.
+
+    Identical slab-streaming shape and trilinear-interpolation step as
+    :func:`_slab_resample_argmax`; differs only in the per-slab finishing:
+    instead of argmax across K, do per-region threshold and paint in
+    ``regions_class_order`` order.
+
+    Painting in order means later (higher-priority) regions overwrite
+    earlier ones at overlapping voxels — the standard nnU-Net region
+    semantics. This matches what :func:`convert_logits_to_segmentation`
+    does at target spacing, just applied per-slab at acquisition spacing.
+
+    The slab's K channels are read into MLX once via trilinear gather,
+    then a numpy host loop paints each region (cheap: only K passes over
+    the slab, each a thresholded mask write).
+    """
+    K, Z_t, Y_t, X_t = logits_target.shape
+    Z_a, Y_a, X_a = out_shape_zyx
+
+    if K != len(regions_class_order):
+        raise ValueError(
+            f"Region prediction has {K} channels but regions_class_order "
+            f"has {len(regions_class_order)} entries."
+        )
+
+    bytes_per_slab_voxel = K * 4
+    max_slab_voxels = int(peak_working_memory_mb) * 1024 * 1024 // bytes_per_slab_voxel
+    plane_voxels = max(1, Y_a * X_a)
+    slab_z = max(1, max_slab_voxels // plane_voxels)
+
+    s2t_z = acq_spacing_zyx[0] / target_spacing_zyx[0]
+    s2t_y = acq_spacing_zyx[1] / target_spacing_zyx[1]
+    s2t_x = acq_spacing_zyx[2] / target_spacing_zyx[2]
+
+    y_coords = mx.arange(Y_a, dtype=mx.float32) * s2t_y
+    x_coords = mx.arange(X_a, dtype=mx.float32) * s2t_x
+
+    out = np.zeros(out_shape_zyx, dtype=out_dtype)
+
+    for z0 in range(0, Z_a, slab_z):
+        z1 = min(z0 + slab_z, Z_a)
+
+        z_global = mx.arange(z0, z1, dtype=mx.float32) * s2t_z
+        z_lo_f = z0 * s2t_z
+        z_hi_f = (z1 - 1) * s2t_z
+        zt_lo = max(0, min(Z_t - 1, int(z_lo_f) - 1))
+        zt_hi = max(zt_lo + 1, min(Z_t, int(z_hi_f) + 2))
+        slab_src = logits_target[:, zt_lo:zt_hi]
+        slab_t_z = slab_src.shape[1]
+        z_local = z_global - zt_lo
+
+        idx = _precompute_trilinear_indices(
+            z_local, y_coords, x_coords, slab_t_z, Y_t, X_t,
+        )
+        slab_K = _trilinear_from_indices_K(slab_src, *idx)   # (K, S, Y_a, X_a)
+        mx.eval(slab_K)
+        slab_K_np = np.asarray(slab_K)
+
+        # Paint in regions_class_order: later regions overwrite earlier ones.
+        slab_seg = np.zeros((z1 - z0, Y_a, X_a), dtype=out_dtype)
+        for region_idx, label_value in enumerate(regions_class_order):
+            slab_seg[slab_K_np[region_idx] > threshold] = label_value
+        out[z0:z1] = slab_seg
+
+    return out
+
+
 def _slab_resample_argmax(
     logits_target: mx.array,            # (K, Z_t, Y_t, X_t)
     out_shape_zyx: tuple[int, int, int],
@@ -464,7 +541,7 @@ def _slab_resample_argmax(
 
 
 def inverse_resample_argmax(
-    logits_target: mx.array,
+    logits_target: "mx.array | np.ndarray",
     out_shape_zyx: tuple[int, int, int],
     target_spacing_zyx: tuple[float, float, float],
     acq_spacing_zyx: tuple[float, float, float],
@@ -525,6 +602,12 @@ def inverse_resample_argmax(
         peak_working_memory_mb = _auto_memory_budget_mb()
     out_dtype = np.dtype(out_dtype)
 
+    # Accept either mx.array (preferred — already in unified memory) or
+    # any numpy-convertible. The bare `mx.array(...)` wrap at every call
+    # site is API friction; this internalizes the same one-time copy.
+    if not isinstance(logits_target, mx.array):
+        logits_target = mx.array(logits_target)
+
     max_ratio = max(
         o / t for t, o in zip(target_spacing_zyx, acq_spacing_zyx)
     )
@@ -546,6 +629,93 @@ def inverse_resample_argmax(
         logits_target, out_shape_zyx,
         target_spacing_zyx, acq_spacing_zyx,
         peak_working_memory_mb, out_dtype,
+    )
+
+
+def inverse_resample_paint(
+    logits_target: "mx.array | np.ndarray",
+    out_shape_zyx: tuple[int, int, int],
+    target_spacing_zyx: tuple[float, float, float],
+    acq_spacing_zyx: tuple[float, float, float],
+    regions_class_order: tuple[int, ...],
+    *,
+    threshold: float = 0.0,
+    out_dtype: np.dtype | str | None = None,
+    peak_working_memory_mb: int | None = None,
+) -> np.ndarray:
+    """Resample region-based logits to acquisition spacing, threshold + paint.
+
+    The region-based (BraTS-style) sibling of :func:`inverse_resample_argmax`.
+    For models whose K output channels are *independent sigmoid heads*
+    (not a softmax distribution), the correct conversion to integer labels
+    is per-region thresholding followed by paint-priority overwrite —
+    *not* argmax (which would silently pick "the region with the highest
+    sigmoid" instead of "all regions above threshold, painted by priority").
+
+    Strategy: identical slab-streaming + K-channel trilinear-gather pass
+    as :func:`inverse_resample_argmax`. The per-slab finishing step
+    paints each region's label value (from ``regions_class_order``) at
+    voxels where that region's interpolated logit exceeds ``threshold``.
+    Higher-index regions overwrite lower-index ones at overlaps — the
+    standard nnU-Net region semantics.
+
+    Parameters
+    ----------
+    logits_target :
+        Per-region logits or post-sigmoid probabilities at the model's
+        target spacing, shape ``(K, Z_t, Y_t, X_t)``. Accepts either
+        ``mx.array`` (preferred — already in unified memory) or a numpy
+        array (converted internally).
+    out_shape_zyx :
+        Shape of the output segmentation at acquisition spacing.
+    target_spacing_zyx, acq_spacing_zyx :
+        Spacings, in millimeters, of the input logit volume and the
+        desired output respectively. Axis order ``(Z, Y, X)``.
+    regions_class_order :
+        Tuple of K label values, one per region channel, in paint-priority
+        order. Region 0 paints first; region K-1 paints last and wins at
+        overlaps. From ``engine.regions_class_order`` for region-based bundles.
+    threshold :
+        Cut for region membership. ``0.0`` (default) matches raw-logit
+        output (``sigmoid > 0.5`` ↔ ``logit > 0``). Pass ``0.5`` if the
+        input has already been sigmoid'd (e.g., a multi-fold ensemble
+        which averages post-sigmoid probabilities).
+    out_dtype :
+        Output integer dtype. ``None`` (default) picks the smallest
+        unsigned dtype that fits ``max(regions_class_order)`` — typically
+        ``uint8``. Pass an explicit dtype to override.
+    peak_working_memory_mb :
+        Same slab budget as :func:`inverse_resample_argmax`; auto-detects
+        from system RAM when ``None``.
+
+    Returns
+    -------
+    np.ndarray
+        Integer label volume at acquisition spacing, shape ``out_shape_zyx``.
+    """
+    if peak_working_memory_mb is None:
+        peak_working_memory_mb = _auto_memory_budget_mb()
+
+    if not isinstance(logits_target, mx.array):
+        logits_target = mx.array(logits_target)
+
+    if out_dtype is None:
+        max_label = max(regions_class_order) if regions_class_order else 0
+        if max_label < 256:
+            out_dtype = np.uint8
+        elif max_label < 65536:
+            out_dtype = np.uint16
+        else:
+            out_dtype = np.uint32
+    out_dtype = np.dtype(out_dtype)
+
+    return _slab_resample_paint(
+        logits_target, out_shape_zyx,
+        target_spacing_zyx, acq_spacing_zyx,
+        peak_working_memory_mb,
+        tuple(int(v) for v in regions_class_order),
+        float(threshold),
+        out_dtype,
     )
 
 
@@ -587,7 +757,7 @@ def predict_with_resampling(
     """
     sitk = _require_sitk()
 
-    target_spacing_zyx = engine.predictor._bundle.target_spacing
+    target_spacing_zyx = engine.target_spacing
     in_spacing_xyz = image_sitk.GetSpacing()
     acq_spacing_zyx = tuple(reversed(in_spacing_xyz))
 
@@ -596,13 +766,12 @@ def predict_with_resampling(
         image_sitk, target_spacing_zyx, interpolation=interpolation,
     )
 
-    # Inference (Metal). engine.predict returns raw logits at target spacing
+    # Inference (Metal). predict_logits returns mx.array at target spacing
     # for single-fold, averaged softmax probs for multi-fold standard
     # ensembles, averaged sigmoid probs for multi-fold region ensembles —
     # all (K, Z_t, Y_t, X_t).
     vol_target = sitk.GetArrayFromImage(resampled).astype(np.float32, copy=False)
-    pred_np = engine.predict(vol_target)        # numpy (K, Z_t, Y_t, X_t)
-    pred_mx = mx.array(pred_np)                  # back to Metal for streaming
+    pred_mx = engine.predict_logits(vol_target)
 
     # Output shape in (Z, Y, X) — SITK GetSize is (X, Y, Z), so reverse.
     in_size_xyz = image_sitk.GetSize()
@@ -611,12 +780,29 @@ def predict_with_resampling(
     # Pick output dtype from the bundle's label scheme.
     out_dtype = engine.label_dtype
 
-    seg_zyx = inverse_resample_argmax(
-        pred_mx, out_shape_zyx,
-        target_spacing_zyx, acq_spacing_zyx,
-        out_dtype=out_dtype,
-        peak_working_memory_mb=peak_working_memory_mb,
-    )
+    # Scheme-aware inverse resample: argmax for standard, threshold+paint
+    # for region-based. The current_path was applying argmax to region-based
+    # sigmoid means before this fix, producing silently-wrong labels for
+    # BraTS-style models.
+    if engine.has_regions:
+        # Multi-fold ensembles average post-sigmoid probabilities (threshold
+        # at 0.5); single-fold returns raw logits (threshold at 0 ↔ sigmoid>0.5).
+        threshold = 0.5 if len(engine.bundle.fold_weights) > 1 else 0.0
+        seg_zyx = inverse_resample_paint(
+            pred_mx, out_shape_zyx,
+            target_spacing_zyx, acq_spacing_zyx,
+            regions_class_order=engine.regions_class_order,
+            threshold=threshold,
+            out_dtype=out_dtype,
+            peak_working_memory_mb=peak_working_memory_mb,
+        )
+    else:
+        seg_zyx = inverse_resample_argmax(
+            pred_mx, out_shape_zyx,
+            target_spacing_zyx, acq_spacing_zyx,
+            out_dtype=out_dtype,
+            peak_working_memory_mb=peak_working_memory_mb,
+        )
 
     if remove_small_components_mm3 > 0:
         from .postprocessing import remove_small_components
@@ -635,5 +821,6 @@ def predict_with_resampling(
 __all__ = [
     "resample_image_to_target",
     "inverse_resample_argmax",
+    "inverse_resample_paint",
     "predict_with_resampling",
 ]

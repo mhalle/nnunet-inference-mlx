@@ -994,6 +994,44 @@ class InferenceEngine:
     def batch_size(self) -> int:
         return self._sliding._batch_size
 
+    @property
+    def bundle(self) -> ModelBundle:
+        """The underlying :class:`ModelBundle` (plans, dataset, weights, metadata).
+
+        Use the curated properties (``target_spacing``, ``has_regions``,
+        ``regions_class_order``, ``label_dtype``) for routine access; this
+        is the escape hatch for anything else from the bundle metadata.
+        """
+        return self._bundle
+
+    @property
+    def target_spacing(self) -> tuple[float, float, float]:
+        """Voxel spacing ``(Z, Y, X)`` in mm the model expects as input.
+
+        Callers resample their input to this spacing before
+        :meth:`predict_logits` / :meth:`predict_segmentation`. Returned
+        in numpy axis order (Z, Y, X), not SITK order (X, Y, Z).
+        """
+        return self._bundle.target_spacing
+
+    @property
+    def has_regions(self) -> bool:
+        """``True`` for BraTS-style models with independent sigmoid heads
+        (region-based label scheme), ``False`` for standard mutually-exclusive
+        classes (softmax)."""
+        return self._bundle.has_regions
+
+    @property
+    def regions_class_order(self) -> tuple[int, ...]:
+        """Paint-priority tuple for region-based label conversion.
+
+        Empty tuple for standard datasets. For region-based datasets, the
+        i-th value is the label ID that region i paints into the output
+        segmentation, applied in order so later regions overwrite earlier
+        ones at overlapping voxels.
+        """
+        return self._bundle.regions_class_order
+
     def normalize(self, volume: np.ndarray) -> np.ndarray:
         return self._sliding.normalize(volume)
 
@@ -1001,7 +1039,7 @@ class InferenceEngine:
         return self._sliding.prepare(shape)
 
     def predict(self, volume: np.ndarray, normalize: bool = True) -> np.ndarray:
-        """Run inference and return per-channel predictions.
+        """Run inference and return per-channel predictions as numpy.
 
         * Standard model, single fold  → raw logits, shape ``(K, Z, Y, X)``.
         * Standard model, multi fold   → averaged softmax probabilities.
@@ -1010,8 +1048,28 @@ class InferenceEngine:
 
         Use :meth:`predict_segmentation` to skip the post-processing branch
         — it handles all four cases and returns integer labels directly.
+        Use :meth:`predict_logits` to receive the same data as ``mx.array``
+        for chaining with MLX operations (``inverse_resample_argmax``,
+        ``inverse_resample_paint``, multi-model arithmetic) without an
+        explicit ``mx.array(...)`` wrap.
         """
         return self._backend.predict(volume, normalize=normalize)
+
+    def predict_logits(self, volume: np.ndarray, normalize: bool = True) -> mx.array:
+        """Run inference and return the per-channel predictions as ``mx.array``.
+
+        Returns the same data as :meth:`predict` but wrapped as an
+        ``mx.array`` in unified memory, ready to be passed directly to
+        ``inverse_resample_argmax`` / ``inverse_resample_paint`` /
+        ``mx.softmax`` / etc. without a per-caller ``mx.array(...)`` wrap.
+
+        Note: the sliding-window accumulator runs in numpy, so this method
+        does not avoid the per-volume numpy materialization that happens
+        inside the inference loop. The win is API ergonomics, not memory
+        — equivalent to ``mx.array(engine.predict(volume))`` but expressed
+        once where it makes architectural sense.
+        """
+        return mx.array(self._backend.predict(volume, normalize=normalize))
 
     def predict_segmentation(
         self,

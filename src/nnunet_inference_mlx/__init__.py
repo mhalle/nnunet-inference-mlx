@@ -35,10 +35,12 @@ from .io import (
 )
 from .resampling import (
     inverse_resample_argmax,
+    inverse_resample_paint,
     predict_with_resampling,
     resample_image_to_target,
 )
 from .postprocessing import remove_small_components
+from .preprocessing import resample_volume
 from .workflow import (
     Bbox,
     Stage,
@@ -99,8 +101,10 @@ __all__ = [
     "predict_folder",
     # Resampling + SITK-based predict_with_resampling (opt-in via [preprocessing] extra)
     "inverse_resample_argmax",
+    "inverse_resample_paint",
     "predict_with_resampling",
     "resample_image_to_target",
+    "resample_volume",
     # Postprocessing (opt-in via [postprocessing] extra; cc3d backend)
     "remove_small_components",
     # Multi-stage workflow + geometric primitives
