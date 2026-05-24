@@ -1,154 +1,264 @@
-# nnunet-mlx
+# nnunet-inference-mlx
 
-MLX inference backend for [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) on Apple Silicon. Runs nnU-Net models natively on Metal without PyTorch.
+MLX inference for [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) models on Apple Silicon. Runs trained nnU-Net checkpoints natively on Metal with no PyTorch dependency at runtime.
 
-[nnU-Net](https://github.com/MIC-DKFZ/nnUNet) is a self-configuring framework for medical image segmentation that consistently achieves state-of-the-art results across a wide range of biomedical datasets. It automates the entire segmentation pipeline -- architecture selection, preprocessing, training, and postprocessing -- making expert-level performance accessible without manual tuning. This package brings nnU-Net's trained models to Apple Silicon with native Metal acceleration.
+[nnU-Net](https://github.com/MIC-DKFZ/nnUNet) is a self-configuring medical-image segmentation framework that consistently achieves state-of-the-art results across biomedical datasets. This package brings those trained models to Mac users with native Metal acceleration. It also integrates with [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) (the widely-used CT segmentation tool with ~117 anatomical classes).
 
-This package also integrates with [TotalSegmentator](https://github.com/wasserth/TotalSegmentator), the widely-used tool for automatic segmentation of 117 anatomical structures in CT images.
+> This is alpha-level software. We aim to demonstrate MLX's value for nnU-Net inference on Apple Silicon, not to maintain a long-term fork — the goal is for these ideas to flow back upstream.
 
-> **Note:** This is an alpha-level port. It is not our intent to maintain a fork of nnU-Net. The goal is to demonstrate the potential performance improvement of using MLX to accelerate nnU-Net inference for Mac users. We hope that these changes can be incorporated back into the official [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) package in the future.
+## Highlights
 
-## Features
-
-- Drop-in MLX backend for TotalSegmentator (`-d mlx`)
-- 6x faster than PyTorch CPU, 1.4x faster than PyTorch MPS on Apple Silicon
-- Memory-efficient segmentation mode for large volumes
-- Auto-scales batch size to available Metal memory
-- Spacing-aware resampling: SimpleITK forward + MLX K-channel trilinear inverse with slab streaming (path B, smoother boundaries than nearest-neighbor on labels)
-- Multi-label connected-component cleanup via `cc3d` (~10× faster than SITK, ~90× faster than scipy)
-- Region-based label models supported (BraTS-style sigmoid heads with paint-priority)
-- Torch-free `.pth` loading
-- Integrates directly with [TotalSegmentator](https://github.com/wasserth/TotalSegmentator)
-
-### Optional extras
-
-- `pip install nnunet-inference-mlx[preprocessing]` — `SimpleITK` for spacing-aware resampling + SITK-image I/O (`predict_with_resampling`)
-- `pip install nnunet-inference-mlx[postprocessing]` — `connected-components-3d` for `remove_small_components`
-- `pip install nnunet-inference-mlx[remote]` — `requests` + `remotezip` for fetching `.pth` checkpoints over HTTP range requests
+- **Torch-free `.pth` loading.** Pretrained nnU-Net checkpoints are read directly via a vendored restricted unpickler. No PyTorch at runtime, no separate conversion step.
+- **Layered inference architecture.** `Predictor` → `SlidingWindowEngine` → `FoldEnsemble` → `InferenceEngine` — compose what you need. Single-patch interactive use bypasses the wrapper; batch use composes the whole stack.
+- **Process-wide engine cache.** Auto-tiered by detected RAM (≥32 GB on by default). ~1500× speedup on warm fetch — batch and cascade workflows pay the load cost once per process.
+- **Multi-stage cascades** via `run_workflow`. MOOSE-style body-detector → high-res organ-specific patterns in ~5 lines of user code. FOV cropping between stages with automatic geometry preservation.
+- **Path-B inverse resampling.** Trilinear interpolation on the K-channel logit volume with argmax-at-the-end, slab-streamed in unified memory. Smoother boundaries than label-NN, affordable at K≥100 because we slab.
+- **Region-based labels** (BraTS-style sigmoid heads with paint-priority order). Auto-detected from `dataset.json`.
+- **Multi-label component cleanup** via [cc3d](https://github.com/seung-lab/connected-components-3d). ~10× faster than SITK, ~90× faster than scipy.
+- **Pluggable weights-folder discovery** (`WeightsLayout` registry). Built-in layouts for nnU-Net and TotalSegmentator; downstream packages register their own.
+- **6× faster than PyTorch CPU**, ~1.4× faster than PyTorch MPS on the same hardware. Identical voxel output to upstream nnU-Net.
 
 ## Installation
 
-We recommend [uv](https://docs.astral.sh/uv/) for managing Python environments:
-
 ```bash
-uv add nnunet-mlx
+uv add nnunet-inference-mlx              # recommended (uv)
+pip install nnunet-inference-mlx         # or pip
 ```
 
-Or with pip:
+Optional extras (install only what you need):
+
+| Extra | What it pulls in | Enables |
+|---|---|---|
+| `[preprocessing]` | `SimpleITK` | `predict_with_resampling`, SITK-image I/O, multi-stage workflows |
+| `[postprocessing]` | `connected-components-3d` | `remove_small_components` (multi-label dust) |
+| `[remote]` | `requests`, `remotezip` | Fetching `.pth` checkpoints over HTTP range requests |
+| `[test]` | `pytest` | Running the test suite |
 
 ```bash
-pip install nnunet-mlx
+pip install 'nnunet-inference-mlx[preprocessing,postprocessing]'
 ```
 
-## Usage with TotalSegmentator
+## Quick start
+
+```python
+from nnunet_inference_mlx import ModelBundle, InferenceEngine, predict_nifti
+
+# Load a model (auto-discovers TS weights from ~/.totalsegmentator/nnunet/results,
+# nnU-Net weights from $nnUNet_results)
+bundle = ModelBundle.from_task(297, folds=0)
+engine = InferenceEngine(bundle)
+
+# Run inference, write the segmentation
+predict_nifti(engine, "scan.nii.gz", "seg.nii.gz")
+```
+
+See [`examples/`](examples/) for batch, cascade, and path-B variants.
+
+## Common workflows
+
+### Single-volume inference
+
+```python
+from nnunet_inference_mlx import ModelBundle, InferenceEngine, predict_nifti
+
+engine = InferenceEngine(ModelBundle.from_task(297, folds=0))
+predict_nifti(engine, "scan.nii.gz", "seg.nii.gz")
+```
+
+### Batch processing with engine cache
+
+```python
+from pathlib import Path
+from nnunet_inference_mlx import cached_engine_from_task, predict_nifti
+
+engine = cached_engine_from_task(297, folds=0)  # loaded once
+for ct in Path("scans/").glob("*.nii.gz"):
+    predict_nifti(engine, ct, f"out/{ct.stem}_seg.nii.gz")
+# Engine survives across calls; load cost amortized to once per process.
+```
+
+### Path-B inverse resampling with SITK
+
+```python
+import SimpleITK as sitk
+from nnunet_inference_mlx import cached_engine_from_task, predict_with_resampling
+
+engine = cached_engine_from_task(297, folds=0)
+img = sitk.ReadImage("scan.nii.gz")
+seg = predict_with_resampling(engine, img,
+                              remove_small_components_mm3=200.0)
+sitk.WriteImage(seg, "seg.nii.gz")
+```
+
+`predict_with_resampling` handles forward resample (CPU/SITK) → inference (Metal) → inverse resample (Metal, path-B trilinear + argmax with slab streaming) → optional cc3d cleanup, all in one call. Output geometry matches input.
+
+### Two-stage cascade
+
+```python
+import SimpleITK as sitk
+from nnunet_inference_mlx import (
+    Stage, run_workflow, cached_engine_from_task,
+)
+
+body  = cached_engine_from_task(298, folds=0)              # low-res body detector
+liver = cached_engine_from_task(291, folds=0,              # high-res organ model
+                                trainer="nnUNetTrainerNoMirroring")
+
+stages = [
+    Stage(engine=body,  crop_to_classes=(BODY_TRUNK,), dilation_mm=10.0),
+    Stage(engine=liver, remove_small_components_mm3=200.0),
+]
+
+seg = run_workflow(sitk.ReadImage("scan.nii.gz"), stages, verbose=True)
+sitk.WriteImage(seg, "seg.nii.gz")
+```
+
+The second stage runs only inside the cropped FOV (bbox of `BODY_TRUNK` from the first stage). Output is pasted back into the original geometry.
+
+### Region-based / BraTS-style models
+
+Models whose `dataset.json` declares regions (lists of underlying classes per output) are detected automatically. `InferenceEngine.predict_segmentation()` applies the right post-processing:
+
+```python
+engine = InferenceEngine(ModelBundle.from_folder(brats_folder))
+seg = engine.predict_segmentation(volume)
+# Standard models: argmax. Region models: per-region sigmoid threshold +
+# paint priority via dataset.json's `regions_class_order`.
+```
+
+## Architecture
+
+The package is split into composable layers so consumers can pick the right entry point:
+
+```
+ModelBundle   ── plans + dataset + N fold weights, pure I/O artifact
+    │
+    ▼
+Predictor                 ── one compiled MLX network, weight-swappable
+    │                        (nnInteractive-style single-patch use sits here)
+    ▼
+SlidingWindowEngine       ── Gaussian-weighted sliding window
+    │
+    ▼
+FoldEnsemble (optional)   ── softmax/sigmoid averaging across folds
+    │
+    ▼
+InferenceEngine           ── back-compat one-call facade
+```
+
+Higher-level building blocks compose on top:
+
+- `predict_nifti` / `predict_folder` — NIfTI I/O around an engine
+- `predict_with_resampling` — full path-B pipeline (SITK in, SITK out)
+- `run_workflow` — multi-stage cascade orchestrator with FOV cropping
+- `cached_engine_from_task` / `cached_engine_from_folder` — process-wide engine cache
+
+The geometric primitives (`Bbox`, `compute_fg_bbox`, `crop_image`, `paste_segmentation`) are exported as public API for bespoke pipelines (nnInteractive sub-volumes, manual FOV limiting).
+
+## Auto-tiering by RAM
+
+A few places adapt automatically to detected unified memory:
+
+| Knob | < 32 GB Mac | ≥ 32 GB Mac |
+|---|---|---|
+| `Predictor.cache_limit_fraction` | 0.30 | 0.50 |
+| `inverse_resample_argmax` slab budget | 200 MB | 2000 MB |
+| Engine cache enabled? | off | on |
+
+Override any of them explicitly when the heuristic doesn't match your workload (`NNUNET_MLX_CACHE_ENGINES=1` to force the cache on, `peak_working_memory_mb=N` to set the inverse-resample slab budget, etc.).
+
+## Weights
+
+Pretrained TotalSegmentator `.pth` checkpoints load directly — no conversion step. The `WeightsLayout` registry auto-discovers:
+
+- `$nnUNet_results` (standard nnU-Net)
+- `$TOTALSEG_WEIGHTS_PATH` (TS env var)
+- `~/.totalsegmentator/nnunet/results` (TS default install location)
+
+Downstream packages can register their own layouts (`register_weights_layout(WeightsLayout(...))`).
+
+## TotalSegmentator integration
 
 ```bash
-# Convert weights (one-time, requires torch)
-uv run --with torch nnunet-mlx-convert --all .
-
-# Run TotalSegmentator with MLX backend
 uv run TotalSegmentator -i scan.nii.gz -o output/ -d mlx
 ```
 
-Or from Python:
-
 ```python
 from totalsegmentator.python_api import totalsegmentator
-
-result = totalsegmentator(input="scan.nii.gz", output="output/", device="mlx")
+totalsegmentator(input="scan.nii.gz", output="output/", device="mlx")
 ```
 
-## Standalone usage
-
-```python
-from nnunet_mlx import nnUNetv2_predict_mlx
-
-nnUNetv2_predict_mlx(
-    dir_in="input/",
-    dir_out="output/",
-    task_id=297,
-    trainer="nnUNetTrainer_4000epochs_NoMirroring",
-)
-```
+The `-d mlx` flag dispatches to this package's engine. No weight conversion required — checkpoints in `~/.totalsegmentator/nnunet/results` are read directly.
 
 ## Benchmarks
 
-Tested on a real abdominal CT (255x178x256, 1.49mm spacing) on an M2 Mac with 16GB RAM:
+Real abdominal CT (255×178×256, 1.49 mm spacing) on M2 Mac 16 GB RAM:
 
-### 3mm fast mode (single model, 118 classes)
+### 3 mm fast mode (single model, K=118)
 
-| Backend | Prediction time |
-|---------|----------------|
-| **MLX** | **8s** |
-| MPS | 12s |
-| CPU | 54s |
+| Backend | Wall time |
+|---|---|
+| **MLX** | **8 s** |
+| MPS | 12 s |
+| CPU | 54 s |
 
-### 1.5mm full mode (5 models)
+### 1.5 mm full mode (5-model ensemble)
 
-| Backend | Prediction time |
-|---------|----------------|
+| Backend | Wall time |
+|---|---|
 | **MLX** | **3.2 min** |
 | MPS | 4.5 min |
 | CPU | 45+ min |
 
-Results are identical across all backends (verified 100% voxel agreement).
+100% voxel agreement vs. upstream PyTorch inference.
+
+### Engine cache (process-wide, warm vs cold)
+
+| | Time |
+|---|---|
+| Cold load (build + compile + warmup) | ~4.5 s |
+| Cache hit | ~3 ms |
+
+### Postprocessing (cc3d vs scipy, K=117 CT)
+
+| Method | Time |
+|---|---|
+| `cc3d.dust` | **80 ms** |
+| SITK ScalarConnectedComponent + RelabelComponent | 820 ms |
+| scipy per-label loop (TS-style) | 7800 ms |
 
 ### Projected scaling with RAM
 
 | RAM | Batch size | Est. full-res time |
-|-----|-----------|-------------------|
-| 16GB | 1 | 3.2 min |
-| 32GB | 2-3 | ~2.0 min |
-| 64GB | 5-6 | ~1.2 min |
-| 96GB+ | 7-8 | ~1 min |
-
-## Weights
-
-TotalSegmentator's released `.pth` checkpoints are loaded directly via a
-vendored, restricted-unpickle reader (`src/nnunet_inference_mlx/_torchfree/`).
-No conversion step, no PyTorch — point `load_model_weights` (or
-`ModelBundle.from_task`) at the standard `~/.totalsegmentator/nnunet/results`
-tree and go. Runtime dependencies: `mlx`, `numpy`, `nibabel`, `scipy`.
-
-## How it works
-
-The package reimplements nnU-Net's inference pipeline in MLX:
-
-- **model.py** -- PlainConvUNet and ResidualEncoderUNet architectures (Conv3d, InstanceNorm, LeakyReLU, ConvTranspose3d)
-- **weights.py** -- PyTorch-to-MLX weight conversion with NCDHW-to-NDHWC transposition
-- **inference.py** -- Sliding window prediction with Gaussian weighting, segmentation mode with top-2 confidence tracking
-- **plans.py** -- Parses nnU-Net plans.json (both old and new formats) to build the correct architecture
-- **preprocessing.py** -- CTNormalization matching nnU-Net's implementation
-- **predict.py** -- `nnUNetv2_predict_mlx()`, the main entry point
-
-Key optimizations:
-- `mx.compile` for fused conv-norm-relu operations (~1.8x speedup)
-- Segmentation mode: accumulates only labels + confidence per voxel instead of all class logits, enabling inference on large volumes with minimal memory
-- Auto batch sizing based on Metal buffer limits
+|---|---|---|
+| 16 GB | 1 | 3.2 min |
+| 32 GB | 2–3 | ~2.0 min |
+| 64 GB | 5–6 | ~1.2 min |
+| 96 GB+ | 7–8 | ~1 min |
 
 ## Supported models
 
-- PlainConvUNet (nnU-Net default) -- fully tested
-- ResidualEncoderUNet -- architecture implemented, weight mapping not yet verified
-- Old-style plans format (TotalSegmentator models) -- supported
-- New-style plans format (network_arch_init_kwargs) -- supported
+- **PlainConvUNet** (nnU-Net default) — fully tested
+- **ResidualEncoderUNet** (TS large models) — implemented, used by `Dataset291`–`295` weights
+- **Standard label scheme** (mutually-exclusive classes via softmax) — supported
+- **Region-based label scheme** (BraTS-style, sigmoid heads + paint priority) — supported
+- **Old-format plans.json** (TotalSegmentator-era) — supported
+- **New-format plans.json** (`network_arch_init_kwargs`) — supported
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Python >= 3.10
-- MLX >= 0.22
+- macOS with Apple Silicon (M1 / M2 / M3 / M4)
+- Python ≥ 3.10
+- MLX ≥ 0.25
 
 ## Citations
 
 If you use this package, please cite the original nnU-Net and TotalSegmentator papers:
 
-**nnU-Net:**
-Isensee, F., Jaeger, P.F., Kohl, S.A.A. et al. nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. *Nat Methods* 18, 203--211 (2021). https://doi.org/10.1038/s41592-020-01008-z
+**nnU-Net:** Isensee, F., Jaeger, P.F., Kohl, S.A.A. et al. nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. *Nat Methods* 18, 203–211 (2021). https://doi.org/10.1038/s41592-020-01008-z
 
-**TotalSegmentator:**
-Wasserthal, J., Breit, H.-C., Meyer, M.T. et al. TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images. *Radiology: Artificial Intelligence* 5(5) (2023). https://doi.org/10.1148/ryai.230024
+**TotalSegmentator:** Wasserthal, J., Breit, H.-C., Meyer, M.T. et al. TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images. *Radiology: Artificial Intelligence* 5(5) (2023). https://doi.org/10.1148/ryai.230024
 
 ## License
 
-Same as nnU-Net (Apache 2.0).
+Apache 2.0 (same as nnU-Net).
