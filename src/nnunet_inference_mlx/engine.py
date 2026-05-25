@@ -326,7 +326,47 @@ class ModelBundle:
                 "No 'spacing' field in plans configuration; cannot determine "
                 "target spacing."
             )
-        return tuple(float(s) for s in spacing)
+        # plans.json stores spacing in *transposed* axis order (the order the
+        # network sees). To present canonical-order spacing to callers (Z, Y, X
+        # = caller's numpy axes), apply ``transpose_backward``. For models with
+        # identity transpose this is a no-op.
+        plans_spacing = tuple(float(s) for s in spacing)
+        tb = self.transpose_backward
+        if tb == (0, 1, 2):
+            return plans_spacing
+        return tuple(plans_spacing[i] for i in tb)
+
+    @property
+    def transpose_forward(self) -> tuple[int, int, int]:
+        """Axis permutation applied to canonical-order volumes before they reach the network.
+
+        Read from ``plans.json``'s top-level ``transpose_forward``. Defaults
+        to ``(0, 1, 2)`` (identity) when absent. nnU-Net's training pipeline
+        applies this permutation to every input volume before patching, so
+        the model has only ever seen volumes in transposed-axis order.
+
+        For TS Datasets 291–298 this is identity; some research nnU-Net
+        models have non-identity transposes (e.g., ``(2, 0, 1)``).
+        :meth:`InferenceEngine.predict_logits` and siblings handle the
+        transpose round-trip automatically so callers always work in
+        canonical axes; this property is exposed for users composing
+        primitive layers manually.
+        """
+        t = self.plans.get("transpose_forward", (0, 1, 2))
+        return tuple(int(x) for x in t)
+
+    @property
+    def transpose_backward(self) -> tuple[int, int, int]:
+        """Inverse permutation of :attr:`transpose_forward`.
+
+        Used to convert model-order logits back to canonical-order. Read
+        from ``plans.json``'s top-level ``transpose_backward`` (which
+        nnU-Net stores alongside ``transpose_forward`` for convenience —
+        it's always ``np.argsort(transpose_forward)``). Defaults to
+        ``(0, 1, 2)`` (identity) when absent.
+        """
+        t = self.plans.get("transpose_backward", (0, 1, 2))
+        return tuple(int(x) for x in t)
 
     @property
     def mirroring_axes(self) -> tuple[int, ...]:
@@ -1038,6 +1078,30 @@ class InferenceEngine:
     def prepare(self, shape: tuple[int, int, int]) -> ShapeContext:
         return self._sliding.prepare(shape)
 
+    def _apply_transpose_forward(self, volume_zyx: np.ndarray) -> np.ndarray:
+        """Permute a canonical-order volume to the model's expected axis order.
+
+        nnU-Net training pipelines apply ``transpose_forward`` to every input
+        before patching; the model has only ever seen volumes in that
+        permuted order. For models with identity transpose this is a no-op.
+        """
+        tf = self._bundle.transpose_forward
+        if tf == (0, 1, 2):
+            return volume_zyx
+        return np.transpose(volume_zyx, axes=tf)
+
+    def _apply_transpose_backward(self, predictions: np.ndarray) -> np.ndarray:
+        """Permute model-order ``(K, *spatial)`` predictions back to canonical.
+
+        The K axis stays at position 0; only the three spatial axes are
+        permuted. For models with identity transpose this is a no-op.
+        """
+        tb = self._bundle.transpose_backward
+        if tb == (0, 1, 2):
+            return predictions
+        # K (axis 0) is unchanged; spatial axes shift by 1.
+        return np.transpose(predictions, axes=(0, tb[0] + 1, tb[1] + 1, tb[2] + 1))
+
     def predict(self, volume: np.ndarray, normalize: bool = True) -> np.ndarray:
         """Run inference and return per-channel predictions as numpy.
 
@@ -1046,6 +1110,13 @@ class InferenceEngine:
         * Region-based, single fold    → per-region logits.
         * Region-based, multi fold     → averaged per-region sigmoid probs.
 
+        Input ``volume`` is in canonical (Z, Y, X) numpy axis order. The
+        engine internally applies ``transpose_forward`` from plans.json so
+        the model sees data in its trained-on axis order, then applies
+        ``transpose_backward`` to the output so the returned predictions
+        are also in canonical axis order. For models with identity
+        transpose (e.g., all of TS) this round-trip is a no-op.
+
         Use :meth:`predict_segmentation` to skip the post-processing branch
         — it handles all four cases and returns integer labels directly.
         Use :meth:`predict_logits` to receive the same data as ``mx.array``
@@ -1053,7 +1124,9 @@ class InferenceEngine:
         ``inverse_resample_paint``, multi-model arithmetic) without an
         explicit ``mx.array(...)`` wrap.
         """
-        return self._backend.predict(volume, normalize=normalize)
+        volume_model = self._apply_transpose_forward(volume)
+        pred_model = self._backend.predict(volume_model, normalize=normalize)
+        return self._apply_transpose_backward(pred_model)
 
     def predict_logits(self, volume: np.ndarray, normalize: bool = True) -> mx.array:
         """Run inference and return the per-channel predictions as ``mx.array``.
@@ -1063,13 +1136,18 @@ class InferenceEngine:
         ``inverse_resample_argmax`` / ``inverse_resample_paint`` /
         ``mx.softmax`` / etc. without a per-caller ``mx.array(...)`` wrap.
 
+        Input volume is in canonical (Z, Y, X) order; output logits are
+        also in canonical (K, Z, Y, X) order (the internal
+        ``transpose_forward`` / ``transpose_backward`` round-trip is
+        handled by :meth:`predict`).
+
         Note: the sliding-window accumulator runs in numpy, so this method
         does not avoid the per-volume numpy materialization that happens
         inside the inference loop. The win is API ergonomics, not memory
         — equivalent to ``mx.array(engine.predict(volume))`` but expressed
         once where it makes architectural sense.
         """
-        return mx.array(self._backend.predict(volume, normalize=normalize))
+        return mx.array(self.predict(volume, normalize=normalize))
 
     def predict_segmentation(
         self,
@@ -1104,7 +1182,9 @@ class InferenceEngine:
         np.ndarray
             Shape ``(Z, Y, X)``, integer dtype.
         """
-        pred = self._backend.predict(volume, normalize=normalize)
+        # Use self.predict to get the transpose round-trip (canonical-order in,
+        # canonical-order out). For identity-transpose models this is a no-op.
+        pred = self.predict(volume, normalize=normalize)
         if self._bundle.has_regions and len(self._bundle.fold_weights) > 1:
             # multi-fold ensemble already applied sigmoid before averaging
             threshold = 0.5

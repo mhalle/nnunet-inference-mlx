@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.2] - 2026-05-24
+
+### Fixed — `transpose_forward` / `transpose_backward` handling
+
+nnU-Net's training pipeline permutes input volume axes by `transpose_forward` from `plans.json` before patches reach the network. The model has only ever seen volumes in that transposed axis order. For models where `transpose_forward != (0, 1, 2)`, feeding the engine canonical-order volumes was producing silently-wrong predictions — same class of bug as the orientation issue in 0.8.1, just at a different axis-mapping layer.
+
+For TS Datasets 291–298 these are all identity, so this fix has zero effect on TS workloads. For research nnU-Net models with non-identity transposes (e.g. `(2, 0, 1)` for axially-acquired thoracic models), this closes a real correctness hole.
+
+### Added — bundle transpose properties
+
+- **`ModelBundle.transpose_forward`** — read from `plans.json`, defaults to `(0, 1, 2)` when absent.
+- **`ModelBundle.transpose_backward`** — same.
+- **`ModelBundle.target_spacing`** now applies `transpose_backward` to the raw plans spacing, returning canonical-order spacing (matching MOOSE's convention). For identity-transpose models the behavior is unchanged.
+
+### Changed — engine round-trip
+
+`InferenceEngine.predict()` / `predict_logits()` / `predict_segmentation()` now:
+
+1. Apply `transpose_forward` to the input volume (numpy `np.transpose`) before the sliding-window backend sees it
+2. Run inference in the model's expected axis order
+3. Apply `transpose_backward` to the output predictions (spatial axes; K dimension preserved at axis 0)
+
+Caller-facing axis order is canonical `(Z, Y, X)` everywhere — both for inputs and for outputs. For identity-transpose models the round-trip is two no-ops; for non-identity models it makes the engine "transparent" so the caller doesn't need to know about the internal permutation.
+
+`SlidingWindowEngine`, `Predictor`, and `FoldEnsemble` are unchanged — they remain raw primitives operating on whatever axis order they're given. The transpose handling lives in the `InferenceEngine` facade, matching the architectural rule: primitives do one thing, facades compose with metadata-awareness.
+
+### Tests
+
+14 new tests in `test_transpose_handling.py`. Total: **167 passing.**
+
+Notable coverage:
+
+- `test_target_spacing_non_identity_transpose` — verifies `bundle.target_spacing` returns canonical-order spacing
+- `test_non_identity_round_trip_preserves_canonical_layout` — runs the engine with five different transpose pairs (identity, swaps, rotations, full reverse) on an asymmetric `(20, 24, 28)` input and verifies output shape is always `(K, 20, 24, 28)` — the engine is transparent regardless of the model's internal axis convention
+- `test_apply_transpose_backward_undoes_forward` — tests the spatial-axis-only K-channel transpose helper directly
+
+### Migration
+
+For identity-transpose models (every TS model): no behavior change.
+
+For non-identity-transpose models: existing callers passing canonical-order volumes get the right answer for the first time. Callers who were manually pre-transposing inputs to compensate for the bug should remove that compensation.
+
 ## [0.8.1] - 2026-05-24
 
 ### Fixed — canonical orientation handling in `predict_with_resampling` and `run_workflow`
