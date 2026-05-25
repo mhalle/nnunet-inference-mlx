@@ -723,6 +723,17 @@ def inverse_resample_paint(
 # High-level: SITK in, SITK out
 # ---------------------------------------------------------------------------
 
+def _orientation_code(sitk_module, image: "sitk.Image") -> str:
+    """Return the 3-letter DICOM-style orientation code for a SITK image.
+
+    e.g. ``"LPS"`` (canonical: Left-Posterior-Superior voxel-axis directions),
+    ``"RAS"``, or for oblique scans something like ``"SAR"``.
+    """
+    return sitk_module.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
+        image.GetDirection()
+    )
+
+
 def predict_with_resampling(
     engine: "InferenceEngine",
     image_sitk: "sitk.Image",
@@ -730,21 +741,37 @@ def predict_with_resampling(
     interpolation: str = "linear",
     peak_working_memory_mb: int | None = None,
     remove_small_components_mm3: float = 0.0,
+    reorient: str | None = "LPS",
 ) -> "sitk.Image":
     """Forward-resample input → run inference → inverse-resample logits.
 
     The full path-B pipeline: caller hands over a SITK image at any
     acquisition spacing, gets back a SITK image at the same acquisition
     spacing with integer labels. Geometry is preserved via
-    ``CopyInformation``.
+    ``CopyInformation``, including the original orientation.
 
     Forward resample runs on CPU via SITK (b-spline if requested);
     inference runs on Metal; inverse resample runs on Metal with
     slab+channel streaming bounded by ``peak_working_memory_mb`` (auto-
     detected from system RAM if None).
 
-    Returns labels at acquisition spacing. The K-channel logits are
-    transient — never materialized at acquisition spacing.
+    Orientation handling
+    --------------------
+    nnU-Net models are trained with a consistent voxel-axis ↔ anatomical-
+    axis mapping (cranio-caudal as the slowest axis, etc.). For
+    axis-aligned scans this is implicit, but oblique acquisitions or
+    re-formatted volumes have a non-identity direction matrix — feeding
+    them to the model raw causes the sliding window to scan in the
+    wrong anatomical direction, severely degrading segmentation quality
+    (vertebrae fragment, cardiac chambers slice in the wrong plane,
+    etc.).
+
+    ``reorient`` (default ``"LPS"``) reorients the input to canonical
+    LPS orientation before forward resample / inference, then maps the
+    output back to the input's original orientation. Set to ``None`` to
+    skip the reorient (useful only when you know the input is already
+    in canonical orientation and want to save the few seconds of
+    reorient cost on huge volumes).
 
     Parameters
     ----------
@@ -754,16 +781,35 @@ def predict_with_resampling(
         (default) disables the cleanup. ``200.0`` matches
         TotalSegmentator's ``--remove_small_blobs`` flag. Requires the
         ``[postprocessing]`` optional extra (cc3d).
+    reorient :
+        Canonical orientation target. ``"LPS"`` (default) is what most
+        nnU-Net models were trained with. Pass ``None`` to skip the
+        reorient + back-reorient round-trip (only safe when the input is
+        already in canonical orientation; otherwise expect badly-axis-
+        aligned segmentations).
     """
     sitk = _require_sitk()
 
+    # --- Reorient input to canonical before inference -----------------
+    # Save the original orientation so we can map the segmentation back
+    # to the caller's coordinate system at the end.
+    if reorient is not None:
+        original_orient = _orientation_code(sitk, image_sitk)
+        if original_orient != reorient:
+            image_for_infer = sitk.DICOMOrient(image_sitk, reorient)
+        else:
+            image_for_infer = image_sitk
+    else:
+        original_orient = None
+        image_for_infer = image_sitk
+
     target_spacing_zyx = engine.target_spacing
-    in_spacing_xyz = image_sitk.GetSpacing()
+    in_spacing_xyz = image_for_infer.GetSpacing()
     acq_spacing_zyx = tuple(reversed(in_spacing_xyz))
 
-    # Forward resample (CPU / SITK)
+    # Forward resample (CPU / SITK), at canonical orientation
     resampled = resample_image_to_target(
-        image_sitk, target_spacing_zyx, interpolation=interpolation,
+        image_for_infer, target_spacing_zyx, interpolation=interpolation,
     )
 
     # Inference (Metal). predict_logits returns mx.array at target spacing
@@ -774,16 +820,15 @@ def predict_with_resampling(
     pred_mx = engine.predict_logits(vol_target)
 
     # Output shape in (Z, Y, X) — SITK GetSize is (X, Y, Z), so reverse.
-    in_size_xyz = image_sitk.GetSize()
+    in_size_xyz = image_for_infer.GetSize()
     out_shape_zyx = (in_size_xyz[2], in_size_xyz[1], in_size_xyz[0])
 
     # Pick output dtype from the bundle's label scheme.
     out_dtype = engine.label_dtype
 
     # Scheme-aware inverse resample: argmax for standard, threshold+paint
-    # for region-based. The current_path was applying argmax to region-based
-    # sigmoid means before this fix, producing silently-wrong labels for
-    # BraTS-style models.
+    # for region-based. Prior to 0.8.0 this always called argmax, which
+    # silently mis-converts region-based (BraTS-style) outputs.
     if engine.has_regions:
         # Multi-fold ensembles average post-sigmoid probabilities (threshold
         # at 0.5); single-fold returns raw logits (threshold at 0 ↔ sigmoid>0.5).
@@ -812,9 +857,17 @@ def predict_with_resampling(
             in_place=True,
         )
 
-    # Wrap as SITK with original geometry
+    # Wrap as SITK in the canonical-orientation grid
     seg_img = sitk.GetImageFromArray(seg_zyx)
-    seg_img.CopyInformation(image_sitk)
+    seg_img.CopyInformation(image_for_infer)
+
+    # --- Reorient seg back to caller's original orientation -----------
+    if original_orient is not None and original_orient != reorient:
+        seg_img = sitk.DICOMOrient(seg_img, original_orient)
+        # After DICOMOrient, geometry attributes reflect the new (original)
+        # orientation. Sanity: size/spacing/origin/direction should now
+        # match the input.
+
     return seg_img
 
 
