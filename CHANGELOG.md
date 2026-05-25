@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.8.1] - 2026-05-24
+
+### Fixed — canonical orientation handling in `predict_with_resampling` and `run_workflow`
+
+Inputs with non-canonical direction matrices (oblique / reformatted scans where voxel axes don't align with anatomical axes) were silently producing badly fragmented segmentations: the sliding window scans along numpy axes assuming they map to canonical anatomical directions, but for a volume where, e.g., voxel-X = patient-superior, vertebrae stretched along the patient's cranio-caudal direction land as thin needles perpendicular to the sliding-window primary axis. Most patches saw only fragments.
+
+Reproduced on a chest CT with SAR orientation (voxel X→S, Y→A, Z→R, spacing 1.0×0.65×0.65 mm). Before the fix:
+
+| Task | FG voxels |
+|---|---|
+| Dataset291 (organs) | 16.3 M |
+| **Dataset292 (vertebrae)** | **18.5 k** (almost entirely missed) |
+| Dataset293 (cardiac) | 187 k |
+| Dataset294 (muscles) | 5.46 M |
+| Dataset295 (ribs) | 215 k |
+| **Total FG** | **22.0 M (58 classes)** |
+
+After the fix:
+
+| Task | FG voxels |
+|---|---|
+| Dataset291 (organs) | 25.5 M (1.6×) |
+| **Dataset292 (vertebrae)** | **2.30 M (124×)** |
+| Dataset293 (cardiac) | 2.38 M (12.7×) |
+| Dataset294 (muscles) | 11.3 M (2.1×) |
+| Dataset295 (ribs) | 1.43 M (6.7×) |
+| **Total FG** | **42.9 M (111 classes)** |
+
+Inference itself ~26% faster aggregate — patches now contain anatomically coherent context so the model spends less compute on garbage paths.
+
+### Changed — `predict_with_resampling` API
+
+New keyword argument `reorient: str | None = "LPS"`. The function now:
+
+1. Reorients the input image to canonical LPS via `sitk.DICOMOrient` before forward resample (if not already canonical),
+2. Runs the full pipeline (forward resample → inference → inverse resample) in canonical orientation,
+3. Reorients the output segmentation back to the caller's original orientation before returning.
+
+Pass `reorient=None` to skip the round-trip when the caller knows the input is already canonical and wants to save the ~3–5 s reorient cost on huge volumes. Pass `reorient="RAS"` or any other DICOM-style orientation code to target a different canonical orientation.
+
+For axis-aligned inputs (the typical case — clinical CTs in LPS, neuroimaging volumes in RAS) the reorient is a no-op and there's no behavior change. The fix only affects volumes with non-identity direction matrices.
+
+### Changed — `run_workflow` reorient at workflow boundary
+
+The orchestrator now reorients to LPS once at the workflow entry and reorients the final output back to the caller's orientation at exit. Each `Stage`'s internal `predict_with_resampling` call is told `reorient=None` (saving the per-stage reorient cost) since the workflow has already done it. Inter-stage crop bboxes are computed in canonical-orientation voxel coordinates, then composed in the same space.
+
+### Tests
+
+7 new orientation tests in `test_canonical_orientation.py`. Total: **153 passing**.
+
+Notable: `test_sar_input_returns_sar_output` and `test_sar_cascade` explicitly verify that an input with SAR direction matrix produces output with the same SAR direction matrix after the LPS round-trip — geometry preserved through both the single-stage and cascade paths.
+
+### Migration
+
+Existing callers of `predict_with_resampling(engine, image)` and `run_workflow(image, stages)` need no changes — the reorient defaults to on. Callers who were already manually canonicalizing inputs can pass `reorient=None` to opt out.
+
 ## [0.8.0] - 2026-05-23
 
 Small, single-purpose primitive additions that complete the mix-and-match toolkit story. No god-methods, no consolidation. Each addition does one thing and composes with what's already there.

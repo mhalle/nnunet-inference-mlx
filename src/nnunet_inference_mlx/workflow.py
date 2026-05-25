@@ -379,13 +379,26 @@ def run_workflow(
     if not stages:
         raise ValueError("stages must be a non-empty list.")
 
-    in_size_xyz = image_sitk.GetSize()
+    # --- Reorient to canonical LPS once for the whole workflow --------
+    # Each stage's predict_with_resampling would otherwise reorient
+    # independently; doing it here amortizes the reorient cost across
+    # all stages and ensures every stage's crop bbox is computed in
+    # the same canonical voxel grid.
+    original_orient = sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
+        image_sitk.GetDirection()
+    )
+    if original_orient != "LPS":
+        image_sitk_canonical = sitk.DICOMOrient(image_sitk, "LPS")
+    else:
+        image_sitk_canonical = image_sitk
+
+    in_size_xyz = image_sitk_canonical.GetSize()
     original_shape_zyx = (in_size_xyz[2], in_size_xyz[1], in_size_xyz[0])
 
     # cumulative_bbox tracks where the current input lives in the ORIGINAL
-    # image's voxel coords. Initially the full volume.
+    # (canonical) image's voxel coords. Initially the full volume.
     cumulative_bbox = Bbox.full(original_shape_zyx)
-    current_input = image_sitk
+    current_input = image_sitk_canonical
     current_seg: "sitk.Image" | None = None
 
     for i, stage in enumerate(stages):
@@ -395,12 +408,15 @@ def run_workflow(
                 f"input shape ZYX={(current_input.GetSize()[2], current_input.GetSize()[1], current_input.GetSize()[0])}"
             )
 
+        # reorient=None skips the per-stage reorient (we already did it
+        # once at the workflow boundary).
         current_seg = predict_with_resampling(
             stage.engine,
             current_input,
             interpolation=stage.interpolation,
             peak_working_memory_mb=stage.peak_working_memory_mb,
             remove_small_components_mm3=stage.remove_small_components_mm3,
+            reorient=None,
         )
 
         # If this is the last stage, no point computing a next-stage crop.
@@ -443,12 +459,17 @@ def run_workflow(
     # Paste final seg back if any cropping happened.
     assert current_seg is not None
     if cumulative_bbox.shape_zyx == original_shape_zyx:
-        return current_seg
+        out_sitk = current_seg
+    else:
+        seg_array = sitk.GetArrayFromImage(current_seg)
+        out_array = paste_segmentation(
+            seg_array, original_shape_zyx, cumulative_bbox,
+        )
+        out_sitk = sitk.GetImageFromArray(out_array)
+        out_sitk.CopyInformation(image_sitk_canonical)
 
-    seg_array = sitk.GetArrayFromImage(current_seg)
-    out_array = paste_segmentation(
-        seg_array, original_shape_zyx, cumulative_bbox,
-    )
-    out_sitk = sitk.GetImageFromArray(out_array)
-    out_sitk.CopyInformation(image_sitk)
+    # --- Reorient final segmentation back to caller's orientation -----
+    if original_orient != "LPS":
+        out_sitk = sitk.DICOMOrient(out_sitk, original_orient)
+
     return out_sitk
