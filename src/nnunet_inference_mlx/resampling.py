@@ -723,15 +723,54 @@ def inverse_resample_paint(
 # High-level: SITK in, SITK out
 # ---------------------------------------------------------------------------
 
-def _orientation_code(sitk_module, image: "sitk.Image") -> str:
+def get_orientation(image: "sitk.Image") -> str:
     """Return the 3-letter DICOM-style orientation code for a SITK image.
 
     e.g. ``"LPS"`` (canonical: Left-Posterior-Superior voxel-axis directions),
     ``"RAS"``, or for oblique scans something like ``"SAR"``.
+
+    The code describes the *anatomical* direction each voxel axis points
+    toward — first letter for the +X voxel axis, second for +Y, third for +Z.
     """
-    return sitk_module.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
+    sitk = _require_sitk()
+    return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
         image.GetDirection()
     )
+
+
+def reorient(image: "sitk.Image", code: str) -> "sitk.Image":
+    """Reorient ``image`` so its voxel axes map to the given DICOM code.
+
+    Thin wrapper over ``sitk.DICOMOrient`` that no-ops when the image is
+    already in the requested orientation. Exists at top level so callers
+    composing custom pipelines (e.g. a multi-task union workflow) can
+    invoke the same reorient logic ``predict_with_resampling`` uses.
+
+    Parameters
+    ----------
+    code :
+        Three-letter DICOM-style code, e.g. ``"LPS"`` (the nnU-Net /
+        TotalSegmentator canonical), ``"RAS"`` (FreeSurfer / NIfTI
+        convention), ``"SAR"`` (some oblique CT scans).
+
+    Returns
+    -------
+    sitk.Image
+        Either ``image`` unchanged (if it's already in ``code``) or a new
+        SITK image with the requested orientation. Geometry attributes
+        (spacing, origin, direction, size) reflect the new orientation.
+
+    Round-trip pattern::
+
+        orig = get_orientation(image)
+        canonical = reorient(image, "LPS")
+        # ... inference / pipeline at canonical orientation ...
+        result = reorient(seg, orig)
+    """
+    sitk = _require_sitk()
+    if get_orientation(image) == code:
+        return image
+    return sitk.DICOMOrient(image, code)
 
 
 def predict_with_resampling(
@@ -741,7 +780,7 @@ def predict_with_resampling(
     interpolation: str = "linear",
     peak_working_memory_mb: int | None = None,
     remove_small_components_mm3: float = 0.0,
-    reorient: str | None = "LPS",
+    reorient_to: str | None = "LPS",
 ) -> "sitk.Image":
     """Forward-resample input → run inference → inverse-resample logits.
 
@@ -766,7 +805,7 @@ def predict_with_resampling(
     (vertebrae fragment, cardiac chambers slice in the wrong plane,
     etc.).
 
-    ``reorient`` (default ``"LPS"``) reorients the input to canonical
+    ``reorient_to`` (default ``"LPS"``) reorients the input to canonical
     LPS orientation before forward resample / inference, then maps the
     output back to the input's original orientation. Set to ``None`` to
     skip the reorient (useful only when you know the input is already
@@ -781,7 +820,7 @@ def predict_with_resampling(
         (default) disables the cleanup. ``200.0`` matches
         TotalSegmentator's ``--remove_small_blobs`` flag. Requires the
         ``[postprocessing]`` optional extra (cc3d).
-    reorient :
+    reorient_to :
         Canonical orientation target. ``"LPS"`` (default) is what most
         nnU-Net models were trained with. Pass ``None`` to skip the
         reorient + back-reorient round-trip (only safe when the input is
@@ -793,12 +832,9 @@ def predict_with_resampling(
     # --- Reorient input to canonical before inference -----------------
     # Save the original orientation so we can map the segmentation back
     # to the caller's coordinate system at the end.
-    if reorient is not None:
-        original_orient = _orientation_code(sitk, image_sitk)
-        if original_orient != reorient:
-            image_for_infer = sitk.DICOMOrient(image_sitk, reorient)
-        else:
-            image_for_infer = image_sitk
+    if reorient_to is not None:
+        original_orient = get_orientation(image_sitk)
+        image_for_infer = reorient(image_sitk, reorient_to)
     else:
         original_orient = None
         image_for_infer = image_sitk
@@ -862,11 +898,9 @@ def predict_with_resampling(
     seg_img.CopyInformation(image_for_infer)
 
     # --- Reorient seg back to caller's original orientation -----------
-    if original_orient is not None and original_orient != reorient:
-        seg_img = sitk.DICOMOrient(seg_img, original_orient)
-        # After DICOMOrient, geometry attributes reflect the new (original)
-        # orientation. Sanity: size/spacing/origin/direction should now
-        # match the input.
+    # `reorient` is a no-op if seg_img already matches original_orient.
+    if original_orient is not None:
+        seg_img = reorient(seg_img, original_orient)
 
     return seg_img
 
@@ -876,4 +910,6 @@ __all__ = [
     "inverse_resample_argmax",
     "inverse_resample_paint",
     "predict_with_resampling",
+    "get_orientation",
+    "reorient",
 ]

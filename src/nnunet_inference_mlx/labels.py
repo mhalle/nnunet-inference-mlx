@@ -153,10 +153,143 @@ def convert_logits_to_segmentation(
     return seg
 
 
+def remap_labels(
+    seg: np.ndarray,
+    mapping: dict[int, int],
+    *,
+    out_dtype: np.dtype | str | None = None,
+    background: int = 0,
+) -> np.ndarray:
+    """Remap integer labels in ``seg`` via a lookup table.
+
+    Designed for the multi-task union pattern: each task predicts labels
+    in its own local ID space (TS lung_vessels uses 1=artery, 2=vein...)
+    and the caller wants to fold them into a shared unified space
+    (1=lung_artery, 2=lung_vein in the TS full-mode label scheme). A
+    plain ``dict`` is the cleanest spelling of that mapping.
+
+    Implementation is a vectorized LUT — a single ``arr[lut]`` indexed
+    lookup, no Python loop over voxels. The LUT is sized to the maximum
+    source value, so very sparse mappings on very large source values
+    cost RAM proportional to the max — fine for ``< 10000`` (typical
+    class counts) but a poor fit for arbitrary remapping.
+
+    Parameters
+    ----------
+    seg :
+        Integer label volume of any shape. Must be a NumPy array.
+    mapping :
+        ``{source_id: target_id}``. Source IDs not listed are remapped
+        to ``background`` — explicit drop. You can put ``background``
+        on the source side to remap it to a foreground value, though
+        it's unusual.
+    out_dtype :
+        Output dtype. ``None`` (default) picks the smallest unsigned
+        integer that fits every target value in ``mapping`` and
+        ``background``. Pass an explicit dtype to override.
+    background :
+        The fill value for source IDs not in ``mapping``. Default ``0``
+        (the standard nnU-Net background).
+
+    Returns
+    -------
+    np.ndarray
+        Same shape as ``seg``, with values from the target side of
+        ``mapping``.
+
+    Raises
+    ------
+    ValueError
+        If ``mapping`` contains negative IDs (LUTs are non-negative).
+    """
+    if not isinstance(seg, np.ndarray):
+        raise TypeError(f"seg must be a numpy array, got {type(seg).__name__}")
+
+    for k, v in mapping.items():
+        if int(k) < 0 or int(v) < 0:
+            raise ValueError(
+                f"remap_labels does not support negative IDs (got {k} -> {v})"
+            )
+
+    # Resolve target dtype from the values we'll write.
+    if out_dtype is None:
+        max_target = max([int(background), *map(int, mapping.values())], default=0)
+        if max_target <= np.iinfo(np.uint8).max:
+            out_dtype = np.dtype(np.uint8)
+        elif max_target <= np.iinfo(np.uint16).max:
+            out_dtype = np.dtype(np.uint16)
+        else:
+            out_dtype = np.dtype(np.uint32)
+    else:
+        out_dtype = np.dtype(out_dtype)
+
+    # Build the LUT. Size it to cover every possible source value we'd
+    # see in ``seg`` (i.e. seg.max()) and every key in ``mapping``.
+    # Out-of-mapping source IDs land on ``background``.
+    max_src = int(seg.max()) if seg.size else 0
+    if mapping:
+        max_src = max(max_src, max(int(k) for k in mapping.keys()))
+
+    lut = np.full(max_src + 1, background, dtype=out_dtype)
+    for src, dst in mapping.items():
+        lut[int(src)] = dst
+
+    return lut[seg]
+
+
+def paint_union(target: np.ndarray, source: np.ndarray) -> np.ndarray:
+    """Overwrite ``target`` with ``source`` wherever ``source != 0``.
+
+    The "union by paint priority" primitive for cross-task label merging.
+    Treats source-background (``0``) as transparent: only non-zero
+    source voxels overwrite the target. Same convention used inside
+    region-based painting (``_slab_resample_paint``): list order is
+    priority, later overwrites earlier.
+
+    The operation is in-place on ``target`` and returns it for chaining.
+
+    Parameters
+    ----------
+    target :
+        Integer label volume. Modified in place.
+    source :
+        Integer label volume of the same shape. Read-only.
+
+    Returns
+    -------
+    np.ndarray
+        ``target`` (the same object passed in), with ``source``'s
+        non-zero voxels written into it.
+
+    Raises
+    ------
+    ValueError
+        On shape mismatch.
+
+    Examples
+    --------
+    Multi-task union by paint order::
+
+        unified = np.zeros_like(template, dtype=np.uint16)
+        for task_seg in segs_in_low_to_high_priority_order:
+            paint_union(unified, task_seg)
+    """
+    if target.shape != source.shape:
+        raise ValueError(
+            f"paint_union shape mismatch: target {target.shape} "
+            f"vs source {source.shape}"
+        )
+    mask = source != 0
+    target[mask] = source[mask]
+    return target
+
+
 __all__ = [
     "has_regions",
     "regions_class_order",
     "label_dtype",
     "convert_logits_to_segmentation",
     "sigmoid_inplace",
+    "remap_labels",
+    "paint_union",
 ]

@@ -24,7 +24,9 @@ from .labels import (
     convert_logits_to_segmentation,
     has_regions,
     label_dtype,
+    paint_union,
     regions_class_order,
+    remap_labels,
     sigmoid_inplace,
 )
 from .io import (
@@ -34,19 +36,23 @@ from .io import (
     save_segmentation_zyx,
 )
 from .resampling import (
+    get_orientation,
     inverse_resample_argmax,
     inverse_resample_paint,
     predict_with_resampling,
+    reorient,
     resample_image_to_target,
 )
 from .postprocessing import remove_small_components
 from .preprocessing import resample_volume
 from .workflow import (
     Bbox,
+    ParallelStage,
     Stage,
     compute_fg_bbox,
     crop_image,
     paste_segmentation,
+    run_label_union_workflow,
     run_workflow,
 )
 from .model import PlainConvUNet, ResidualEncoderUNet
@@ -84,7 +90,9 @@ __all__ = [
     "convert_logits_to_segmentation",
     "has_regions",
     "label_dtype",
+    "paint_union",
     "regions_class_order",
+    "remap_labels",
     # Model + plans + weights
     "PlainConvUNet",
     "ResidualEncoderUNet",
@@ -100,18 +108,22 @@ __all__ = [
     "predict_nifti",
     "predict_folder",
     # Resampling + SITK-based predict_with_resampling (opt-in via [preprocessing] extra)
+    "get_orientation",
     "inverse_resample_argmax",
     "inverse_resample_paint",
     "predict_with_resampling",
+    "reorient",
     "resample_image_to_target",
     "resample_volume",
     # Postprocessing (opt-in via [postprocessing] extra; cc3d backend)
     "remove_small_components",
     # Multi-stage workflow + geometric primitives
     "Bbox",
+    "ParallelStage",
     "Stage",
     "compute_fg_bbox",
     "crop_image",
     "paste_segmentation",
+    "run_label_union_workflow",
     "run_workflow",
 ]

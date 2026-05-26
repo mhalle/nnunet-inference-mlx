@@ -1,5 +1,7 @@
 # Post-0.8.2 roadmap
 
+> **Update (0.9.0 landed):** the multi-task label-union orchestrator and the four supporting top-level primitives (`get_orientation`, `reorient`, `remap_labels`, `paint_union`) are now shipped. See CHANGELOG 0.9.0. Next milestones below: declarative `TS_TASKS` registry (0.9.1) and CLI `mlxseg` (0.10.0).
+
 State as of this document: **v0.8.2 shipped to origin.** The package now has:
 
 - Architectural foundations (Predictor / SlidingWindowEngine / FoldEnsemble / InferenceEngine)

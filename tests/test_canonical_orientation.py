@@ -22,7 +22,7 @@ import pytest
 
 from nnunet_inference_mlx import (
     InferenceEngine, ModelBundle, Stage,
-    predict_with_resampling, run_workflow,
+    get_orientation, predict_with_resampling, reorient, run_workflow,
 )
 from nnunet_inference_mlx.plans import build_network_from_plans
 
@@ -109,10 +109,10 @@ class TestPredictWithResamplingReorient:
                    for a, b in zip(seg.GetDirection(), img.GetDirection()))
 
     def test_reorient_none_skips_reorient(self, engine):
-        """reorient=None preserves the input orientation but skips the
+        """reorient_to=None preserves the input orientation but skips the
         round-trip. Output direction should match the input."""
         img = _make_sitk(direction=SAR_DIRECTION)
-        seg = predict_with_resampling(engine, img, reorient=None)
+        seg = predict_with_resampling(engine, img, reorient_to=None)
         assert seg.GetSize() == img.GetSize()
         assert seg.GetDirection() == img.GetDirection()
 
@@ -121,7 +121,7 @@ class TestPredictWithResamplingReorient:
         # Input is LPS; ask for RAS internally; output should still be LPS
         # (caller's original orientation).
         img = _make_sitk()  # default LPS
-        seg = predict_with_resampling(engine, img, reorient="RAS")
+        seg = predict_with_resampling(engine, img, reorient_to="RAS")
         assert seg.GetDirection() == img.GetDirection()
 
 
@@ -162,3 +162,53 @@ class TestRunWorkflowReorient:
         assert seg.GetSize() == img.GetSize()
         assert all(abs(a - b) < 1e-3
                    for a, b in zip(seg.GetDirection(), img.GetDirection()))
+
+
+# ---------------------------------------------------------------------------
+# Top-level orientation primitives
+# ---------------------------------------------------------------------------
+
+
+class TestOrientationPrimitives:
+    """``get_orientation`` and ``reorient`` are the public building
+    blocks. ``predict_with_resampling`` + ``run_workflow`` are now thin
+    callers — multi-task / custom pipelines build the same recipe
+    themselves from these two."""
+
+    def test_get_orientation_lps(self):
+        img = _make_sitk()  # default identity direction = LPS
+        assert get_orientation(img) == "LPS"
+
+    def test_get_orientation_sar(self):
+        img = _make_sitk(direction=SAR_DIRECTION)
+        assert get_orientation(img) == "SAR"
+
+    def test_reorient_to_lps_changes_direction(self):
+        sar = _make_sitk(direction=SAR_DIRECTION)
+        lps = reorient(sar, "LPS")
+        assert get_orientation(lps) == "LPS"
+        # New SITK object, geometry attributes reflect the new orientation.
+        assert lps is not sar
+
+    def test_reorient_noop_when_already_target(self):
+        img = _make_sitk()  # LPS
+        out = reorient(img, "LPS")
+        # No-op should return the same object (we guarantee identity).
+        assert out is img
+
+    def test_reorient_round_trip_preserves_geometry(self):
+        """The user-facing invariant: get_orientation + reorient back
+        recovers the original image geometry."""
+        original = _make_sitk(direction=SAR_DIRECTION,
+                              spacing_xyz=(0.65, 0.65, 1.0),
+                              origin=(10.0, 20.0, 30.0))
+        orig_code = get_orientation(original)
+        canonical = reorient(original, "LPS")
+        recovered = reorient(canonical, orig_code)
+        assert recovered.GetSize() == original.GetSize()
+        assert recovered.GetSpacing() == original.GetSpacing()
+        assert all(abs(a - b) < 1e-3
+                   for a, b in zip(recovered.GetOrigin(), original.GetOrigin()))
+        assert all(abs(a - b) < 1e-3
+                   for a, b in zip(recovered.GetDirection(),
+                                   original.GetDirection()))

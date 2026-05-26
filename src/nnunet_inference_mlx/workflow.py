@@ -60,10 +60,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Bbox",
+    "ParallelStage",
     "Stage",
     "compute_fg_bbox",
     "crop_image",
     "paste_segmentation",
+    "run_label_union_workflow",
     "run_workflow",
 ]
 
@@ -384,13 +386,9 @@ def run_workflow(
     # independently; doing it here amortizes the reorient cost across
     # all stages and ensures every stage's crop bbox is computed in
     # the same canonical voxel grid.
-    original_orient = sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
-        image_sitk.GetDirection()
-    )
-    if original_orient != "LPS":
-        image_sitk_canonical = sitk.DICOMOrient(image_sitk, "LPS")
-    else:
-        image_sitk_canonical = image_sitk
+    from .resampling import get_orientation, reorient
+    original_orient = get_orientation(image_sitk)
+    image_sitk_canonical = reorient(image_sitk, "LPS")
 
     in_size_xyz = image_sitk_canonical.GetSize()
     original_shape_zyx = (in_size_xyz[2], in_size_xyz[1], in_size_xyz[0])
@@ -408,15 +406,15 @@ def run_workflow(
                 f"input shape ZYX={(current_input.GetSize()[2], current_input.GetSize()[1], current_input.GetSize()[0])}"
             )
 
-        # reorient=None skips the per-stage reorient (we already did it
-        # once at the workflow boundary).
+        # reorient_to=None skips the per-stage reorient (we already did
+        # it once at the workflow boundary).
         current_seg = predict_with_resampling(
             stage.engine,
             current_input,
             interpolation=stage.interpolation,
             peak_working_memory_mb=stage.peak_working_memory_mb,
             remove_small_components_mm3=stage.remove_small_components_mm3,
-            reorient=None,
+            reorient_to=None,
         )
 
         # If this is the last stage, no point computing a next-stage crop.
@@ -469,7 +467,199 @@ def run_workflow(
         out_sitk.CopyInformation(image_sitk_canonical)
 
     # --- Reorient final segmentation back to caller's orientation -----
-    if original_orient != "LPS":
-        out_sitk = sitk.DICOMOrient(out_sitk, original_orient)
+    # `reorient` is a no-op when original_orient == "LPS".
+    out_sitk = reorient(out_sitk, original_orient)
+
+    return out_sitk
+
+
+# ---------------------------------------------------------------------------
+# Multi-task label-union orchestrator (TS full-mode pattern)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ParallelStage:
+    """One task in a multi-task label-union workflow.
+
+    Each task runs independently against the same input volume, predicts
+    a task-local label segmentation, gets its labels remapped into a
+    shared unified label space, and paints into a running union.
+
+    The "parallel" in the name is logical, not literal: on a single
+    Apple Silicon GPU the tasks still run sequentially (Metal serializes
+    GPU work). The point of the dataclass is that the tasks are
+    *independent* — no inter-stage cropping, no dependency graph — and
+    fold together by paint priority into a single output.
+
+    Parameters
+    ----------
+    engine :
+        An already-built :class:`InferenceEngine`. Use
+        :func:`cached_engine_from_task` to amortize load cost across
+        tasks that share weights.
+    label_remap :
+        ``{task_local_id: unified_id}`` lookup table. Task-local IDs not
+        in this dict become background in the unified output — explicit
+        drop. See :func:`remap_labels`.
+    part_name :
+        Optional human-readable name for logging (e.g. ``"vertebrae"``,
+        ``"organs"``). Not used by the orchestrator.
+    """
+
+    engine: "InferenceEngine"
+    label_remap: dict[int, int]
+    part_name: str | None = None
+
+
+def run_label_union_workflow(
+    image_sitk: "sitk.Image",
+    stages: list[ParallelStage],
+    *,
+    peak_working_memory_mb: int | None = None,
+    reorient_to: str | None = "LPS",
+    verbose: bool = False,
+) -> "sitk.Image":
+    """Run independent multi-task inference and fold outputs by paint priority.
+
+    This is the TotalSegmentator full-mode pattern: each "part" (vertebrae,
+    organs, ribs, cardiac, muscles, ...) is a separate trained model that
+    predicts in its own task-local label space; the user wants a single
+    segmentation in a shared 117-class space. Each stage's task-local IDs
+    are remapped into the unified space via ``label_remap``, then painted
+    into a running union — last stage in the list wins overlapping voxels.
+
+    Unlike :func:`run_workflow` (sequential cascade with inter-stage cropping),
+    this orchestrator runs every stage against the *same* input. There's no
+    inter-stage data dependency.
+
+    The recipe is intentionally thin — every step is a public top-level
+    function the caller could call themselves:
+
+    1. ``reorient`` to canonical (``reorient_to``, default ``"LPS"``)
+    2. For each stage:
+
+       - :func:`predict_with_resampling` (returns SITK seg at input geometry)
+       - :func:`~nnunet_inference_mlx.remap_labels` (task IDs → unified IDs)
+       - :func:`~nnunet_inference_mlx.paint_union` (overwrite-where-nonzero)
+
+    3. ``reorient`` back to original
+
+    Callers who want a non-standard variant (custom paint priority, hold
+    all intermediate logits in RAM and do logit-confidence merging,
+    serialize intermediates, etc.) build the same recipe themselves from
+    the primitives — this function isn't doing anything they can't do.
+
+    Parameters
+    ----------
+    image_sitk :
+        Input SITK image at any orientation / spacing.
+    stages :
+        List of :class:`ParallelStage`. Order matters: later stages
+        overwrite earlier stages at voxels where both fire. Empty list
+        raises ``ValueError``.
+    peak_working_memory_mb :
+        Memory budget passed to each stage's inverse-resample slab loop.
+        ``None`` (default) auto-tiers from system RAM.
+    reorient_to :
+        Canonical orientation. ``"LPS"`` (default) for nnU-Net / TS.
+        Pass ``None`` to skip the reorient round-trip (only safe when
+        the input is already in canonical orientation).
+    verbose :
+        Print per-stage progress.
+
+    Returns
+    -------
+    sitk.Image
+        Unified segmentation at the original input's geometry (size,
+        spacing, origin, direction). Dtype is the smallest unsigned int
+        that fits every unified target ID across all stages.
+
+    Raises
+    ------
+    ValueError
+        If ``stages`` is empty.
+
+    Examples
+    --------
+    The TotalSegmentator full-mode 5-part union (sketch)::
+
+        from nnunet_inference_mlx import (
+            cached_engine_from_task, ParallelStage, run_label_union_workflow,
+        )
+
+        # Each engine is a different TS part model. The remaps go from
+        # task-local labels into the 117-class unified TS scheme.
+        stages = [
+            ParallelStage(cached_engine_from_task(291), TS_REMAP_ORGANS,    "organs"),
+            ParallelStage(cached_engine_from_task(292), TS_REMAP_VERTEBRAE, "vertebrae"),
+            ParallelStage(cached_engine_from_task(293), TS_REMAP_CARDIAC,   "cardiac"),
+            ParallelStage(cached_engine_from_task(294), TS_REMAP_MUSCLES,   "muscles"),
+            ParallelStage(cached_engine_from_task(295), TS_REMAP_RIBS,      "ribs"),
+        ]
+        seg = run_label_union_workflow(image, stages)
+    """
+    from .labels import paint_union, remap_labels
+    from .resampling import get_orientation, reorient
+
+    sitk = _require_sitk()
+    if not stages:
+        raise ValueError("stages must be a non-empty list.")
+
+    # --- Reorient once at boundary ------------------------------------
+    if reorient_to is not None:
+        original_orient = get_orientation(image_sitk)
+        image_canonical = reorient(image_sitk, reorient_to)
+    else:
+        original_orient = None
+        image_canonical = image_sitk
+
+    in_size_xyz = image_canonical.GetSize()
+    out_shape_zyx = (in_size_xyz[2], in_size_xyz[1], in_size_xyz[0])
+
+    # --- Pick unified dtype from the union of all stages' target IDs --
+    # Use the smallest unsigned int that fits every unified ID across
+    # all stages. TS's 117-class scheme fits uint8; cohorts with more
+    # tasks may push to uint16.
+    max_target = 0
+    for s in stages:
+        if s.label_remap:
+            max_target = max(max_target, max(int(v) for v in s.label_remap.values()))
+    if max_target <= np.iinfo(np.uint8).max:
+        out_dtype = np.dtype(np.uint8)
+    elif max_target <= np.iinfo(np.uint16).max:
+        out_dtype = np.dtype(np.uint16)
+    else:
+        out_dtype = np.dtype(np.uint32)
+
+    unified = np.zeros(out_shape_zyx, dtype=out_dtype)
+
+    # --- Per-stage: predict → remap → paint --------------------------
+    for i, stage in enumerate(stages):
+        if verbose:
+            name = stage.part_name or f"<stage {i+1}>"
+            print(
+                f"[label_union] stage {i+1}/{len(stages)} ({name}): "
+                f"input ZYX={out_shape_zyx}"
+            )
+
+        # reorient_to=None — we already did the reorient once at boundary.
+        seg_img = predict_with_resampling(
+            stage.engine, image_canonical,
+            reorient_to=None,
+            peak_working_memory_mb=peak_working_memory_mb,
+        )
+        seg_array = sitk.GetArrayFromImage(seg_img)
+
+        remapped = remap_labels(seg_array, stage.label_remap, out_dtype=out_dtype)
+        paint_union(unified, remapped)
+
+    # --- Wrap as SITK at canonical geometry ---------------------------
+    out_sitk = sitk.GetImageFromArray(unified)
+    out_sitk.CopyInformation(image_canonical)
+
+    # --- Reorient back ------------------------------------------------
+    if original_orient is not None:
+        out_sitk = reorient(out_sitk, original_orient)
 
     return out_sitk

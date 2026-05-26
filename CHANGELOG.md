@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.9.0] - 2026-05-26
+
+### Added — multi-task label-union orchestrator
+
+The TotalSegmentator full-mode pattern as a first-class primitive: run multiple independent task models against the same input, remap each to a shared unified label space, fold by paint priority. Previously buildable as ~25 lines of user code; now a documented, tested primitive.
+
+**`ParallelStage`** dataclass — one task in the union:
+
+```python
+@dataclass
+class ParallelStage:
+    engine: InferenceEngine
+    label_remap: dict[int, int]      # task-local ID → unified ID
+    part_name: str | None = None     # optional, for logging
+```
+
+**`run_label_union_workflow(image, stages, *, reorient_to="LPS", ...)`** — orchestrator:
+
+```python
+from nnunet_inference_mlx import (
+    cached_engine_from_task, ParallelStage, run_label_union_workflow,
+)
+
+stages = [
+    ParallelStage(cached_engine_from_task(291), TS_REMAP_ORGANS,    "organs"),
+    ParallelStage(cached_engine_from_task(292), TS_REMAP_VERTEBRAE, "vertebrae"),
+    ParallelStage(cached_engine_from_task(293), TS_REMAP_CARDIAC,   "cardiac"),
+    ParallelStage(cached_engine_from_task(294), TS_REMAP_MUSCLES,   "muscles"),
+    ParallelStage(cached_engine_from_task(295), TS_REMAP_RIBS,      "ribs"),
+]
+seg = run_label_union_workflow(image, stages)
+```
+
+Semantics: each stage runs against the same input volume independently; labels are remapped from task-local to unified space; later stages overwrite earlier ones at overlapping voxels (list order = priority — matching the existing `_slab_resample_paint` convention).
+
+Unlike `run_workflow` (sequential cascade with inter-stage cropping), there's no data dependency between stages — the orchestrator only adds a single LPS canonicalization at the boundary and a unified output buffer.
+
+The orchestrator is intentionally thin glue — every step is a public top-level function (see below). Callers building non-standard variants (custom paint priority, logit-confidence merging, persistent intermediates) write the same recipe themselves.
+
+### Added — top-level toolbox primitives
+
+Four new public functions, exposed so the orchestrator recipe is fully decomposable:
+
+- **`get_orientation(image_sitk) -> str`** — read the 3-letter DICOM orientation code (`"LPS"`, `"RAS"`, `"SAR"`, …) of a SITK image. Wraps the longwinded `DICOMOrientImageFilter_GetOrientationFromDirectionCosines`.
+- **`reorient(image_sitk, code) -> sitk.Image`** — symmetric primitive that reorients to any DICOM code. No-op (returns the same object) when already in the requested orientation. Used to be inlined inside `predict_with_resampling` / `run_workflow`.
+- **`remap_labels(seg, mapping)`** — vectorized LUT remap of integer labels. Source IDs not in the mapping become background. Auto-picks the smallest unsigned-int target dtype.
+- **`paint_union(target, source)`** — overwrite `target` with `source` wherever `source != 0`. Same convention as `_slab_resample_paint`: list order is priority.
+
+### Changed — `predict_with_resampling` kwarg rename: `reorient=` → `reorient_to=`
+
+The previous parameter name shadowed the new top-level `reorient` function. Renamed to `reorient_to` (which also reads more naturally: "reorient *to* LPS"). Same default (`"LPS"`), same semantics.
+
+**Migration:** rename any `reorient="LPS"` / `reorient=None` call to `reorient_to=...`.
+
+### Refactor — `predict_with_resampling` and `run_workflow` use the new primitives
+
+Both functions previously had the DICOMOrient logic inlined. They now call `get_orientation` / `reorient` directly, removing duplication. No behavior change.
+
+### Tests
+
+41 new tests across three files. Total: **182 passing.**
+
+- `test_label_primitives.py` (20 tests) — `remap_labels` auto-dtype tiers, unmapped-drops-to-background, negative-ID rejection, shape preservation; `paint_union` overwrite-where-nonzero, zero-source transparency, priority-via-call-order, shape-mismatch error; a composition test that hand-rolls the union recipe (two tasks → remap each → paint into shared unified) to prove the toolbox is usable without the orchestrator
+- `test_label_union_workflow.py` (10 tests) — empty-stages error, single-stage remap dispatch, geometry preservation, SAR orientation round-trip (the 0.8.1 chest-CT canary), `reorient_to=None` skip, two-stage paint priority (defining property of the orchestrator), disjoint-stages paint cohabit, output-dtype resolution across stages
+- `test_canonical_orientation.py` (5 new tests) — `get_orientation` code detection, `reorient` direction change, no-op when already at target, round-trip geometry preservation
+
+### What's not in this release
+
+- **Declarative `TS_TASKS` registry + `run_named_task` dispatcher.** Originally planned for the same 0.9.0 milestone; split out to keep this release focused on the orchestrator + primitives. Likely lands as 0.9.1.
+- **CLI (`mlxseg`)** — still 0.10.0, depends on the task registry.
+
 ## [0.8.2] - 2026-05-24
 
 ### Fixed — `transpose_forward` / `transpose_backward` handling
