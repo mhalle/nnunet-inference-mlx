@@ -1,9 +1,1808 @@
 {
   "_meta": {
     "schema_version": 1,
-    "description": "Built-in task registry for nnunet-inference-mlx. Consumed by tasks.py at first registry use.",
-    "generator": "scripts/refresh_ts_registry.py (planned)",
-    "note": "This file is machine-generated from an installed TotalSegmentator distribution. Hand-editing is discouraged; use scripts/refresh_ts_registry.py to regenerate. Until the generator lands and is verified against a real TS install, the tasks list ships empty — users can call register_task() at runtime to add their own entries."
+    "ts_version": "2.13.0",
+    "generated": "2026-05-27",
+    "generator": "scripts/refresh_ts_registry.py",
+    "generator_version": 1,
+    "task_count": 50
   },
-  "tasks": []
+  "tasks": [
+    {
+      "name": "abdominal_muscles",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 300,
+          "crop_to_classes": [
+            1
+          ],
+          "dilation_mm": 5.0
+        },
+        {
+          "weights_id": 952,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "pectoralis_major_right",
+        "2": "pectoralis_major_left",
+        "3": "rectus_abdominis_right",
+        "4": "rectus_abdominis_left",
+        "5": "serratus_anterior_right",
+        "6": "serratus_anterior_left",
+        "7": "latissimus_dorsi_right",
+        "8": "latissimus_dorsi_left",
+        "9": "trapezius_right",
+        "10": "trapezius_left",
+        "11": "external_oblique_right",
+        "12": "external_oblique_left",
+        "13": "internal_oblique_right",
+        "14": "internal_oblique_left",
+        "15": "erector_spinae_right",
+        "16": "erector_spinae_left",
+        "17": "transversospinalis_right",
+        "18": "transversospinalis_left",
+        "19": "psoas_major_right",
+        "20": "psoas_major_left",
+        "21": "quadratus_lumborum_right",
+        "22": "quadratus_lumborum_left"
+      }
+    },
+    {
+      "name": "aortic_sinuses",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            51
+          ],
+          "dilation_mm": 0.0
+        },
+        {
+          "weights_id": 920,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "left_ventricular_outflow_tract",
+        "2": "right_coronary_cusp",
+        "3": "left_coronary_cusp",
+        "4": "non_coronary_cusp"
+      }
+    },
+    {
+      "name": "appendicular_bones",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 304,
+      "label_map": {
+        "1": "patella",
+        "2": "tibia",
+        "3": "fibula",
+        "4": "tarsal",
+        "5": "metatarsal",
+        "6": "phalanges_feet",
+        "7": "ulna",
+        "8": "radius",
+        "9": "carpal",
+        "10": "metacarpal",
+        "11": "phalanges_hand"
+      }
+    },
+    {
+      "name": "appendicular_bones_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 855,
+      "label_map": {
+        "1": "patella",
+        "2": "tibia",
+        "3": "fibula",
+        "4": "tarsal",
+        "5": "metatarsal",
+        "6": "phalanges_feet",
+        "7": "ulna",
+        "8": "radius"
+      }
+    },
+    {
+      "name": "body",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 299,
+      "label_map": {
+        "1": "body_trunc",
+        "2": "body_extremities"
+      }
+    },
+    {
+      "name": "body_fast",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 300,
+      "label_map": {
+        "1": "body_trunc",
+        "2": "body_extremities"
+      }
+    },
+    {
+      "name": "body_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 597,
+      "label_map": {
+        "1": "body_trunc",
+        "2": "body_extremities"
+      }
+    },
+    {
+      "name": "body_mr_fast",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 598,
+      "label_map": {
+        "1": "body_trunc",
+        "2": "body_extremities"
+      }
+    },
+    {
+      "name": "brain_aneurysm",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 615,
+      "label_map": {
+        "1": "brain_aneurysm"
+      }
+    },
+    {
+      "name": "brain_structures",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            90
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 409,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "brainstem",
+        "2": "subarachnoid_space",
+        "3": "venous_sinuses",
+        "4": "septum_pellucidum",
+        "5": "cerebellum",
+        "6": "caudate_nucleus",
+        "7": "lentiform_nucleus",
+        "8": "insular_cortex",
+        "9": "internal_capsule",
+        "10": "ventricle",
+        "11": "central_sulcus",
+        "12": "frontal_lobe",
+        "13": "parietal_lobe",
+        "14": "occipital_lobe",
+        "15": "temporal_lobe",
+        "16": "thalamus"
+      }
+    },
+    {
+      "name": "breasts",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 527,
+      "label_map": {
+        "1": "breast"
+      }
+    },
+    {
+      "name": "cerebral_bleed",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            90
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 150,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "intracerebral_hemorrhage"
+      }
+    },
+    {
+      "name": "coronary_arteries",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            51
+          ],
+          "dilation_mm": 20.0
+        },
+        {
+          "weights_id": 509,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "coronary_arteries"
+      }
+    },
+    {
+      "name": "coronary_arteries_LEGACY",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            51
+          ],
+          "dilation_mm": 20.0
+        },
+        {
+          "weights_id": 507,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "coronary_arteries"
+      }
+    },
+    {
+      "name": "craniofacial_structures",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            91
+          ],
+          "dilation_mm": 20.0
+        },
+        {
+          "weights_id": 115,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "mandible",
+        "2": "teeth_lower",
+        "3": "skull",
+        "4": "head",
+        "5": "sinus_maxillary",
+        "6": "sinus_frontal",
+        "7": "teeth_upper"
+      }
+    },
+    {
+      "name": "face",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 303,
+      "label_map": {
+        "1": "face"
+      }
+    },
+    {
+      "name": "face_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 856,
+      "label_map": {
+        "1": "face"
+      }
+    },
+    {
+      "name": "head_glands_cavities",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            91
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 775,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "eye_left",
+        "2": "eye_right",
+        "3": "eye_lens_left",
+        "4": "eye_lens_right",
+        "5": "optic_nerve_left",
+        "6": "optic_nerve_right",
+        "7": "parotid_gland_left",
+        "8": "parotid_gland_right",
+        "9": "submandibular_gland_right",
+        "10": "submandibular_gland_left",
+        "11": "nasopharynx",
+        "12": "oropharynx",
+        "13": "hypopharynx",
+        "14": "nasal_cavity_right",
+        "15": "nasal_cavity_left",
+        "16": "auditory_canal_right",
+        "17": "auditory_canal_left",
+        "18": "soft_palate",
+        "19": "hard_palate"
+      }
+    },
+    {
+      "name": "head_muscles",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            91
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 777,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "masseter_right",
+        "2": "masseter_left",
+        "3": "temporalis_right",
+        "4": "temporalis_left",
+        "5": "lateral_pterygoid_right",
+        "6": "lateral_pterygoid_left",
+        "7": "medial_pterygoid_right",
+        "8": "medial_pterygoid_left",
+        "9": "tongue",
+        "10": "digastric_right",
+        "11": "digastric_left"
+      }
+    },
+    {
+      "name": "headneck_bones_vessels",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            73,
+            74,
+            50,
+            46,
+            43,
+            40
+          ],
+          "dilation_mm": 40.0
+        },
+        {
+          "weights_id": 776,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "larynx_air",
+        "2": "thyroid_cartilage",
+        "3": "hyoid",
+        "4": "cricoid_cartilage",
+        "5": "zygomatic_arch_right",
+        "6": "zygomatic_arch_left",
+        "7": "styloid_process_right",
+        "8": "styloid_process_left",
+        "9": "internal_carotid_artery_right",
+        "10": "internal_carotid_artery_left",
+        "11": "internal_jugular_vein_right",
+        "12": "internal_jugular_vein_left"
+      }
+    },
+    {
+      "name": "heartchambers_highres",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 297,
+          "crop_to_classes": [
+            51
+          ],
+          "dilation_mm": 5.0
+        },
+        {
+          "weights_id": 301,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "heart_myocardium",
+        "2": "heart_atrium_left",
+        "3": "heart_ventricle_left",
+        "4": "heart_atrium_right",
+        "5": "heart_ventricle_right",
+        "6": "aorta",
+        "7": "pulmonary_artery"
+      }
+    },
+    {
+      "name": "hip_implant",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            75,
+            76,
+            77,
+            78
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 260,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "hip_implant"
+      }
+    },
+    {
+      "name": "kidney_cysts",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            3,
+            2,
+            5,
+            1,
+            20
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 789,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "kidney_cyst_left",
+        "2": "kidney_cyst_right"
+      }
+    },
+    {
+      "name": "liver_lesions",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 297,
+          "crop_to_classes": [
+            5
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 591,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "liver_lesions"
+      }
+    },
+    {
+      "name": "liver_lesions_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 852,
+          "crop_to_classes": [
+            5
+          ],
+          "dilation_mm": 3.0
+        },
+        {
+          "weights_id": 589,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "liver_lesions"
+      }
+    },
+    {
+      "name": "liver_segments",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            5
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 570,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "liver_segment_1",
+        "2": "liver_segment_2",
+        "3": "liver_segment_3",
+        "4": "liver_segment_4",
+        "5": "liver_segment_5",
+        "6": "liver_segment_6",
+        "7": "liver_segment_7",
+        "8": "liver_segment_8"
+      }
+    },
+    {
+      "name": "liver_segments_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 852,
+          "crop_to_classes": [
+            5
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 576,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "liver_segment_1",
+        "2": "liver_segment_2",
+        "3": "liver_segment_3",
+        "4": "liver_segment_4",
+        "5": "liver_segment_5",
+        "6": "liver_segment_6",
+        "7": "liver_segment_7",
+        "8": "liver_segment_8"
+      }
+    },
+    {
+      "name": "liver_vessels",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            5
+          ],
+          "dilation_mm": 20.0
+        },
+        {
+          "weights_id": 8,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "liver_vessels",
+        "2": "liver_tumor"
+      }
+    },
+    {
+      "name": "lung_nodules",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 913,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "lung",
+        "2": "lung_nodules"
+      }
+    },
+    {
+      "name": "lung_vessels",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 297,
+          "crop_to_classes": [
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 117,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "lung_airways",
+        "2": "lung_airways_wall",
+        "3": "lung_arteries",
+        "4": "lung_veins"
+      }
+    },
+    {
+      "name": "lung_vessels_LEGACY",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "dilation_mm": 10.0
+        },
+        {
+          "weights_id": 258,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "lung_vessels",
+        "2": "lung_trachea_bronchia"
+      }
+    },
+    {
+      "name": "oculomotor_muscles",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            91
+          ],
+          "dilation_mm": 20.0
+        },
+        {
+          "weights_id": 351,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "skull",
+        "2": "eyeball_right",
+        "3": "lateral_rectus_muscle_right",
+        "4": "superior_oblique_muscle_right",
+        "5": "levator_palpebrae_superioris_right",
+        "6": "superior_rectus_muscle_right",
+        "7": "medial_rectus_muscle_left",
+        "8": "inferior_oblique_muscle_right",
+        "9": "inferior_rectus_muscle_right",
+        "10": "optic_nerve_left",
+        "11": "eyeball_left",
+        "12": "lateral_rectus_muscle_left",
+        "13": "superior_oblique_muscle_left",
+        "14": "levator_palpebrae_superioris_left",
+        "15": "superior_rectus_muscle_left",
+        "16": "medial_rectus_muscle_right",
+        "17": "inferior_oblique_muscle_left",
+        "18": "inferior_rectus_muscle_left",
+        "19": "optic_nerve_right"
+      }
+    },
+    {
+      "name": "pleural_pericard_effusion",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "dilation_mm": 50.0
+        },
+        {
+          "weights_id": 315,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "lung_pleural",
+        "2": "pleural_effusion",
+        "3": "pericardial_effusion"
+      }
+    },
+    {
+      "name": "test",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "label_union",
+      "union": [
+        {
+          "weights_id": 517,
+          "label_remap": {
+            "1": 1
+          },
+          "name": "test"
+        }
+      ],
+      "label_map": {
+        "1": "carpal"
+      }
+    },
+    {
+      "name": "thigh_shoulder_muscles",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 857,
+      "label_map": {
+        "1": "quadriceps_femoris_left",
+        "2": "quadriceps_femoris_right",
+        "3": "thigh_medial_compartment_left",
+        "4": "thigh_medial_compartment_right",
+        "5": "thigh_posterior_compartment_left",
+        "6": "thigh_posterior_compartment_right",
+        "7": "sartorius_left",
+        "8": "sartorius_right",
+        "9": "deltoid",
+        "10": "supraspinatus",
+        "11": "infraspinatus",
+        "12": "subscapularis",
+        "13": "coracobrachial",
+        "14": "trapezius",
+        "15": "pectoralis_minor",
+        "16": "serratus_anterior",
+        "17": "teres_major",
+        "18": "triceps_brachii"
+      }
+    },
+    {
+      "name": "thigh_shoulder_muscles_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 857,
+      "label_map": {
+        "1": "quadriceps_femoris_left",
+        "2": "quadriceps_femoris_right",
+        "3": "thigh_medial_compartment_left",
+        "4": "thigh_medial_compartment_right",
+        "5": "thigh_posterior_compartment_left",
+        "6": "thigh_posterior_compartment_right",
+        "7": "sartorius_left",
+        "8": "sartorius_right",
+        "9": "deltoid",
+        "10": "supraspinatus",
+        "11": "infraspinatus",
+        "12": "subscapularis",
+        "13": "coracobrachial",
+        "14": "trapezius",
+        "15": "pectoralis_minor",
+        "16": "serratus_anterior",
+        "17": "teres_major",
+        "18": "triceps_brachii"
+      }
+    },
+    {
+      "name": "tissue_4_types",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 485,
+      "label_map": {
+        "1": "subcutaneous_fat",
+        "2": "torso_fat",
+        "3": "skeletal_muscle",
+        "4": "intermuscular_fat"
+      }
+    },
+    {
+      "name": "tissue_types",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 481,
+      "label_map": {
+        "1": "subcutaneous_fat",
+        "2": "torso_fat",
+        "3": "skeletal_muscle"
+      }
+    },
+    {
+      "name": "tissue_types_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 925,
+      "label_map": {
+        "1": "subcutaneous_fat",
+        "2": "torso_fat",
+        "3": "skeletal_muscle"
+      }
+    },
+    {
+      "name": "total",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "label_union",
+      "union": [
+        {
+          "weights_id": 291,
+          "label_remap": {
+            "1": 1,
+            "2": 2,
+            "3": 3,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "7": 7,
+            "8": 8,
+            "9": 9,
+            "10": 10,
+            "11": 11,
+            "12": 12,
+            "13": 13,
+            "14": 14,
+            "15": 15,
+            "16": 16,
+            "17": 17,
+            "18": 18,
+            "19": 19,
+            "20": 20,
+            "21": 21,
+            "22": 22,
+            "23": 23,
+            "24": 24
+          },
+          "name": "organs"
+        },
+        {
+          "weights_id": 292,
+          "label_remap": {
+            "1": 25,
+            "2": 26,
+            "3": 27,
+            "4": 28,
+            "5": 29,
+            "6": 30,
+            "7": 31,
+            "8": 32,
+            "9": 33,
+            "10": 34,
+            "11": 35,
+            "12": 36,
+            "13": 37,
+            "14": 38,
+            "15": 39,
+            "16": 40,
+            "17": 41,
+            "18": 42,
+            "19": 43,
+            "20": 44,
+            "21": 45,
+            "22": 46,
+            "23": 47,
+            "24": 48,
+            "25": 49,
+            "26": 50
+          },
+          "name": "vertebrae"
+        },
+        {
+          "weights_id": 293,
+          "label_remap": {
+            "1": 51,
+            "2": 52,
+            "3": 53,
+            "4": 54,
+            "5": 55,
+            "6": 56,
+            "7": 57,
+            "8": 58,
+            "9": 59,
+            "10": 60,
+            "11": 61,
+            "12": 62,
+            "13": 63,
+            "14": 64,
+            "15": 65,
+            "16": 66,
+            "17": 67,
+            "18": 68
+          },
+          "name": "cardiac"
+        },
+        {
+          "weights_id": 294,
+          "label_remap": {
+            "1": 69,
+            "2": 70,
+            "3": 71,
+            "4": 72,
+            "5": 73,
+            "6": 74,
+            "7": 75,
+            "8": 76,
+            "9": 77,
+            "10": 78,
+            "11": 79,
+            "12": 80,
+            "13": 81,
+            "14": 82,
+            "15": 83,
+            "16": 84,
+            "17": 85,
+            "18": 86,
+            "19": 87,
+            "20": 88,
+            "21": 89,
+            "22": 90,
+            "23": 91
+          },
+          "name": "muscles"
+        },
+        {
+          "weights_id": 295,
+          "label_remap": {
+            "1": 92,
+            "2": 93,
+            "3": 94,
+            "4": 95,
+            "5": 96,
+            "6": 97,
+            "7": 98,
+            "8": 99,
+            "9": 100,
+            "10": 101,
+            "11": 102,
+            "12": 103,
+            "13": 104,
+            "14": 105,
+            "15": 106,
+            "16": 107,
+            "17": 108,
+            "18": 109,
+            "19": 110,
+            "20": 111,
+            "21": 112,
+            "22": 113,
+            "23": 114,
+            "24": 115,
+            "25": 116,
+            "26": 117
+          },
+          "name": "ribs"
+        }
+      ],
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_upper_lobe_left",
+        "11": "lung_lower_lobe_left",
+        "12": "lung_upper_lobe_right",
+        "13": "lung_middle_lobe_right",
+        "14": "lung_lower_lobe_right",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "thyroid_gland",
+        "18": "small_bowel",
+        "19": "duodenum",
+        "20": "colon",
+        "21": "urinary_bladder",
+        "22": "prostate",
+        "23": "kidney_cyst_left",
+        "24": "kidney_cyst_right",
+        "25": "sacrum",
+        "26": "vertebrae_S1",
+        "27": "vertebrae_L5",
+        "28": "vertebrae_L4",
+        "29": "vertebrae_L3",
+        "30": "vertebrae_L2",
+        "31": "vertebrae_L1",
+        "32": "vertebrae_T12",
+        "33": "vertebrae_T11",
+        "34": "vertebrae_T10",
+        "35": "vertebrae_T9",
+        "36": "vertebrae_T8",
+        "37": "vertebrae_T7",
+        "38": "vertebrae_T6",
+        "39": "vertebrae_T5",
+        "40": "vertebrae_T4",
+        "41": "vertebrae_T3",
+        "42": "vertebrae_T2",
+        "43": "vertebrae_T1",
+        "44": "vertebrae_C7",
+        "45": "vertebrae_C6",
+        "46": "vertebrae_C5",
+        "47": "vertebrae_C4",
+        "48": "vertebrae_C3",
+        "49": "vertebrae_C2",
+        "50": "vertebrae_C1",
+        "51": "heart",
+        "52": "aorta",
+        "53": "pulmonary_vein",
+        "54": "brachiocephalic_trunk",
+        "55": "subclavian_artery_right",
+        "56": "subclavian_artery_left",
+        "57": "common_carotid_artery_right",
+        "58": "common_carotid_artery_left",
+        "59": "brachiocephalic_vein_left",
+        "60": "brachiocephalic_vein_right",
+        "61": "atrial_appendage_left",
+        "62": "superior_vena_cava",
+        "63": "inferior_vena_cava",
+        "64": "portal_vein_and_splenic_vein",
+        "65": "iliac_artery_left",
+        "66": "iliac_artery_right",
+        "67": "iliac_vena_left",
+        "68": "iliac_vena_right",
+        "69": "humerus_left",
+        "70": "humerus_right",
+        "71": "scapula_left",
+        "72": "scapula_right",
+        "73": "clavicula_left",
+        "74": "clavicula_right",
+        "75": "femur_left",
+        "76": "femur_right",
+        "77": "hip_left",
+        "78": "hip_right",
+        "79": "spinal_cord",
+        "80": "gluteus_maximus_left",
+        "81": "gluteus_maximus_right",
+        "82": "gluteus_medius_left",
+        "83": "gluteus_medius_right",
+        "84": "gluteus_minimus_left",
+        "85": "gluteus_minimus_right",
+        "86": "autochthon_left",
+        "87": "autochthon_right",
+        "88": "iliopsoas_left",
+        "89": "iliopsoas_right",
+        "90": "brain",
+        "91": "skull",
+        "92": "rib_left_1",
+        "93": "rib_left_2",
+        "94": "rib_left_3",
+        "95": "rib_left_4",
+        "96": "rib_left_5",
+        "97": "rib_left_6",
+        "98": "rib_left_7",
+        "99": "rib_left_8",
+        "100": "rib_left_9",
+        "101": "rib_left_10",
+        "102": "rib_left_11",
+        "103": "rib_left_12",
+        "104": "rib_right_1",
+        "105": "rib_right_2",
+        "106": "rib_right_3",
+        "107": "rib_right_4",
+        "108": "rib_right_5",
+        "109": "rib_right_6",
+        "110": "rib_right_7",
+        "111": "rib_right_8",
+        "112": "rib_right_9",
+        "113": "rib_right_10",
+        "114": "rib_right_11",
+        "115": "rib_right_12",
+        "116": "sternum",
+        "117": "costal_cartilages"
+      }
+    },
+    {
+      "name": "total_fast",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 297,
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_upper_lobe_left",
+        "11": "lung_lower_lobe_left",
+        "12": "lung_upper_lobe_right",
+        "13": "lung_middle_lobe_right",
+        "14": "lung_lower_lobe_right",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "thyroid_gland",
+        "18": "small_bowel",
+        "19": "duodenum",
+        "20": "colon",
+        "21": "urinary_bladder",
+        "22": "prostate",
+        "23": "kidney_cyst_left",
+        "24": "kidney_cyst_right",
+        "25": "sacrum",
+        "26": "vertebrae_S1",
+        "27": "vertebrae_L5",
+        "28": "vertebrae_L4",
+        "29": "vertebrae_L3",
+        "30": "vertebrae_L2",
+        "31": "vertebrae_L1",
+        "32": "vertebrae_T12",
+        "33": "vertebrae_T11",
+        "34": "vertebrae_T10",
+        "35": "vertebrae_T9",
+        "36": "vertebrae_T8",
+        "37": "vertebrae_T7",
+        "38": "vertebrae_T6",
+        "39": "vertebrae_T5",
+        "40": "vertebrae_T4",
+        "41": "vertebrae_T3",
+        "42": "vertebrae_T2",
+        "43": "vertebrae_T1",
+        "44": "vertebrae_C7",
+        "45": "vertebrae_C6",
+        "46": "vertebrae_C5",
+        "47": "vertebrae_C4",
+        "48": "vertebrae_C3",
+        "49": "vertebrae_C2",
+        "50": "vertebrae_C1",
+        "51": "heart",
+        "52": "aorta",
+        "53": "pulmonary_vein",
+        "54": "brachiocephalic_trunk",
+        "55": "subclavian_artery_right",
+        "56": "subclavian_artery_left",
+        "57": "common_carotid_artery_right",
+        "58": "common_carotid_artery_left",
+        "59": "brachiocephalic_vein_left",
+        "60": "brachiocephalic_vein_right",
+        "61": "atrial_appendage_left",
+        "62": "superior_vena_cava",
+        "63": "inferior_vena_cava",
+        "64": "portal_vein_and_splenic_vein",
+        "65": "iliac_artery_left",
+        "66": "iliac_artery_right",
+        "67": "iliac_vena_left",
+        "68": "iliac_vena_right",
+        "69": "humerus_left",
+        "70": "humerus_right",
+        "71": "scapula_left",
+        "72": "scapula_right",
+        "73": "clavicula_left",
+        "74": "clavicula_right",
+        "75": "femur_left",
+        "76": "femur_right",
+        "77": "hip_left",
+        "78": "hip_right",
+        "79": "spinal_cord",
+        "80": "gluteus_maximus_left",
+        "81": "gluteus_maximus_right",
+        "82": "gluteus_medius_left",
+        "83": "gluteus_medius_right",
+        "84": "gluteus_minimus_left",
+        "85": "gluteus_minimus_right",
+        "86": "autochthon_left",
+        "87": "autochthon_right",
+        "88": "iliopsoas_left",
+        "89": "iliopsoas_right",
+        "90": "brain",
+        "91": "skull",
+        "92": "rib_left_1",
+        "93": "rib_left_2",
+        "94": "rib_left_3",
+        "95": "rib_left_4",
+        "96": "rib_left_5",
+        "97": "rib_left_6",
+        "98": "rib_left_7",
+        "99": "rib_left_8",
+        "100": "rib_left_9",
+        "101": "rib_left_10",
+        "102": "rib_left_11",
+        "103": "rib_left_12",
+        "104": "rib_right_1",
+        "105": "rib_right_2",
+        "106": "rib_right_3",
+        "107": "rib_right_4",
+        "108": "rib_right_5",
+        "109": "rib_right_6",
+        "110": "rib_right_7",
+        "111": "rib_right_8",
+        "112": "rib_right_9",
+        "113": "rib_right_10",
+        "114": "rib_right_11",
+        "115": "rib_right_12",
+        "116": "sternum",
+        "117": "costal_cartilages"
+      }
+    },
+    {
+      "name": "total_fastest",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 298,
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_upper_lobe_left",
+        "11": "lung_lower_lobe_left",
+        "12": "lung_upper_lobe_right",
+        "13": "lung_middle_lobe_right",
+        "14": "lung_lower_lobe_right",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "thyroid_gland",
+        "18": "small_bowel",
+        "19": "duodenum",
+        "20": "colon",
+        "21": "urinary_bladder",
+        "22": "prostate",
+        "23": "kidney_cyst_left",
+        "24": "kidney_cyst_right",
+        "25": "sacrum",
+        "26": "vertebrae_S1",
+        "27": "vertebrae_L5",
+        "28": "vertebrae_L4",
+        "29": "vertebrae_L3",
+        "30": "vertebrae_L2",
+        "31": "vertebrae_L1",
+        "32": "vertebrae_T12",
+        "33": "vertebrae_T11",
+        "34": "vertebrae_T10",
+        "35": "vertebrae_T9",
+        "36": "vertebrae_T8",
+        "37": "vertebrae_T7",
+        "38": "vertebrae_T6",
+        "39": "vertebrae_T5",
+        "40": "vertebrae_T4",
+        "41": "vertebrae_T3",
+        "42": "vertebrae_T2",
+        "43": "vertebrae_T1",
+        "44": "vertebrae_C7",
+        "45": "vertebrae_C6",
+        "46": "vertebrae_C5",
+        "47": "vertebrae_C4",
+        "48": "vertebrae_C3",
+        "49": "vertebrae_C2",
+        "50": "vertebrae_C1",
+        "51": "heart",
+        "52": "aorta",
+        "53": "pulmonary_vein",
+        "54": "brachiocephalic_trunk",
+        "55": "subclavian_artery_right",
+        "56": "subclavian_artery_left",
+        "57": "common_carotid_artery_right",
+        "58": "common_carotid_artery_left",
+        "59": "brachiocephalic_vein_left",
+        "60": "brachiocephalic_vein_right",
+        "61": "atrial_appendage_left",
+        "62": "superior_vena_cava",
+        "63": "inferior_vena_cava",
+        "64": "portal_vein_and_splenic_vein",
+        "65": "iliac_artery_left",
+        "66": "iliac_artery_right",
+        "67": "iliac_vena_left",
+        "68": "iliac_vena_right",
+        "69": "humerus_left",
+        "70": "humerus_right",
+        "71": "scapula_left",
+        "72": "scapula_right",
+        "73": "clavicula_left",
+        "74": "clavicula_right",
+        "75": "femur_left",
+        "76": "femur_right",
+        "77": "hip_left",
+        "78": "hip_right",
+        "79": "spinal_cord",
+        "80": "gluteus_maximus_left",
+        "81": "gluteus_maximus_right",
+        "82": "gluteus_medius_left",
+        "83": "gluteus_medius_right",
+        "84": "gluteus_minimus_left",
+        "85": "gluteus_minimus_right",
+        "86": "autochthon_left",
+        "87": "autochthon_right",
+        "88": "iliopsoas_left",
+        "89": "iliopsoas_right",
+        "90": "brain",
+        "91": "skull",
+        "92": "rib_left_1",
+        "93": "rib_left_2",
+        "94": "rib_left_3",
+        "95": "rib_left_4",
+        "96": "rib_left_5",
+        "97": "rib_left_6",
+        "98": "rib_left_7",
+        "99": "rib_left_8",
+        "100": "rib_left_9",
+        "101": "rib_left_10",
+        "102": "rib_left_11",
+        "103": "rib_left_12",
+        "104": "rib_right_1",
+        "105": "rib_right_2",
+        "106": "rib_right_3",
+        "107": "rib_right_4",
+        "108": "rib_right_5",
+        "109": "rib_right_6",
+        "110": "rib_right_7",
+        "111": "rib_right_8",
+        "112": "rib_right_9",
+        "113": "rib_right_10",
+        "114": "rib_right_11",
+        "115": "rib_right_12",
+        "116": "sternum",
+        "117": "costal_cartilages"
+      }
+    },
+    {
+      "name": "total_highres_test",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 957,
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_upper_lobe_left",
+        "11": "lung_lower_lobe_left",
+        "12": "lung_upper_lobe_right",
+        "13": "lung_middle_lobe_right",
+        "14": "lung_lower_lobe_right",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "thyroid_gland",
+        "18": "small_bowel",
+        "19": "duodenum",
+        "20": "colon",
+        "21": "urinary_bladder",
+        "22": "prostate",
+        "23": "kidney_cyst_left",
+        "24": "kidney_cyst_right"
+      }
+    },
+    {
+      "name": "total_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "label_union",
+      "union": [
+        {
+          "weights_id": 850,
+          "label_remap": {
+            "1": 1,
+            "2": 2,
+            "3": 3,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "7": 7,
+            "8": 8,
+            "9": 9,
+            "15": 12,
+            "18": 13,
+            "19": 14,
+            "20": 15,
+            "21": 16,
+            "22": 17
+          },
+          "name": "organs"
+        },
+        {
+          "weights_id": 851,
+          "label_remap": {
+            "1": 30,
+            "2": 31,
+            "3": 32,
+            "4": 33,
+            "5": 34,
+            "6": 35,
+            "7": 36,
+            "8": 37,
+            "9": 38,
+            "10": 39,
+            "11": 21,
+            "12": 40,
+            "13": 41,
+            "14": 42,
+            "15": 43,
+            "16": 44,
+            "17": 45,
+            "18": 46,
+            "19": 47,
+            "20": 48,
+            "21": 49,
+            "22": 50
+          },
+          "name": "muscles"
+        }
+      ],
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_left",
+        "11": "lung_right",
+        "12": "esophagus",
+        "13": "small_bowel",
+        "14": "duodenum",
+        "15": "colon",
+        "16": "urinary_bladder",
+        "17": "prostate",
+        "18": "sacrum",
+        "19": "vertebrae",
+        "20": "intervertebral_discs",
+        "21": "spinal_cord",
+        "22": "heart",
+        "23": "aorta",
+        "24": "inferior_vena_cava",
+        "25": "portal_vein_and_splenic_vein",
+        "26": "iliac_artery_left",
+        "27": "iliac_artery_right",
+        "28": "iliac_vena_left",
+        "29": "iliac_vena_right",
+        "30": "humerus_left",
+        "31": "humerus_right",
+        "32": "scapula_left",
+        "33": "scapula_right",
+        "34": "clavicula_left",
+        "35": "clavicula_right",
+        "36": "femur_left",
+        "37": "femur_right",
+        "38": "hip_left",
+        "39": "hip_right",
+        "40": "gluteus_maximus_left",
+        "41": "gluteus_maximus_right",
+        "42": "gluteus_medius_left",
+        "43": "gluteus_medius_right",
+        "44": "gluteus_minimus_left",
+        "45": "gluteus_minimus_right",
+        "46": "autochthon_left",
+        "47": "autochthon_right",
+        "48": "iliopsoas_left",
+        "49": "iliopsoas_right",
+        "50": "brain"
+      }
+    },
+    {
+      "name": "total_mr_fast",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 852,
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_left",
+        "11": "lung_right",
+        "12": "esophagus",
+        "13": "small_bowel",
+        "14": "duodenum",
+        "15": "colon",
+        "16": "urinary_bladder",
+        "17": "prostate",
+        "18": "sacrum",
+        "19": "vertebrae",
+        "20": "intervertebral_discs",
+        "21": "spinal_cord",
+        "22": "heart",
+        "23": "aorta",
+        "24": "inferior_vena_cava",
+        "25": "portal_vein_and_splenic_vein",
+        "26": "iliac_artery_left",
+        "27": "iliac_artery_right",
+        "28": "iliac_vena_left",
+        "29": "iliac_vena_right",
+        "30": "humerus_left",
+        "31": "humerus_right",
+        "32": "scapula_left",
+        "33": "scapula_right",
+        "34": "clavicula_left",
+        "35": "clavicula_right",
+        "36": "femur_left",
+        "37": "femur_right",
+        "38": "hip_left",
+        "39": "hip_right",
+        "40": "gluteus_maximus_left",
+        "41": "gluteus_maximus_right",
+        "42": "gluteus_medius_left",
+        "43": "gluteus_medius_right",
+        "44": "gluteus_minimus_left",
+        "45": "gluteus_minimus_right",
+        "46": "autochthon_left",
+        "47": "autochthon_right",
+        "48": "iliopsoas_left",
+        "49": "iliopsoas_right",
+        "50": "brain"
+      }
+    },
+    {
+      "name": "total_mr_fastest",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 853,
+      "label_map": {
+        "1": "spleen",
+        "2": "kidney_right",
+        "3": "kidney_left",
+        "4": "gallbladder",
+        "5": "liver",
+        "6": "stomach",
+        "7": "pancreas",
+        "8": "adrenal_gland_right",
+        "9": "adrenal_gland_left",
+        "10": "lung_left",
+        "11": "lung_right",
+        "12": "esophagus",
+        "13": "small_bowel",
+        "14": "duodenum",
+        "15": "colon",
+        "16": "urinary_bladder",
+        "17": "prostate",
+        "18": "sacrum",
+        "19": "vertebrae",
+        "20": "intervertebral_discs",
+        "21": "spinal_cord",
+        "22": "heart",
+        "23": "aorta",
+        "24": "inferior_vena_cava",
+        "25": "portal_vein_and_splenic_vein",
+        "26": "iliac_artery_left",
+        "27": "iliac_artery_right",
+        "28": "iliac_vena_left",
+        "29": "iliac_vena_right",
+        "30": "humerus_left",
+        "31": "humerus_right",
+        "32": "scapula_left",
+        "33": "scapula_right",
+        "34": "clavicula_left",
+        "35": "clavicula_right",
+        "36": "femur_left",
+        "37": "femur_right",
+        "38": "hip_left",
+        "39": "hip_right",
+        "40": "gluteus_maximus_left",
+        "41": "gluteus_maximus_right",
+        "42": "gluteus_medius_left",
+        "43": "gluteus_medius_right",
+        "44": "gluteus_minimus_left",
+        "45": "gluteus_minimus_right",
+        "46": "autochthon_left",
+        "47": "autochthon_right",
+        "48": "iliopsoas_left",
+        "49": "iliopsoas_right",
+        "50": "brain"
+      }
+    },
+    {
+      "name": "trunk_cavities",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 343,
+      "label_map": {
+        "1": "abdominal_cavity",
+        "2": "thoracic_cavity",
+        "3": "pericardium",
+        "4": "mediastinum"
+      }
+    },
+    {
+      "name": "ventricle_parts",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "cascade",
+      "cascade": [
+        {
+          "weights_id": 298,
+          "crop_to_classes": [
+            90
+          ],
+          "dilation_mm": 0.0
+        },
+        {
+          "weights_id": 552,
+          "crop_to_classes": null,
+          "dilation_mm": 10.0
+        }
+      ],
+      "label_map": {
+        "1": "ventricle_frontal_horn_left",
+        "2": "ventricle_occipital_horn_left",
+        "3": "ventricle_body_left",
+        "4": "ventricle_temporal_horn_left",
+        "5": "ventricle_trigone_left",
+        "6": "ventricle_frontal_horn_right",
+        "7": "ventricle_occipital_horn_right",
+        "8": "ventricle_body_right",
+        "9": "ventricle_temporal_horn_right",
+        "10": "ventricle_trigone_right",
+        "11": "third_ventricle",
+        "12": "fourth_ventricle"
+      }
+    },
+    {
+      "name": "vertebrae_body",
+      "source": "ts",
+      "modality": "CT",
+      "shape": "single",
+      "single": 305,
+      "label_map": {
+        "1": "vertebrae_body",
+        "2": "intervertebral_discs"
+      }
+    },
+    {
+      "name": "vertebrae_mr",
+      "source": "ts",
+      "modality": "MR",
+      "shape": "single",
+      "single": 756,
+      "label_map": {
+        "1": "sacrum",
+        "2": "vertebrae_L5",
+        "3": "vertebrae_L4",
+        "4": "vertebrae_L3",
+        "5": "vertebrae_L2",
+        "6": "vertebrae_L1",
+        "7": "vertebrae_T12",
+        "8": "vertebrae_T11",
+        "9": "vertebrae_T10",
+        "10": "vertebrae_T9",
+        "11": "vertebrae_T8",
+        "12": "vertebrae_T7",
+        "13": "vertebrae_T6",
+        "14": "vertebrae_T5",
+        "15": "vertebrae_T4",
+        "16": "vertebrae_T3",
+        "17": "vertebrae_T2",
+        "18": "vertebrae_T1",
+        "19": "vertebrae_C7",
+        "20": "vertebrae_C6",
+        "21": "vertebrae_C5",
+        "22": "vertebrae_C4",
+        "23": "vertebrae_C3",
+        "24": "vertebrae_C2",
+        "25": "vertebrae_C1"
+      }
+    }
+  ]
 }

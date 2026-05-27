@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.9.2] - 2026-05-27
+
+### Added — TS registry generator + 50 populated TS task entries
+
+`scripts/refresh_ts_registry.py` extracts task definitions from an installed `totalsegmentator` distribution and emits `src/nnunet_inference_mlx/data/ts_tasks.json`. The shipped JSON now contains 50 TS tasks (23 single, 24 cascade, 3 label-union), covering essentially the full TS v2.13.0 catalog.
+
+### How the generator works
+
+TS's task dispatch lives in `totalsegmentator.python_api.totalsegmentator()` as a flat `if task == "..." / elif` chain. Each branch is pure variable assignment:
+
+```python
+elif task == "lung_vessels":
+    task_id = 117
+    resample = [0.703125, 0.703125, 1.0]
+    trainer = "nnUNetTrainerSkeletonRecall"
+    crop = ["lung_upper_lobe_left", ...]
+    robust_crop = True
+```
+
+The generator:
+
+1. AST-locates the dispatch chain in the function source (just for the line span — no walking)
+2. Dedents and `exec()`s it in a controlled namespace with `task` / `fast` / `fastest` set to each combination
+3. Reads the resulting locals (`task_id`, `resample`, `trainer`, `crop`, ...)
+4. Classifies by shape: list of IDs → label-union, crop=None → single, crop=names → cascade
+5. Builds TaskSpec entries, resolving crop class names against `class_map["total"]` / `class_map["total_mr"]` / `class_map["body"]` as appropriate
+6. Writes JSON to stdout
+
+The "exec a code block in a controlled namespace" approach is more robust than AST walking — it tolerates TS syntax changes (the dispatch could become a match/case in a future TS version and our generator still works) and offloads Python's syntactic complexity to Python itself.
+
+### What's covered
+
+| Shape | Count | Examples |
+|---|---|---|
+| `single` | 23 | `body`, `body_mr`, `appendicular_bones`, `tissue_types`, `total_fast` (297), `total_fastest` (298), `total_mr_fast` (852), all the focused single-shot models |
+| `cascade` | 24 | `lung_vessels`, `liver_vessels`, `liver_segments`, `cerebral_bleed`, `coronary_arteries`, `craniofacial_structures`, `kidney_cysts`, etc. — all the "rough total → focused" patterns |
+| `label_union` | 3 | `total` (5 parts on CT, datasets 291-295), `total_mr` (2 parts on MR, datasets 850/851), `test` |
+
+The `fast`/`fastest` flags on `total` and `total_mr` are expanded into separate registered names (`total_fast`, `total_fastest`, `total_mr_fast`, `total_mr_fastest`) — each is a distinct logical task with its own dataset ID.
+
+### Skipped (with reasons)
+
+- `teeth` — uses `crop_model="craniofacial_structures"` (nested-task cascade). Our flat `CascadeStep` can't express a task reference yet; deferred to 0.10.x.
+- `total_v1`, `covid`, `appendicular_bones_auxiliary`, `face_mr_auxiliary`, `kidney_cysts_auxiliary` — present in TS's `class_map` but absent from the dispatch chain (legacy, deprecated, or auxiliary internal tasks).
+
+### Usage
+
+```bash
+# Run inside an env with totalsegmentator installed
+python scripts/refresh_ts_registry.py > src/nnunet_inference_mlx/data/ts_tasks.json
+git diff src/nnunet_inference_mlx/data/ts_tasks.json
+```
+
+Now `run_named_task("total_fast", img)`, `run_named_task("lung_vessels", img)`, etc. work out-of-the-box (provided the underlying TS weights are downloaded; we don't manage that yet — that's the 0.11.0+ remote-download work).
+
+### Tests
+
+5 new tests in `test_tasks.py::TestBuiltinRegistry`. Total: **217 passing**, 1 skipped, full suite in ~75s.
+
+- `test_ts_tasks_present` — assert ≥ 40 tasks registered (catches generator regression)
+- `test_canonical_ts_tasks_resolve` — verifies popular task names (`total`, `total_fast`, `body`, `lung_vessels`, …) are all registered with `source="ts"`
+- `test_total_is_label_union_with_5_parts` — flagship task structurally is 5-part union with dataset IDs `{291, 292, 293, 294, 295}`
+- `test_total_fast_is_single_model` — `total_fast` → dataset 297
+- `test_lung_vessels_is_cascade` — 2-stage cascade ending at dataset 117
+
+These assertions are pinned to TS v2.13.0. Future TS releases that change dataset IDs will fail these tests, surfacing the change at refresh time rather than silently.
+
+### What's still TBD
+
+- **CI workflow** to auto-refresh on a cron schedule + open a PR if `ts_tasks.json` diffs — planned for 0.9.2.x. Not blocking — manual refresh is one command.
+- **Nested-task cascade support** (for `teeth`) — `CascadeStep.task_name: str | None` alternative to `weights_id: int`. Deferred to 0.10.x.
+- **MOOSE compatibility** — still 0.9.3 work (was 0.9.2 — bumped because this release ate the slot).
+- **CLI (`mlxseg`)** — still 0.10.0; consumes this registry.
+
 ## [0.9.1] - 2026-05-27
 
 ### Added — declarative task registry + `run_named_task` dispatcher
