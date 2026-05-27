@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.9.1] - 2026-05-27
+
+### Added — declarative task registry + `run_named_task` dispatcher
+
+Names tasks. `mlxseg --task lung_vessels ...` (coming in 0.10.0 CLI) needs a registry; here it is.
+
+The schema is informed by both TS (which has three pipeline shapes — single-model, cascade, label-union) and MOOSE's `moosez/constants.py` (which contributed modality-as-first-class, body coverage hints, and weight provisioning slots).
+
+**New module `tasks.py`** with:
+
+- **`TaskSpec`** dataclass — the descriptor:
+  ```python
+  TaskSpec(
+      name: str,
+      source: Literal["ts", "moose", "user"],
+      modality: Literal["CT", "MR", "PET"],
+      shape: Literal["single", "cascade", "label_union"],
+      # Exactly one of these, matching `shape`:
+      single: int | None = None,
+      cascade: tuple[CascadeStep, ...] | None = None,
+      union: tuple[UnionPart, ...] | None = None,
+      # Informational:
+      label_map: dict[int, str] = {},
+      expected_coverage: str = "any",       # MOOSE-inspired
+      weights_url: str | None = None,        # slot for 0.11.0+ remote weights
+      weights_sha256: str | None = None,
+  )
+  ```
+  Validated in `__post_init__`.
+
+- **`CascadeStep`** / **`UnionPart`** — shape-specific sub-types.
+
+- **Registry API**:
+  - `register_task(spec, *, overwrite=False)`
+  - `get_task(name)`
+  - `unregister_task(name)`
+  - `list_registered_tasks()`
+  - `list_tasks_by_modality(modality)`
+
+- **`run_named_task(name, image_sitk, *, folds=None, reorient_to="LPS", peak_working_memory_mb=None, verbose=False, engine_factory=None)`** — the dispatcher:
+  - `shape="single"` → `predict_with_resampling`
+  - `shape="cascade"` → `run_workflow` with `Stage` per `CascadeStep`
+  - `shape="label_union"` → `run_label_union_workflow` with `ParallelStage` per `UnionPart`
+  - `engine_factory` hook allows injecting custom engine construction (tests, non-standard weight locations).
+
+### Added — JSON registry file
+
+`src/nnunet_inference_mlx/data/ts_tasks.json` ships in the wheel. Loaded lazily on first registry access. Schema version 1; currently ships with an empty `tasks: []` — `scripts/refresh_ts_registry.py` (a generator that imports an installed TotalSegmentator distribution and emits this file) is planned for a follow-up patch.
+
+Users can register custom tasks at runtime via `register_task(TaskSpec(...))` regardless of whether the shipped JSON has entries.
+
+### Architecture notes
+
+- The dispatcher is thin glue over 0.9.0's `predict_with_resampling`, `run_workflow`, and `run_label_union_workflow`. The registry adds *naming and persistence*; the dispatch logic itself is one branch per shape.
+- The `engine_factory` injection point makes the dispatcher testable without weight files and gives users an extension point for non-standard weight locations (MOOSE-style remote downloads, custom WeightsLayout entries, etc.).
+- The JSON storage is reviewable in PRs (vs hand-written Python dict), language-agnostic (other tools can consume it), and decoupled from our Python module — a downstream CLI or evaluator can read `ts_tasks.json` without importing our package.
+
+### Tests
+
+30 new tests in `test_tasks.py`. Total: **212 passing.**
+
+Coverage:
+- `TaskSpec` validation: shape↔data field consistency, allow-list enforcement (modality / source / shape), cascade min-length, union min-length, multiple-shape-fields rejection, missing-shape-field rejection
+- JSON round-trip for all three shapes; int-key recovery in `label_remap` / `label_map`; default-value omission on disk
+- Registry API: register / get / unregister / list / list-by-modality, duplicate-rejection, overwrite-with-explicit-flag, name-collision errors
+- Dispatcher: per-shape backend routing, `weights_id` forwarding to factory, factory called once per distinct ID in order, unknown-task error, output geometry preservation
+- Builtin registry loadability sanity check
+
+### What's not in this release
+
+- **`scripts/refresh_ts_registry.py`** — the generator that imports an installed TS and writes `ts_tasks.json`. Planned for 0.9.1.1 once verified against a real TS install. Until then, the shipped registry is empty and users register tasks at runtime.
+- **CI cron** to auto-refresh against new TS releases — same dependency.
+- **MOOSE entries / MOOSE-compat fields** — those are 0.9.2 work.
+- **CLI (`mlxseg`)** — still 0.10.0; consumes this registry.
+
 ## [0.9.0] - 2026-05-26
 
 ### Added — multi-task label-union orchestrator

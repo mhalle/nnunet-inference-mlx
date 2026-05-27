@@ -1,0 +1,9 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "description": "Built-in task registry for nnunet-inference-mlx. Consumed by tasks.py at first registry use.",
+    "generator": "scripts/refresh_ts_registry.py (planned)",
+    "note": "This file is machine-generated from an installed TotalSegmentator distribution. Hand-editing is discouraged; use scripts/refresh_ts_registry.py to regenerate. Until the generator lands and is verified against a real TS install, the tasks list ships empty — users can call register_task() at runtime to add their own entries."
+  },
+  "tasks": []
+}

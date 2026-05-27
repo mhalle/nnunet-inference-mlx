@@ -1,6 +1,6 @@
 [project]
 name = "nnunet-inference-mlx"
-version = "0.9.0"
+version = "0.9.1"
 description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -26,6 +26,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nnunet_inference_mlx"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,8 @@
 # Post-0.8.2 roadmap
 
-> **Update (0.9.0 landed):** the multi-task label-union orchestrator and the four supporting top-level primitives (`get_orientation`, `reorient`, `remap_labels`, `paint_union`) are now shipped. See CHANGELOG 0.9.0. Next milestones below: declarative `TS_TASKS` registry (0.9.1) and CLI `mlxseg` (0.10.0).
+> **Update (0.9.1 landed):** declarative task registry (`TaskSpec`, `CascadeStep`, `UnionPart`) + `run_named_task` dispatcher + JSON-storage registry in `data/ts_tasks.json` (empty for now; generator deferred to 0.9.1.x). See CHANGELOG 0.9.1.
+>
+> **Update (0.9.0 landed):** the multi-task label-union orchestrator and the four supporting top-level primitives (`get_orientation`, `reorient`, `remap_labels`, `paint_union`) are now shipped. See CHANGELOG 0.9.0. Next milestones below: TS task data via generator script (0.9.1.x), MOOSE compatibility (0.9.2), CLI `mlxseg` (0.10.0).
 
 State as of this document: **v0.8.2 shipped to origin.** The package now has:
 
@@ -83,6 +85,59 @@ Concrete proposal in chat: TS_TASKS as a Python dict (or shippable JSON) with th
 **Why this is 0.9.0:** completes the "TS-equivalent at the API level" story. After this ships, `run_named_task("lung_vessels", img)` does what `totalsegmentator(input=..., task="lung_vessels")` does — but with our path-B, scheme-correct, orientation-correct, transpose-correct backend.
 
 Can ship alongside the orchestrator above as a single 0.9.0 release, or split into 0.9.0 (orchestrator) + 0.9.1 (registry).
+
+---
+
+### 0.9.2 — MOOSE compatibility
+
+MOOSE (Multi-organ objective segmentation, QIMP Vienna) ships nnU-Netv2-trained models for whole-body CT/PET segmentation. Most of MOOSE's catalog already works through our engine — single-channel CT, plain cascade, standard normalization. A handful of small pieces close the gaps for full parity.
+
+**Audit of current coverage (no work needed):**
+
+- ✅ CT single-channel inference (`clin_ct_organs`, `clin_ct_lungs`, `clin_ct_ribs`, `clin_ct_vertebrae`, `clin_ct_fat_muscles`, `clin_ct_body`, `preclin_ct_all`)
+- ✅ `CTNormalization`, `ZScoreNormalization`, `NoNormalization`
+- ✅ Sequential cascade with FOV crop (the MOOSE body→organ pattern, via `run_workflow`)
+- ✅ Multi-fold ensemble (softmax / sigmoid)
+- ✅ Region-based heads
+- ✅ Engine cache (helps MOOSE more than TS — MOOSE has many small models)
+- ✅ LPS reorient + transpose handling
+- ✅ Per-ROI volume stats (one-liner: `np.bincount(seg.ravel()) * np.prod(spacing_zyx)`; documented in example, not a primitive)
+
+**What's missing (the actual scope):**
+
+1. **True multi-channel input path** (~50 lines)
+
+   `InferenceEngine.predict()` / `predict_logits()` currently accept `(Z, Y, X)` and `SlidingWindowEngine.normalize()` is hardcoded to `ch = 0`. The infrastructure (`num_input_channels`, per-channel scheme list, per-channel norm params) is already in place — only the public path needs to loop.
+
+   Changes:
+   - Accept `(C, Z, Y, X)` numpy arrays in `predict` / `predict_logits` / `predict_segmentation`
+   - Extend `normalize()` to iterate over `num_input_channels`, dispatching per-channel scheme
+   - `predict_with_resampling` accepts a `list[sitk.Image]` (one per modality) instead of a single image, resamples each to target spacing independently, stacks
+   - Tests: synthetic 2-channel engine with two different per-channel norm schemes
+
+   Required only for true PET/CT *fused* MOOSE models (some PUMA variants). PET-only and CT-only single-channel tasks already work without this.
+
+2. **`RescaleTo01Normalization`** (~15 lines)
+
+   nnU-Net's percentile-clip + rescale-to-[0,1] scheme. Used by some PET models. Just another branch in `apply_normalization`.
+
+3. **MOOSE `WeightsLayout` entry** (~30 lines)
+
+   MOOSE's folder layout matches nnU-Net's `nnUNet_results/...` convention with minor variations (the directory naming for fold checkpoints, sometimes flattened, sometimes wrapped in a MOOSE-specific top level). Need to verify against a real MOOSE install and either confirm the existing nnU-Net layout works as-is or add a MOOSE layout to the `WeightsLayout` registry.
+
+4. **`MOOSE_TASKS` registry entries** (~50 lines + data)
+
+   Same shape as `TS_TASKS` (0.9.1). Per-task descriptors with model paths, cascade dependencies, label remaps, organ-name lookups. Generated from MOOSE's `expected_modality.json` and `organ_indices.json` (their internal config files).
+
+5. **`use_mask_for_norm`** (~30 lines, optional)
+
+   For MR `preclin_mr_all` (rodent MR). ZScoreNormalization computed over the foreground mask only, not the full volume. Already on the roadmap as 0.11.0+; consider promoting if MR matters.
+
+**Total scope:** ~145 lines (excluding MR) or ~175 lines (with MR). Plus a verification pass on real MOOSE weights.
+
+**Why this is 0.9.2:** sits naturally after the TS registry (0.9.1) — same machinery, second consumer. Single-channel MOOSE tasks already work today via `cached_engine_from_folder` + `predict_with_resampling`; the registry + multi-channel path are the gap-closers for "full MOOSE replacement."
+
+**Coordination with 0.9.1:** the `TaskSpec` design from 0.9.1 should be MOOSE-aware from day one — extending the dataclass with an optional `modalities: list[str]` field for multi-channel tasks, and making the registry name-resolved across both TS and MOOSE rather than baking in a TS-only assumption. That way 0.9.2 is purely additive (new task entries, new weights layout, new norm scheme), not a redesign.
 
 ---
 

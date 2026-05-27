@@ -45,6 +45,17 @@ from .resampling import (
 )
 from .postprocessing import remove_small_components
 from .preprocessing import resample_volume
+from .tasks import (
+    CascadeStep,
+    TaskSpec,
+    UnionPart,
+    get_task,
+    list_registered_tasks,
+    list_tasks_by_modality,
+    register_task,
+    run_named_task,
+    unregister_task,
+)
 from .workflow import (
     Bbox,
     ParallelStage,
@@ -126,4 +137,14 @@ __all__ = [
     "paste_segmentation",
     "run_label_union_workflow",
     "run_workflow",
+    # Declarative task registry + named-task dispatcher
+    "CascadeStep",
+    "TaskSpec",
+    "UnionPart",
+    "get_task",
+    "list_registered_tasks",
+    "list_tasks_by_modality",
+    "register_task",
+    "run_named_task",
+    "unregister_task",
 ]
