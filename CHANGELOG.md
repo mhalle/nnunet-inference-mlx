@@ -2,6 +2,16 @@
 
 ## [0.9.2] - 2026-05-27
 
+### Added — `int | str` weights identifiers (MOOSE-ready)
+
+A source audit of MOOSE v3.1.6 confirmed MOOSE identifies models by **string** (`"clin_ct_organs"` / `"Dataset123_Organs"`), not the integer dataset IDs TS/nnU-Net use. So the weights identifier is now the union type **`WeightsId = int | str`** (exported from the package root):
+
+- `TaskSpec.single`, `CascadeStep.weights_id`, `UnionPart.weights_id` accept `int | str`.
+- JSON (de)serialization preserves the incoming type — an integer stays an nnU-Net dataset ID, a string stays a MOOSE model identifier; TS integer IDs are *not* silently stringified.
+- `run_named_task`'s default `engine_factory` resolves only integer IDs (via `cached_engine_from_task`); a string identifier without a custom factory raises a clear `NotImplementedError` rather than globbing for a bogus `Dataset` folder. Source-aware string resolution lands with MOOSE support (0.9.3).
+
+6 new tests (`TestStringWeightsId`) cover string-id validation, type-preserving round-trip, and the factory guard. The full MOOSE scope — grounded in the v3.1.6 audit — is in `docs/post-0.8.2-roadmap.md`.
+
 ### Added — source-qualified task names (anticipating multi-system registries)
 
 The registry now keys on `source:name` (e.g. `ts:total`, `moose:total`, `user:mytask`) so two model systems can ship a task with the same bare name without colliding. This is forward-prep for MOOSE support (0.9.3) — done now, while TS is the only source and there's nothing to migrate.
@@ -91,7 +101,7 @@ Now `run_named_task("total_fast", img)`, `run_named_task("lung_vessels", img)`, 
 
 ### Tests
 
-New `test_tasks.py` coverage: `TestBuiltinRegistry` (TS-catalog breadth + canonical task pins) and `TestCrossSourceConflicts` (8 tests for qualified-name resolution and `AmbiguousTaskError`). Total: **224 passing** (`-m "not slow"`), 1 skipped, 2 heavy benchmarks deselected by default. ~6.5s for the fast suite.
+New `test_tasks.py` coverage: `TestBuiltinRegistry` (TS-catalog breadth + canonical task pins), `TestCrossSourceConflicts` (qualified-name resolution + `AmbiguousTaskError`), and `TestStringWeightsId` (MOOSE-style string IDs). Total: **230 passing** (`-m "not slow"`), 1 skipped, 2 heavy benchmarks deselected by default. ~7s for the fast suite.
 
 - `test_ts_tasks_present` — assert ≥ 40 tasks registered (catches generator regression)
 - `test_canonical_ts_tasks_resolve` — verifies popular task names (`total`, `total_fast`, `body`, `lung_vessels`, …) are all registered with `source="ts"`

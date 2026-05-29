@@ -66,6 +66,16 @@ if TYPE_CHECKING:
     from .engine import InferenceEngine
 
 
+# A weights identifier is either an integer nnU-Net dataset ID (nnU-Net /
+# TotalSegmentator convention, resolved by ``cached_engine_from_task``) or
+# a string model/folder identifier (MOOSE convention, e.g. "clin_ct_organs"
+# or "Dataset123_Organs"). The dispatcher's ``engine_factory`` is what
+# turns either form into an engine; the default factory handles only the
+# integer form (string resolution is source-aware and provided by the
+# caller's factory).
+WeightsId = int | str
+
+
 # ---------------------------------------------------------------------------
 # Shape-specific data classes
 # ---------------------------------------------------------------------------
@@ -82,7 +92,8 @@ class CascadeStep:
     Parameters
     ----------
     weights_id :
-        nnU-Net dataset ID (integer) used by ``cached_engine_from_task``.
+        Weights identifier (see :data:`WeightsId`): an integer nnU-Net
+        dataset ID (TS) or a string model/folder identifier (MOOSE).
     crop_to_classes :
         If set, after this stage runs, the foreground bbox of these class
         IDs (in this stage's output) is used to crop the *next* stage's
@@ -91,7 +102,7 @@ class CascadeStep:
         Safety margin added to the bbox in physical units (mm).
     """
 
-    weights_id: int
+    weights_id: WeightsId
     crop_to_classes: tuple[int, ...] | None = None
     dilation_mm: float = 10.0
 
@@ -108,7 +119,8 @@ class UnionPart:
     Parameters
     ----------
     weights_id :
-        nnU-Net dataset ID for this part's model.
+        Weights identifier (see :data:`WeightsId`): an integer nnU-Net
+        dataset ID (TS) or a string model/folder identifier (MOOSE).
     label_remap :
         ``{task_local_id: unified_id}`` — exactly the same shape as the
         argument to :func:`remap_labels`.
@@ -116,7 +128,7 @@ class UnionPart:
         Human-readable name (``"organs"``, ``"vertebrae"``, …) for logs.
     """
 
-    weights_id: int
+    weights_id: WeightsId
     label_remap: Mapping[int, int]
     name: str = ""
 
@@ -153,7 +165,7 @@ class TaskSpec:
         ``"cascade"`` → :func:`run_workflow`; ``"label_union"`` →
         :func:`run_label_union_workflow`.
     single :
-        Weights ID for ``shape="single"``.
+        Weights identifier (see :data:`WeightsId`) for ``shape="single"``.
     cascade :
         Tuple of :class:`CascadeStep` (≥ 2) for ``shape="cascade"``.
     union :
@@ -177,7 +189,7 @@ class TaskSpec:
     shape: str
 
     # Shape-specific fields (exactly one populated)
-    single: int | None = None
+    single: WeightsId | None = None
     cascade: tuple[CascadeStep, ...] | None = None
     union: tuple[UnionPart, ...] | None = None
 
@@ -268,21 +280,38 @@ class TaskSpec:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_weights_id(v: object) -> WeightsId:
+    """Normalize a JSON weights-id value to ``int`` or ``str``.
+
+    JSON already distinguishes ``123`` (int) from ``"Dataset123_Organs"``
+    (str), so we preserve the incoming type rather than forcing one — an
+    integer stays an nnU-Net dataset ID, a string stays a MOOSE
+    model/folder identifier. ``bool`` (a subclass of ``int``) is rejected
+    to catch malformed input.
+    """
+    if isinstance(v, bool):
+        raise TypeError(f"weights_id must be int or str, got bool: {v!r}")
+    if isinstance(v, int):
+        return v
+    return str(v)
+
+
 def _taskspec_from_dict(d: Mapping) -> TaskSpec:
     """Construct a TaskSpec from its JSON-friendly dict form.
 
     JSON only supports string keys; this restores integer keys in
-    ``label_remap`` and ``label_map``.
+    ``label_remap`` and ``label_map``. Weights identifiers keep their
+    JSON type (int dataset ID or str model identifier).
     """
     shape = d["shape"]
 
-    single = int(d["single"]) if shape == "single" else None
+    single = _coerce_weights_id(d["single"]) if shape == "single" else None
 
     cascade: tuple[CascadeStep, ...] | None = None
     if shape == "cascade":
         cascade = tuple(
             CascadeStep(
-                weights_id=int(step["weights_id"]),
+                weights_id=_coerce_weights_id(step["weights_id"]),
                 crop_to_classes=(
                     tuple(int(c) for c in step["crop_to_classes"])
                     if step.get("crop_to_classes")
@@ -297,7 +326,7 @@ def _taskspec_from_dict(d: Mapping) -> TaskSpec:
     if shape == "label_union":
         union = tuple(
             UnionPart(
-                weights_id=int(part["weights_id"]),
+                weights_id=_coerce_weights_id(part["weights_id"]),
                 label_remap={int(k): int(v) for k, v in part["label_remap"].items()},
                 name=part.get("name", ""),
             )
@@ -522,7 +551,7 @@ def run_named_task(
     reorient_to: str | None = "LPS",
     peak_working_memory_mb: int | None = None,
     verbose: bool = False,
-    engine_factory: "Callable[[int], InferenceEngine] | None" = None,
+    engine_factory: "Callable[[WeightsId], InferenceEngine] | None" = None,
 ) -> "sitk.Image":
     """Run a named segmentation task end-to-end on a SITK image.
 
@@ -554,10 +583,12 @@ def run_named_task(
     verbose :
         Print per-stage progress.
     engine_factory :
-        Override engine construction. Signature: ``(weights_id: int)
-        -> InferenceEngine``. Used by tests with synthetic engines and
-        by callers with non-standard weight locations. ``None``
-        (default) uses :func:`cached_engine_from_task`.
+        Override engine construction. Signature: ``(weights_id: int | str)
+        -> InferenceEngine``. Used by tests with synthetic engines and by
+        callers with non-standard weight locations. ``None`` (default)
+        uses :func:`cached_engine_from_task`, which handles only integer
+        nnU-Net dataset IDs — string identifiers (e.g. MOOSE model names)
+        require a source-aware factory passed here.
 
     Returns
     -------
@@ -571,6 +602,10 @@ def run_named_task(
     AmbiguousTaskError
         If ``name`` is a bare name defined by more than one source.
         Qualify it as ``"source:name"`` (e.g. ``"ts:total"``).
+    NotImplementedError
+        If a task carries a string weights identifier but no
+        ``engine_factory`` is supplied (the default factory only resolves
+        integer dataset IDs).
     """
     from .resampling import predict_with_resampling
     from .workflow import (
@@ -582,7 +617,15 @@ def run_named_task(
     if engine_factory is None:
         from .engine_cache import cached_engine_from_task
 
-        def engine_factory(wid: int):  # type: ignore[misc]
+        def engine_factory(wid: WeightsId):  # type: ignore[misc]
+            if not isinstance(wid, int):
+                raise NotImplementedError(
+                    f"task {spec.qualified_name!r} uses a string weights "
+                    f"identifier ({wid!r}); the default engine factory only "
+                    f"resolves integer nnU-Net dataset IDs. Pass a "
+                    f"source-aware engine_factory to run_named_task() "
+                    f"(MOOSE-style resolution is not yet built in)."
+                )
             return cached_engine_from_task(wid, folds=folds, verbose=verbose)
 
     if verbose:
@@ -638,6 +681,7 @@ __all__ = [
     "CascadeStep",
     "TaskSpec",
     "UnionPart",
+    "WeightsId",
     "get_task",
     "list_registered_tasks",
     "list_tasks_by_modality",

@@ -250,6 +250,71 @@ class TestJsonRoundTrip:
 
 
 # ---------------------------------------------------------------------------
+# String weights identifiers (MOOSE: models keyed by name, not dataset ID)
+# ---------------------------------------------------------------------------
+
+
+class TestStringWeightsId:
+    """MOOSE identifies models by string (e.g. 'clin_ct_organs' /
+    'Dataset123_Organs'), not integer dataset ID. The schema accepts both;
+    the default engine factory only resolves ints, so string-id tasks need
+    a source-aware factory (or raise a clear NotImplementedError)."""
+
+    def test_single_accepts_string_id(self):
+        spec = TaskSpec(name="clin_ct_organs", source="moose", modality="CT",
+                        shape="single", single="Dataset123_Organs")
+        assert spec.single == "Dataset123_Organs"
+
+    def test_cascade_step_accepts_string_id(self):
+        spec = TaskSpec(
+            name="clin_ct_body_composition", source="moose", modality="CT",
+            shape="cascade",
+            cascade=(CascadeStep(weights_id="Dataset666_FastVert",
+                                  crop_to_classes=(22,)),
+                     CascadeStep(weights_id="Dataset778_BodyComp")),
+        )
+        assert spec.cascade[0].weights_id == "Dataset666_FastVert"
+        assert spec.cascade[1].weights_id == "Dataset778_BodyComp"
+
+    def test_string_id_round_trips(self):
+        spec = TaskSpec(name="clin_ct_organs", source="moose", modality="CT",
+                        shape="single", single="Dataset123_Organs")
+        rt = _taskspec_from_dict(json.loads(json.dumps(_taskspec_to_dict(spec))))
+        assert spec == rt
+        assert isinstance(rt.single, str)
+
+    def test_int_id_stays_int_through_round_trip(self):
+        """Widening to int|str must not silently stringify TS integer IDs."""
+        spec = TaskSpec(name="total_fast", source="ts", modality="CT",
+                        shape="single", single=297)
+        rt = _taskspec_from_dict(json.loads(json.dumps(_taskspec_to_dict(spec))))
+        assert rt.single == 297
+        assert isinstance(rt.single, int)
+
+    def test_default_factory_rejects_string_id(self):
+        """Dispatching a string-id task without a custom factory must fail
+        loudly (not glob for a bogus Dataset folder)."""
+        register_task(TaskSpec(name="clin_ct_organs", source="moose",
+                               modality="CT", shape="single",
+                               single="Dataset123_Organs"))
+        with pytest.raises(NotImplementedError, match="string weights"):
+            run_named_task("moose:clin_ct_organs", _make_sitk())
+
+    def test_string_id_dispatches_with_custom_factory(self, engine):
+        """A source-aware engine_factory makes string-id tasks runnable."""
+        register_task(TaskSpec(name="clin_ct_organs", source="moose",
+                               modality="CT", shape="single",
+                               single="Dataset123_Organs"))
+        seen = []
+        seg = run_named_task(
+            "moose:clin_ct_organs", _make_sitk(),
+            engine_factory=lambda wid: (seen.append(wid), engine)[1],
+        )
+        assert seen == ["Dataset123_Organs"]
+        assert seg.GetSize() == (24, 24, 24)
+
+
+# ---------------------------------------------------------------------------
 # Registry API
 # ---------------------------------------------------------------------------
 

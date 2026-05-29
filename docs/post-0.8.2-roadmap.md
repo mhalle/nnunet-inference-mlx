@@ -2,7 +2,7 @@
 
 > **Update (0.9.1 landed):** declarative task registry (`TaskSpec`, `CascadeStep`, `UnionPart`) + `run_named_task` dispatcher + JSON-storage registry in `data/ts_tasks.json` (empty for now; generator deferred to 0.9.1.x). See CHANGELOG 0.9.1.
 >
-> **Update (0.9.0 landed):** the multi-task label-union orchestrator and the four supporting top-level primitives (`get_orientation`, `reorient`, `remap_labels`, `paint_union`) are now shipped. See CHANGELOG 0.9.0. Next milestones below: TS task data via generator script (0.9.1.x), MOOSE compatibility (0.9.2), CLI `mlxseg` (0.10.0).
+> **Update (0.9.0–0.9.2 landed):** Shipped — the label-union orchestrator + top-level primitives (`get_orientation`, `reorient`, `remap_labels`, `paint_union`, 0.9.0); the declarative task registry + `run_named_task` dispatcher (0.9.1); the TS registry generator + 50 populated TS tasks + source-qualified names + `int|str` weights IDs (0.9.2). Next milestones below: MOOSE compatibility (0.9.3, audit-grounded), CLI `mlxseg` (0.10.0). The MOOSE section reflects a real source audit of v3.1.6.
 
 State as of this document: **v0.8.2 shipped to origin.** The package now has:
 
@@ -88,56 +88,45 @@ Can ship alongside the orchestrator above as a single 0.9.0 release, or split in
 
 ---
 
-### 0.9.2 — MOOSE compatibility
+### 0.9.3 — MOOSE compatibility (audit-grounded)
 
-MOOSE (Multi-organ objective segmentation, QIMP Vienna) ships nnU-Netv2-trained models for whole-body CT/PET segmentation. Most of MOOSE's catalog already works through our engine — single-channel CT, plain cascade, standard normalization. A handful of small pieces close the gaps for full parity.
+MOOSE (Multi-organ objective segmentation, ENHANCE-PET) ships nnU-Netv2-trained models for whole-body CT/PET/MR segmentation. **This section is grounded in a source audit of MOOSE v3.1.6** (`~/Dropbox/development/moose/MOOSE`), not from memory — the TS audit taught us that auditing materially changes the plan.
 
-**Audit of current coverage (no work needed):**
+**Audit findings (MOOSE v3.1.6):**
 
-- ✅ CT single-channel inference (`clin_ct_organs`, `clin_ct_lungs`, `clin_ct_ribs`, `clin_ct_vertebrae`, `clin_ct_fat_muscles`, `clin_ct_body`, `preclin_ct_all`)
-- ✅ `CTNormalization`, `ZScoreNormalization`, `NoNormalization`
-- ✅ Sequential cascade with FOV crop (the MOOSE body→organ pattern, via `run_workflow`)
-- ✅ Multi-fold ensemble (softmax / sigmoid)
-- ✅ Region-based heads
-- ✅ Engine cache (helps MOOSE more than TS — MOOSE has many small models)
-- ✅ LPS reorient + transpose handling
-- ✅ Per-ROI volume stats (one-liner: `np.bincount(seg.ravel()) * np.prod(spacing_zyx)`; documented in example, not a primitive)
+MOOSE is nnU-Netv2-native. `moosez/models.py`'s `Model` class reads `dataset.json` + `plans.json`, pulls `transpose_forward`/`transpose_backward`, and computes `voxel_spacing = [voxel_spacing_t[i] for i in transpose_backward]` — **byte-identical to our `ModelBundle.target_spacing`.** Config folders are standard `trainer__planner__resolution` with `fold_*` subdirs. So our loader, engine, transpose handling, resampling, and sliding window apply unchanged.
 
-**What's missing (the actual scope):**
+Catalog: **25 models — 22 CT, 2 PET (`PT`), 1 MR.** Only **2 cascades** (`clin_ct_body_composition` ← `clin_ct_fast_vertebrae`; `clin_ct_face` ← `clin_ct_body`), both referencing the crop model **by name**. The other 23 are single-model. **No `label_union`** — running multiple MOOSE models yields multiple *separate* segmentations (one multilabel file per model), not a merged unified-class map. So MOOSE exercises only our `single` and `cascade` shapes.
 
-1. **True multi-channel input path** (~50 lines)
+Model identity is a **string** (`"clin_ct_organs"`) plus `KEY_FOLDER_NAME` (`"Dataset123_Organs"`) and a `KEY_URL` download link. `KEY_LIMIT_FOV` is the cascade descriptor: `{model_to_crop_from, inference_fov_intensities: [lo,hi], label_intensity_to_crop_from, largest_component_only}` — richer than our `crop_to_classes` + `dilation_mm`.
 
-   `InferenceEngine.predict()` / `predict_logits()` currently accept `(Z, Y, X)` and `SlidingWindowEngine.normalize()` is hardcoded to `ch = 0`. The infrastructure (`num_input_channels`, per-channel scheme list, per-channel norm params) is already in place — only the public path needs to loop.
+**Done (groundwork shipped before this milestone):**
 
-   Changes:
-   - Accept `(C, Z, Y, X)` numpy arrays in `predict` / `predict_logits` / `predict_segmentation`
-   - Extend `normalize()` to iterate over `num_input_channels`, dispatching per-channel scheme
-   - `predict_with_resampling` accepts a `list[sitk.Image]` (one per modality) instead of a single image, resamples each to target spacing independently, stacks
-   - Tests: synthetic 2-channel engine with two different per-channel norm schemes
+- ✅ Registry machinery with source qualification — `source="moose"` valid; `moose:total` / `ts:total` coexist; `AmbiguousTaskError` resolves collisions
+- ✅ Source-agnostic dispatcher — `run_named_task` branches on `shape`, not source
+- ✅ The two shapes MOOSE uses (`single`, `cascade`)
+- ✅ Generator pattern (PEP 723 `uv run` admin CLI) — `refresh_moose_registry.py` parallels the TS one; MOOSE's `MODEL_METADATA` is already a clean dict (no AST/exec needed — *easier* than TS)
+- ✅ **Weights identifier widened to `int | str`** (shipped 0.9.2) — MOOSE string folder names are storable/round-trippable; default engine factory raises `NotImplementedError` on string IDs until item 2
 
-   Required only for true PET/CT *fused* MOOSE models (some PUMA variants). PET-only and CT-only single-channel tasks already work without this.
+**Remaining required changes (ranked, now certain):**
 
-2. **`RescaleTo01Normalization`** (~15 lines)
+1. **Source-aware engine resolution** (~50 lines) — *the real integration point.* The default factory globs `Dataset{int}_*`; MOOSE folders carry arbitrary suffixes under MOOSE's models dir. Add a MOOSE `WeightsLayout` entry keyed by folder name + a source-aware factory in `run_named_task`.
 
-   nnU-Net's percentile-clip + rescale-to-[0,1] scheme. Used by some PET models. Just another branch in `apply_normalization`.
+2. **Nested-task cascade in `CascadeStep`** (~80 lines) — *doubly-motivated.* Both MOOSE cascades reference the crop model by name, same as TS's deferred `teeth`. Needs `CascadeStep.crop_from_task: str | None` and the workflow running that referenced task first. Also map MOOSE's richer `limit_fov` (intensity-range crop, `largest_component_only`) onto our crop primitives.
 
-3. **MOOSE `WeightsLayout` entry** (~30 lines)
+3. **`refresh_moose_registry.py` admin CLI** (~120 lines) — parallel to TS; `MODEL_METADATA` is a plain dict, so simpler. Emits `data/moose_tasks.json`.
 
-   MOOSE's folder layout matches nnU-Net's `nnUNet_results/...` convention with minor variations (the directory naming for fold checkpoints, sometimes flattened, sometimes wrapped in a MOOSE-specific top level). Need to verify against a real MOOSE install and either confirm the existing nnU-Net layout works as-is or add a MOOSE layout to the `WeightsLayout` registry.
+**Genuine unknowns — need a downloaded MOOSE model's `plans.json` to resolve:**
 
-4. **`MOOSE_TASKS` registry entries** (~50 lines + data)
+- **Normalization schemes.** We have CTNormalization / ZScoreNormalization / NoNormalization. If any model's `plans.json` uses `RescaleTo01Normalization` or `use_mask_for_norm`, add it (~15–30 lines each). PET/MR models are the likely culprits.
+- **Multi-channel PET-CT.** `clin_pt_fdg_*` / PUMA models report `modality="FDG-PET-CT"` → `expected_modalities=['FDG-PET','CT']` → genuine 2-channel input. Our public `predict` path is single-channel; the 22 CT-only models don't need this.
+- **RAS orientation.** Recent model URLs say `_ras_`. Likely handled by the plans transpose (our engine already round-trips), but confirm against a real model. Our `reorient(code)` primitive supports arbitrary targets if needed.
 
-   Same shape as `TS_TASKS` (0.9.1). Per-task descriptors with model paths, cascade dependencies, label remaps, organ-name lookups. Generated from MOOSE's `expected_modality.json` and `organ_indices.json` (their internal config files).
+**Recommended scope split:**
 
-5. **`use_mask_for_norm`** (~30 lines, optional)
-
-   For MR `preclin_mr_all` (rodent MR). ZScoreNormalization computed over the foreground mask only, not the full volume. Already on the roadmap as 0.11.0+; consider promoting if MR matters.
-
-**Total scope:** ~145 lines (excluding MR) or ~175 lines (with MR). Plus a verification pass on real MOOSE weights.
-
-**Why this is 0.9.2:** sits naturally after the TS registry (0.9.1) — same machinery, second consumer. Single-channel MOOSE tasks already work today via `cached_engine_from_folder` + `predict_with_resampling`; the registry + multi-channel path are the gap-closers for "full MOOSE replacement."
-
-**Coordination with 0.9.1:** the `TaskSpec` design from 0.9.1 should be MOOSE-aware from day one — extending the dataclass with an optional `modalities: list[str]` field for multi-channel tasks, and making the registry name-resolved across both TS and MOOSE rather than baking in a TS-only assumption. That way 0.9.2 is purely additive (new task entries, new weights layout, new norm scheme), not a redesign.
+- **MOOSE-CT-single parity** (~200 lines): items 1 + 3 + verify normalization on one downloaded CT model. Covers 20 of 25 models. Clean, shippable **0.9.3**.
+- **MOOSE cascades**: item 2 (also unblocks TS `teeth`). Separate, ~80 lines — **0.9.4**.
+- **MOOSE PET multi-channel**: deferred — only 2 models, heaviest change. Its own milestone if demand appears.
 
 ---
 
