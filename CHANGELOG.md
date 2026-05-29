@@ -2,9 +2,43 @@
 
 ## [0.9.2] - 2026-05-27
 
+### Added — source-qualified task names (anticipating multi-system registries)
+
+The registry now keys on `source:name` (e.g. `ts:total`, `moose:total`, `user:mytask`) so two model systems can ship a task with the same bare name without colliding. This is forward-prep for MOOSE support (0.9.3) — done now, while TS is the only source and there's nothing to migrate.
+
+- **`TaskSpec.qualified_name`** property → `"source:name"`.
+- **`get_task(name)`** accepts bare or qualified names. A bare name resolves when exactly one source defines it (the common case today); when multiple sources define it, it raises the new **`AmbiguousTaskError`** with the qualified alternatives. A qualified name (`"ts:total"`) always resolves directly.
+- **`register_task`** keys on the qualified name — `ts:total` and `moose:total` coexist; re-registering the *same* qualified name still needs `overwrite=True`.
+- **`unregister_task`** / **`run_named_task`** accept bare or qualified names with the same resolution rules.
+- **`list_registered_tasks(*, source=None)`** returns sorted qualified keys; pass `source` to filter to one system. **`list_tasks_by_modality`** likewise returns qualified keys.
+- **`TaskSpec.name`** may no longer contain `:` (reserved as the separator) — validated in `__post_init__`.
+
+`AmbiguousTaskError` is exported from the package root.
+
+### Added — `uv run`-native admin CLI for the registry (PEP 723)
+
+`scripts/refresh_ts_registry.py` is now a two-subcommand admin tool — the maintainer-side counterpart to the user-facing `mlxseg` CLI (which never needs TotalSegmentator). It declares its `totalsegmentator` dependency via a PEP 723 inline `# /// script` block, so `uv run` provisions TS in an ephemeral environment on demand. TS (and its torch stack) never enters the package's own dependency set.
+
+```bash
+# Regenerate the shipped registry in place
+uv run scripts/refresh_ts_registry.py generate --write
+
+# Or emit to stdout for inspection
+uv run scripts/refresh_ts_registry.py generate
+
+# Verify the committed JSON is in sync with the generator
+uv run scripts/refresh_ts_registry.py check
+```
+
+`check` exit codes are designed for CI automation (deferred): `0` in sync, `1` drift at the same TS version (regenerate), `2` committed file built against a different TS version than is currently resolved, `3` TS unimportable / file missing.
+
+The generator output is now **deterministic** — the wall-clock `generated` timestamp was removed from `_meta` (it made every run diff). `_meta.ts_version` records what the data was built from; git history records when it changed. Two runs at the same TS version are byte-identical, so `check` only reports a real change.
+
+Note: the "is the committed registry stale?" check is deliberately *not* a pytest — it requires provisioning the heavy TS/torch stack, which we keep out of the test environment. It lives in the admin CLI (`check`), to be wired into CI later. The unit suite validates the committed fixture's schema and content against our own code (`TestBuiltinRegistry`), which is the part that belongs there.
+
 ### Added — TS registry generator + 50 populated TS task entries
 
-`scripts/refresh_ts_registry.py` extracts task definitions from an installed `totalsegmentator` distribution and emits `src/nnunet_inference_mlx/data/ts_tasks.json`. The shipped JSON now contains 50 TS tasks (23 single, 24 cascade, 3 label-union), covering essentially the full TS v2.13.0 catalog.
+`scripts/refresh_ts_registry.py` extracts task definitions from a `totalsegmentator` distribution (provisioned via `uv run`, see above) and emits `src/nnunet_inference_mlx/data/ts_tasks.json`. The shipped JSON now contains 50 TS tasks (23 single, 24 cascade, 3 label-union), covering essentially the full TS v2.13.0 catalog.
 
 ### How the generator works
 
@@ -57,7 +91,7 @@ Now `run_named_task("total_fast", img)`, `run_named_task("lung_vessels", img)`, 
 
 ### Tests
 
-5 new tests in `test_tasks.py::TestBuiltinRegistry`. Total: **217 passing**, 1 skipped, full suite in ~75s.
+New `test_tasks.py` coverage: `TestBuiltinRegistry` (TS-catalog breadth + canonical task pins) and `TestCrossSourceConflicts` (8 tests for qualified-name resolution and `AmbiguousTaskError`). Total: **224 passing** (`-m "not slow"`), 1 skipped, 2 heavy benchmarks deselected by default. ~6.5s for the fast suite.
 
 - `test_ts_tasks_present` — assert ≥ 40 tasks registered (catches generator regression)
 - `test_canonical_ts_tasks_resolve` — verifies popular task names (`total`, `total_fast`, `body`, `lung_vessels`, …) are all registered with `source="ts"`

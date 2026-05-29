@@ -46,6 +46,7 @@ from .resampling import (
 from .postprocessing import remove_small_components
 from .preprocessing import resample_volume
 from .tasks import (
+    AmbiguousTaskError,
     CascadeStep,
     TaskSpec,
     UnionPart,
@@ -138,6 +139,7 @@ __all__ = [
     "run_label_union_workflow",
     "run_workflow",
     # Declarative task registry + named-task dispatcher
+    "AmbiguousTaskError",
     "CascadeStep",
     "TaskSpec",
     "UnionPart",

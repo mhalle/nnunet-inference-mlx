@@ -2,7 +2,6 @@
   "_meta": {
     "schema_version": 1,
     "ts_version": "2.13.0",
-    "generated": "2026-05-27",
     "generator": "scripts/refresh_ts_registry.py",
     "generator_version": 1,
     "task_count": 50

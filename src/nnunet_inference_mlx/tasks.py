@@ -190,6 +190,11 @@ class TaskSpec:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("TaskSpec.name must be non-empty")
+        if ":" in self.name:
+            raise ValueError(
+                f"TaskSpec.name must not contain ':' (reserved as the "
+                f"source qualifier separator, e.g. 'ts:total'); got {self.name!r}"
+            )
         if self.source not in _VALID_SOURCES:
             raise ValueError(
                 f"TaskSpec.source must be one of {_VALID_SOURCES}, "
@@ -245,6 +250,17 @@ class TaskSpec:
                 raise ValueError(
                     f"label_union must have at least 1 part, got {len(self.union)}"
                 )
+
+    @property
+    def qualified_name(self) -> str:
+        """The unambiguous ``"source:name"`` registry key for this task.
+
+        Two model systems can ship a task with the same bare ``name``
+        (e.g. TS and MOOSE both having ``"total"``); the qualifier keeps
+        them distinct. ``run_named_task`` / ``get_task`` accept either the
+        bare name (when unambiguous) or this qualified form.
+        """
+        return f"{self.source}:{self.name}"
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +374,20 @@ def _taskspec_to_dict(spec: TaskSpec) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# The registry is keyed by the *qualified* name ``"source:name"`` so that
+# two model systems (TS, MOOSE, user) can ship a task with the same bare
+# name without colliding. Lookups accept the bare name when it's
+# unambiguous and require the qualified form otherwise.
 _REGISTRY: dict[str, TaskSpec] = {}
 _BUILTIN_LOADED = False
+
+
+class AmbiguousTaskError(LookupError):
+    """Raised when a bare task name matches entries from multiple sources.
+
+    The caller must disambiguate with a ``"source:name"`` qualifier. The
+    error message lists the available qualified names.
+    """
 
 
 def _builtin_registry_path() -> Path:
@@ -383,62 +411,101 @@ def _load_builtin_registry() -> None:
     payload = json.loads(path.read_text())
     for entry in payload.get("tasks", []):
         spec = _taskspec_from_dict(entry)
-        _REGISTRY[spec.name] = spec
+        _REGISTRY[spec.qualified_name] = spec
 
 
-def register_task(spec: TaskSpec, *, overwrite: bool = False) -> None:
-    """Register a :class:`TaskSpec` under ``spec.name``.
+def _resolve_key(name: str) -> str:
+    """Resolve a bare or qualified task name to its registry key.
 
-    Raises ``ValueError`` if a task is already registered under the same
-    name unless ``overwrite=True``. Use this for user-defined tasks or to
-    add MOOSE entries before the native MOOSE-compat release (0.9.2).
+    * ``"source:name"`` → direct qualified lookup.
+    * ``"name"`` → bare lookup. Returns the single match, raises
+      :class:`AmbiguousTaskError` if multiple sources define it, or
+      ``KeyError`` if none do.
+
+    Assumes the builtin registry is already loaded.
     """
-    _load_builtin_registry()
-    if spec.name in _REGISTRY and not overwrite:
-        raise ValueError(
-            f"task {spec.name!r} already registered "
-            f"(source={_REGISTRY[spec.name].source!r}); "
-            f"pass overwrite=True to replace."
-        )
-    _REGISTRY[spec.name] = spec
+    if ":" in name:
+        if name not in _REGISTRY:
+            raise KeyError(
+                f"unknown task: {name!r}. "
+                f"Available: {sorted(_REGISTRY) or '(empty)'}"
+            )
+        return name
 
-
-def unregister_task(name: str) -> None:
-    """Remove a task from the registry. Raises ``KeyError`` if absent.
-
-    Useful in tests and when temporarily overriding a builtin task.
-    """
-    _load_builtin_registry()
-    if name not in _REGISTRY:
-        raise KeyError(f"unknown task: {name!r}")
-    del _REGISTRY[name]
-
-
-def get_task(name: str) -> TaskSpec:
-    """Look up a :class:`TaskSpec` by name.
-
-    Raises ``KeyError`` with a list of available task names if not found.
-    """
-    _load_builtin_registry()
-    if name not in _REGISTRY:
+    matches = [key for key, spec in _REGISTRY.items() if spec.name == name]
+    if not matches:
         raise KeyError(
             f"unknown task: {name!r}. "
             f"Available: {sorted(_REGISTRY) or '(empty)'}"
         )
-    return _REGISTRY[name]
+    if len(matches) > 1:
+        raise AmbiguousTaskError(
+            f"task name {name!r} is defined by multiple sources: "
+            f"{sorted(matches)}. Qualify it, e.g. {sorted(matches)[0]!r}."
+        )
+    return matches[0]
 
 
-def list_registered_tasks() -> list[str]:
-    """Return the sorted list of registered task names."""
+def register_task(spec: TaskSpec, *, overwrite: bool = False) -> None:
+    """Register a :class:`TaskSpec` under its qualified ``source:name`` key.
+
+    Tasks from different sources never collide (``ts:total`` and
+    ``moose:total`` coexist). Registering the *same* qualified name twice
+    raises ``ValueError`` unless ``overwrite=True``. Use this for
+    user-defined tasks or to add MOOSE entries before native MOOSE support.
+    """
     _load_builtin_registry()
-    return sorted(_REGISTRY)
+    key = spec.qualified_name
+    if key in _REGISTRY and not overwrite:
+        raise ValueError(
+            f"task {key!r} already registered; pass overwrite=True to replace."
+        )
+    _REGISTRY[key] = spec
+
+
+def unregister_task(name: str) -> None:
+    """Remove a task from the registry by bare or qualified name.
+
+    Raises ``KeyError`` if absent, :class:`AmbiguousTaskError` if a bare
+    name matches multiple sources. Useful in tests and when temporarily
+    overriding a builtin task.
+    """
+    _load_builtin_registry()
+    del _REGISTRY[_resolve_key(name)]
+
+
+def get_task(name: str) -> TaskSpec:
+    """Look up a :class:`TaskSpec` by bare or qualified name.
+
+    A bare name (``"total"``) resolves when exactly one source defines it.
+    When multiple sources define it, pass the qualified form
+    (``"ts:total"``); otherwise :class:`AmbiguousTaskError` is raised.
+    Raises ``KeyError`` with the available names if not found.
+    """
+    _load_builtin_registry()
+    return _REGISTRY[_resolve_key(name)]
+
+
+def list_registered_tasks(*, source: str | None = None) -> list[str]:
+    """Return sorted qualified (``source:name``) task keys.
+
+    Pass ``source`` to filter to one model system (``"ts"`` / ``"moose"``
+    / ``"user"``). Qualified keys are returned regardless so the result is
+    always unambiguous and directly usable with :func:`get_task`.
+    """
+    _load_builtin_registry()
+    keys = (
+        k for k, spec in _REGISTRY.items()
+        if source is None or spec.source == source
+    )
+    return sorted(keys)
 
 
 def list_tasks_by_modality(modality: str) -> list[str]:
-    """Return registered task names matching ``modality`` (``CT`` / ``MR`` / ``PET``)."""
+    """Return sorted qualified task keys matching ``modality`` (``CT`` / ``MR`` / ``PET``)."""
     _load_builtin_registry()
     return sorted(
-        name for name, spec in _REGISTRY.items() if spec.modality == modality
+        key for key, spec in _REGISTRY.items() if spec.modality == modality
     )
 
 
@@ -501,6 +568,9 @@ def run_named_task(
     ------
     KeyError
         If ``name`` is not registered.
+    AmbiguousTaskError
+        If ``name`` is a bare name defined by more than one source.
+        Qualify it as ``"source:name"`` (e.g. ``"ts:total"``).
     """
     from .resampling import predict_with_resampling
     from .workflow import (
@@ -517,9 +587,8 @@ def run_named_task(
 
     if verbose:
         print(
-            f"[run_named_task] {name} "
-            f"(source={spec.source}, modality={spec.modality}, "
-            f"shape={spec.shape})"
+            f"[run_named_task] {spec.qualified_name} "
+            f"(modality={spec.modality}, shape={spec.shape})"
         )
 
     if spec.shape == "single":
@@ -565,6 +634,7 @@ def run_named_task(
 
 
 __all__ = [
+    "AmbiguousTaskError",
     "CascadeStep",
     "TaskSpec",
     "UnionPart",

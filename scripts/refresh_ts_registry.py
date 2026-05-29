@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Generate src/nnunet_inference_mlx/data/ts_tasks.json from an installed TotalSegmentator.
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "totalsegmentator",
+# ]
+# ///
+"""Generate src/nnunet_inference_mlx/data/ts_tasks.json from TotalSegmentator.
 
 Strategy
 --------
@@ -31,24 +37,42 @@ Compared to a pure AST walk, this is:
 The audit confirming this is safe lives at the top of ``CHANGELOG.md`` for
 0.9.1.x; see also ``docs/post-0.8.2-roadmap.md``.
 
-Usage
------
-Run inside an environment that has TotalSegmentator installed::
+Admin CLI
+---------
+This is the maintainer-side admin tool for the TS task registry — separate
+from the user-facing ``mlxseg`` CLI (which never needs TotalSegmentator).
+It declares its TotalSegmentator dependency via PEP 723 inline metadata
+(the ``# /// script`` block above), so ``uv run`` provisions an ephemeral
+environment with TS on demand — no persistent install, no "is TS installed"
+question. TS (and its torch stack) never enters the package's own deps.
 
-    uv pip install --python /tmp/ts_audit/bin/python totalsegmentator
-    /tmp/ts_audit/bin/python scripts/refresh_ts_registry.py > \\
-        src/nnunet_inference_mlx/data/ts_tasks.json
-    git diff src/nnunet_inference_mlx/data/ts_tasks.json
+Two subcommands::
+
+    # Regenerate and write the shipped registry in place
+    uv run scripts/refresh_ts_registry.py generate --write
+
+    # Or emit to stdout (for inspection / manual redirection)
+    uv run scripts/refresh_ts_registry.py generate
+
+    # Verify the committed JSON matches the generator (for CI later).
+    # Exit 0 = in sync; 1 = drift at same TS version (regenerate!);
+    # 2 = TS version differs from what the committed file was built on.
+    uv run scripts/refresh_ts_registry.py check
+
+To pin or bump the TS version, edit the ``dependencies`` line in the PEP
+723 header (e.g. ``"totalsegmentator==2.13.0"``). The resolved version is
+recorded in the output's ``_meta.ts_version``.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import json
 import sys
 import textwrap
-from datetime import date
+from pathlib import Path
 from importlib.metadata import version
 from typing import Any, Iterable
 
@@ -467,11 +491,23 @@ def params_to_taskspec(
 
 
 # --------------------------------------------------------------------------
-# Main
+# Build the registry (the core work — needs TotalSegmentator)
 # --------------------------------------------------------------------------
 
 
-def main(out_stream=sys.stdout) -> None:
+# Canonical location of the shipped registry, relative to this script.
+_DATA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src" / "nnunet_inference_mlx" / "data" / "ts_tasks.json"
+)
+
+
+def _import_ts():
+    """Import the TS data structures, or exit with a helpful message.
+
+    The error path should be rare — this script is meant to run under
+    ``uv run``, which provisions TS from the PEP 723 header.
+    """
     try:
         import totalsegmentator.python_api as ts_api
         from totalsegmentator.map_to_binary import (
@@ -480,19 +516,32 @@ def main(out_stream=sys.stdout) -> None:
         )
     except ImportError as e:
         sys.stderr.write(
-            "ERROR: totalsegmentator is not installed in this Python.\n"
+            "ERROR: totalsegmentator is not importable.\n"
             f"  ({e})\n\n"
-            "Install with: uv pip install --python <python> totalsegmentator\n"
+            "Run this script via uv so the PEP 723 header provisions TS:\n"
+            "  uv run scripts/refresh_ts_registry.py <generate|check>\n"
         )
-        sys.exit(1)
+        sys.exit(3)
+    return (ts_api, class_map, class_map_5_parts,
+            map_taskid_to_partname_ct, map_taskid_to_partname_mr)
+
+
+def build_registry(*, log=lambda msg: None) -> dict:
+    """Build the full registry payload from the installed TS.
+
+    ``log`` is called with progress strings (the CLI wires it to stderr;
+    pass a no-op for silent operation). Returns the JSON-ready dict.
+    """
+    (ts_api, class_map, class_map_5_parts,
+     taskid_ct, taskid_mr) = _import_ts()
 
     ts_version = version("totalsegmentator")
-    print(f"  TS version: {ts_version}", file=sys.stderr)
-    print(f"  class_map: {len(class_map)} task names", file=sys.stderr)
+    log(f"  TS version: {ts_version}")
+    log(f"  class_map: {len(class_map)} task names")
 
     fn_src = inspect.getsource(ts_api.totalsegmentator)
     dispatch_src = extract_dispatch_block(fn_src)
-    print(f"  dispatch block: {dispatch_src.count(chr(10))} lines", file=sys.stderr)
+    log(f"  dispatch block: {dispatch_src.count(chr(10))} lines")
 
     tasks_json: list[dict] = []
     skipped: list[str] = []
@@ -506,40 +555,127 @@ def main(out_stream=sys.stdout) -> None:
         for variant_name, params in variants:
             spec = params_to_taskspec(
                 variant_name, params,
-                class_map, class_map_5_parts,
-                map_taskid_to_partname_ct, map_taskid_to_partname_mr,
+                class_map, class_map_5_parts, taskid_ct, taskid_mr,
             )
             if spec is not None:
                 tasks_json.append(spec)
 
-    print(
+    log(
         f"  emitted: {len(tasks_json)} task specs "
         f"({sum(1 for t in tasks_json if t['shape'] == 'single')} single, "
         f"{sum(1 for t in tasks_json if t['shape'] == 'cascade')} cascade, "
-        f"{sum(1 for t in tasks_json if t['shape'] == 'label_union')} label_union)",
-        file=sys.stderr,
+        f"{sum(1 for t in tasks_json if t['shape'] == 'label_union')} label_union)"
     )
     if skipped:
-        print(
+        log(
             f"  skipped (no dispatch branch): {len(skipped)}: "
-            f"{', '.join(skipped[:8])}{'...' if len(skipped) > 8 else ''}",
-            file=sys.stderr,
+            f"{', '.join(skipped[:8])}{'...' if len(skipped) > 8 else ''}"
         )
 
-    output = {
+    # NOTE: deliberately no wall-clock timestamp in the output. The file
+    # must be a deterministic function of (TS version, generator version)
+    # so that a "regenerate and diff" check only sees a change when the
+    # task data actually changed — not on every run. Git history records
+    # *when* the file changed; `ts_version` records *what* it was built from.
+    return {
         "_meta": {
             "schema_version": 1,
             "ts_version": ts_version,
-            "generated": str(date.today()),
             "generator": "scripts/refresh_ts_registry.py",
             "generator_version": 1,
             "task_count": len(tasks_json),
         },
         "tasks": tasks_json,
     }
-    json.dump(output, out_stream, indent=2)
-    out_stream.write("\n")
+
+
+def _dumps(payload: dict) -> str:
+    """Canonical JSON serialization (must match what `generate --write` writes)."""
+    return json.dumps(payload, indent=2) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Admin CLI: generate / check
+# --------------------------------------------------------------------------
+
+
+def _cmd_generate(args) -> int:
+    payload = build_registry(log=lambda m: print(m, file=sys.stderr))
+    text = _dumps(payload)
+    if args.write:
+        _DATA_PATH.write_text(text)
+        print(f"  wrote {_DATA_PATH}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _cmd_check(args) -> int:
+    """Compare the committed registry to a fresh generation.
+
+    Exit codes (designed for CI automation later):
+      0 — in sync
+      1 — drift at the SAME TS version (hand-edit or generator bug; regenerate)
+      2 — committed file built against a different TS version than is
+          currently resolved (refresh expected, not a code regression)
+      3 — TS not importable / committed file missing
+    """
+    if not _DATA_PATH.exists():
+        sys.stderr.write(f"ERROR: committed registry not found: {_DATA_PATH}\n")
+        return 3
+
+    committed = json.loads(_DATA_PATH.read_text())
+    regenerated = build_registry(log=lambda m: print(m, file=sys.stderr))
+
+    committed_ver = committed.get("_meta", {}).get("ts_version")
+    regen_ver = regenerated["_meta"]["ts_version"]
+
+    if committed_ver != regen_ver:
+        sys.stderr.write(
+            f"\nTS VERSION DRIFT: committed file built against "
+            f"{committed_ver}, currently resolved {regen_ver}.\n"
+            f"Refresh with: uv run {Path(__file__).name} generate --write\n"
+        )
+        return 2
+
+    if regenerated == committed:
+        print(f"\nIN SYNC (TS {regen_ver}, {regenerated['_meta']['task_count']} tasks).",
+              file=sys.stderr)
+        return 0
+
+    sys.stderr.write(
+        f"\nOUT OF SYNC at TS {regen_ver}: committed ts_tasks.json differs "
+        f"from generator output. Do not hand-edit; regenerate with:\n"
+        f"  uv run {Path(__file__).name} generate --write\n"
+    )
+    return 1
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="refresh_ts_registry.py",
+        description="Admin tool: (re)generate or verify the TS task registry JSON.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_gen = sub.add_parser(
+        "generate", help="regenerate the registry from the installed TS",
+    )
+    p_gen.add_argument(
+        "--write", action="store_true",
+        help=f"write in place to {_DATA_PATH.name} (default: print to stdout)",
+    )
+    p_gen.set_defaults(func=_cmd_generate)
+
+    p_check = sub.add_parser(
+        "check",
+        help="verify the committed registry matches the generator (CI-friendly exit codes)",
+    )
+    p_check.set_defaults(func=_cmd_check)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

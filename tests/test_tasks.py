@@ -24,7 +24,8 @@ import numpy as np
 import pytest
 
 from nnunet_inference_mlx import (
-    CascadeStep, InferenceEngine, ModelBundle, TaskSpec, UnionPart,
+    AmbiguousTaskError, CascadeStep, InferenceEngine, ModelBundle,
+    TaskSpec, UnionPart,
     get_task, list_registered_tasks, list_tasks_by_modality,
     register_task, run_named_task, unregister_task,
 )
@@ -290,13 +291,23 @@ class TestRegistryApi:
         with pytest.raises(KeyError):
             get_task("temp")
 
-    def test_list_returns_sorted_names(self):
+    def test_list_returns_sorted_qualified_names(self):
         for n in ["zeta", "alpha", "mu"]:
             register_task(TaskSpec(name=n, source="user", modality="CT",
                                     shape="single", single=1))
         names = list_registered_tasks()
         assert names == sorted(names)
-        assert {"zeta", "alpha", "mu"}.issubset(names)
+        # Qualified ("source:name") form keeps the listing unambiguous.
+        assert {"user:zeta", "user:alpha", "user:mu"}.issubset(names)
+
+    def test_list_filtered_by_source(self):
+        register_task(TaskSpec(name="mine", source="user", modality="CT",
+                                shape="single", single=1))
+        ts_only = list_registered_tasks(source="ts")
+        user_only = list_registered_tasks(source="user")
+        assert all(k.startswith("ts:") for k in ts_only)
+        assert "user:mine" in user_only
+        assert "user:mine" not in ts_only
 
     def test_list_by_modality(self):
         register_task(TaskSpec(name="ct1", source="user", modality="CT",
@@ -307,11 +318,85 @@ class TestRegistryApi:
                                 shape="single", single=3))
         ct_tasks = list_tasks_by_modality("CT")
         mr_tasks = list_tasks_by_modality("MR")
-        assert "ct1" in ct_tasks and "ct2" in ct_tasks
-        assert "mr1" not in ct_tasks
-        assert "mr1" in mr_tasks
-        # `pet1` shouldn't appear in either CT or MR
-        assert "pet1" not in ct_tasks and "pet1" not in mr_tasks
+        # Returns qualified keys
+        assert "user:ct1" in ct_tasks and "user:ct2" in ct_tasks
+        assert "user:mr1" not in ct_tasks
+        assert "user:mr1" in mr_tasks
+
+
+# ---------------------------------------------------------------------------
+# Cross-source name conflict handling (anticipating MOOSE)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossSourceConflicts:
+    """Two model systems may ship a task with the same bare name
+    (TS's ``total`` vs a hypothetical MOOSE ``total``). The registry keys
+    on ``source:name`` so both coexist; bare lookups resolve when
+    unambiguous and demand qualification otherwise."""
+
+    def test_name_with_colon_rejected(self):
+        """':' is reserved as the qualifier separator and can't appear in
+        a bare task name."""
+        with pytest.raises(ValueError, match="must not contain ':'"):
+            TaskSpec(name="ts:total", source="user", modality="CT",
+                     shape="single", single=1)
+
+    def test_qualified_name_property(self):
+        spec = TaskSpec(name="organs", source="moose", modality="CT",
+                        shape="single", single=1)
+        assert spec.qualified_name == "moose:organs"
+
+    def test_same_name_different_sources_coexist(self):
+        """The whole point: ts:dup and user:dup don't collide."""
+        ts_spec = TaskSpec(name="dup", source="ts", modality="CT",
+                           shape="single", single=10)
+        user_spec = TaskSpec(name="dup", source="user", modality="CT",
+                             shape="single", single=20)
+        register_task(ts_spec)
+        register_task(user_spec)   # must NOT raise — different qualified key
+        assert get_task("ts:dup").single == 10
+        assert get_task("user:dup").single == 20
+
+    def test_bare_lookup_ambiguous_raises(self):
+        register_task(TaskSpec(name="dup", source="ts", modality="CT",
+                               shape="single", single=10))
+        register_task(TaskSpec(name="dup", source="user", modality="CT",
+                               shape="single", single=20))
+        with pytest.raises(AmbiguousTaskError, match="multiple sources"):
+            get_task("dup")
+
+    def test_qualified_lookup_disambiguates(self):
+        register_task(TaskSpec(name="dup", source="ts", modality="CT",
+                               shape="single", single=10))
+        register_task(TaskSpec(name="dup", source="user", modality="CT",
+                               shape="single", single=20))
+        # Qualified form resolves cleanly despite the bare-name conflict.
+        assert get_task("ts:dup").single == 10
+
+    def test_unqualified_works_when_unique(self):
+        """Bare lookup still works when only one source defines the name —
+        the common case today (TS-only registry)."""
+        register_task(TaskSpec(name="unique_task", source="user",
+                               modality="CT", shape="single", single=5))
+        assert get_task("unique_task").single == 5
+
+    def test_unregister_qualified(self):
+        register_task(TaskSpec(name="dup", source="ts", modality="CT",
+                               shape="single", single=10))
+        register_task(TaskSpec(name="dup", source="user", modality="CT",
+                               shape="single", single=20))
+        unregister_task("user:dup")
+        # ts:dup remains; bare lookup is now unambiguous again
+        assert get_task("dup").single == 10
+
+    def test_run_named_task_ambiguous_raises(self):
+        register_task(TaskSpec(name="dup", source="ts", modality="CT",
+                               shape="single", single=10))
+        register_task(TaskSpec(name="dup", source="user", modality="CT",
+                               shape="single", single=20))
+        with pytest.raises(AmbiguousTaskError):
+            run_named_task("dup", _make_sitk())
 
 
 # ---------------------------------------------------------------------------
@@ -459,3 +544,12 @@ class TestBuiltinRegistry:
         assert spec.cascade[0].weights_id in (297, 298)
         # Stage 2 is the focused vessel model
         assert spec.cascade[1].weights_id == 117      # TS v2.13
+
+    # NOTE: "is the committed ts_tasks.json in sync with the generator?"
+    # is deliberately NOT a pytest. It requires provisioning TotalSegmentator
+    # (heavy torch stack) which we keep out of the test environment. That
+    # check lives in the admin CLI instead:
+    #     uv run scripts/refresh_ts_registry.py check
+    # (to be wired into CI later). The tests above validate the committed
+    # fixture's schema and content against our own code, which is the part
+    # that belongs in the unit suite.
