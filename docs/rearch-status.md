@@ -163,6 +163,19 @@ Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
   + `test_imageio.test_int16_source_becomes_float32_volume`. The synthetic oracle
   missed this because its volumes were already float32 — real int16 CT was the
   first input to expose it.
+- **Full `total` task (5-part label_union, 1.5mm) validated on real weights:** new
+  `segment → _segment_union` (per-part `model.segment` + `labels.remap_labels`/
+  `paint_union`) vs old `run_label_union_workflow`, same engines → **bit-identical**
+  float-vs-float (0/11.6M differ); 99.9875% vs old-int16 (1448 boundary voxels, label
+  sets identical — the float decision doesn't compound across parts). *This run also
+  uncovered the `build_model` config bug fixed above.*
+- **Per-part reorient is NOT a perf concern (measured).** The new union reorients per
+  part (~10 reorients: 5×forward+5×back) vs the old once-at-boundary (2). On a
+  256×178×255 CT, reorient = 6.3ms (fwd) / 4.0ms (back), so the extra ~8 reorients ≈
+  **~40ms** (+~40ms mx↔sitk) out of ~290s = 0.03%, below run-to-run noise (old passes
+  varied 4.8s on identical work). **Decision: keep the clean per-part composition.**
+  Lever if ever needed (huge volumes / many parts): reorient once to LPS, run parts
+  with `reorient_to=None`, paint in canonical, reorient unified result back once.
 - Caveat — **`step_size`/`use_mirroring` are threaded but not yet truly free**:
   `infer.sliding_window` applies them by temporarily overriding the loaded model's
   `engine.sliding_window` for the call (save/set/restore). The real fix (baking
