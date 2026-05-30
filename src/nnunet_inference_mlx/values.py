@@ -335,24 +335,25 @@ class RestorePlan:
 
 
 # ---------------------------------------------------------------------------
-# EngineOptions — the build-knob tail (frozen, hashable → cache key)
+# BuildOptions — what determines the built model (frozen, hashable → cache key)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class EngineOptions:
-    """Build-time knobs that affect engine *state* (and thus cache identity).
+class BuildOptions:
+    """Knobs that determine *what model gets built* — and thus its cache identity.
 
-    Hashable so it can key the model store's loaded-engine cache. Deliberately
-    excludes ``verbose`` / ``progress`` — those are call-time display flags
-    that must not participate in identity.
+    Hashable so it keys the model store's loaded-model cache. Holds only the
+    build-identity fields: a different value here means a genuinely different
+    compiled model. Deliberately **excludes** run-behavior knobs (``step_size``,
+    ``use_mirroring``) — those change how you *run* a model, not what's built,
+    so they're per-call arguments to ``segment`` / the infer step, not part of
+    the cache key. (Also excludes ``verbose`` / ``progress`` — display flags.)
     """
 
     configuration: str | None = None
     folds: tuple[int, ...] | Literal["all"] = "all"
-    step_size: float = 0.5
     batch_size: int | None = None
-    use_mirroring: bool = False
     compile: bool = True
     dtype: str | None = None
 
@@ -369,5 +370,5 @@ __all__ = [
     "Segmentation",
     "Probabilities",
     "RestorePlan",
-    "EngineOptions",
+    "BuildOptions",
 ]

@@ -130,7 +130,7 @@ Each capability's home:
 - `LabelSchema` — int↔name, plus region definitions + paint priority (sigmoid models).
 - `ModelData` — `config` + `schema` + `fold_weights` (MLX arrays) + `provenance`.
   **No GPU state.** Output of IO; input to `build_model`.
-- `EngineOptions` — the build knob tail (folds, step_size, batch_size, mirroring,
+- `BuildOptions` — the build knob tail (folds, step_size, batch_size, mirroring,
   compile, dtype), frozen & hashable → doubles as the store's cache key.
 
 Channels-last because the MLX port is channels-last end-to-end. SITK stays the
@@ -195,7 +195,7 @@ in a `medseg`-style namespace, get it green, then migrate `run_named_task`
 callers and **delete** the old surface. Each phase is shippable and tested.
 
 - **Phase 1 — value types** (`types`): Geometry, Volume, Segmentation,
-  Probabilities, RestorePlan, LabelSchema, EngineOptions. No deps. ← *start here*
+  Probabilities, RestorePlan, LabelSchema, BuildOptions. No deps. ← *start here*
 - **Phase 2 — ModelData + ModelStore**: pure artifact; read-through store
   (format×location, download/load layers, memory budget, the readiness verbs,
   free, context manager). Synthetic-tree tests (no real weights).

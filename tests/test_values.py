@@ -2,7 +2,7 @@
 
 Pure values — no GPU, no IO. Verify construction, validation, derived
 properties, the with_* copy methods, channel selection, schema parsing
-(standard + region), and EngineOptions hashability.
+(standard + region), and BuildOptions hashability.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import mlx.core as mx
 import pytest
 
 from nnunet_inference_mlx.values import (
-    EngineOptions,
+    BuildOptions,
     Geometry,
     LabelSchema,
     Probabilities,
@@ -184,11 +184,11 @@ class TestSegmentationProbabilities:
 
 
 # ---------------------------------------------------------------------------
-# RestorePlan / EngineOptions
+# RestorePlan / BuildOptions
 # ---------------------------------------------------------------------------
 
 
-class TestRestorePlanEngineOptions:
+class TestRestorePlanBuildOptions:
     def test_restore_plan_is_a_value(self):
         g = _geom()
         plan = RestorePlan(
@@ -198,18 +198,25 @@ class TestRestorePlanEngineOptions:
         assert plan.source_geometry is g
         assert plan.axis_permutation == (0, 1, 2)
 
-    def test_engine_options_hashable(self):
-        a = EngineOptions(folds=(0, 1), step_size=0.5)
-        b = EngineOptions(folds=[0, 1], step_size=0.5)
+    def test_build_options_hashable(self):
+        a = BuildOptions(folds=(0, 1), configuration="3d_fullres")
+        b = BuildOptions(folds=[0, 1], configuration="3d_fullres")
         assert a == b
         assert hash(a) == hash(b)
         assert len({a, b}) == 1
 
-    def test_engine_options_folds_all(self):
-        o = EngineOptions()
+    def test_build_options_folds_all(self):
+        o = BuildOptions()
         assert o.folds == "all"
         assert hash(o)  # hashable
 
-    def test_engine_options_distinct_keys(self):
-        assert EngineOptions(step_size=0.5) != EngineOptions(step_size=0.3)
-        assert hash(EngineOptions(folds=(0,))) != hash(EngineOptions(folds=(0, 1)))
+    def test_build_options_distinct_keys(self):
+        assert BuildOptions(configuration="a") != BuildOptions(configuration="b")
+        assert hash(BuildOptions(folds=(0,))) != hash(BuildOptions(folds=(0, 1)))
+
+    def test_build_options_has_no_run_knobs(self):
+        # step_size / use_mirroring are run-time, not build identity — they
+        # must NOT be on BuildOptions (else they'd wrongly force rebuilds).
+        o = BuildOptions()
+        assert not hasattr(o, "step_size")
+        assert not hasattr(o, "use_mirroring")

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Callable, Hashable, Iterable, Sequence
 
 from .model_data import ModelData
-from .values import EngineOptions
+from .values import BuildOptions
 
 
 # Visible default memory budget for resident models (MB). NOT RAM-detected —
@@ -131,7 +131,7 @@ def _default_read(folder, *, folds="all", dtype=None, ecosystem="local", id=None
                                  ecosystem=ecosystem, id=id)
 
 
-def _default_build(model_data: ModelData, options: EngineOptions):
+def _default_build(model_data: ModelData, options: BuildOptions):
     from .build import build_model  # phase 3
     return build_model(model_data, options)
 
@@ -156,7 +156,9 @@ class ModelStore:
         Budget for resident (loaded) models; LRU-evicted to fit. Visible
         default, never RAM-detected.
     options :
-        Default :class:`EngineOptions` for builds (folds, step_size, ...).
+        Default :class:`BuildOptions` (the cache key: configuration, folds,
+        batch_size, compile, dtype). Run knobs (step_size, mirroring) are
+        per-call, not part of build identity.
     read, build :
         Injectable transforms (folder→ModelData, ModelData→LoadedModel).
         Default to the real ones; tests pass fakes.
@@ -168,7 +170,7 @@ class ModelStore:
         *,
         model_root_dir: str | os.PathLike | None = None,
         max_memory_mb: float = DEFAULT_MAX_MEMORY_MB,
-        options: EngineOptions = EngineOptions(),
+        options: BuildOptions = BuildOptions(),
         read: Callable | None = None,
         build: Callable | None = None,
     ):
@@ -241,7 +243,7 @@ class ModelStore:
                 pass
 
     # ----- hot (memory) layer -----
-    def load(self, ids, *, options: EngineOptions | None = None):
+    def load(self, ids, *, options: BuildOptions | None = None):
         """Build (or reuse) the loaded model(s) for ``ids`` and keep them resident.
 
         Single id → one :class:`~nnunet_inference_mlx.build.LoadedModel`; an

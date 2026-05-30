@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .model_data import ModelData
-from .values import EngineOptions, LabelSchema, Segmentation, Volume
+from .values import BuildOptions, LabelSchema, Segmentation, Volume
 
 if TYPE_CHECKING:
     from .engine import InferenceEngine
@@ -97,11 +97,21 @@ class LoadedModel:
 
 def build_model(
     model_data: ModelData,
-    options: EngineOptions = EngineOptions(),
+    options: BuildOptions = BuildOptions(),
+    *,
+    step_size: float = 0.5,
+    use_mirroring: bool = False,
 ) -> LoadedModel:
     """Compile :class:`ModelData` into a runnable :class:`LoadedModel`.
 
     The single allocation point for GPU state in the toolkit.
+
+    ``options`` (:class:`BuildOptions`) holds the build-identity knobs (and is
+    the model store's cache key). ``step_size`` / ``use_mirroring`` are
+    *run* knobs — they don't change what's built, so they're plain kwargs here
+    (not part of identity). They're applied at construction for now because the
+    current engine bakes them; once the engine internals are rehomed they move
+    to per-call ``segment`` arguments.
     """
     from .engine import InferenceEngine, ModelBundle
 
@@ -115,10 +125,10 @@ def build_model(
     engine = InferenceEngine(
         bundle,
         configuration=options.configuration,
-        step_size=options.step_size,
+        step_size=step_size,
         compile=options.compile,
         batch_size=options.batch_size,
-        use_mirroring=options.use_mirroring,
+        use_mirroring=use_mirroring,
         verbose=False,
     )
     # Resident footprint ≈ weights across folds (the dominant term).
