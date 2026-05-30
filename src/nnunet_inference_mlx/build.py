@@ -2,14 +2,16 @@
 
 ``build_model(model_data, options)`` compiles a :class:`ModelData` into a
 :class:`LoadedModel`: the runnable form of a model, with weights resident and
-the network compiled. ``LoadedModel`` exposes ``.segment(volume)`` (and the
-metadata views), plus ``.memory_mb`` and ``.close()`` so a :class:`ModelStore`
-can size and free it.
+the network compiled. ``LoadedModel`` exposes ``.predict(volume)`` /
+``.segment(volume)`` (and the metadata views), plus ``.memory_mb`` and
+``.close()`` so a :class:`ModelStore` can size and free it.
 
-During migration the heavy lifting (sliding window, normalization, transpose
-+ orientation, fold ensemble, region/argmax, resampling) is reused from the
-proven ``InferenceEngine`` + ``predict_with_resampling`` path; at cutover that
-internal machinery is rehomed under here and the old facade is removed.
+``predict`` / ``segment`` compose the toolkit stages —
+``preprocess.to_model_frame → infer.sliding_window`` (→ ``postprocess.restore``
+for ``segment``) — so the single-model path *is* the decomposed pipeline. The
+compute core (sliding window, normalization, transpose, fold ensemble,
+region/argmax) still lives in ``InferenceEngine``; at the Phase 5 cutover that
+machinery is rehomed under ``infer`` and the old facade is removed.
 """
 
 from __future__ import annotations
@@ -57,6 +59,8 @@ class LoadedModel:
         *,
         reorient_to: str | None = "LPS",
         interpolation: str = "linear",
+        step_size: float = 0.5,
+        use_mirroring: bool = False,
     ) -> Prediction:
         """Per-class model output at the model's native (training) spacing.
 
@@ -65,64 +69,63 @@ class LoadedModel:
         Stops *before* the inverse resample back to the input grid (the lossy
         trip), so a caller can branch on the raw K-channel surface: uncertainty
         maps, multi-model arithmetic, custom thresholding, the sub-voxel logit
-        render. ``segment`` is this plus to-labels plus restore.
+        render. ``segment`` is this plus restore.
 
-        ``activation`` records what the values are: ``"logits"`` for a single
-        fold; ``"softmax"`` (standard) or ``"sigmoid"`` (region) for a
-        fold-ensembled model.
+        Composed from the toolkit stages: ``preprocess.to_model_frame`` then
+        ``infer.sliding_window``. ``activation`` records what the values are:
+        ``"logits"`` for a single fold; ``"softmax"`` (standard) or
+        ``"sigmoid"`` (region) for a fold-ensembled model.
         """
         if self._engine is None:
             raise RuntimeError("LoadedModel has been closed")
-        import numpy as np
-        from .imageio import _require_sitk, geometry_from_sitk, volume_to_sitk
-        from .resampling import reorient as _reorient, resample_image_to_target
+        from .infer import sliding_window
+        from .preprocess import to_model_frame
 
-        sitk = _require_sitk()
-        img = volume_to_sitk(volume)
-        if reorient_to is not None:
-            img = _reorient(img, reorient_to)
-        resampled = resample_image_to_target(
-            img, self.model_data.target_spacing_zyx, interpolation=interpolation,
+        model_vol, _plan = to_model_frame(
+            volume, self.model_data,
+            reorient_to=reorient_to, interpolation=interpolation,
         )
-        vol_target = sitk.GetArrayFromImage(resampled).astype(np.float32, copy=False)
-        logits = self._engine.predict_logits(vol_target)        # (K, Zt, Yt, Xt)
-        if self.model_data.num_folds > 1:
-            activation = "sigmoid" if self.schema.is_region_model else "softmax"
-        else:
-            activation = "logits"
-        return Prediction(
-            data=logits,
-            geometry=geometry_from_sitk(resampled),
-            schema=self.schema,
-            activation=activation,
-        )
+        return sliding_window(self, model_vol,
+                              step_size=step_size, use_mirroring=use_mirroring)
 
     def segment(
         self,
         volume: Volume,
         *,
         reorient_to: str | None = "LPS",
+        interpolation: str = "linear",
         peak_working_memory_mb: int | None = None,
         remove_small_components_mm3: float = 0.0,
+        step_size: float = 0.5,
+        use_mirroring: bool = False,
     ) -> Segmentation:
         """Segment a single-channel :class:`Volume` → :class:`Segmentation`.
 
-        Reuses the full forward-resample → infer → inverse-resample path with
-        orientation/transpose handling; the result is in the input's geometry.
+        The full pipeline, composed from the toolkit stages:
+        ``to_model_frame → sliding_window → restore`` (logits are resampled
+        back to the caller's grid, then argmax/paint — higher quality than
+        argmax-then-resample). The result is in the input's geometry.
         """
         if self._engine is None:
             raise RuntimeError("LoadedModel has been closed")
-        from .imageio import sitk_to_segmentation, volume_to_sitk
-        from .resampling import predict_with_resampling
+        from .infer import sliding_window
+        from .postprocess import drop_small_components, restore
+        from .preprocess import to_model_frame
 
-        seg_sitk = predict_with_resampling(
-            self._engine,
-            volume_to_sitk(volume),
-            reorient_to=reorient_to,
-            peak_working_memory_mb=peak_working_memory_mb,
-            remove_small_components_mm3=remove_small_components_mm3,
+        model_vol, plan = to_model_frame(
+            volume, self.model_data,
+            reorient_to=reorient_to, interpolation=interpolation,
         )
-        return sitk_to_segmentation(seg_sitk, self.schema)
+        prediction = sliding_window(self, model_vol,
+                                    step_size=step_size, use_mirroring=use_mirroring)
+        segmentation = restore(prediction, plan,
+                               peak_working_memory_mb=peak_working_memory_mb)
+        if remove_small_components_mm3 > 0:
+            segmentation = drop_small_components(
+                segmentation, min_volume_mm3=remove_small_components_mm3,
+                in_place=True,
+            )
+        return segmentation
 
     # ----- lifecycle -----
     def close(self) -> None:

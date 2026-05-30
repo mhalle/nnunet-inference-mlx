@@ -9,17 +9,18 @@ same verb for a single already-loaded model.
 * **cascade**  → coarse → crop FOV → fine → paste
 * **label_union** → run parts → remap → paint by priority
 
-The recipe layer (``TaskSpec``/``TaskCatalog``) and the cascade/union
-*orchestration* (``run_workflow`` / ``run_label_union_workflow``) are reused
-from the proven implementation during migration — bridged here via the store's
-loaded models and ``Volume``↔SITK conversion. At cutover the orchestration is
-re-expressed over the decomposed ``Volume``-native stage namespaces (phase 3b)
-and the old workflow module is folded in.
+All three shapes are expressed over the toolkit stages — ``LoadedModel.segment``
+(itself ``to_model_frame → sliding_window → restore``), the Volume-native
+``geometry`` ops (``bbox_of_labels``/``crop``/``paste``), and the ``labels``
+primitives (``remap_labels``/``paint_union``). No bridge to the old SITK
+``run_workflow``/``run_label_union_workflow``.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from .tasks import TaskSpec
 from .values import LabelSchema, Segmentation, Volume
@@ -52,6 +53,7 @@ def segment(
                               peak_working_memory_mb=peak_working_memory_mb)
     if spec.shape == "cascade":
         return _segment_cascade(spec, image, store, catalog,
+                              reorient_to=reorient_to,
                               peak_working_memory_mb=peak_working_memory_mb)
     if spec.shape == "label_union":
         return _segment_union(spec, image, store,
@@ -111,41 +113,86 @@ def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb) 
                          peak_working_memory_mb=peak_working_memory_mb)
 
 
-def _segment_cascade(spec, image, store, catalog, *, peak_working_memory_mb) -> Segmentation:
-    from .imageio import sitk_to_segmentation, volume_to_sitk
-    from .workflow import Stage, run_workflow
+def _segment_cascade(spec, image, store, catalog, *, reorient_to,
+                     peak_working_memory_mb) -> Segmentation:
+    """coarse → crop FOV around target classes → fine → paste into full grid.
+
+    Each stage runs the proven single-model pipeline (``model.segment``, which
+    reorients to canonical internally), so its output is in the *current*
+    input's grid. The foreground bbox of ``crop_to_classes`` in that output
+    crops the next stage's input; the final stage's output is pasted back into
+    the original grid. Crop/paste stay in the caller's orientation throughout.
+    """
+    from .geometry import Box, bbox_of_labels, crop, paste
 
     descriptors = _flatten_cascade(spec, catalog, store)
-    stages = [
-        Stage(
-            engine=store.load(wid)._engine,
-            crop_to_classes=crop,
-            dilation_mm=dil,
-            peak_working_memory_mb=peak_working_memory_mb,
-        )
-        for (wid, crop, dil) in descriptors
-    ]
-    seg_sitk = run_workflow(volume_to_sitk(image), stages)
-    return sitk_to_segmentation(seg_sitk, _schema(spec))
+    schema = _schema(spec)
+
+    current = image
+    cumulative = Box.full(image.geometry.shape_zyx)
+    final_seg: Segmentation | None = None
+
+    for i, (wid, crop_classes, dilation) in enumerate(descriptors):
+        model = store.load(wid)
+        seg = model.segment(current, reorient_to=reorient_to,
+                            peak_working_memory_mb=peak_working_memory_mb)
+        if i == len(descriptors) - 1:
+            final_seg = seg
+            break
+        if crop_classes is None:
+            continue
+        box = bbox_of_labels(seg, classes=tuple(crop_classes), dilation_mm=dilation)
+        if box is None:
+            continue   # target class absent — leave FOV unchanged
+        current = crop(current, box)
+        cumulative = cumulative.compose(box)
+
+    assert final_seg is not None
+    # Re-label the final output with the cascade's unified schema, then place
+    # it back in the original grid if any stage cropped.
+    final_seg = Segmentation(data=final_seg.data, geometry=final_seg.geometry,
+                             schema=schema)
+    if cumulative.shape_zyx == image.geometry.shape_zyx:
+        return final_seg   # no crop happened — already in the original grid
+    return paste(final_seg, image.geometry, cumulative)
 
 
 def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
-    from .imageio import sitk_to_segmentation, volume_to_sitk
-    from .workflow import ParallelStage, run_label_union_workflow
+    """Run each part independently, remap into the unified space, paint by priority.
 
-    stages = [
-        ParallelStage(
-            engine=store.load(part.weights_id)._engine,
-            label_remap=dict(part.label_remap),
-            part_name=part.name,
-        )
-        for part in spec.union
-    ]
-    seg_sitk = run_label_union_workflow(
-        volume_to_sitk(image), stages,
-        reorient_to=reorient_to, peak_working_memory_mb=peak_working_memory_mb,
-    )
-    return sitk_to_segmentation(seg_sitk, _schema(spec))
+    Parts share the same input; later parts overwrite earlier ones at
+    overlapping voxels (``paint_union``). Each part's ``model.segment`` returns
+    a segmentation in the input's grid, so the remapped arrays line up for the
+    paint without any further resampling.
+    """
+    import mlx.core as mx
+
+    from .labels import paint_union, remap_labels
+
+    schema = _schema(spec)
+
+    # Unified dtype: smallest uint fitting every remap target across parts.
+    max_target = 0
+    for part in spec.union:
+        if part.label_remap:
+            max_target = max(max_target, max(int(v) for v in part.label_remap.values()))
+    if max_target <= np.iinfo(np.uint8).max:
+        out_dtype = np.dtype(np.uint8)
+    elif max_target <= np.iinfo(np.uint16).max:
+        out_dtype = np.dtype(np.uint16)
+    else:
+        out_dtype = np.dtype(np.uint32)
+
+    unified = np.zeros(image.geometry.shape_zyx, dtype=out_dtype)
+    for part in spec.union:
+        model = store.load(part.weights_id)
+        seg = model.segment(image, reorient_to=reorient_to,
+                           peak_working_memory_mb=peak_working_memory_mb)
+        remapped = remap_labels(np.asarray(seg.data), dict(part.label_remap),
+                                out_dtype=out_dtype)
+        paint_union(unified, remapped)
+
+    return Segmentation(data=mx.array(unified), geometry=image.geometry, schema=schema)
 
 
 __all__ = ["segment"]
