@@ -15,7 +15,7 @@ import pytest
 from nnunet_inference_mlx.build import LoadedModel, build_model
 from nnunet_inference_mlx.model_data import ModelData
 from nnunet_inference_mlx.plans import build_network_from_plans
-from nnunet_inference_mlx.values import Geometry, Volume
+from nnunet_inference_mlx.values import Geometry, Prediction, Volume
 
 sitk = pytest.importorskip("SimpleITK")
 
@@ -79,6 +79,16 @@ class TestBuildModel:
         vol = _volume((24, 24, 24))
         seg = m.segment(vol)
         assert seg.geometry.spacing_zyx == (1.0, 1.0, 1.0)
+
+    def test_predict_returns_prediction_at_target_spacing(self):
+        # logits are first-class: predict() stops at the model's native output
+        m = build_model(_make_model_data())
+        pred = m.predict(_volume((24, 24, 24)))      # input 1.0mm; target 1.5mm
+        assert isinstance(pred, Prediction)
+        assert pred.num_classes == 3
+        assert pred.activation == "logits"           # single fold → raw logits
+        assert pred.geometry.spacing_zyx == (1.5, 1.5, 1.5)
+        assert pred.data.ndim == 4                   # (K, Z, Y, X)
 
     def test_close_releases_and_blocks_use(self):
         m = build_model(_make_model_data())

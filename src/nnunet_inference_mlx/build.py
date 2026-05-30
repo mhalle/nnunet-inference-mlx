@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .model_data import ModelData
-from .values import BuildOptions, LabelSchema, Segmentation, Volume
+from .values import BuildOptions, LabelSchema, Prediction, Segmentation, Volume
 
 if TYPE_CHECKING:
     from .engine import InferenceEngine
@@ -51,6 +51,52 @@ class LoadedModel:
         return self._memory_mb
 
     # ----- run -----
+    def predict(
+        self,
+        volume: Volume,
+        *,
+        reorient_to: str | None = "LPS",
+        interpolation: str = "linear",
+    ) -> Prediction:
+        """Per-class model output at the model's native (training) spacing.
+
+        Logits have been first-class since the engine's ``predict_logits``
+        primitive — this surfaces them as a :class:`Prediction` value.
+        Stops *before* the inverse resample back to the input grid (the lossy
+        trip), so a caller can branch on the raw K-channel surface: uncertainty
+        maps, multi-model arithmetic, custom thresholding, the sub-voxel logit
+        render. ``segment`` is this plus to-labels plus restore.
+
+        ``activation`` records what the values are: ``"logits"`` for a single
+        fold; ``"softmax"`` (standard) or ``"sigmoid"`` (region) for a
+        fold-ensembled model.
+        """
+        if self._engine is None:
+            raise RuntimeError("LoadedModel has been closed")
+        import numpy as np
+        from .imageio import _require_sitk, geometry_from_sitk, volume_to_sitk
+        from .resampling import reorient as _reorient, resample_image_to_target
+
+        sitk = _require_sitk()
+        img = volume_to_sitk(volume)
+        if reorient_to is not None:
+            img = _reorient(img, reorient_to)
+        resampled = resample_image_to_target(
+            img, self.model_data.target_spacing_zyx, interpolation=interpolation,
+        )
+        vol_target = sitk.GetArrayFromImage(resampled).astype(np.float32, copy=False)
+        logits = self._engine.predict_logits(vol_target)        # (K, Zt, Yt, Xt)
+        if self.model_data.num_folds > 1:
+            activation = "sigmoid" if self.schema.is_region_model else "softmax"
+        else:
+            activation = "logits"
+        return Prediction(
+            data=logits,
+            geometry=geometry_from_sitk(resampled),
+            schema=self.schema,
+            activation=activation,
+        )
+
     def segment(
         self,
         volume: Volume,

@@ -18,7 +18,7 @@ Conventions
   these types stay backend-free.
 
 Array-carrying types use ``eq=False``: MLX arrays don't define scalar
-equality, and we never compare images by value. ``EngineOptions`` and
+equality, and we never compare images by value. ``BuildOptions`` and
 ``Geometry`` hold only scalars/tuples, so they are fully frozen-hashable and
 usable as cache keys.
 """
@@ -280,7 +280,7 @@ class Segmentation:
 
 
 @dataclass(frozen=True, eq=False)
-class Probabilities:
+class Prediction:
     """Per-class continuous output at a geometry.
 
     ``data`` is ``(K, Z, Y, X)`` float32. ``activation`` records what the
@@ -295,12 +295,12 @@ class Probabilities:
     def __post_init__(self) -> None:
         if self.data.ndim != 4:
             raise ValueError(
-                f"Probabilities.data must be 4-D (K, Z, Y, X); got ndim={self.data.ndim}"
+                f"Prediction.data must be 4-D (K, Z, Y, X); got ndim={self.data.ndim}"
             )
         k, z, y, x = self.data.shape
         if (int(z), int(y), int(x)) != self.geometry.shape_zyx:
             raise ValueError(
-                f"Probabilities spatial shape {(z, y, x)} != geometry.shape_zyx "
+                f"Prediction spatial shape {(z, y, x)} != geometry.shape_zyx "
                 f"{self.geometry.shape_zyx}"
             )
 
@@ -368,7 +368,7 @@ __all__ = [
     "LabelSchema",
     "Volume",
     "Segmentation",
-    "Probabilities",
+    "Prediction",
     "RestorePlan",
     "BuildOptions",
 ]

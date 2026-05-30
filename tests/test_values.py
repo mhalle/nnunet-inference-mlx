@@ -14,7 +14,7 @@ from nnunet_inference_mlx.values import (
     BuildOptions,
     Geometry,
     LabelSchema,
-    Probabilities,
+    Prediction,
     Region,
     RestorePlan,
     Segmentation,
@@ -154,11 +154,11 @@ class TestVolume:
 
 
 # ---------------------------------------------------------------------------
-# Segmentation / Probabilities
+# Segmentation / Prediction
 # ---------------------------------------------------------------------------
 
 
-class TestSegmentationProbabilities:
+class TestSegmentationPrediction:
     def test_segmentation(self):
         s = LabelSchema(names={0: "background", 1: "liver"})
         seg = Segmentation(data=mx.zeros((8, 8, 8), dtype=mx.uint8),
@@ -172,7 +172,7 @@ class TestSegmentationProbabilities:
 
     def test_probabilities(self):
         s = LabelSchema(names={0: "bg", 1: "a", 2: "b"})
-        p = Probabilities(data=mx.zeros((3, 8, 8, 8)), geometry=_geom(),
+        p = Prediction(data=mx.zeros((3, 8, 8, 8)), geometry=_geom(),
                           schema=s, activation="softmax")
         assert p.num_classes == 3
         assert p.activation == "softmax"
@@ -180,7 +180,7 @@ class TestSegmentationProbabilities:
     def test_probabilities_requires_4d(self):
         s = LabelSchema(names={0: "bg"})
         with pytest.raises(ValueError, match="4-D"):
-            Probabilities(data=mx.zeros((8, 8, 8)), geometry=_geom(), schema=s)
+            Prediction(data=mx.zeros((8, 8, 8)), geometry=_geom(), schema=s)
 
 
 # ---------------------------------------------------------------------------

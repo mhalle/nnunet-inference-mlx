@@ -96,7 +96,7 @@ with ModelStore(...) as store: ...       # unload_all() on exit; downloads kept
 ```
 L5  segment(task, image, store=…)                          one call; fans out over the task's ids
 L4  TaskCatalog / recipes (SingleModel/Cascade/Union)  name→recipe; compose; refs resolved at load
-L3  preprocess.* | infer.* | postprocess.* | geometry  pure fns over Volume/Probabilities/Segmentation
+L3  preprocess.* | infer.* | postprocess.* | geometry  pure fns over Volume/Prediction/Segmentation
 L2  build_model(model_data, opts) -> LoadedModel       the only GPU allocation (one place)
 L1  ModelStore (read-through: load/download)            id→model; readiness; bounded; freeable
 L0  ModelData (frozen) | Volume (frozen)            pure data: weights+config | image+geometry
@@ -110,7 +110,7 @@ Each capability's home:
 | image from NIfTI/DICOM/array, in-memory | L0 readers (`NiftiReader`, …) |
 | build ~600 MB compute; reuse; free | L1/L2 `build_model` + the store's memory layer |
 | reorient/permute/resample/normalize (+inverse) | L3 `preprocess.*` + `RestorePlan` + `postprocess.restore` |
-| sliding window, Gaussian, mirroring, fold ensemble, region sigmoid | L3 `infer.sliding_window` → `Probabilities` |
+| sliding window, Gaussian, mirroring, fold ensemble, region sigmoid | L3 `infer.sliding_window` → `Prediction` |
 | argmax vs region-paint; subvoxel inverse; small-component drop | L3 `postprocess.*` |
 | cascade (crop FOV → fine → paste) | L4 `Cascade` + L3 geometry crop/paste |
 | label-union (remap + paint priority) | L4 `LabelUnion` + L3 `remap_labels`/`paint_priority` |
@@ -124,7 +124,7 @@ Each capability's home:
 - `Geometry` — spacing_zyx, direction (cosines), origin, shape. Array order ZYX.
 - `Volume` — `data: mx.array` channels-last `(Z, Y, X, C)`, `geometry`, `channels`.
 - `Segmentation` — integer label `data (Z,Y,X)`, `geometry`, `schema`.
-- `Probabilities` — `data (K,Z,Y,X)` float, `geometry`, `schema`, `activation`.
+- `Prediction` — `data (K,Z,Y,X)` float, `geometry`, `schema`, `activation`.
 - `RestorePlan` — original geometry + orientation + axis-permutation; the inverse
   recipe, **returned** from preprocess (never hidden), consumed by `postprocess.restore`.
 - `LabelSchema` — int↔name, plus region definitions + paint priority (sigmoid models).
@@ -195,7 +195,7 @@ in a `medseg`-style namespace, get it green, then migrate `run_named_task`
 callers and **delete** the old surface. Each phase is shippable and tested.
 
 - **Phase 1 — value types** (`types`): Geometry, Volume, Segmentation,
-  Probabilities, RestorePlan, LabelSchema, BuildOptions. No deps. ← *start here*
+  Prediction, RestorePlan, LabelSchema, BuildOptions. No deps. ← *start here*
 - **Phase 2 — ModelData + ModelStore**: pure artifact; read-through store
   (format×location, download/load layers, memory budget, the readiness verbs,
   free, context manager). Synthetic-tree tests (no real weights).
