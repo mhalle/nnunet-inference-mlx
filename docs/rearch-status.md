@@ -183,9 +183,43 @@ Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
 
 ## What's NEXT
 
-### Phase 5 — cutover + delete old surface (task #23)
-- Wire the new API into `__init__.py` (export `TaskCatalog`, `ModelStore`, `segment`,
-  `predict`?, `build_model`, `LoadedModel`, `ModelData`, value types, readers/writers).
+### Phase 5 — cutover + delete old surface (task #23) — IN PROGRESS
+- **5a DONE** (`<commit>`): new API wired into `__init__.py` additively — `TaskCatalog`,
+  `ModelStore`, `segment`, `build_model`, `LoadedModel`, `ModelData`, value types,
+  readers/writers, and the `preprocess`/`infer`/`postprocess`/`geometry` namespaces.
+  Legacy surface kept alongside; removed per-module in 5b–5e. Both paths import; 347 green.
+
+**Confirmed importer map (who still uses the old surface at runtime):**
+- `engine_cache` → imported only by `tasks.run_named_task` (lazy) + `__init__`.
+- `tasks` registry/`run_named_task` → used only by `__init__` (catalog reuses just
+  `TaskSpec`/`_taskspec_from_dict`/`AmbiguousTaskError`, no global).
+- `workflow` + `resampling.predict_with_resampling` → used only by `tasks.run_named_task`
+  (lazy) + `__init__` (all other matches are docstrings). New path uses neither.
+- `WeightsLayout`/`discover_weights`/`from_folder`/`from_dataset`/`from_task` → `engine.py`,
+  `engine_cache.py`, and `model_data.read_folder` (delegates to `from_folder`).
+
+**Remaining ordered steps (each its own green commit):**
+- **5b** — relocate `ModelBundle.from_folder` folder-reading into `ModelData.read_folder`
+  (stop delegating). No test deletion; keeps `from_folder` until 5e.
+- **5c+5d** — delete the two hidden globals together (coupled): `engine_cache.py` whole +
+  `tasks.py` registry (`_REGISTRY`/`_load_builtin_registry`/`_resolve_key`/`register_task`/
+  `unregister_task`/`get_task`/`list_registered_tasks`/`list_tasks_by_modality`/
+  `_resolve_cascade_descriptors`/`_default_engine_factory`/`run_named_task`). KEEP
+  `TaskSpec`/`CascadeStep`/`UnionPart`/`WeightsId`/`_coerce_weights_id`/`_taskspec_from_dict`/
+  `_taskspec_to_dict`/`AmbiguousTaskError`. Remove their `__init__` exports. **Tests:** delete
+  `test_engine_cache.py`; split `test_tasks.py` → keep TaskSpec-validation/JSON-round-trip/
+  string-id-parsing (~3 classes) as `test_recipe.py`, drop registry/dispatch/moose-resolution
+  classes (`TestMooseEngineResolution`, the `run_named_task` dispatch tests, registry tests).
+- **5e** — delete `workflow.py` + `resampling.predict_with_resampling` + `engine.py`
+  `WeightsLayout`/`_WEIGHTS_LAYOUTS`/`register_weights_layout`/`discover_weights`/
+  `_find_model_folder`/`ModelBundle.from_folder`/`from_dataset`/`from_task`. Remove `__init__`
+  exports. **Tests:** delete `test_workflow.py`, `test_label_union_workflow.py`,
+  `test_predict_with_resampling_scheme.py`, `test_weights_layout*.py`; retire the
+  `predict_with_resampling` oracle assert in `test_decompose.py` (keep the rest).
+- **5f** (optional) — rehome `step_size`/`use_mirroring` into the per-call sliding-window so
+  `infer.sliding_window` drops the temporary engine-attr override.
+
+(Original detail retained below.)
 - Move `ModelBundle.from_folder` folder-reading orchestration INTO
   `ModelData.read_folder` (it currently delegates to `ModelBundle`); then delete:
   - `engine_cache.py` globals: `_CACHE`, `cache_enabled`, `get_cached_engine`,
