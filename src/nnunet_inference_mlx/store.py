@@ -11,16 +11,16 @@ Two layers, one object (a read-through stack):
 
 * **disk** (downloaded / cold) — model files under ``model_root_dir``.
   Verbs: ``download`` / ``delete_downloads`` / ``downloaded``.
-* **memory** (loaded / hot) — built engines, bounded by ``max_memory_mb``
-  (LRU-evicted to fit). Verbs: ``load`` / ``unload`` / ``loaded``.
+* **memory** (loaded / hot) — built ``LoadedModel`` s, bounded by
+  ``max_memory_mb`` (LRU-evicted to fit). Verbs: ``load`` / ``unload`` / ``loaded``.
 
-``get(id)`` returns a cold :class:`ModelData` (no GPU). ``load(id)``
-returns a hot engine, building on miss and caching it. "engine" is the
-internal name for a loaded model; the user vocabulary is models + readiness.
+``get(id)`` returns cold :class:`ModelData` (config + weights, no GPU).
+``load(id)`` returns a hot ``LoadedModel``, building on miss and caching it.
+The whole vocabulary is models + readiness; nothing user-facing is an "engine".
 
-The two transforms — read (folder → artifact) and build (artifact → engine) —
-are injectable, so the store's mechanics are testable without real weights or
-a GPU.
+The two transforms — read (folder → ModelData) and build (ModelData →
+LoadedModel) — are injectable, so the store's mechanics are testable without
+real weights or a GPU.
 """
 
 from __future__ import annotations
@@ -31,11 +31,11 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Hashable, Iterable, Sequence
 
-from .model_data import ModelData, Provenance
+from .model_data import ModelData
 from .values import EngineOptions
 
 
-# Visible default memory budget for resident engines (MB). NOT RAM-detected —
+# Visible default memory budget for resident models (MB). NOT RAM-detected —
 # an explicit constant you can see and override.
 DEFAULT_MAX_MEMORY_MB = 4000
 
@@ -122,17 +122,18 @@ def _resolve_model_root_dir(ecosystem: str, explicit) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Default transforms (read / build)
+# Default transforms (read folder → ModelData; build ModelData → LoadedModel)
 # ---------------------------------------------------------------------------
 
 
-def _default_read(folder, *, folds="all", dtype=None, provenance=None) -> ModelData:
-    return ModelData.read_folder(folder, folds=folds, dtype=dtype, provenance=provenance)
+def _default_read(folder, *, folds="all", dtype=None, ecosystem="local", id=None) -> ModelData:
+    return ModelData.read_folder(folder, folds=folds, dtype=dtype,
+                                 ecosystem=ecosystem, id=id)
 
 
-def _default_build(artifact: ModelData, options: EngineOptions):
-    from .build import build_engine  # phase 3
-    return build_engine(artifact, options)
+def _default_build(model_data: ModelData, options: EngineOptions):
+    from .build import build_model  # phase 3
+    return build_model(model_data, options)
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +153,13 @@ class ModelStore:
         Local root holding the model folders. ``None`` → resolve from the
         ecosystem's env var(s) then built-in default (precedence is explicit).
     max_memory_mb :
-        Budget for resident (loaded) engines; LRU-evicted to fit. Visible
+        Budget for resident (loaded) models; LRU-evicted to fit. Visible
         default, never RAM-detected.
     options :
         Default :class:`EngineOptions` for builds (folds, step_size, ...).
     read, build :
-        Injectable transforms (folder→artifact, artifact→engine). Default to
-        the real ones; tests pass fakes.
+        Injectable transforms (folder→ModelData, ModelData→LoadedModel).
+        Default to the real ones; tests pass fakes.
     """
 
     def __init__(
@@ -185,7 +186,7 @@ class ModelStore:
         self._resolve_folder = resolve
         self._model_dir = model_dir
         self._list_downloaded = downloaded
-        self._engines: "OrderedDict[Hashable, object]" = OrderedDict()
+        self._loaded: "OrderedDict[Hashable, object]" = OrderedDict()
 
     # ----- root -----
     def _require_root(self) -> Path:
@@ -200,11 +201,10 @@ class ModelStore:
     # ----- cold (disk) layer -----
     def get(self, id, *, folds=None, dtype=None) -> ModelData:
         """Read a cold :class:`ModelData` for ``id`` (no GPU). Reads the
-        folder fresh each call; the artifact is not retained."""
+        folder fresh each call; the data is not retained."""
         folder = self._resolve_folder(self._require_root(), id)
-        prov = Provenance(ecosystem=self.ecosystem, id=id)
         return self._read(folder, folds=folds if folds is not None else "all",
-                          dtype=dtype, provenance=prov)
+                          dtype=dtype, ecosystem=self.ecosystem, id=id)
 
     def downloaded(self) -> list:
         """Ids whose model files are present on disk."""
@@ -242,10 +242,10 @@ class ModelStore:
 
     # ----- hot (memory) layer -----
     def load(self, ids, *, options: EngineOptions | None = None):
-        """Build (or reuse) the engine(s) for ``ids`` and keep them resident.
+        """Build (or reuse) the loaded model(s) for ``ids`` and keep them resident.
 
-        Single id → one engine; an iterable → a list. LRU-evicts other engines
-        to fit ``max_memory_mb``.
+        Single id → one :class:`~nnunet_inference_mlx.build.LoadedModel`; an
+        iterable → a list. LRU-evicts others to fit ``max_memory_mb``.
         """
         if _is_single(ids):
             return self._load_one(ids, options)
@@ -254,40 +254,40 @@ class ModelStore:
     def _load_one(self, id, options):
         opts = options or self.options
         key = (id, opts)
-        if key in self._engines:
-            self._engines.move_to_end(key)
-            return self._engines[key]
-        artifact = self.get(id, folds=opts.folds if opts.folds != "all" else None)
-        engine = self._build(artifact, opts)
-        self._engines[key] = engine
+        if key in self._loaded:
+            self._loaded.move_to_end(key)
+            return self._loaded[key]
+        model_data = self.get(id, folds=opts.folds if opts.folds != "all" else None)
+        loaded = self._build(model_data, opts)
+        self._loaded[key] = loaded
         self._evict_to_fit()
-        return engine
+        return loaded
 
     def _evict_to_fit(self) -> None:
         # Evict oldest first; never evict the most-recently-added (it's at the
-        # end). A single engine larger than the budget degrades to no-reuse.
-        while len(self._engines) > 1 and self.loaded_mb > self.max_memory_mb:
-            _, victim = self._engines.popitem(last=False)
+        # end). A single model larger than the budget degrades to no-reuse.
+        while len(self._loaded) > 1 and self.loaded_mb > self.max_memory_mb:
+            _, victim = self._loaded.popitem(last=False)
             _close(victim)
 
     def loaded(self) -> list[tuple]:
-        """``[(id, memory_mb), ...]`` for resident engines (LRU order)."""
-        return [(key[0], _mb(eng)) for key, eng in self._engines.items()]
+        """``[(id, memory_mb), ...]`` for resident loaded models (LRU order)."""
+        return [(key[0], _mb(m)) for key, m in self._loaded.items()]
 
     @property
     def loaded_mb(self) -> float:
-        return sum(_mb(eng) for eng in self._engines.values())
+        return sum(_mb(m) for m in self._loaded.values())
 
     def unload(self, ids) -> None:
         """Free the memory held by ``ids`` (download kept). No-op if absent."""
         wanted = set(_as_list(ids))
-        for key in [k for k in self._engines if k[0] in wanted]:
-            _close(self._engines.pop(key))
+        for key in [k for k in self._loaded if k[0] in wanted]:
+            _close(self._loaded.pop(key))
 
     def unload_all(self) -> None:
-        for eng in self._engines.values():
-            _close(eng)
-        self._engines.clear()
+        for m in self._loaded.values():
+            _close(m)
+        self._loaded.clear()
 
     # ----- lifecycle / inspection -----
     def __enter__(self) -> "ModelStore":
@@ -297,13 +297,13 @@ class ModelStore:
         self.unload_all()
 
     def __len__(self) -> int:
-        return len(self._engines)
+        return len(self._loaded)
 
     def __repr__(self) -> str:
         return (
             f"ModelStore(ecosystem={self.ecosystem!r}, "
             f"model_root_dir={str(self.model_root_dir)!r}, "
-            f"max_memory_mb={self.max_memory_mb}, loaded={len(self._engines)})"
+            f"max_memory_mb={self.max_memory_mb}, loaded={len(self._loaded)})"
         )
 
 
@@ -320,12 +320,12 @@ def _as_list(ids) -> list:
     return [ids] if _is_single(ids) else list(ids)
 
 
-def _mb(engine) -> float:
-    return float(getattr(engine, "memory_mb", 0.0))
+def _mb(model) -> float:
+    return float(getattr(model, "memory_mb", 0.0))
 
 
-def _close(engine) -> None:
-    close = getattr(engine, "close", None)
+def _close(model) -> None:
+    close = getattr(model, "close", None)
     if callable(close):
         close()
 

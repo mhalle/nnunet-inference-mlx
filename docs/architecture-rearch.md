@@ -97,7 +97,7 @@ with ModelStore(...) as store: ...       # unload_all() on exit; downloads kept
 L5  run(task, image, store=…)                          one call; fans out over the task's ids
 L4  TaskCatalog / recipes (SingleModel/Cascade/Union)  name→recipe; compose; refs resolved at load
 L3  preprocess.* | infer.* | postprocess.* | geometry  pure fns over Volume/Probabilities/Segmentation
-L2  build_engine(artifact, opts) -> CompiledModel       the only GPU allocation (one place)
+L2  build_model(model_data, opts) -> LoadedModel       the only GPU allocation (one place)
 L1  ModelStore (read-through: load/download)            id→model; readiness; bounded; freeable
 L0  ModelData (frozen) | Volume (frozen)            pure data: weights+config | image+geometry
 ```
@@ -108,7 +108,7 @@ Each capability's home:
 |---|---|
 | read ckpt (torch-free) → MLX arrays; per-ecosystem packaging | L1 source plug-ins → `ModelData` |
 | image from NIfTI/DICOM/array, in-memory | L0 readers (`NiftiReader`, …) |
-| build ~600 MB compute; reuse; free | L1/L2 `build_engine` + the store's memory layer |
+| build ~600 MB compute; reuse; free | L1/L2 `build_model` + the store's memory layer |
 | reorient/permute/resample/normalize (+inverse) | L3 `preprocess.*` + `RestorePlan` + `postprocess.restore` |
 | sliding window, Gaussian, mirroring, fold ensemble, region sigmoid | L3 `infer.sliding_window` → `Probabilities` |
 | argmax vs region-paint; subvoxel inverse; small-component drop | L3 `postprocess.*` |
@@ -129,7 +129,7 @@ Each capability's home:
   recipe, **returned** from preprocess (never hidden), consumed by `postprocess.restore`.
 - `LabelSchema` — int↔name, plus region definitions + paint priority (sigmoid models).
 - `ModelData` — `config` + `schema` + `fold_weights` (MLX arrays) + `provenance`.
-  **No GPU state.** Output of IO; input to `build_engine`.
+  **No GPU state.** Output of IO; input to `build_model`.
 - `EngineOptions` — the build knob tail (folds, step_size, batch_size, mirroring,
   compile, dtype), frozen & hashable → doubles as the store's cache key.
 

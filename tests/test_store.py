@@ -18,7 +18,7 @@ from nnunet_inference_mlx.store import ModelStore, _resolve_model_root_dir
 # ---------------------------------------------------------------------------
 
 
-class FakeEngine:
+class FakeLoadedModel:
     def __init__(self, id, memory_mb):
         self.id = id
         self.memory_mb = memory_mb
@@ -52,7 +52,7 @@ def _store(root, sizes, *, max_memory_mb=10_000, build_calls=None):
     def fake_build(artifact, opts):
         if build_calls is not None:
             build_calls.append(artifact)
-        return FakeEngine(artifact, sizes.get(artifact, 100.0))
+        return FakeLoadedModel(artifact, sizes.get(artifact, 100.0))
     return ModelStore("nnunet", model_root_dir=root, max_memory_mb=max_memory_mb,
                       read=_fake_read_nnunet, build=fake_build)
 
@@ -240,7 +240,7 @@ class TestMooseEcosystem:
         def fake_read(folder, **kw):
             return folder.parent.name   # the MOOSE folder name
         def fake_build(artifact, opts):
-            return FakeEngine(artifact, sizes.get(artifact, 100.0))
+            return FakeLoadedModel(artifact, sizes.get(artifact, 100.0))
         return ModelStore("moose", model_root_dir=root,
                           read=fake_read, build=fake_build)
 

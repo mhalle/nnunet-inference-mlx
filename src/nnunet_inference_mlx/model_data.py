@@ -23,15 +23,6 @@ import mlx.core as mx
 from .values import LabelSchema
 
 
-@dataclass(frozen=True)
-class Provenance:
-    """Where an artifact came from — for display, logging, and cache identity."""
-
-    ecosystem: str            # "nnunet" | "totalsegmentator" | "moose" | "local" | ...
-    id: int | str             # dataset id / folder name / path
-    version: str | None = None
-
-
 @dataclass(frozen=True, eq=False)
 class ModelData:
     """Parsed model data with no GPU state.
@@ -42,8 +33,10 @@ class ModelData:
         Parsed ``plans.json`` / ``dataset.json``.
     fold_weights :
         One ``{param_name: mx.array}`` dict per cross-validation fold.
-    provenance :
-        Where it came from.
+    ecosystem, id, version :
+        Where it came from — ecosystem (``"totalsegmentator"`` / ``"moose"``
+        / ``"local"`` / …), the id within that ecosystem (dataset id or
+        folder name), and an optional version string. For display/logging.
     configuration :
         Which entry of ``plans["configurations"]`` to use. ``None`` → resolve
         to ``"3d_fullres"`` if present, else the first.
@@ -52,7 +45,9 @@ class ModelData:
     plans: Mapping
     dataset: Mapping
     fold_weights: tuple[Mapping[str, mx.array], ...]
-    provenance: Provenance
+    ecosystem: str = "local"
+    id: int | str = ""
+    version: str | None = None
     configuration: str | None = None
 
     # ----- label schema -----
@@ -139,10 +134,12 @@ class ModelData:
         *,
         folds: int | "list[int]" | str = "all",
         dtype: str | None = None,
-        provenance: Provenance | None = None,
+        ecosystem: str = "local",
+        id: int | str | None = None,
+        version: str | None = None,
     ) -> "ModelData":
-        """Read a model config folder (``{trainer}__{plans}__{config}``) into an
-        artifact.
+        """Read a model config folder (``{trainer}__{plans}__{config}``) into
+        :class:`ModelData`.
 
         During migration this delegates to the proven folder reader; at cutover
         the orchestration moves here and the old reader is deleted.
@@ -155,8 +152,10 @@ class ModelData:
             plans=bundle.plans,
             dataset=bundle.dataset,
             fold_weights=tuple(bundle.fold_weights),
-            provenance=provenance or Provenance(ecosystem="local", id=str(folder)),
+            ecosystem=ecosystem,
+            id=id if id is not None else str(folder),
+            version=version,
         )
 
 
-__all__ = ["ModelData", "Provenance"]
+__all__ = ["ModelData"]
