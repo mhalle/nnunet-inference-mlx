@@ -1,7 +1,8 @@
 # Rearchitecture — status & handoff
 
-**Branch:** `feature/medseg-rearch` (off `main`). **Tests:** 326 passed, 1 skipped,
-2 deselected (`uv run pytest -m "not slow"`, ~7s). All work committed.
+**Branch:** `feature/medseg-rearch` (off `main`). **Tests:** 344 passed, 1 skipped,
+2 deselected (`uv run pytest -m "not slow"`, ~7s). All work committed. **Phase 3b
+is done** (decomposition); only **Phase 5** (cutover/delete) remains.
 
 Read `docs/architecture-rearch.md` for the full target design + rationale. This
 file is the *where-we-are / what's-next* handoff.
@@ -27,6 +28,10 @@ the Phase 5 cutover — deliberately avoiding two public surfaces mid-migration)
 b1facf9 phase 4: TaskCatalog (explicit, no global) + run()
 540b9b8 rename run() -> segment()
 6fef99f Probabilities -> Prediction; add LoadedModel.predict (logits first-class)
+dc13f26 status/handoff doc
+56f8ef6 phase 3b: Volume-native geometry namespace (Box/bbox_of_labels/crop/paste)
+76d5f11 phase 3b: preprocess/infer/postprocess namespaces + RestorePlan refit
+0fb0e9a phase 3b: re-express segment/cascade/union over namespaces (drop workflow bridge)
 ```
 (`main` also has unpushed `bdf216d` = MOOSE engine resolution + nested cascade,
 the 0.9.3 groundwork, plus the 0.9.0–0.9.2 line; tags v0.9.0/v0.9.1/v0.9.2 are
@@ -88,11 +93,14 @@ image   = NiftiReader().read("ct.nii.gz")            # or DicomReader / ArrayRea
 seg     = segment("total_fast", image, store=store, catalog=catalog)
 NiftiWriter().write("seg.nii.gz", seg)
 ```
-Single dispatches natively (`store.load(id).segment`); **cascade & union bridge to
-the proven `run_workflow`/`run_label_union_workflow`** via `store.load(id)._engine`
-+ Volume↔SITK (the migration seam). Nested `crop_from_task` cascades resolve
-through the catalog. All exercised with synthetic models (real build, no real
-weights, no GPU needed beyond MLX) + SITK.
+All three shapes are expressed over the toolkit stages (Phase 3b): single =
+`LoadedModel.segment` (itself `to_model_frame → sliding_window → restore`);
+**cascade** = `model.segment` per stage + `geometry.bbox_of_labels/crop/paste`;
+**union** = `model.segment` per part + `labels.remap_labels/paint_union`. No more
+bridge to `run_workflow`/`run_label_union_workflow` — they're untouched by the new
+path and deleted at Phase 5. Nested `crop_from_task` cascades resolve through the
+catalog. All exercised with synthetic models (real build, no real weights, no GPU
+needed beyond MLX) + SITK.
 
 ## Module ↔ test map (all committed, green)
 
@@ -100,10 +108,14 @@ weights, no GPU needed beyond MLX) + SITK.
 |---|---|---|
 | `values.py` | `test_values.py` (26) | done |
 | `model_data.py` + `store.py` | `test_store.py` (25) | done |
-| `build.py` (`build_model`/`LoadedModel`/`predict`/`segment`) | `test_build.py` | done (spine) |
+| `build.py` (`build_model`/`LoadedModel`/`predict`/`segment` — compose namespaces) | `test_build.py` | done |
 | `imageio.py` (Geometry↔SITK, Nifti/Dicom/Array readers, writer) | `test_imageio.py` | done |
 | `catalog.py` (`TaskCatalog`) | `test_catalog.py` | done |
-| `segment.py` (`segment()` dispatch) | `test_segment.py` | done |
+| `segment.py` (`segment()` dispatch; cascade/union over namespaces) | `test_segment.py` | done |
+| `geometry.py` (`Box`/`bbox_of_labels`/`crop`/`paste`, Volume-native) | `test_geometry.py` (12) | done (3b) |
+| `preprocess.py` (`reorient`/`resample`/`to_model_frame`) | `test_decompose.py` | done (3b) |
+| `infer.py` (`sliding_window` → `Prediction`) | `test_decompose.py` | done (3b) |
+| `postprocess.py` (`to_labels`/`restore`/`drop_small_components`) | `test_decompose.py` (regression oracle) | done (3b) |
 
 ## Hidden globals eliminated
 
@@ -112,30 +124,38 @@ weights, no GPU needed beyond MLX) + SITK.
 - old module-global task `_REGISTRY` (in `tasks.py`) → owned `TaskCatalog`. **Old one
   still exists** — deleted at cutover.
 
-## What's NEXT
+## Phase 3b — DONE (decomposition into Volume-native pure-fn namespaces)
 
-### Phase 3b — decompose compute into Volume-native pure-fn namespaces (task #24)
-The careful one (touches the geometry glue that has historically caused bugs:
-orientation, transpose, resample, region/argmax, sub-voxel inverse).
-- `preprocess`: `reorient`/`permute_axes`/`resample`/`normalize` over `Volume`,
-  plus `to_model_frame(volume, model_data) -> (Volume, RestorePlan)`.
-- `infer`: `sliding_window(loaded_model, volume) -> Prediction` (already have
-  `LoadedModel.predict` returning a `Prediction` at training spacing — extend so it
-  *also* yields/accepts a `RestorePlan` for the inverse).
-- `postprocess`: `to_labels(prediction) -> Segmentation` (argmax / region-paint),
-  `resample_prediction`/`restore(result, plan) -> Segmentation` (inverse-resample,
-  incl. sub-voxel logit path), `drop_small_components`.
-- geometry: `bbox_of_labels(seg, labels, margin_mm) -> Box`, `crop(volume, box)`,
-  `paste(canvas, patch, box)` — Volume/Segmentation-native (the old workflow.py
-  versions are SITK/numpy).
-- Then **re-express `segment` as `predict → to_labels → restore`**, and **re-express
-  cascade/union over these namespaces** so `segment.py` stops bridging to the old
-  `run_workflow`/`run_label_union_workflow`. Make `step_size`/`use_mirroring`
-  true per-call args to `infer` (they're baked at engine construction today; this
-  is the rehome that frees them — see build.py TODO).
-- Reuse the existing proven primitives in `resampling.py` (`resample_image_to_target`,
-  `inverse_resample_argmax`/`inverse_resample_paint`, `reorient`, `get_orientation`)
-  and `preprocessing.py` (normalization) — wrap them Volume-native, don't rewrite.
+The careful one (touches the geometry glue that has historically caused bugs).
+Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
+- `geometry.py`: `Box`, `bbox_of_labels(seg, classes, dilation_mm)`,
+  `crop(volume, box)` (shifts world origin to the cropped corner — validated
+  against SITK `RegionOfInterest` incl. oblique directions), `paste(patch,
+  canvas_geometry, box)`.
+- `preprocess.py`: `reorient(volume, code)`, `resample(volume, spacing)`,
+  `to_model_frame(volume, model_data) -> (Volume, RestorePlan)` (reorient to
+  canonical + resample to model spacing).
+- `infer.py`: `sliding_window(loaded_model, volume, *, step_size, use_mirroring)
+  -> Prediction`. The engine normalizes + transposes internally, so neither
+  `to_model_frame` nor the `RestorePlan` touch axis permutation.
+- `postprocess.py`: `to_labels(prediction)` (same-grid argmax/paint),
+  `restore(prediction, plan)` (inverse-resample logits to source grid,
+  scheme-aware, then reorient back — the high-quality logit-resample path),
+  `drop_small_components`.
+- `LoadedModel.predict/segment` now compose these; cascade re-expressed over
+  `geometry`, union over `labels` — **no `workflow` bridge on the new path**.
+- `RestorePlan` refit: dropped unused `axis_permutation`; added
+  `inference_geometry` / `inference_orientation`.
+- **Regression oracle** (`test_decompose.py`): `to_model_frame → sliding_window
+  → restore` is asserted *bit-identical* to the old fused `predict_with_resampling`
+  for both a canonical (LPS) and a reoriented (RAS) volume. This is the safety net
+  that let the geometry glue be restructured without behavior drift.
+- Caveat — **`step_size`/`use_mirroring` are threaded but not yet truly free**:
+  `infer.sliding_window` applies them by temporarily overriding the loaded model's
+  `engine.sliding_window` for the call (save/set/restore). The real fix (baking
+  removed) is the engine rehome in Phase 5.
+
+## What's NEXT
 
 ### Phase 5 — cutover + delete old surface (task #23)
 - Wire the new API into `__init__.py` (export `TaskCatalog`, `ModelStore`, `segment`,
@@ -152,12 +172,20 @@ orientation, transpose, resample, region/argmax, sub-voxel inverse).
     `run_named_task`, etc.) — `TaskSpec`/`CascadeStep`/`UnionPart`/`_taskspec_from_dict`/
     `AmbiguousTaskError` SURVIVE (reused by catalog.py); decide whether to rename
     `TaskSpec`→a recipe name or keep.
-  - update the old tests that exercise deleted symbols.
+  - `workflow.py` (`Bbox`/`Stage`/`ParallelStage`/`run_workflow`/`run_label_union_workflow`/
+    `compute_fg_bbox`/`crop_image`/`paste_segmentation`) and `resampling.predict_with_resampling`:
+    **no longer used by the new path** (3b replaced them with `geometry`/`preprocess`/
+    `postprocess`). Decide at cutover: delete, or keep as a public SITK-level convenience.
+    Keep the lower-level `resampling` primitives (`resample_image_to_target`,
+    `inverse_resample_*`, `reorient`, `get_orientation`) — the new namespaces wrap them.
+  - update the old tests that exercise deleted symbols (`test_workflow*`, the
+    `predict_with_resampling` regression assert in `test_decompose.py` once the oracle
+    is retired).
 - Decide: keep `InferenceEngine` as a private compute core, or fold fully into `build`.
+  When rehoming, fold `step_size`/`use_mirroring` into the per-call sliding-window path
+  so `infer.sliding_window` stops the temporary engine-attr override (see 3b caveat).
 
 ### Deferred / open (not blocking)
-- `EngineOptions`→`BuildOptions` split note: `step_size`/`use_mirroring` are passed to
-  `build_model` as kwargs for now (engine bakes them); make per-call in 3b.
 - MOOSE: the `ModelStore("moose", ...)` path + nested cascade + string ids all exist;
   remaining MOOSE-compat (the `refresh_moose_registry.py` generator, a downloaded-model
   verification, possible RescaleTo01/use_mask_for_norm normalization) is the old
@@ -171,8 +199,10 @@ orientation, transpose, resample, region/argmax, sub-voxel inverse).
 
 ## How to resume
 
-1. `git checkout feature/medseg-rearch`; `uv run pytest -m "not slow"` (expect 326).
-2. Pick Phase 3b (decomposition) or Phase 5 (cutover). 3b makes 5's deletions clean
-   (removes the bridge to old workflow first); doing 5 first is possible but leaves
-   the cascade/union bridge in place.
+1. `git checkout feature/medseg-rearch`; `uv run pytest -m "not slow"` (expect 344).
+2. Phase 3b is done. Next is **Phase 5** (cutover): wire `__init__.py`, move
+   folder-reading into `ModelData.read_folder`, then delete the old surface
+   (`engine_cache` globals, `WeightsLayout`, `ModelBundle.from_dataset/from_task`,
+   `tasks.py` global registry, and `workflow.py`/`predict_with_resampling` now that
+   nothing on the new path uses them).
 3. Keep committing per-step; keep the old API working until the Phase 5 cutover.
