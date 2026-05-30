@@ -164,17 +164,20 @@ def build_model(
     """
     from .engine import InferenceEngine, ModelBundle
 
-    # Thread the resolved configuration explicitly. ModelData already picked it
-    # (e.g. "3d_fullres"); if we leave it implicit, both the engine and
-    # ``bundle.target_spacing`` fall back to the *first* config in plans.json —
-    # which for TS part models is "2d" (a 2-element spacing). Stamp it into the
-    # bundle metadata too so ``bundle.target_spacing`` resolves the same config.
+    # Carry the real on-disk checkpoint metadata (mirroring axes, init_args) and
+    # ensure the resolved configuration is present. ModelData already picked the
+    # config (e.g. "3d_fullres"); without it the engine and ``bundle.target_spacing``
+    # fall back to the *first* config in plans.json — "2d" for TS part models
+    # (a 2-element spacing). We set it only if the metadata doesn't already carry it.
     configuration = options.configuration or model_data.config_name
+    init_args = {**(model_data.metadata.get("init_args") or {})}
+    init_args.setdefault("configuration", configuration)
+    metadata = {**model_data.metadata, "init_args": init_args}
     bundle = ModelBundle(
         plans=dict(model_data.plans),
         dataset=dict(model_data.dataset),
         fold_weights=list(model_data.fold_weights),
-        metadata={"init_args": {"configuration": configuration}},
+        metadata=metadata,
         fold_ids=tuple(range(model_data.num_folds)),
     )
     engine = InferenceEngine(

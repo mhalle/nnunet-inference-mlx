@@ -14,7 +14,8 @@ channel count), so consumers never re-parse ``plans``/``dataset`` by hand.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
@@ -33,6 +34,11 @@ class ModelData:
         Parsed ``plans.json`` / ``dataset.json``.
     fold_weights :
         One ``{param_name: mx.array}`` dict per cross-validation fold.
+    metadata :
+        The checkpoint metadata read from disk (``init_args``,
+        ``inference_allowed_mirroring_axes``, …). Carried so the built model
+        resolves the right configuration and mirroring axes from the real
+        training-time settings rather than a guess. Empty for hand-built data.
     ecosystem, id, version :
         Where it came from — ecosystem (``"totalsegmentator"`` / ``"moose"``
         / ``"local"`` / …), the id within that ecosystem (dataset id or
@@ -45,6 +51,7 @@ class ModelData:
     plans: Mapping
     dataset: Mapping
     fold_weights: tuple[Mapping[str, mx.array], ...]
+    metadata: Mapping = field(default_factory=dict)
     ecosystem: str = "local"
     id: int | str = ""
     version: str | None = None
@@ -138,20 +145,54 @@ class ModelData:
         id: int | str | None = None,
         version: str | None = None,
     ) -> "ModelData":
-        """Read a model config folder (``{trainer}__{plans}__{config}``) into
-        :class:`ModelData`.
+        """Read a model config folder into :class:`ModelData`.
 
-        During migration this delegates to the proven folder reader; at cutover
-        the orchestration moves here and the old reader is deleted.
+        Accepts either the trainer/config folder
+        (``.../nnUNetTrainer__nnUNetPlans__3d_fullres``) or the dataset folder
+        (``.../Dataset297_...``). Reads ``plans.json`` / ``dataset.json`` and the
+        per-fold checkpoint weights + metadata directly — no engine/bundle.
+
+        ``folds``: ``int`` (single), iterable of ints, or ``"all"`` (auto-detect
+        every ``fold_*`` subdir). ``dtype`` casts weights on load.
         """
-        from .engine import ModelBundle
+        from .weights import discover_folds, load_checkpoint_with_metadata
 
-        folder = Path(folder)
-        bundle = ModelBundle.from_folder(folder, folds=folds, dtype=dtype)
+        folder = Path(folder).expanduser()
+        # Accept a dataset dir: descend to the single trainer/config subfolder.
+        if not (folder / "plans.json").exists():
+            trainer_dirs = sorted(folder.glob("*__*__*"))
+            if trainer_dirs:
+                folder = trainer_dirs[0]
+
+        plans = json.loads((folder / "plans.json").read_text())
+        dataset = json.loads((folder / "dataset.json").read_text())
+
+        if isinstance(folds, str):
+            if folds != "all":
+                raise ValueError(f"folds= must be int, iterable, or 'all'; got {folds!r}")
+            fold_ids = discover_folds(folder)
+            if not fold_ids:
+                raise FileNotFoundError(f"No fold_* subdirs in {folder}")
+        elif isinstance(folds, int):
+            fold_ids = (folds,)
+        else:
+            fold_ids = tuple(int(f) for f in folds)
+            if not fold_ids:
+                raise ValueError("folds= must contain at least one fold ID.")
+
+        fold_weights: list[Mapping[str, mx.array]] = []
+        metadata: Mapping = {}
+        for i, f in enumerate(fold_ids):
+            w, meta = load_checkpoint_with_metadata(folder, fold=f, dtype=dtype)
+            fold_weights.append(w)
+            if i == 0:
+                metadata = meta
+
         return ModelData(
-            plans=bundle.plans,
-            dataset=bundle.dataset,
-            fold_weights=tuple(bundle.fold_weights),
+            plans=plans,
+            dataset=dataset,
+            fold_weights=tuple(fold_weights),
+            metadata=metadata,
             ecosystem=ecosystem,
             id=id if id is not None else str(folder),
             version=version,
