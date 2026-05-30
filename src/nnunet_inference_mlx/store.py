@@ -14,7 +14,7 @@ Two layers, one object (a read-through stack):
 * **memory** (loaded / hot) — built engines, bounded by ``max_memory_mb``
   (LRU-evicted to fit). Verbs: ``load`` / ``unload`` / ``loaded``.
 
-``get(id)`` returns a cold :class:`ModelArtifact` (no GPU). ``load(id)``
+``get(id)`` returns a cold :class:`ModelData` (no GPU). ``load(id)``
 returns a hot engine, building on miss and caching it. "engine" is the
 internal name for a loaded model; the user vocabulary is models + readiness.
 
@@ -31,7 +31,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Hashable, Iterable, Sequence
 
-from .artifact import ModelArtifact, Provenance
+from .model_data import ModelData, Provenance
 from .values import EngineOptions
 
 
@@ -126,11 +126,11 @@ def _resolve_model_root_dir(ecosystem: str, explicit) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def _default_read(folder, *, folds="all", dtype=None, provenance=None) -> ModelArtifact:
-    return ModelArtifact.read_folder(folder, folds=folds, dtype=dtype, provenance=provenance)
+def _default_read(folder, *, folds="all", dtype=None, provenance=None) -> ModelData:
+    return ModelData.read_folder(folder, folds=folds, dtype=dtype, provenance=provenance)
 
 
-def _default_build(artifact: ModelArtifact, options: EngineOptions):
+def _default_build(artifact: ModelData, options: EngineOptions):
     from .build import build_engine  # phase 3
     return build_engine(artifact, options)
 
@@ -198,8 +198,8 @@ class ModelStore:
         return self.model_root_dir
 
     # ----- cold (disk) layer -----
-    def get(self, id, *, folds=None, dtype=None) -> ModelArtifact:
-        """Read a cold :class:`ModelArtifact` for ``id`` (no GPU). Reads the
+    def get(self, id, *, folds=None, dtype=None) -> ModelData:
+        """Read a cold :class:`ModelData` for ``id`` (no GPU). Reads the
         folder fresh each call; the artifact is not retained."""
         folder = self._resolve_folder(self._require_root(), id)
         prov = Provenance(ecosystem=self.ecosystem, id=id)

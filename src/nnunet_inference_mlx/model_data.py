@@ -1,10 +1,11 @@
-"""ModelArtifact — the IO/compute seam.
+"""ModelData — the IO/compute seam.
 
-A ``ModelArtifact`` is the *fully-read, zero-GPU* representation of a model:
-parsed plans + dataset + per-fold weight dicts (already MLX arrays) +
-provenance. Reading produces it; :func:`build.build_engine` consumes it. It
-holds no compiled network and allocates no Metal state — it's cheap data you
-can construct, inspect, and pass between layers.
+``ModelData`` is the *fully-read, zero-GPU* representation of a model: parsed
+plans + dataset + per-fold weight dicts (already MLX arrays) + provenance.
+Reading produces it; :func:`build.build_engine` consumes it. It holds no
+compiled network and allocates no Metal state — it's cheap data you can
+construct, inspect, and pass between layers. (It is the model in its *data*
+form, between "downloaded files on disk" and "loaded engine in memory".)
 
 Derived accessors mirror what the network builder and preprocessing need
 (patch size, target spacing with the transpose applied, label schema, input
@@ -32,7 +33,7 @@ class Provenance:
 
 
 @dataclass(frozen=True, eq=False)
-class ModelArtifact:
+class ModelData:
     """Parsed model data with no GPU state.
 
     Parameters
@@ -139,7 +140,7 @@ class ModelArtifact:
         folds: int | "list[int]" | str = "all",
         dtype: str | None = None,
         provenance: Provenance | None = None,
-    ) -> "ModelArtifact":
+    ) -> "ModelData":
         """Read a model config folder (``{trainer}__{plans}__{config}``) into an
         artifact.
 
@@ -150,7 +151,7 @@ class ModelArtifact:
 
         folder = Path(folder)
         bundle = ModelBundle.from_folder(folder, folds=folds, dtype=dtype)
-        return ModelArtifact(
+        return ModelData(
             plans=bundle.plans,
             dataset=bundle.dataset,
             fold_weights=tuple(bundle.fold_weights),
@@ -158,4 +159,4 @@ class ModelArtifact:
         )
 
 
-__all__ = ["ModelArtifact", "Provenance"]
+__all__ = ["ModelData", "Provenance"]

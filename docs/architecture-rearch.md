@@ -99,14 +99,14 @@ L4  TaskCatalog / recipes (SingleModel/Cascade/Union)  name→recipe; compose; r
 L3  preprocess.* | infer.* | postprocess.* | geometry  pure fns over Volume/Probabilities/Segmentation
 L2  build_engine(artifact, opts) -> CompiledModel       the only GPU allocation (one place)
 L1  ModelStore (read-through: load/download)            id→model; readiness; bounded; freeable
-L0  ModelArtifact (frozen) | Volume (frozen)            pure data: weights+config | image+geometry
+L0  ModelData (frozen) | Volume (frozen)            pure data: weights+config | image+geometry
 ```
 
 Each capability's home:
 
 | capability | home |
 |---|---|
-| read ckpt (torch-free) → MLX arrays; per-ecosystem packaging | L1 source plug-ins → `ModelArtifact` |
+| read ckpt (torch-free) → MLX arrays; per-ecosystem packaging | L1 source plug-ins → `ModelData` |
 | image from NIfTI/DICOM/array, in-memory | L0 readers (`NiftiReader`, …) |
 | build ~600 MB compute; reuse; free | L1/L2 `build_engine` + the store's memory layer |
 | reorient/permute/resample/normalize (+inverse) | L3 `preprocess.*` + `RestorePlan` + `postprocess.restore` |
@@ -128,7 +128,7 @@ Each capability's home:
 - `RestorePlan` — original geometry + orientation + axis-permutation; the inverse
   recipe, **returned** from preprocess (never hidden), consumed by `postprocess.restore`.
 - `LabelSchema` — int↔name, plus region definitions + paint priority (sigmoid models).
-- `ModelArtifact` — `config` + `schema` + `fold_weights` (MLX arrays) + `provenance`.
+- `ModelData` — `config` + `schema` + `fold_weights` (MLX arrays) + `provenance`.
   **No GPU state.** Output of IO; input to `build_engine`.
 - `EngineOptions` — the build knob tail (folds, step_size, batch_size, mirroring,
   compile, dtype), frozen & hashable → doubles as the store's cache key.
@@ -196,7 +196,7 @@ callers and **delete** the old surface. Each phase is shippable and tested.
 
 - **Phase 1 — value types** (`types`): Geometry, Volume, Segmentation,
   Probabilities, RestorePlan, LabelSchema, EngineOptions. No deps. ← *start here*
-- **Phase 2 — ModelArtifact + ModelStore**: pure artifact; read-through store
+- **Phase 2 — ModelData + ModelStore**: pure artifact; read-through store
   (format×location, download/load layers, memory budget, the readiness verbs,
   free, context manager). Synthetic-tree tests (no real weights).
 - **Phase 3 — build_engine + stage namespaces**: `build_engine(artifact, opts)`
