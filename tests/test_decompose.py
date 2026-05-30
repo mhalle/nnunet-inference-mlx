@@ -63,41 +63,40 @@ def _volume(shape=(24, 24, 24), *, spacing=(1.0, 1.0, 1.0),
     return Volume(data=data, geometry=geom, channels=("CT",))
 
 
-def _old_path(model, vol):
-    from nnunet_inference_mlx.imageio import sitk_to_segmentation, volume_to_sitk
-    from nnunet_inference_mlx.resampling import predict_with_resampling
-    seg_sitk = predict_with_resampling(model._engine, volume_to_sitk(vol),
-                                       reorient_to="LPS")
-    return sitk_to_segmentation(seg_sitk, model.schema)
-
-
 def _new_path(model, vol):
     mv, plan = to_model_frame(vol, model.model_data, reorient_to="LPS")
     pred = sliding_window(model, mv)
     return restore(pred, plan)
 
 
-class TestDecompositionMatchesOracle:
+class TestDecompositionGeometry:
+    """The decomposed pipeline lands the result back on the caller's grid.
+
+    (The historical bit-identical-vs-predict_with_resampling oracle was retired
+    with that function at the Phase 5 cutover; it had already confirmed the
+    decomposition faithful on synthetic + real TS weights. These keep the
+    geometry round-trip — including a reoriented input — under test.)
+    """
+
     def test_canonical_volume(self):
         m = build_model(_make_model_data())
         vol = _volume((24, 24, 24))
-        seg_new = _new_path(m, vol)
-        seg_old = _old_path(m, vol)
-        np.testing.assert_array_equal(np.asarray(seg_new.data), np.asarray(seg_old.data))
-        assert seg_new.geometry.shape_zyx == vol.geometry.shape_zyx
-        assert seg_new.geometry.spacing_zyx == vol.geometry.spacing_zyx
+        seg = _new_path(m, vol)
+        assert seg.geometry.shape_zyx == vol.geometry.shape_zyx
+        assert seg.geometry.spacing_zyx == vol.geometry.spacing_zyx
 
     def test_reoriented_volume_roundtrips(self):
-        # RAS direction (flips X and Y vs LPS) forces a real reorient round-trip.
+        # RAS direction (flips X and Y vs LPS) forces a real reorient round-trip:
+        # to_model_frame → LPS, restore → back to RAS, landing on the input grid.
         m = build_model(_make_model_data())
         vol = _volume((20, 24, 28), spacing=(2.0, 1.0, 1.5),
                       direction=(-1, 0, 0, 0, -1, 0, 0, 0, 1))
-        seg_new = _new_path(m, vol)
-        seg_old = _old_path(m, vol)
-        np.testing.assert_array_equal(np.asarray(seg_new.data), np.asarray(seg_old.data))
-        assert seg_new.geometry.shape_zyx == vol.geometry.shape_zyx
-        np.testing.assert_allclose(seg_new.geometry.origin_xyz, vol.geometry.origin_xyz,
+        seg = _new_path(m, vol)
+        assert seg.geometry.shape_zyx == vol.geometry.shape_zyx
+        np.testing.assert_allclose(seg.geometry.origin_xyz, vol.geometry.origin_xyz,
                                    atol=1e-4)
+        np.testing.assert_allclose(seg.geometry.direction_xyz, vol.geometry.direction_xyz,
+                                   atol=1e-6)
 
 
 class TestPredictionAndToLabels:

@@ -55,7 +55,6 @@ from .resampling import (
     get_orientation,
     inverse_resample_argmax,
     inverse_resample_paint,
-    predict_with_resampling,
     reorient,
     resample_image_to_target,
 )
@@ -67,16 +66,6 @@ from .tasks import (
     TaskSpec,
     UnionPart,
     WeightsId,
-)
-from .workflow import (
-    Bbox,
-    ParallelStage,
-    Stage,
-    compute_fg_bbox,
-    crop_image,
-    paste_segmentation,
-    run_label_union_workflow,
-    run_workflow,
 )
 from .model import PlainConvUNet, ResidualEncoderUNet
 from .plans import build_network_from_plans
@@ -155,21 +144,11 @@ __all__ = [
     "get_orientation",
     "inverse_resample_argmax",
     "inverse_resample_paint",
-    "predict_with_resampling",
     "reorient",
     "resample_image_to_target",
     "resample_volume",
     # Postprocessing (opt-in via [postprocessing] extra; cc3d backend)
     "remove_small_components",
-    # Multi-stage workflow + geometric primitives
-    "Bbox",
-    "ParallelStage",
-    "Stage",
-    "compute_fg_bbox",
-    "crop_image",
-    "paste_segmentation",
-    "run_label_union_workflow",
-    "run_workflow",
     # Recipe types (the declarative task vocabulary; lookup is via TaskCatalog)
     "AmbiguousTaskError",
     "CascadeStep",
