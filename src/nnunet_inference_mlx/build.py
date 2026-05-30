@@ -164,16 +164,22 @@ def build_model(
     """
     from .engine import InferenceEngine, ModelBundle
 
+    # Thread the resolved configuration explicitly. ModelData already picked it
+    # (e.g. "3d_fullres"); if we leave it implicit, both the engine and
+    # ``bundle.target_spacing`` fall back to the *first* config in plans.json —
+    # which for TS part models is "2d" (a 2-element spacing). Stamp it into the
+    # bundle metadata too so ``bundle.target_spacing`` resolves the same config.
+    configuration = options.configuration or model_data.config_name
     bundle = ModelBundle(
         plans=dict(model_data.plans),
         dataset=dict(model_data.dataset),
         fold_weights=list(model_data.fold_weights),
-        metadata={},
+        metadata={"init_args": {"configuration": configuration}},
         fold_ids=tuple(range(model_data.num_folds)),
     )
     engine = InferenceEngine(
         bundle,
-        configuration=options.configuration,
+        configuration=configuration,
         step_size=step_size,
         compile=options.compile,
         batch_size=options.batch_size,
