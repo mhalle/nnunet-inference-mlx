@@ -106,15 +106,15 @@ Model identity is a **string** (`"clin_ct_organs"`) plus `KEY_FOLDER_NAME` (`"Da
 - ✅ Source-agnostic dispatcher — `run_named_task` branches on `shape`, not source
 - ✅ The two shapes MOOSE uses (`single`, `cascade`)
 - ✅ Generator pattern (PEP 723 `uv run` admin CLI) — `refresh_moose_registry.py` parallels the TS one; MOOSE's `MODEL_METADATA` is already a clean dict (no AST/exec needed — *easier* than TS)
-- ✅ **Weights identifier widened to `int | str`** (shipped 0.9.2) — MOOSE string folder names are storable/round-trippable; default engine factory raises `NotImplementedError` on string IDs until item 2
+- ✅ **Weights identifier widened to `int | str`** (shipped 0.9.2) — MOOSE string folder names are storable/round-trippable
+- ✅ **Source-aware engine resolution** (shipped 0.9.2) — `cached_engine_from_moose_model(folder_name, models_dir)` + `resolve_moose_config_folder`; `run_named_task` picks the factory by `source` and takes a `moose_models_dir=` param (env-var fallbacks + moosez auto-detect)
+- ✅ **Nested-task cascade** (shipped 0.9.2) — `CascadeStep.crop_from_task` + recursive flattening in the dispatcher; proven on TS `teeth` (3-deep). Covers MOOSE's two FOV-limited models structurally.
 
-**Remaining required changes (ranked, now certain):**
+**Remaining required changes:**
 
-1. **Source-aware engine resolution** (~50 lines) — *the real integration point.* The default factory globs `Dataset{int}_*`; MOOSE folders carry arbitrary suffixes under MOOSE's models dir. Add a MOOSE `WeightsLayout` entry keyed by folder name + a source-aware factory in `run_named_task`.
+1. **`refresh_moose_registry.py` admin CLI** (~120 lines) — parallel to TS; `MODEL_METADATA` is a plain dict, so simpler. Emits `data/moose_tasks.json`. Map MOOSE's richer `limit_fov` (intensity-range crop, `largest_component_only`) onto `crop_from_task` + `crop_to_classes` (expand `[lo,hi]` ranges to class tuples; `largest_component_only` is a future crop-primitive flag).
 
-2. **Nested-task cascade in `CascadeStep`** (~80 lines) — *doubly-motivated.* Both MOOSE cascades reference the crop model by name, same as TS's deferred `teeth`. Needs `CascadeStep.crop_from_task: str | None` and the workflow running that referenced task first. Also map MOOSE's richer `limit_fov` (intensity-range crop, `largest_component_only`) onto our crop primitives.
-
-3. **`refresh_moose_registry.py` admin CLI** (~120 lines) — parallel to TS; `MODEL_METADATA` is a plain dict, so simpler. Emits `data/moose_tasks.json`.
+2. **Verification pass** on a downloaded MOOSE CT model — confirm our loader reads its `plans.json`/`dataset.json`, the normalization scheme is one we support, and the engine produces a sane segmentation.
 
 **Genuine unknowns — need a downloaded MOOSE model's `plans.json` to resolve:**
 
@@ -124,9 +124,8 @@ Model identity is a **string** (`"clin_ct_organs"`) plus `KEY_FOLDER_NAME` (`"Da
 
 **Recommended scope split:**
 
-- **MOOSE-CT-single parity** (~200 lines): items 1 + 3 + verify normalization on one downloaded CT model. Covers 20 of 25 models. Clean, shippable **0.9.3**.
-- **MOOSE cascades**: item 2 (also unblocks TS `teeth`). Separate, ~80 lines — **0.9.4**.
-- **MOOSE PET multi-channel**: deferred — only 2 models, heaviest change. Its own milestone if demand appears.
+- **MOOSE-CT parity** (~120 lines): the generator + verification above. The engine-resolution and nested-cascade groundwork already shipped in 0.9.2, so 0.9.3 is mostly the registry generator + a real-model check. Covers the CT catalog (incl. both cascades structurally).
+- **MOOSE PET multi-channel**: deferred — only 2 models, heaviest change (multi-channel input path). Its own milestone if demand appears.
 
 ---
 

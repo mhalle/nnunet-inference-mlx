@@ -16,9 +16,11 @@ from .engine_cache import (
     cache_enabled,
     cache_engine,
     cached_engine_from_folder,
+    cached_engine_from_moose_model,
     cached_engine_from_task,
     clear_engine_cache,
     get_cached_engine,
+    resolve_moose_config_folder,
 )
 from .labels import (
     convert_logits_to_segmentation,
@@ -96,9 +98,11 @@ __all__ = [
     "cache_enabled",
     "cache_engine",
     "cached_engine_from_folder",
+    "cached_engine_from_moose_model",
     "cached_engine_from_task",
     "clear_engine_cache",
     "get_cached_engine",
+    "resolve_moose_config_folder",
     # Label-scheme post-processing
     "convert_logits_to_segmentation",
     "has_regions",

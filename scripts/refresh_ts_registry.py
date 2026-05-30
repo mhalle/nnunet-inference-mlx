@@ -440,16 +440,54 @@ def params_to_taskspec(
         return spec
 
     # ----- cascade -----
-    if params.get("crop_model") is not None:
-        # TS uses a custom rough-segmentation task (recursive totalsegmentator
-        # call). Our flat CascadeStep can't express a task reference yet —
-        # future TaskSpec extension. Skip for now with a clear note.
-        print(
-            f"  [skip] {variant_name}: uses crop_model={params['crop_model']!r} "
-            "(nested-task cascade not yet supported in TaskSpec)",
-            file=sys.stderr,
-        )
-        return None
+    crop_model = params.get("crop_model")
+    if crop_model is not None:
+        # Nested-task cascade: TS crops from another *named task* (a
+        # recursive totalsegmentator call), not a rough total model.
+        # Emit a crop_from_task step; crop names resolve against the
+        # crop model's own label space.
+        if crop_model not in class_map:
+            print(
+                f"  [skip] {variant_name}: crop_model={crop_model!r} not in "
+                f"class_map",
+                file=sys.stderr,
+            )
+            return None
+        inv = {name: cid for cid, name in class_map[crop_model].items()}
+        try:
+            crop_ids = [inv[name] for name in crop]
+        except KeyError as e:
+            print(
+                f"  [warn] {variant_name}: crop class {e} not in "
+                f"class_map[{crop_model!r}]",
+                file=sys.stderr,
+            )
+            return None
+        dilation_mm = 10.0
+        if params.get("crop_addon"):
+            dilation_mm = float(max(params["crop_addon"]))
+        spec = {
+            "name": variant_name,
+            "source": "ts",
+            "modality": modality,
+            "shape": "cascade",
+            "cascade": [
+                {
+                    "crop_from_task": crop_model,
+                    "crop_to_classes": crop_ids,
+                    "dilation_mm": dilation_mm,
+                },
+                {
+                    "weights_id": int(task_id),
+                    "crop_to_classes": None,
+                    "dilation_mm": 10.0,
+                },
+            ],
+        }
+        lm = _build_label_map(base_task_name, class_map)
+        if lm:
+            spec["label_map"] = {str(k): v for k, v in lm.items()}
+        return spec
 
     rough_id = _rough_cropper_dataset_id(crop, params.get("robust_crop", False), modality)
     try:

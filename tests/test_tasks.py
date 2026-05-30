@@ -27,7 +27,8 @@ from nnunet_inference_mlx import (
     AmbiguousTaskError, CascadeStep, InferenceEngine, ModelBundle,
     TaskSpec, UnionPart,
     get_task, list_registered_tasks, list_tasks_by_modality,
-    register_task, run_named_task, unregister_task,
+    register_task, resolve_moose_config_folder, run_named_task,
+    unregister_task,
 )
 from nnunet_inference_mlx.plans import build_network_from_plans
 from nnunet_inference_mlx.tasks import (
@@ -291,14 +292,16 @@ class TestStringWeightsId:
         assert rt.single == 297
         assert isinstance(rt.single, int)
 
-    def test_default_factory_rejects_string_id(self):
-        """Dispatching a string-id task without a custom factory must fail
-        loudly (not glob for a bogus Dataset folder)."""
-        register_task(TaskSpec(name="clin_ct_organs", source="moose",
+    def test_default_factory_rejects_string_id_for_nonmoose(self):
+        """A non-MOOSE (ts/user) task with a string id has no default
+        resolver — the int factory must fail loudly rather than glob for
+        a bogus Dataset folder. (MOOSE strings DO resolve — see
+        TestMooseEngineResolution.)"""
+        register_task(TaskSpec(name="weird", source="user",
                                modality="CT", shape="single",
-                               single="Dataset123_Organs"))
-        with pytest.raises(NotImplementedError, match="string weights"):
-            run_named_task("moose:clin_ct_organs", _make_sitk())
+                               single="some_string_id"))
+        with pytest.raises(NotImplementedError, match="string"):
+            run_named_task("user:weird", _make_sitk())
 
     def test_string_id_dispatches_with_custom_factory(self, engine):
         """A source-aware engine_factory makes string-id tasks runnable."""
@@ -312,6 +315,188 @@ class TestStringWeightsId:
         )
         assert seen == ["Dataset123_Organs"]
         assert seg.GetSize() == (24, 24, 24)
+
+
+# ---------------------------------------------------------------------------
+# MOOSE source-aware engine resolution
+# ---------------------------------------------------------------------------
+
+
+class TestMooseEngineResolution:
+    """resolve_moose_config_folder maps a MOOSE folder name to the inner
+    nnU-Net config folder under a models dir. We test the path logic with
+    a synthetic tree (no weights needed); the engine build itself is the
+    same cached_engine_from_folder path TS uses."""
+
+    def _make_moose_tree(self, tmp_path, folder="Dataset123_Organs",
+                          config="nnUNetTrainer__nnUNetPlans__3d_fullres"):
+        cfg = tmp_path / folder / config
+        (cfg / "fold_0").mkdir(parents=True)
+        return cfg
+
+    def test_resolves_config_folder(self, tmp_path):
+        cfg = self._make_moose_tree(tmp_path)
+        resolved = resolve_moose_config_folder("Dataset123_Organs",
+                                                models_dir=tmp_path)
+        assert resolved == cfg
+
+    def test_missing_model_folder_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="model folder not found"):
+            resolve_moose_config_folder("Dataset999_Nope", models_dir=tmp_path)
+
+    def test_no_config_subfolder_raises(self, tmp_path):
+        (tmp_path / "Dataset123_Organs").mkdir()
+        with pytest.raises(FileNotFoundError, match="config folder"):
+            resolve_moose_config_folder("Dataset123_Organs", models_dir=tmp_path)
+
+    def test_unknown_models_dir_raises(self, tmp_path, monkeypatch):
+        # No env vars, no moosez, no explicit models_dir
+        monkeypatch.delenv("NNUNET_MLX_MOOSE_MODELS", raising=False)
+        monkeypatch.delenv("MOOSE_MODELS", raising=False)
+        import nnunet_inference_mlx.engine_cache as ec
+        monkeypatch.setattr(ec, "_default_moose_models_dir", lambda: None)
+        with pytest.raises(FileNotFoundError, match="models directory is unknown"):
+            resolve_moose_config_folder("Dataset123_Organs")
+
+    def test_moose_task_routes_to_moose_resolver(self, tmp_path):
+        """A source='moose' task with the default factory must resolve under
+        the MOOSE models dir — proven by the FileNotFoundError naming that
+        dir, not an nnU-Net dataset glob."""
+        register_task(TaskSpec(name="clin_ct_organs", source="moose",
+                               modality="CT", shape="single",
+                               single="Dataset123_Organs"))
+        with pytest.raises(FileNotFoundError, match="MOOSE model folder not found"):
+            run_named_task("moose:clin_ct_organs", _make_sitk(),
+                           moose_models_dir=str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Nested-task cascade (CascadeStep.crop_from_task)
+# ---------------------------------------------------------------------------
+
+
+class TestNestedCascade:
+    """A cascade step can reference another registered task by name
+    (crop_from_task) instead of an inline weights_id. The dispatcher
+    flattens the reference — recursively — into the run_workflow stage
+    list. Unblocks TS `teeth` (crops from craniofacial_structures, itself
+    a cascade) and MOOSE's FOV-limited models."""
+
+    def test_step_requires_exactly_one_source(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            CascadeStep()  # neither
+        with pytest.raises(ValueError, match="exactly one"):
+            CascadeStep(weights_id=1, crop_from_task="other")  # both
+
+    def test_crop_from_task_step_valid(self):
+        step = CascadeStep(crop_from_task="craniofacial_structures",
+                           crop_to_classes=(2, 7))
+        assert step.weights_id is None
+        assert step.crop_from_task == "craniofacial_structures"
+
+    def test_nested_cascade_round_trips(self):
+        spec = TaskSpec(
+            name="teeth", source="ts", modality="CT", shape="cascade",
+            cascade=(
+                CascadeStep(crop_from_task="craniofacial_structures",
+                            crop_to_classes=(2, 7), dilation_mm=10.0),
+                CascadeStep(weights_id=113),
+            ),
+        )
+        rt = _taskspec_from_dict(json.loads(json.dumps(_taskspec_to_dict(spec))))
+        assert spec == rt
+        assert rt.cascade[0].crop_from_task == "craniofacial_structures"
+        assert rt.cascade[0].weights_id is None
+        assert rt.cascade[1].weights_id == 113
+
+    def test_descriptors_single(self):
+        from nnunet_inference_mlx.tasks import _resolve_cascade_descriptors
+        spec = TaskSpec(name="m", source="user", modality="CT",
+                        shape="single", single=5)
+        assert _resolve_cascade_descriptors(spec) == [(5, None, 10.0)]
+
+    def test_descriptors_plain_cascade(self):
+        from nnunet_inference_mlx.tasks import _resolve_cascade_descriptors
+        spec = TaskSpec(
+            name="c", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(weights_id=1, crop_to_classes=(3,),
+                                  dilation_mm=5.0),
+                     CascadeStep(weights_id=2)),
+        )
+        assert _resolve_cascade_descriptors(spec) == [
+            (1, (3,), 5.0), (2, None, 10.0),
+        ]
+
+    def test_descriptors_nested(self):
+        """A crop_from_task referencing a cascade flattens recursively,
+        with the referenced task's final stage carrying the outer crop."""
+        from nnunet_inference_mlx.tasks import _resolve_cascade_descriptors
+        register_task(TaskSpec(
+            name="cropper", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(weights_id=10, crop_to_classes=(1,)),
+                     CascadeStep(weights_id=11)),
+        ))
+        register_task(TaskSpec(
+            name="target", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(crop_from_task="cropper",
+                                  crop_to_classes=(4, 5), dilation_mm=8.0),
+                     CascadeStep(weights_id=20)),
+        ))
+        desc = _resolve_cascade_descriptors(get_task("user:target"))
+        # cropper flattens to [10(crop=1), 11], then 11 takes the outer
+        # crop (4,5)/dil 8, then the target model 20.
+        assert desc == [
+            (10, (1,), 10.0),
+            (11, (4, 5), 8.0),
+            (20, None, 10.0),
+        ]
+
+    def test_label_union_cannot_be_crop_source(self):
+        from nnunet_inference_mlx.tasks import _resolve_cascade_descriptors
+        register_task(TaskSpec(
+            name="u", source="user", modality="CT", shape="label_union",
+            union=(UnionPart(weights_id=1, label_remap={1: 1}),),
+        ))
+        register_task(TaskSpec(
+            name="bad", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(crop_from_task="u", crop_to_classes=(1,)),
+                     CascadeStep(weights_id=2)),
+        ))
+        with pytest.raises(ValueError, match="crop source"):
+            _resolve_cascade_descriptors(get_task("user:bad"))
+
+    def test_nested_cascade_dispatches(self, engine):
+        """End-to-end dispatch: each flattened descriptor's weights_id is
+        passed to the factory in order."""
+        register_task(TaskSpec(
+            name="cropper", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(weights_id=10, crop_to_classes=(1,)),
+                     CascadeStep(weights_id=11)),
+        ))
+        register_task(TaskSpec(
+            name="target", source="user", modality="CT", shape="cascade",
+            cascade=(CascadeStep(crop_from_task="cropper",
+                                  crop_to_classes=(1,)),
+                     CascadeStep(weights_id=20)),
+        ))
+        seen = []
+        seg = run_named_task(
+            "user:target", _make_sitk(shape_zyx=(32, 32, 32)),
+            engine_factory=lambda wid: (seen.append(wid), engine)[1],
+        )
+        assert seen == [10, 11, 20]
+        assert seg.GetSize() == (32, 32, 32)
+
+    def test_teeth_registered_and_expands(self):
+        """The shipped TS registry now includes `teeth` (was skipped before
+        nested-task support), and it flattens through craniofacial_structures."""
+        from nnunet_inference_mlx.tasks import _resolve_cascade_descriptors
+        spec = get_task("teeth")
+        assert spec.shape == "cascade"
+        assert spec.cascade[0].crop_from_task == "craniofacial_structures"
+        desc = _resolve_cascade_descriptors(spec)
+        # 298 (rough total) -> 115 (craniofacial) -> 113 (teeth)
+        assert [wid for wid, _, _ in desc] == [298, 115, 113]
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +758,7 @@ class TestBuiltinRegistry:
         """The generator must produce a non-trivial registry. Hard count
         is intentional: drops in this number indicate either a generator
         regression or a TS release we should investigate."""
-        # As of TS 2.13.0, generator emits 50 specs. Reasonable bound
+        # As of TS 2.13.0, generator emits 51 specs. Reasonable bound
         # for any near-future TS version — alert on drop, not on growth.
         n = len(list_registered_tasks())
         assert n >= 40, f"only {n} tasks registered; generator may be broken"

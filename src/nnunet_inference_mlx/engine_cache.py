@@ -42,6 +42,8 @@ __all__ = [
     "cache_engine",
     "cached_engine_from_folder",
     "cached_engine_from_task",
+    "cached_engine_from_moose_model",
+    "resolve_moose_config_folder",
 ]
 
 
@@ -249,6 +251,123 @@ def cached_engine_from_task(
         trainer=eff_trainer, plans=eff_plans, model=eff_model,
     )
 
+    return cached_engine_from_folder(
+        model_folder,
+        configuration=configuration,
+        folds=folds,
+        step_size=step_size,
+        compile=compile,
+        batch_size=batch_size,
+        use_mirroring=use_mirroring,
+        verbose=verbose,
+        progress=progress,
+        dtype=dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MOOSE model resolution
+# ---------------------------------------------------------------------------
+#
+# MOOSE (ENHANCE-PET) stores nnU-Netv2 models under a flat models directory,
+# one folder per model named ``Dataset{NNN}_{Name}`` (e.g. ``Dataset123_Organs``).
+# Inside each is the standard nnU-Net config folder ``{trainer}__{plans}__{res}``
+# containing ``plans.json`` / ``dataset.json`` / ``fold_*``. This is the same
+# on-disk shape TS uses; only the *outer* identifier differs — MOOSE keys by
+# the full folder name (a string), not an integer dataset ID.
+
+
+def _default_moose_models_dir() -> Path | None:
+    """Best-effort default MOOSE models directory.
+
+    Resolution order:
+      1. ``NNUNET_MLX_MOOSE_MODELS`` env var (our override).
+      2. ``MOOSE_MODELS`` env var.
+      3. The installed ``moosez`` package's models dir, if importable.
+
+    Returns ``None`` if none resolve — the caller then raises a clear error.
+    """
+    for var in ("NNUNET_MLX_MOOSE_MODELS", "MOOSE_MODELS"):
+        val = os.environ.get(var)
+        if val:
+            return Path(val).expanduser()
+    try:
+        import moosez.system as _moose_system  # type: ignore
+
+        return Path(_moose_system.MODELS_DIRECTORY_PATH)
+    except Exception:
+        return None
+
+
+def resolve_moose_config_folder(
+    folder_name: str, models_dir: str | Path | None = None,
+) -> Path:
+    """Resolve a MOOSE model folder name to its nnU-Net config folder.
+
+    ``folder_name`` is MOOSE's ``KEY_FOLDER_NAME`` (e.g. ``"Dataset123_Organs"``).
+    Returns the inner ``{trainer}__{plans}__{res}`` folder that
+    :func:`cached_engine_from_folder` consumes (the one holding
+    ``plans.json`` / ``dataset.json`` / ``fold_*``).
+
+    ``models_dir`` defaults to :func:`_default_moose_models_dir`.
+
+    Raises ``FileNotFoundError`` with an actionable message if the models
+    directory is unknown, the model folder is absent, or it contains no
+    nnU-Net config subfolder.
+    """
+    base = Path(models_dir).expanduser() if models_dir else _default_moose_models_dir()
+    if base is None:
+        raise FileNotFoundError(
+            "MOOSE models directory is unknown. Set NNUNET_MLX_MOOSE_MODELS "
+            "(or MOOSE_MODELS), pass models_dir=..., or install moosez."
+        )
+
+    model_dir = base / folder_name
+    if not model_dir.is_dir():
+        raise FileNotFoundError(
+            f"MOOSE model folder not found: {model_dir}. "
+            f"(models_dir={base})"
+        )
+
+    # nnU-Net config subfolder: name has exactly two '__' separators
+    # (trainer__plans__resolution), matching MOOSE's own selection logic.
+    configs = sorted(
+        p for p in model_dir.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name.count("__") == 2
+    )
+    if not configs:
+        raise FileNotFoundError(
+            f"No nnU-Net config folder (trainer__plans__resolution) found in "
+            f"{model_dir}."
+        )
+    return configs[0]
+
+
+def cached_engine_from_moose_model(
+    folder_name: str,
+    *,
+    models_dir: str | Path | None = None,
+    folds: int | Iterable[int] | str | None = None,
+    configuration: str | None = None,
+    step_size: float = 0.5,
+    compile: bool = True,
+    batch_size: int | None = None,
+    use_mirroring: bool = False,
+    verbose: bool = False,
+    progress: bool = False,
+    dtype: str | mx.Dtype | None = None,
+) -> InferenceEngine:
+    """Get a cached engine for a MOOSE model identified by folder name.
+
+    Resolves ``folder_name`` (e.g. ``"Dataset123_Organs"``) under the MOOSE
+    models directory to its nnU-Net config folder, then delegates to
+    :func:`cached_engine_from_folder` (so cache hits never touch disk).
+
+    This is the MOOSE-side counterpart to :func:`cached_engine_from_task`
+    (which resolves integer nnU-Net dataset IDs under the TS/nnU-Net results
+    dir). Same engine, same cache — only the folder resolution differs.
+    """
+    model_folder = resolve_moose_config_folder(folder_name, models_dir)
     return cached_engine_from_folder(
         model_folder,
         configuration=configuration,

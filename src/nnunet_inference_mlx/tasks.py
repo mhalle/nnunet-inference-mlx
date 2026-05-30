@@ -85,26 +85,51 @@ WeightsId = int | str
 class CascadeStep:
     """One stage of a ``shape="cascade"`` task.
 
-    Mirrors :class:`workflow.Stage` but stores ``weights_id`` instead of a
-    built engine — engines are constructed lazily by the dispatcher via
-    the engine cache.
+    Mirrors :class:`workflow.Stage` but stores a *reference* to a model
+    instead of a built engine — engines are constructed lazily by the
+    dispatcher via the engine cache.
+
+    Exactly one of ``weights_id`` / ``crop_from_task`` is set:
+
+    * ``weights_id`` — run this model directly (the common case).
+    * ``crop_from_task`` — run another *registered task* by name as this
+      step. This is the "nested-task cascade": the referenced task may
+      itself be single or cascade and is expanded inline by the
+      dispatcher. Used by TS ``teeth`` (crops from
+      ``craniofacial_structures``) and MOOSE's FOV-limited models.
 
     Parameters
     ----------
     weights_id :
         Weights identifier (see :data:`WeightsId`): an integer nnU-Net
         dataset ID (TS) or a string model/folder identifier (MOOSE).
+        Mutually exclusive with ``crop_from_task``.
+    crop_from_task :
+        Bare name of another registered task to run as this step,
+        resolved within the *same source* as the enclosing task.
+        Mutually exclusive with ``weights_id``.
     crop_to_classes :
-        If set, after this stage runs, the foreground bbox of these class
-        IDs (in this stage's output) is used to crop the *next* stage's
-        input. ``None`` for the final stage of the cascade.
+        If set, after this step runs, the foreground bbox of these class
+        IDs (in this step's output) is used to crop the *next* step's
+        input. ``None`` for the final step of the cascade.
     dilation_mm :
         Safety margin added to the bbox in physical units (mm).
     """
 
-    weights_id: WeightsId
+    weights_id: WeightsId | None = None
+    crop_from_task: str | None = None
     crop_to_classes: tuple[int, ...] | None = None
     dilation_mm: float = 10.0
+
+    def __post_init__(self) -> None:
+        has_wid = self.weights_id is not None
+        has_ref = self.crop_from_task is not None
+        if has_wid == has_ref:
+            raise ValueError(
+                "CascadeStep requires exactly one of weights_id / "
+                f"crop_from_task (got weights_id={self.weights_id!r}, "
+                f"crop_from_task={self.crop_from_task!r})"
+            )
 
 
 @dataclass(frozen=True)
@@ -311,7 +336,12 @@ def _taskspec_from_dict(d: Mapping) -> TaskSpec:
     if shape == "cascade":
         cascade = tuple(
             CascadeStep(
-                weights_id=_coerce_weights_id(step["weights_id"]),
+                weights_id=(
+                    _coerce_weights_id(step["weights_id"])
+                    if step.get("weights_id") is not None
+                    else None
+                ),
+                crop_from_task=step.get("crop_from_task"),
                 crop_to_classes=(
                     tuple(int(c) for c in step["crop_to_classes"])
                     if step.get("crop_to_classes")
@@ -366,16 +396,19 @@ def _taskspec_to_dict(spec: TaskSpec) -> dict:
         d["single"] = spec.single
     elif spec.shape == "cascade":
         assert spec.cascade is not None
-        d["cascade"] = [
-            {
-                "weights_id": step.weights_id,
-                "crop_to_classes": (
-                    list(step.crop_to_classes) if step.crop_to_classes else None
-                ),
-                "dilation_mm": step.dilation_mm,
-            }
-            for step in spec.cascade
-        ]
+        cascade_list = []
+        for step in spec.cascade:
+            step_d: dict = {}
+            if step.weights_id is not None:
+                step_d["weights_id"] = step.weights_id
+            if step.crop_from_task is not None:
+                step_d["crop_from_task"] = step.crop_from_task
+            step_d["crop_to_classes"] = (
+                list(step.crop_to_classes) if step.crop_to_classes else None
+            )
+            step_d["dilation_mm"] = step.dilation_mm
+            cascade_list.append(step_d)
+        d["cascade"] = cascade_list
     elif spec.shape == "label_union":
         assert spec.union is not None
         d["union"] = [
@@ -543,6 +576,98 @@ def list_tasks_by_modality(modality: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_cascade_descriptors(
+    spec: TaskSpec, _depth: int = 0,
+) -> list[tuple[WeightsId, tuple[int, ...] | None, float]]:
+    """Flatten a task into ordered ``(weights_id, crop_to_classes, dilation_mm)``
+    descriptors for :func:`run_workflow`.
+
+    Handles nested-task cascades: a :class:`CascadeStep` with
+    ``crop_from_task`` is expanded by recursively resolving that task
+    (within the same source) and setting the last descriptor's crop to
+    this step's ``crop_to_classes`` — so the referenced task's final
+    output crops the FOV for the next step. The referenced task may be
+    ``single`` or itself ``cascade``; ``label_union`` cannot be a crop
+    source (no single segmentation to crop from).
+
+    Each descriptor's ``weights_id`` is resolved to an engine by the
+    dispatcher's ``engine_factory``.
+    """
+    if _depth > 8:
+        raise ValueError(
+            f"cascade nesting too deep (>8) at {spec.qualified_name!r}; "
+            f"likely a crop_from_task cycle."
+        )
+
+    if spec.shape == "single":
+        assert spec.single is not None
+        return [(spec.single, None, 10.0)]
+
+    if spec.shape != "cascade":
+        raise ValueError(
+            f"task {spec.qualified_name!r} (shape={spec.shape!r}) cannot be "
+            f"used as a cascade / crop source."
+        )
+
+    assert spec.cascade is not None
+    out: list[tuple[WeightsId, tuple[int, ...] | None, float]] = []
+    for step in spec.cascade:
+        if step.crop_from_task is not None:
+            # Resolve the referenced task within the same source.
+            ref = get_task(f"{spec.source}:{step.crop_from_task}")
+            sub = _resolve_cascade_descriptors(ref, _depth + 1)
+            # The referenced task's final output provides the crop FOV for
+            # the next step in *this* cascade.
+            wid, _, _ = sub[-1]
+            sub[-1] = (wid, step.crop_to_classes, step.dilation_mm)
+            out.extend(sub)
+        else:
+            out.append((step.weights_id, step.crop_to_classes, step.dilation_mm))
+    return out
+
+
+def _default_engine_factory(
+    source: str,
+    *,
+    folds: int | Iterable[int] | str | None,
+    verbose: bool,
+    moose_models_dir: str | None,
+) -> "Callable[[WeightsId], InferenceEngine]":
+    """Build the source-appropriate engine factory.
+
+    * ``moose`` → string folder names resolved via
+      :func:`cached_engine_from_moose_model`.
+    * ``ts`` / ``user`` → integer nnU-Net dataset IDs via
+      :func:`cached_engine_from_task`; a string id here raises a clear
+      error (the caller should pass an explicit ``engine_factory``).
+    """
+    if source == "moose":
+        from .engine_cache import cached_engine_from_moose_model
+
+        def factory(wid: WeightsId):
+            if not isinstance(wid, str):
+                raise TypeError(
+                    f"MOOSE tasks use string folder identifiers; got {wid!r}"
+                )
+            return cached_engine_from_moose_model(
+                wid, models_dir=moose_models_dir, folds=folds, verbose=verbose,
+            )
+        return factory
+
+    from .engine_cache import cached_engine_from_task
+
+    def factory(wid: WeightsId):
+        if not isinstance(wid, int):
+            raise NotImplementedError(
+                f"weights identifier {wid!r} is a string, but the default "
+                f"factory for source={source!r} resolves only integer "
+                f"nnU-Net dataset IDs. Pass an explicit engine_factory to "
+                f"run_named_task()."
+            )
+        return cached_engine_from_task(wid, folds=folds, verbose=verbose)
+    return factory
+
+
 def run_named_task(
     name: str,
     image_sitk: "sitk.Image",
@@ -552,6 +677,7 @@ def run_named_task(
     peak_working_memory_mb: int | None = None,
     verbose: bool = False,
     engine_factory: "Callable[[WeightsId], InferenceEngine] | None" = None,
+    moose_models_dir: str | None = None,
 ) -> "sitk.Image":
     """Run a named segmentation task end-to-end on a SITK image.
 
@@ -586,9 +712,15 @@ def run_named_task(
         Override engine construction. Signature: ``(weights_id: int | str)
         -> InferenceEngine``. Used by tests with synthetic engines and by
         callers with non-standard weight locations. ``None`` (default)
-        uses :func:`cached_engine_from_task`, which handles only integer
-        nnU-Net dataset IDs — string identifiers (e.g. MOOSE model names)
-        require a source-aware factory passed here.
+        selects a factory by the task's ``source``: integer nnU-Net dataset
+        IDs (``ts`` / ``user``) resolve via :func:`cached_engine_from_task`;
+        string folder names (``moose``) resolve via
+        :func:`cached_engine_from_moose_model`.
+    moose_models_dir :
+        Directory holding MOOSE model folders. Only used for ``source="moose"``
+        tasks with the default factory. ``None`` (default) falls back to the
+        ``NNUNET_MLX_MOOSE_MODELS`` / ``MOOSE_MODELS`` env vars or the
+        installed ``moosez`` package location.
 
     Returns
     -------
@@ -615,18 +747,10 @@ def run_named_task(
     spec = get_task(name)
 
     if engine_factory is None:
-        from .engine_cache import cached_engine_from_task
-
-        def engine_factory(wid: WeightsId):  # type: ignore[misc]
-            if not isinstance(wid, int):
-                raise NotImplementedError(
-                    f"task {spec.qualified_name!r} uses a string weights "
-                    f"identifier ({wid!r}); the default engine factory only "
-                    f"resolves integer nnU-Net dataset IDs. Pass a "
-                    f"source-aware engine_factory to run_named_task() "
-                    f"(MOOSE-style resolution is not yet built in)."
-                )
-            return cached_engine_from_task(wid, folds=folds, verbose=verbose)
+        engine_factory = _default_engine_factory(
+            spec.source, folds=folds, verbose=verbose,
+            moose_models_dir=moose_models_dir,
+        )
 
     if verbose:
         print(
@@ -644,15 +768,15 @@ def run_named_task(
         )
 
     if spec.shape == "cascade":
-        assert spec.cascade is not None
+        descriptors = _resolve_cascade_descriptors(spec)
         stages = [
             Stage(
-                engine=engine_factory(step.weights_id),
-                crop_to_classes=step.crop_to_classes,
-                dilation_mm=step.dilation_mm,
+                engine=engine_factory(wid),
+                crop_to_classes=crop,
+                dilation_mm=dil,
                 peak_working_memory_mb=peak_working_memory_mb,
             )
-            for step in spec.cascade
+            for (wid, crop, dil) in descriptors
         ]
         return run_workflow(image_sitk, stages, verbose=verbose)
 

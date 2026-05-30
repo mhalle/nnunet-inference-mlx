@@ -2,6 +2,27 @@
 
 ## [0.9.2] - 2026-05-27
 
+### Added — source-aware engine resolution (MOOSE models)
+
+`run_named_task` now picks an engine factory by the task's `source`:
+
+- `ts` / `user` → integer nnU-Net dataset IDs via `cached_engine_from_task` (unchanged)
+- `moose` → string folder names via the new **`cached_engine_from_moose_model(folder_name, models_dir=...)`**
+
+MOOSE stores nnU-Netv2 models one folder per model (`Dataset123_Organs`) under a flat models dir — same inner `{trainer}__{plans}__{res}` config layout TS uses, only the outer identifier is a string. New **`resolve_moose_config_folder(folder_name, models_dir)`** maps the folder name to the config folder `cached_engine_from_folder` consumes. The MOOSE models dir resolves from `models_dir=` → `NNUNET_MLX_MOOSE_MODELS` / `MOOSE_MODELS` env vars → the installed `moosez` package, with a clear error if none resolve. `run_named_task` gains a `moose_models_dir=` parameter. Both new functions are exported.
+
+### Added — nested-task cascade (`CascadeStep.crop_from_task`)
+
+A cascade step can now reference another *registered task by name* instead of an inline `weights_id`:
+
+```python
+CascadeStep(crop_from_task="craniofacial_structures", crop_to_classes=(2, 7))
+```
+
+The dispatcher flattens the reference — recursively — into the `run_workflow` stage list: the referenced task (which may itself be `single` or `cascade`) runs, and its final stage carries the outer step's crop. `CascadeStep` validates exactly one of `weights_id` / `crop_from_task`.
+
+This unblocks **TS `teeth`** (previously skipped by the generator). teeth crops from `craniofacial_structures`, which is itself a cascade — so it flattens three deep: `298 (rough total, crop→skull) → 115 (craniofacial, crop→teeth 2,7) → 113 (teeth)`. The TS registry now ships **51 tasks** (was 50; 23 single / 25 cascade / 3 label_union). The same mechanism covers MOOSE's two FOV-limited models (0.9.3).
+
 ### Added — `int | str` weights identifiers (MOOSE-ready)
 
 A source audit of MOOSE v3.1.6 confirmed MOOSE identifies models by **string** (`"clin_ct_organs"` / `"Dataset123_Organs"`), not the integer dataset IDs TS/nnU-Net use. So the weights identifier is now the union type **`WeightsId = int | str`** (exported from the package root):
@@ -48,7 +69,7 @@ Note: the "is the committed registry stale?" check is deliberately *not* a pytes
 
 ### Added — TS registry generator + 50 populated TS task entries
 
-`scripts/refresh_ts_registry.py` extracts task definitions from a `totalsegmentator` distribution (provisioned via `uv run`, see above) and emits `src/nnunet_inference_mlx/data/ts_tasks.json`. The shipped JSON now contains 50 TS tasks (23 single, 24 cascade, 3 label-union), covering essentially the full TS v2.13.0 catalog.
+`scripts/refresh_ts_registry.py` extracts task definitions from a `totalsegmentator` distribution (provisioned via `uv run`, see above) and emits `src/nnunet_inference_mlx/data/ts_tasks.json`. The shipped JSON contains **51 TS tasks** (23 single, 25 cascade, 3 label-union) — including `teeth` via the nested-task cascade above — covering essentially the full TS v2.13.0 catalog.
 
 ### How the generator works
 
@@ -86,8 +107,9 @@ The `fast`/`fastest` flags on `total` and `total_mr` are expanded into separate 
 
 ### Skipped (with reasons)
 
-- `teeth` — uses `crop_model="craniofacial_structures"` (nested-task cascade). Our flat `CascadeStep` can't express a task reference yet; deferred to 0.10.x.
 - `total_v1`, `covid`, `appendicular_bones_auxiliary`, `face_mr_auxiliary`, `kidney_cysts_auxiliary` — present in TS's `class_map` but absent from the dispatch chain (legacy, deprecated, or auxiliary internal tasks).
+
+(`teeth` was skipped in the first generator pass — its `crop_model` reference needed nested-task cascade support, now added above; it's included.)
 
 ### Usage
 
@@ -101,7 +123,7 @@ Now `run_named_task("total_fast", img)`, `run_named_task("lung_vessels", img)`, 
 
 ### Tests
 
-New `test_tasks.py` coverage: `TestBuiltinRegistry` (TS-catalog breadth + canonical task pins), `TestCrossSourceConflicts` (qualified-name resolution + `AmbiguousTaskError`), and `TestStringWeightsId` (MOOSE-style string IDs). Total: **230 passing** (`-m "not slow"`), 1 skipped, 2 heavy benchmarks deselected by default. ~7s for the fast suite.
+New `test_tasks.py` coverage: `TestBuiltinRegistry` (TS-catalog breadth + canonical pins), `TestCrossSourceConflicts` (qualified-name resolution + `AmbiguousTaskError`), `TestStringWeightsId` (MOOSE-style string IDs), `TestMooseEngineResolution` (folder resolution + source routing), and `TestNestedCascade` (crop_from_task flattening incl. the 3-deep `teeth` case). Total: **244 passing** (`-m "not slow"`), 1 skipped, 2 heavy benchmarks deselected by default. ~7s for the fast suite.
 
 - `test_ts_tasks_present` — assert ≥ 40 tasks registered (catches generator regression)
 - `test_canonical_ts_tasks_resolve` — verifies popular task names (`total`, `total_fast`, `body`, `lung_vessels`, …) are all registered with `source="ts"`
@@ -113,10 +135,10 @@ These assertions are pinned to TS v2.13.0. Future TS releases that change datase
 
 ### What's still TBD
 
-- **CI workflow** to auto-refresh on a cron schedule + open a PR if `ts_tasks.json` diffs — planned for 0.9.2.x. Not blocking — manual refresh is one command.
-- **Nested-task cascade support** (for `teeth`) — `CascadeStep.task_name: str | None` alternative to `weights_id: int`. Deferred to 0.10.x.
-- **MOOSE compatibility** — still 0.9.3 work (was 0.9.2 — bumped because this release ate the slot).
-- **CLI (`mlxseg`)** — still 0.10.0; consumes this registry.
+- **CI workflow** to auto-refresh on a cron schedule + open a PR if `ts_tasks.json` diffs — not blocking; manual refresh (`uv run scripts/refresh_ts_registry.py generate --write`) is one command.
+- **MOOSE registry generator + populated `moose_tasks.json`** — the engine resolution (`cached_engine_from_moose_model`) and nested cascade (`crop_from_task`) groundwork is now in place; remaining is `refresh_moose_registry.py` + a verification pass on a downloaded MOOSE model's `plans.json` (0.9.3).
+- **MOOSE PET multi-channel** — only 2 models; deferred.
+- **CLI (`mlxseg`)** — 0.10.0; consumes this registry.
 
 ## [0.9.1] - 2026-05-27
 
