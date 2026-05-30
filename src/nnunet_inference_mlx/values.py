@@ -316,21 +316,28 @@ class Prediction:
 
 @dataclass(frozen=True)
 class RestorePlan:
-    """Everything needed to map a model-frame result back to the caller's grid.
+    """Everything needed to map a model-frame prediction back to the caller's grid.
 
-    Returned by the preprocess step that moved a Volume into model frame
-    (reorient → permute → resample). ``postprocess.restore`` consumes it.
+    Returned by ``preprocess.to_model_frame`` (which reoriented the input to a
+    canonical orientation and resampled it to the model's spacing).
+    ``postprocess.restore`` consumes it: it inverse-resamples the model-frame
+    logits onto ``inference_geometry`` (the canonical-orientation grid at the
+    source spacing), then reorients from ``inference_orientation`` back to
+    ``source_orientation`` — landing on ``source_geometry``.
+
     This is how the pipeline avoids hidden state: the inverse instructions are
     a value the caller holds, not state stashed on an object or a temp file.
+    The axis transpose (``transpose_forward``/``backward``) is *not* recorded
+    here — the engine round-trips it internally, so the inverse never sees it.
 
-    ``source_geometry`` doubles as a binding token — restore checks that the
-    result it's handed actually came from this plan's input grid.
+    ``model_spacing_zyx`` doubles as a binding token — restore checks the
+    prediction it's handed was computed at this plan's model spacing.
     """
 
     source_geometry: Geometry
     source_orientation: str
-    target_orientation: str
-    axis_permutation: tuple[int, int, int]
+    inference_geometry: Geometry
+    inference_orientation: str
     model_spacing_zyx: tuple[float, float, float]
 
 

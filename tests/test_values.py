@@ -192,11 +192,13 @@ class TestRestorePlanBuildOptions:
     def test_restore_plan_is_a_value(self):
         g = _geom()
         plan = RestorePlan(
-            source_geometry=g, source_orientation="SAR", target_orientation="LPS",
-            axis_permutation=(0, 1, 2), model_spacing_zyx=(1.5, 1.5, 1.5),
+            source_geometry=g, source_orientation="SAR",
+            inference_geometry=g, inference_orientation="LPS",
+            model_spacing_zyx=(1.5, 1.5, 1.5),
         )
         assert plan.source_geometry is g
-        assert plan.axis_permutation == (0, 1, 2)
+        assert plan.inference_orientation == "LPS"
+        assert plan.model_spacing_zyx == (1.5, 1.5, 1.5)
 
     def test_build_options_hashable(self):
         a = BuildOptions(folds=(0, 1), configuration="3d_fullres")
