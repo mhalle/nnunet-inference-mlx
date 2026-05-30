@@ -1,5 +1,29 @@
 """nnU-Net inference on Apple Silicon via MLX."""
 
+# ---------------------------------------------------------------------------
+# 1.0 toolkit API (the composable, no-hidden-state surface).
+# Three nouns + one verb: TaskCatalog (name→recipe), ModelStore (id→model,
+# read-through + bounded), segment (the headline). Frozen value types as the
+# currency; preprocess/infer/postprocess/geometry as pure-fn namespaces.
+# ---------------------------------------------------------------------------
+from . import geometry, infer, postprocess, preprocess
+from .build import LoadedModel, build_model
+from .catalog import TaskCatalog
+from .imageio import ArrayReader, DicomReader, NiftiReader, NiftiWriter
+from .model_data import ModelData
+from .segment import segment
+from .store import ModelStore
+from .values import (
+    BuildOptions,
+    Geometry,
+    LabelSchema,
+    Prediction,
+    Region,
+    RestorePlan,
+    Segmentation,
+    Volume,
+)
+
 from .engine import (
     FoldEnsemble,
     InferenceEngine,
@@ -81,6 +105,34 @@ from .weights import (
 )
 
 __all__ = [
+    # ===== 1.0 toolkit API =====
+    # nouns + verb
+    "TaskCatalog",
+    "ModelStore",
+    "segment",
+    "build_model",
+    "LoadedModel",
+    "ModelData",
+    # value types (the inter-stage currency)
+    "Geometry",
+    "Volume",
+    "Segmentation",
+    "Prediction",
+    "LabelSchema",
+    "Region",
+    "RestorePlan",
+    "BuildOptions",
+    # image IO (format plug-ins)
+    "NiftiReader",
+    "DicomReader",
+    "ArrayReader",
+    "NiftiWriter",
+    # pure-fn stage namespaces (use as preprocess.to_model_frame, etc.)
+    "preprocess",
+    "infer",
+    "postprocess",
+    "geometry",
+    # ===== legacy surface (removed at the rest of the Phase 5 cutover) =====
     # Layered primitives
     "ModelBundle",
     "Predictor",
