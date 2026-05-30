@@ -150,6 +150,19 @@ Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
   → restore` is asserted *bit-identical* to the old fused `predict_with_resampling`
   for both a canonical (LPS) and a reoriented (RAS) volume. This is the safety net
   that let the geometry glue be restructured without behavior drift.
+- **Real-weights validation (TS Dataset297 3mm, abdominal CT):** ran the new
+  `ModelStore.load(297).segment` vs old `predict_with_resampling` on the same
+  engine. Initially 99.973% match (3152/11.6M voxels, organ boundaries only).
+  Root-caused to a single difference: the new path resamples in **float32**
+  (`sitk_to_volume` casts int16→float32 at read), the old path resampled the raw
+  **int16** image and rounded interpolated HU. Feeding the old path a float32
+  image → **bit-identical** (0 voxels differ). Decision: **keep float32** (matches
+  nnU-Net v2; the int16 rounding was a legacy quirk). Perf is a wash (~2ms on a
+  one-time resample vs ~20s inference; float resample is actually marginally
+  faster). Guards added: `test_decompose.test_to_model_frame_resamples_in_float_not_int`
+  + `test_imageio.test_int16_source_becomes_float32_volume`. The synthetic oracle
+  missed this because its volumes were already float32 — real int16 CT was the
+  first input to expose it.
 - Caveat — **`step_size`/`use_mirroring` are threaded but not yet truly free**:
   `infer.sliding_window` applies them by temporarily overriding the loaded model's
   `engine.sliding_window` for the call (save/set/restore). The real fix (baking

@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] — 1.0 toolkit rearchitecture (branch `feature/medseg-rearch`)
+
+In progress: a composable toolkit API (`TaskCatalog` / `ModelStore` / `segment`,
+value types, `preprocess`/`infer`/`postprocess`/`geometry` namespaces) built
+alongside the old surface; not yet wired into `__init__.py` (Phase 5 cutover).
+
+### Changed — forward resample now runs in float32 (behavior change)
+
+The new pipeline casts the input to **float32 at read** (`sitk_to_volume`) and
+resamples in float, matching nnU-Net v2's reference preprocessing. The legacy
+`predict_with_resampling` resampled the raw int16 SITK image, which rounded
+interpolated HU values to integers. On real int16 CT (TotalSegmentator
+Dataset297, abdominal) this rounding accounted for **all** of the new-vs-old
+divergence: 99.973% of voxels identical, differences confined to organ
+boundaries. With both paths resampling in float the outputs are **bit-identical**
+(verified end-to-end on real weights, same engine). Float is the intended
+behavior going forward.
+
 ## [0.9.2] - 2026-05-27
 
 ### Added — source-aware engine resolution (MOOSE models)

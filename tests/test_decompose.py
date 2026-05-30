@@ -125,6 +125,24 @@ class TestPredictionAndToLabels:
         assert seg.geometry.shape_zyx == pred.geometry.shape_zyx
         assert int(seg.data.max()) <= 2
 
+    def test_to_model_frame_resamples_in_float_not_int(self):
+        # Decision (Phase 3b): the toolkit resamples in float32 — matching
+        # nnU-Net v2 — NOT the old predict_with_resampling behaviour of
+        # resampling a raw int16 image and rounding interpolated values.
+        # On real int16 CT that rounding flipped ~0.03% of boundary voxels at
+        # argmax. Guard: resampling an integer-valued volume to a non-aligned
+        # spacing must produce fractional values (proves float interpolation).
+        m = build_model(_make_model_data())
+        shape = (24, 24, 24)
+        ramp = (mx.arange(int(np.prod(shape)), dtype=mx.float32) % 5).reshape((*shape, 1))
+        vol = Volume(data=ramp,
+                     geometry=Geometry(spacing_zyx=(1.0, 1.0, 1.0), shape_zyx=shape),
+                     channels=("CT",))
+        model_vol, _ = to_model_frame(vol, m.model_data)   # 1.0 -> 1.5 mm
+        arr = np.asarray(model_vol.data[..., 0])
+        frac = np.abs(arr - np.round(arr))
+        assert frac.max() > 1e-3, "model-frame values are integer-rounded; resample is not float"
+
     def test_restore_rejects_mismatched_prediction(self):
         m = build_model(_make_model_data())
         mv, plan = to_model_frame(_volume((24, 24, 24)), m.model_data)

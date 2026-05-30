@@ -75,7 +75,16 @@ def volume_to_sitk(volume: Volume):
 
 
 def sitk_to_volume(image, *, channels: Sequence[str] = ("CT",)) -> Volume:
-    """A single-channel :class:`Volume` from a SITK image."""
+    """A single-channel :class:`Volume` from a SITK image.
+
+    The image is cast to **float32** here (clinical CT is typically int16).
+    This is deliberate: everything downstream — the forward resample in
+    ``preprocess.to_model_frame`` and the network input — works in float, so
+    interpolated values are never rounded to integers. (The legacy
+    ``predict_with_resampling`` resampled the raw int16 image, rounding
+    interpolated HU; on real CT that flipped ~0.03% of boundary voxels at
+    argmax. Float resampling matches nnU-Net v2's reference preprocessing.)
+    """
     sitk = _require_sitk()
     arr = sitk.GetArrayFromImage(image).astype(np.float32, copy=False)  # (Z, Y, X)
     data = mx.array(arr)[..., None]                                     # (Z, Y, X, 1)

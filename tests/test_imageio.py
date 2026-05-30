@@ -57,6 +57,22 @@ class TestVolumeRoundTrip:
         with pytest.raises(NotImplementedError, match="single-channel"):
             volume_to_sitk(vol)
 
+    def test_int16_source_becomes_float32_volume(self, tmp_path):
+        # Clinical CT on disk is int16 (HU). The reader casts to float32 so the
+        # downstream resample interpolates in float (matches nnU-Net v2), rather
+        # than rounding interpolated values to integers. Guards the read seam
+        # where int16 enters the toolkit.
+        arr = (np.arange(8 * 10 * 12).reshape(8, 10, 12) % 7).astype(np.int16)
+        img = sitk.GetImageFromArray(arr)
+        assert img.GetPixelIDTypeAsString() == "16-bit signed integer"
+        path = tmp_path / "ct_int16.nii.gz"
+        sitk.WriteImage(img, str(path))
+
+        vol = NiftiReader().read(path)
+        assert vol.data.dtype == mx.float32
+        np.testing.assert_array_equal(np.asarray(vol.data[..., 0]),
+                                      arr.astype(np.float32))
+
 
 class TestReadersWriters:
     def test_array_reader_3d_adds_channel(self):
