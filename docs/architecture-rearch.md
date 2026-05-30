@@ -25,7 +25,7 @@ in-memory. None of that here.
 
 ## The user-facing vocabulary (three nouns)
 
-A novice meets **`run(task, image)`** and nothing else. Beyond that, the whole
+A novice meets **`segment(task, image)`** and nothing else. Beyond that, the whole
 surface is three nouns, each named for what it holds and how you access it:
 
 | noun | holds | access | analogy |
@@ -94,7 +94,7 @@ with ModelStore(...) as store: ...       # unload_all() on exit; downloads kept
 ## The layering, top to bottom
 
 ```
-L5  run(task, image, store=…)                          one call; fans out over the task's ids
+L5  segment(task, image, store=…)                          one call; fans out over the task's ids
 L4  TaskCatalog / recipes (SingleModel/Cascade/Union)  name→recipe; compose; refs resolved at load
 L3  preprocess.* | infer.* | postprocess.* | geometry  pure fns over Volume/Probabilities/Segmentation
 L2  build_model(model_data, opts) -> LoadedModel       the only GPU allocation (one place)
@@ -165,7 +165,7 @@ making a frozen recipe know about runtime caches.)
 import medseg as ms
 
 # one-liner
-seg = ms.run("total_fast", ms.NiftiReader().read("ct.nii.gz"))   # defaults wire catalog+store
+seg = ms.segment("total_fast", ms.NiftiReader().read("ct.nii.gz"))   # defaults wire catalog+store
 
 # toolbox, every step by hand
 store    = ms.ModelStore('totalsegmentator', model_root_dir="/data/ts")
@@ -182,7 +182,7 @@ with ms.ModelStore('totalsegmentator', max_memory_mb=4000) as store:
     task = catalog['total']                 # 5-part union
     store.load(task.model_refs)             # optional pre-warm (build now, fail-fast)
     for path in cohort:
-        seg = ms.run(task, ms.NiftiReader().read(path), store=store)
+        seg = ms.segment(task, ms.NiftiReader().read(path), store=store)
 # store.unload_all() at exit; downloads kept
 ```
 

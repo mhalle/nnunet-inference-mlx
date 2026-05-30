@@ -1,7 +1,9 @@
-"""run — the named-task / pipeline dispatcher on the new (Volume + store) path.
+"""segment — the named-task / pipeline dispatcher on the new (Volume + store) path.
 
-``run(task, image, store=…)`` resolves a task to its recipe and dispatches by
-shape, returning a :class:`Segmentation` in the input's geometry:
+``segment(task, image, store=…)`` resolves a task to its recipe and dispatches
+by shape, returning a :class:`Segmentation` in the input's geometry. It is the
+top-level verb for "produce a segmentation"; ``LoadedModel.segment`` is the
+same verb for a single already-loaded model.
 
 * **single**   → ``store.load(id).segment(image)`` (the native path)
 * **cascade**  → coarse → crop FOV → fine → paste
@@ -27,7 +29,7 @@ if TYPE_CHECKING:
     from .store import ModelStore
 
 
-def run(
+def segment(
     task: str | TaskSpec,
     image: Volume,
     *,
@@ -36,7 +38,7 @@ def run(
     reorient_to: str | None = "LPS",
     peak_working_memory_mb: int | None = None,
 ) -> Segmentation:
-    """Run a named task (or a recipe) on a :class:`Volume` → :class:`Segmentation`.
+    """Segment a :class:`Volume` with a named task (or recipe) → :class:`Segmentation`.
 
     ``task`` may be a recipe (:class:`TaskSpec`) or a name resolved via
     ``catalog`` (default: a catalog for the store's ecosystem). Models are
@@ -45,16 +47,16 @@ def run(
     spec = task if isinstance(task, TaskSpec) else _resolve(task, catalog, store)
 
     if spec.shape == "single":
-        return _run_single(spec, image, store,
-                           reorient_to=reorient_to,
-                           peak_working_memory_mb=peak_working_memory_mb)
+        return _segment_single(spec, image, store,
+                              reorient_to=reorient_to,
+                              peak_working_memory_mb=peak_working_memory_mb)
     if spec.shape == "cascade":
-        return _run_cascade(spec, image, store, catalog,
-                           peak_working_memory_mb=peak_working_memory_mb)
+        return _segment_cascade(spec, image, store, catalog,
+                              peak_working_memory_mb=peak_working_memory_mb)
     if spec.shape == "label_union":
-        return _run_union(spec, image, store,
-                         reorient_to=reorient_to,
-                         peak_working_memory_mb=peak_working_memory_mb)
+        return _segment_union(spec, image, store,
+                            reorient_to=reorient_to,
+                            peak_working_memory_mb=peak_working_memory_mb)
     raise ValueError(f"unhandled task shape: {spec.shape!r}")
 
 
@@ -103,13 +105,13 @@ def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
 # ---------------------------------------------------------------------------
 
 
-def _run_single(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
+def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
     model = store.load(spec.single)
     return model.segment(image, reorient_to=reorient_to,
                          peak_working_memory_mb=peak_working_memory_mb)
 
 
-def _run_cascade(spec, image, store, catalog, *, peak_working_memory_mb) -> Segmentation:
+def _segment_cascade(spec, image, store, catalog, *, peak_working_memory_mb) -> Segmentation:
     from .imageio import sitk_to_segmentation, volume_to_sitk
     from .workflow import Stage, run_workflow
 
@@ -127,7 +129,7 @@ def _run_cascade(spec, image, store, catalog, *, peak_working_memory_mb) -> Segm
     return sitk_to_segmentation(seg_sitk, _schema(spec))
 
 
-def _run_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
+def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
     from .imageio import sitk_to_segmentation, volume_to_sitk
     from .workflow import ParallelStage, run_label_union_workflow
 
@@ -146,4 +148,4 @@ def _run_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Se
     return sitk_to_segmentation(seg_sitk, _schema(spec))
 
 
-__all__ = ["run"]
+__all__ = ["segment"]

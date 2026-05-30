@@ -1,4 +1,4 @@
-"""Tests for run() (Phase 4): named-task / pipeline dispatch on the new path.
+"""Tests for segment() (Phase 4): named-task / pipeline dispatch on the new path.
 
 Uses synthetic ModelData (real build) behind a ModelStore whose read returns
 it for any id, and runs single / cascade / label_union recipes on a small
@@ -14,7 +14,7 @@ import pytest
 from nnunet_inference_mlx.catalog import TaskCatalog
 from nnunet_inference_mlx.model_data import ModelData
 from nnunet_inference_mlx.plans import build_network_from_plans
-from nnunet_inference_mlx.run import run
+from nnunet_inference_mlx.segment import segment
 from nnunet_inference_mlx.store import ModelStore
 from nnunet_inference_mlx.tasks import CascadeStep, TaskSpec, UnionPart
 from nnunet_inference_mlx.values import Geometry, Volume
@@ -63,11 +63,11 @@ def _store(tmp_path, ids):
                       read=lambda folder, **kw: md)   # real build
 
 
-class TestRunSingle:
+class TestSegmentSingle:
     def test_run_single_recipe(self, tmp_path):
         store = _store(tmp_path, [1])
         spec = TaskSpec(name="t", source="ts", modality="CT", shape="single", single=1)
-        seg = run(spec, _volume(), store=store)
+        seg = segment(spec, _volume(), store=store)
         assert seg.geometry.shape_zyx == (28, 28, 28)
         assert tuple(seg.data.shape) == (28, 28, 28)
 
@@ -76,11 +76,11 @@ class TestRunSingle:
         cat = TaskCatalog()
         cat.register(TaskSpec(name="mytask", source="ts", modality="CT",
                               shape="single", single=1))
-        seg = run("mytask", _volume(), store=store, catalog=cat)
+        seg = segment("mytask", _volume(), store=store, catalog=cat)
         assert seg.geometry.shape_zyx == (28, 28, 28)
 
 
-class TestRunCascade:
+class TestSegmentCascade:
     def test_run_inline_cascade(self, tmp_path):
         store = _store(tmp_path, [1, 2])
         spec = TaskSpec(
@@ -89,7 +89,7 @@ class TestRunCascade:
                      CascadeStep(weights_id=2)),
             label_map={1: "a", 2: "b"},
         )
-        seg = run(spec, _volume(), store=store)
+        seg = segment(spec, _volume(), store=store)
         assert seg.geometry.shape_zyx == (28, 28, 28)
 
     def test_run_nested_cascade_via_catalog(self, tmp_path):
@@ -106,11 +106,11 @@ class TestRunCascade:
         cat = TaskCatalog()
         cat.register(cropper)
         cat.register(target)
-        seg = run(target, _volume(), store=store, catalog=cat)
+        seg = segment(target, _volume(), store=store, catalog=cat)
         assert seg.geometry.shape_zyx == (28, 28, 28)
 
 
-class TestRunUnion:
+class TestSegmentUnion:
     def test_run_union(self, tmp_path):
         store = _store(tmp_path, [1, 2])
         spec = TaskSpec(
@@ -119,7 +119,7 @@ class TestRunUnion:
                    UnionPart(weights_id=2, label_remap={1: 3}, name="p2")),
             label_map={1: "x", 2: "y", 3: "z"},
         )
-        seg = run(spec, _volume(), store=store)
+        seg = segment(spec, _volume(), store=store)
         assert seg.geometry.shape_zyx == (28, 28, 28)
         # union output uses the unified schema's names
         assert seg.schema.names == {1: "x", 2: "y", 3: "z"}
