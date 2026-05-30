@@ -36,16 +36,6 @@ from .engine import (
     register_weights_layout,
     softmax_inplace,
 )
-from .engine_cache import (
-    cache_enabled,
-    cache_engine,
-    cached_engine_from_folder,
-    cached_engine_from_moose_model,
-    cached_engine_from_task,
-    clear_engine_cache,
-    get_cached_engine,
-    resolve_moose_config_folder,
-)
 from .labels import (
     convert_logits_to_segmentation,
     has_regions,
@@ -77,12 +67,6 @@ from .tasks import (
     TaskSpec,
     UnionPart,
     WeightsId,
-    get_task,
-    list_registered_tasks,
-    list_tasks_by_modality,
-    register_task,
-    run_named_task,
-    unregister_task,
 )
 from .workflow import (
     Bbox,
@@ -146,15 +130,6 @@ __all__ = [
     "discover_weights",
     "list_weights_layouts",
     "register_weights_layout",
-    # Process-wide engine cache
-    "cache_enabled",
-    "cache_engine",
-    "cached_engine_from_folder",
-    "cached_engine_from_moose_model",
-    "cached_engine_from_task",
-    "clear_engine_cache",
-    "get_cached_engine",
-    "resolve_moose_config_folder",
     # Label-scheme post-processing
     "convert_logits_to_segmentation",
     "has_regions",
@@ -195,16 +170,10 @@ __all__ = [
     "paste_segmentation",
     "run_label_union_workflow",
     "run_workflow",
-    # Declarative task registry + named-task dispatcher
+    # Recipe types (the declarative task vocabulary; lookup is via TaskCatalog)
     "AmbiguousTaskError",
     "CascadeStep",
     "TaskSpec",
     "UnionPart",
     "WeightsId",
-    "get_task",
-    "list_registered_tasks",
-    "list_tasks_by_modality",
-    "register_task",
-    "run_named_task",
-    "unregister_task",
 ]
