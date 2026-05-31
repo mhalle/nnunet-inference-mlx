@@ -32,7 +32,7 @@ peripheral features:
 | Extra | What it pulls in | Enables |
 |---|---|---|
 | `[postprocessing]` | `connected-components-3d` | `segment --remove-small-components-mm3` (multi-label dust) |
-| `[remote]` | `requests`, `remotezip` | Fetching `.pth` checkpoints over HTTP range requests |
+| `[remote]` | `httpx` | Remote weight download (`store.download`) + HTTP-range `.pth` loading |
 | `[test]` | `pytest` | Running the test suite |
 
 ```bash

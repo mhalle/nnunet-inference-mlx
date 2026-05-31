@@ -7,8 +7,12 @@ CachingRangeFile: fetches in aligned blocks and caches them, so adjacent/repeate
 
 Both resolve redirects once to a stable URL and use only forward ranges
 (no suffix/negative ranges, which some CDNs reject).
+
+Uses httpx (the package's HTTP client; install the ``remote`` extra). httpx
+does not follow redirects by default, so the client is created with
+``follow_redirects=True``.
 """
-import requests
+import httpx
 
 
 class _Base:
@@ -25,10 +29,10 @@ class _Base:
     def __exit__(self, *a): self.close()
 
     def _setup(self, url, session):
-        self.session = session or requests.Session()
-        r = self.session.head(url, allow_redirects=True, timeout=30)
+        self.session = session or httpx.Client(follow_redirects=True)
+        r = self.session.head(url, timeout=30)
         r.raise_for_status()
-        self.url = r.url
+        self.url = str(r.url)
         self.size = int(r.headers["Content-Length"])
         if r.headers.get("Accept-Ranges") != "bytes":
             t = self.session.get(self.url, headers={"Range": "bytes=0-0"}, timeout=30)

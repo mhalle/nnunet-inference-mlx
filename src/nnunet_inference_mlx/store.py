@@ -181,10 +181,14 @@ def verify_and_unpack(archive_path, expected_sha256: str | None, dest_dir) -> No
 
 
 def download_archive(url: str, dest_path) -> None:
-    """Stream ``url`` to ``dest_path`` (needs the ``remote`` extra: requests)."""
+    """Stream ``url`` to ``dest_path`` (needs the ``remote`` extra: httpx).
+
+    ``follow_redirects=True`` because release assets (e.g. GitHub) 302 to a CDN
+    and httpx, unlike requests, does not follow redirects by default.
+    """
     from pathlib import Path
     try:
-        import requests
+        import httpx
     except ImportError as e:  # pragma: no cover
         raise ImportError(
             "remote download needs the 'remote' extra: pip install "
@@ -192,10 +196,10 @@ def download_archive(url: str, dest_path) -> None:
         ) from e
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=60) as r:
+    with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
+            for chunk in r.iter_bytes(chunk_size=1 << 20):
                 f.write(chunk)
 
 

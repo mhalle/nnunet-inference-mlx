@@ -252,8 +252,8 @@ def plan_load(zf, weights_key="network_weights"):
 
 
 def load_from_zip(zf, weights_key="network_weights"):
-    """Core loader: take an open ZipFile (or any subclass like RemoteZip)
-    and return the checkpoint as numpy arrays.
+    """Core loader: take an open ZipFile (local, or one backed by a
+    range-request file like CachingRangeFile) and return numpy arrays.
 
     If weights_key is given and present at the top level, only that subtree
     is materialized (other storages, e.g. optimizer state, are never read —
@@ -283,19 +283,21 @@ def load_pth(path_or_file, weights_key="network_weights"):
         return load_from_zip(zf, weights_key=weights_key)
 
 
-def load_pth_url(url, weights_key="network_weights", **kwargs):
+def load_pth_url(url, weights_key="network_weights", *, session=None,
+                 block_size=8 * 1024 * 1024):
     """Load a remote .pth via HTTP range requests, downloading only the
     pickle index and the storage members actually realized.
 
     With the default weights_key='network_weights', optimizer state and
     other large non-weight storages are never fetched.
 
-    Requires `remotezip` and a server that supports the Range header.
-    kwargs are passed to RemoteZip (auth, headers, session, timeout,
-    initial_buffer_size, ...).
+    Uses our httpx-backed :class:`CachingRangeFile` (install the ``remote``
+    extra: httpx) over any server that supports the Range header. Pass
+    ``session=`` an ``httpx.Client`` to reuse a connection / set auth+headers.
     """
-    from remotezip import RemoteZip
-    with RemoteZip(url, **kwargs) as zf:
+    from .rangefile import CachingRangeFile
+    rf = CachingRangeFile(url, session=session, block_size=block_size)
+    with zipfile.ZipFile(rf) as zf:
         return load_from_zip(zf, weights_key=weights_key)
 
 def smart_load_url(url, weights_key="network_weights", session=None,
@@ -311,10 +313,10 @@ def smart_load_url(url, weights_key="network_weights", session=None,
     Returns (weights_dict, plan). The plan dict explains the choice.
     """
     import io as _io
+    import httpx as _httpx
     from .rangefile import CachingRangeFile
-    import requests as _requests
 
-    sess = session or _requests.Session()
+    sess = session or _httpx.Client(follow_redirects=True)
     # Plan with small blocks (cheap: just index + central directory)
     plan_rf = CachingRangeFile(url, session=sess, block_size=256 * 1024)
     with zipfile.ZipFile(plan_rf) as zf:

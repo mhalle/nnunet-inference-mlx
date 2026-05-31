@@ -12,6 +12,10 @@
   this is a supply-chain gate, not just corruption detection; writes a `.verified` sidecar
   to avoid re-hashing) + `download_archive(url, dest)` + `sha256_file`. CLI: `nnmlx models
   download <ids> [--force]`. (The actual remote fetch / recipe URLs land with 0.11.)
+- **HTTP client is now `httpx`** (was `requests`): `download_archive` and the torch-free
+  range loader (`_torchfree/rangefile.py`, `load_pth_url`/`smart_load_url`) use httpx with
+  `follow_redirects=True` (release assets 302 to a CDN). The `remote` extra is now just
+  `httpx` (dropped `requests`/`remotezip` — `load_pth_url` reuses our `CachingRangeFile`).
 - **Confirmed RAS is nnU-Net v2's universal canonical** (not just TS): the installed
   nnU-Net readers reorient inputs to RAS (`SimpleITKIO.read_images(orientation="RAS")`,
   `NibabelIO` to RAS) and back on write. So the RAS default is correct for all

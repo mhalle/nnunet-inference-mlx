@@ -23,8 +23,8 @@ TotalSegmentator = "nnunet_inference_mlx.ts_cli:main"
 totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
 
 [project.optional-dependencies]
-# Remote loading of .pth checkpoints over HTTP range requests.
-remote = ["requests", "remotezip"]
+# Remote weight download (store.download / download_archive).
+remote = ["httpx"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
 test = ["pytest"]
