@@ -1,7 +1,7 @@
 """nnU-Net inference on Apple Silicon via MLX."""
 
 # ---------------------------------------------------------------------------
-# 1.0 toolkit API (the composable, no-hidden-state surface).
+# Toolkit API (0.10; the composable, no-hidden-state surface).
 # Three nouns + one verb: TaskCatalog (name→recipe), ModelStore (id→model,
 # read-through + bounded), segment (the headline). Frozen value types as the
 # currency; preprocess/infer/postprocess/geometry as pure-fn namespaces.
@@ -74,7 +74,7 @@ from .weights import (
 )
 
 __all__ = [
-    # ===== 1.0 toolkit API =====
+    # ===== toolkit API (0.10) =====
     # nouns + verb
     "TaskCatalog",
     "ModelStore",

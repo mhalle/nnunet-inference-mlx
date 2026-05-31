@@ -1,4 +1,4 @@
-# Rearchitecture: the toolkit API (1.0 target)
+# Rearchitecture: the toolkit API (ships in 0.10; 1.0 after more testing)
 
 This captures the API design settled in the long design conversation, and the
 phased plan to get there. Governing principles (in priority order):

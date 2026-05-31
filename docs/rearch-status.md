@@ -15,7 +15,7 @@ file is the *where-we-are / what's-next* handoff.
 
 ## What this rearchitecture is
 
-Building the 1.0 toolkit API **alongside** the old one (which still works:
+Building the 0.10 toolkit API **alongside** the old one (which still works:
 validated inference, the old tests still pass), then cutting over and deleting
 the old surface. Governed by: composable toolkit, **no hidden state**,
 format/source-agnostic plug-ins, IO separated from compute. The new modules
@@ -264,7 +264,10 @@ Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
   Remote download (`store.download` from URL) is stubbed (raises) — local only.
 - A `segment` lacks a top-level `predict(task, image) -> Prediction` sibling; only
   `LoadedModel.predict` exists. Add the top-level sibling when convenient.
-- Suggested release framing once cutover lands: this is a 1.0 (breaking) API.
+- Release framing: ship the cutover as **0.10** (breaking, still pre-1.0). 1.0 is
+  gated on broader testing — real-weights integration coverage (the `~/tmp/` parity
+  scripts → proper `@slow` "weights-present" smoke/parity tests), more tasks/ecosystems
+  (MOOSE, region models) exercised, examples migrated.
 
 ## How to resume
 

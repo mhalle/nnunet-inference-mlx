@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased] — 1.0 toolkit rearchitecture (branch `feature/medseg-rearch`)
+## [Unreleased] — 0.10 toolkit rearchitecture (branch `feature/medseg-rearch`)
+
+Lands the composable toolkit API and removes the old hidden-state surface. Still
+**pre-1.0** — breaking changes are expected, and 1.0 is gated on broader testing
+(real-weights integration coverage, more tasks/ecosystems exercised).
 
 A composable toolkit API with **no hidden state**: three nouns + one verb —
 `TaskCatalog` (name→recipe), `ModelStore` (id→model; read-through, bounded,
