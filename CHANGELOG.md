@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 0.10 toolkit rearchitecture (branch `feature/medseg-rearch`)
+## [0.10.0] - 2026-05-31 — toolkit rearchitecture
 
 Lands the composable toolkit API and removes the old hidden-state surface. Still
 **pre-1.0** — breaking changes are expected, and 1.0 is gated on broader testing
