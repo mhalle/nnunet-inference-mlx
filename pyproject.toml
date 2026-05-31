@@ -1,6 +1,6 @@
 [project]
 name = "nnunet-inference-mlx"
-version = "0.9.2"
+version = "0.10.0.dev0"
 description = "nnU-Net inference on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -9,7 +9,11 @@ dependencies = [
     "mlx>=0.25",
     "numpy",
     "tqdm",
+    "typer>=0.12",
 ]
+
+[project.scripts]
+nnmlx = "nnunet_inference_mlx.cli:app"
 
 [project.optional-dependencies]
 # Remote loading of .pth checkpoints over HTTP range requests.

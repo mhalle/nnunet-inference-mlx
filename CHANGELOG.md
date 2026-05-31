@@ -6,6 +6,24 @@ Lands the composable toolkit API and removes the old hidden-state surface. Still
 **pre-1.0** — breaking changes are expected, and 1.0 is gated on broader testing
 (real-weights integration coverage, more tasks/ecosystems exercised).
 
+### Added — `nnmlx` CLI (Typer)
+
+A command-line shell over the toolkit, so real-weights runs are one command:
+
+```
+uv run nnmlx segment total_fast ct.nii.gz seg.nii.gz
+uv run nnmlx tasks list --modality CT
+uv run nnmlx tasks show total
+uv run nnmlx models list
+```
+
+Command groups: `segment` (run a named task → NIfTI), `tasks list`/`tasks show`
+(catalog inspection), `models list`/`models loaded` (store inspection). Shared
+`--ecosystem` / `--model-root` / `--max-memory-mb` on the top-level callback;
+each command builds an explicit request-scoped `ModelStore` + `TaskCatalog` (no
+global state). `typer` added to core deps; entry point `nnmlx`, also
+`python -m nnunet_inference_mlx`.
+
 A composable toolkit API with **no hidden state**: three nouns + one verb —
 `TaskCatalog` (name→recipe), `ModelStore` (id→model; read-through, bounded,
 freeable), `segment` — over frozen value types (`Geometry`/`Volume`/
