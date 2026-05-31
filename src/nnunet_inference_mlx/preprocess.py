@@ -64,12 +64,17 @@ def to_model_frame(
     """Move a :class:`Volume` into the model's input frame.
 
     Reorients to ``reorient_to`` then resamples to ``model_data.target_spacing_zyx``.
-    The default ``"RAS"`` is the nnU-Net / TotalSegmentator canonical (nibabel's
-    ``as_closest_canonical``): the model is **not** left/right-equivariant, so it
-    must see data in the orientation it was trained on — feeding ``"LPS"`` mirrors
-    L↔R and silently swaps left/right labels. Returns the model-frame volume and a
-    :class:`RestorePlan` capturing the inverse (the canonical source-spacing grid
-    the logits map back onto, and the orientation to return to).
+    The default ``"RAS"`` is nnU-Net v2's universal canonical: its readers reorient
+    every input to RAS before inference and back to the input's orientation on
+    write (``nnunetv2.imageio.SimpleITKIO.read_images(orientation="RAS")`` via
+    ``sitk.DICOMOrient``; ``NibabelIO`` likewise reorients to RAS). TotalSegmentator
+    and MOOSE both run on nnU-Net v2, so RAS applies to all three ecosystems. The
+    network is **not** left/right-equivariant, so it must see data in that trained
+    orientation — feeding ``"LPS"`` mirrors L↔R and silently swaps left/right
+    labels. (Override only for a model trained on an older nnU-Net whose reader
+    did not canonicalize.) Returns the model-frame volume and a :class:`RestorePlan`
+    capturing the inverse (the canonical source-spacing grid the logits map back
+    onto, and the orientation to return to).
 
     ``reorient_to=None`` skips the reorient round-trip (only safe when the
     input is already canonical).

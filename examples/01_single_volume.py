@@ -1,53 +1,43 @@
-"""Single-volume inference: NIfTI in, NIfTI out.
+"""Single-volume inference with the toolkit API: NIfTI in, NIfTI out.
 
-The minimum viable usage. Loads a model, runs inference, writes the
-segmentation to disk. Output dtype is auto-picked (uint8 for K <= 255).
+The minimal usage: a ``ModelStore`` (id → model; read-through + bounded), a
+reader, the ``segment`` one-liner, a writer.
 
-Usage:
-    python examples/01_single_volume.py scan.nii.gz seg.nii.gz [TASK_ID]
+    uv run python examples/01_single_volume.py scan.nii.gz seg.nii.gz [TASK]
 
-If TASK_ID is omitted, defaults to 297 (TotalSegmentator's "fast" 3 mm task).
+``TASK`` is a task name (default ``"total_fast"`` — TS 3 mm). Weights are read
+from ``~/.totalsegmentator/nnunet/results`` (or ``$TOTALSEG_WEIGHTS_PATH``).
 
-Prerequisites:
-    - macOS with Apple Silicon, mlx >= 0.25
-    - TotalSegmentator weights for the requested task downloaded into
-      ~/.totalsegmentator/nnunet/results/ (the default TS install path)
-      OR set $nnUNet_results / $TOTALSEG_WEIGHTS_PATH to your weights dir.
+Equivalent CLIs:
+    uv run nnmlx segment total_fast scan.nii.gz seg.nii.gz
+    uv run TotalSegmentator -i scan.nii.gz -o seg.nii.gz --ml --fast
 """
 
 from __future__ import annotations
 
 import sys
-import time
+
+import numpy as np
 
 from nnunet_inference_mlx import (
-    InferenceEngine,
-    ModelBundle,
-    predict_nifti,
+    ModelStore, NiftiReader, NiftiWriter, TaskCatalog, segment,
 )
 
 
-def main() -> int:
-    if len(sys.argv) < 3:
-        print(__doc__)
-        return 1
-    in_path = sys.argv[1]
-    out_path = sys.argv[2]
-    task_id = int(sys.argv[3]) if len(sys.argv) > 3 else 297
+def main(inp: str, out: str, task: str = "total_fast") -> None:
+    store = ModelStore("totalsegmentator")           # bounded, read-through, owned
+    catalog = TaskCatalog("totalsegmentator")         # name → recipe (no global)
 
-    print(f"Loading task {task_id}...")
-    t0 = time.perf_counter()
-    bundle = ModelBundle.from_task(task_id, folds=0)
-    engine = InferenceEngine(bundle, verbose=False, progress=True)
-    print(f"  loaded in {time.perf_counter() - t0:.1f}s")
-    print(f"  patch_size={engine.patch_size}, num_classes={engine.num_classes}")
+    image = NiftiReader().read(inp)                   # → Volume (channels-last + geometry)
+    seg = segment(task, image, store=store, catalog=catalog)   # → Segmentation
+    NiftiWriter().write(out, seg)
 
-    print(f"Inferring {in_path} -> {out_path} ...")
-    t0 = time.perf_counter()
-    predict_nifti(engine, in_path, out_path)
-    print(f"  done in {time.perf_counter() - t0:.1f}s")
-    return 0
+    labels = sorted(int(v) for v in np.unique(seg.data) if v)
+    print(f"wrote {out}: {seg.geometry.shape_zyx}, {len(labels)} structures")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+    main(*sys.argv[1:])

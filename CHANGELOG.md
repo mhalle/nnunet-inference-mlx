@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+- **Confirmed RAS is nnU-Net v2's universal canonical** (not just TS): the installed
+  nnU-Net readers reorient inputs to RAS (`SimpleITKIO.read_images(orientation="RAS")`,
+  `NibabelIO` to RAS) and back on write. So the RAS default is correct for all
+  nnU-Net v2 ecosystems (TS, MOOSE, raw nnUNet); rationale documented in
+  `preprocess.to_model_frame`.
+- **Migrated `examples/` to the toolkit API** (the old ones imported removed
+  symbols): `01_single_volume`, `02_batch_folder`, `03_logits_and_resolution`,
+  `04_cascade_and_union`, `05_toolkit_namespaces`, plus a rewritten `examples/README`.
+- **Expanded the `@slow` real-weights suite** (`test_real_weights.py`): organ-volume
+  sanity, a non-default-trainer model (`Dataset117`), and skip-guarded region /
+  MOOSE tests that run automatically once such weights are present. (Region,
+  multi-fold, and MOOSE remain unvalidated on real data — no such weights downloaded.)
+
 ## [0.10.0] - 2026-05-31 — toolkit rearchitecture
 
 Lands the composable toolkit API and removes the old hidden-state surface. Still
