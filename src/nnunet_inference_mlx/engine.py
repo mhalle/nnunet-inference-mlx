@@ -25,11 +25,8 @@ Downstream consumers compose what they need:
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -49,12 +46,7 @@ from .labels import (
 )
 from .plans import build_network_from_plans
 from .preprocessing import ct_normalization, get_normalization_params, zscore_normalization
-from .weights import (
-    discover_folds,
-    fuzzy_load_weights,
-    load_checkpoint_with_metadata,
-    load_model_weights,
-)
+from .weights import fuzzy_load_weights
 
 
 # ---------------------------------------------------------------------------
@@ -62,188 +54,6 @@ from .weights import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_WEIGHTS_DIR = None  # resolved lazily
-
-
-# ---------------------------------------------------------------------------
-# WeightsLayout — pluggable model-folder discovery
-# ---------------------------------------------------------------------------
-#
-# Different consumers store nnU-Net weights in slightly different places and
-# with slightly different folder conventions. nnU-Net itself uses
-# ``$nnUNet_results/Dataset{id}_*/{trainer}__{plans}__{model}/``.
-# TotalSegmentator uses ``$TOTALSEG_WEIGHTS_PATH`` (or
-# ``~/.totalsegmentator/nnunet/results``) with the same Dataset/trainer
-# structure but a TS-specific trainer (``nnUNetTrainerNoMirroring`` for
-# some models). MOOSE has its own root.
-#
-# Rather than special-case each, a ``WeightsLayout`` captures "where to look
-# + what trainer conventions to assume" as data. Downstream packages can
-# register their own layout via :func:`register_weights_layout`.
-
-
-@dataclass(frozen=True)
-class WeightsLayout:
-    """Specification for an nnU-Net-style weights tree.
-
-    Attributes
-    ----------
-    name :
-        Human-readable identifier (``"nnUNet"``, ``"TotalSegmentator"``, ...).
-    env_var :
-        Optional env var that overrides the default path when set.
-    default_path :
-        Filesystem path checked when ``env_var`` is unset / missing.
-        ``None`` means "no default; this layout requires the env var."
-    trainer, plans, model :
-        Preferred names for the ``{trainer}__{plans}__{model}`` subfolder
-        inside ``Dataset{id}_*``. ``None`` for any field means "auto-pick
-        whatever's there." Layouts with multiple co-installed trainers
-        (e.g. TS ships some Datasets with both ``nnUNetTrainer`` and
-        ``nnUNetTrainerNoMirroring``) should set ``trainer`` to disambiguate.
-    """
-    name: str
-    env_var: str | None = None
-    default_path: Path | None = None
-    trainer: str | None = None
-    plans: str | None = None
-    model: str | None = None
-
-    def resolve_weights_dir(self) -> Path | None:
-        """Return the weights directory if this layout is available, else None."""
-        if self.env_var and self.env_var in os.environ:
-            return Path(os.environ[self.env_var]).expanduser()
-        if self.default_path is not None:
-            p = self.default_path.expanduser()
-            if p.is_dir():
-                return p
-        return None
-
-
-# Built-in layouts, checked in declaration order.
-#
-# nnU-Net standard wins over TS when both env vars are set, on the principle
-# that a user who explicitly set $nnUNet_results meant it.
-_WEIGHTS_LAYOUTS: list[WeightsLayout] = [
-    WeightsLayout(name="nnUNet", env_var="nnUNet_results"),
-    WeightsLayout(
-        name="TotalSegmentator",
-        env_var="TOTALSEG_WEIGHTS_PATH",
-        default_path=Path("~/.totalsegmentator/nnunet/results"),
-    ),
-]
-
-
-def register_weights_layout(layout: WeightsLayout, *, prepend: bool = False) -> None:
-    """Register an additional weights layout.
-
-    Downstream packages (MOOSE, custom clinical installs) can call this at
-    import time to make their weights tree discoverable via :func:`discover_weights`
-    and ``ModelBundle.from_task(..., weights_dir=None)``.
-
-    Parameters
-    ----------
-    layout :
-        The layout to register.
-    prepend :
-        If True, insert at the front of the registry so this layout is checked
-        before the built-ins. Default is to append (built-ins win on collision).
-    """
-    if prepend:
-        _WEIGHTS_LAYOUTS.insert(0, layout)
-    else:
-        _WEIGHTS_LAYOUTS.append(layout)
-
-
-def list_weights_layouts() -> tuple[WeightsLayout, ...]:
-    """Return the registered weights layouts in lookup order."""
-    return tuple(_WEIGHTS_LAYOUTS)
-
-
-def discover_weights() -> tuple[Path, WeightsLayout]:
-    """Find the first registered weights tree that exists.
-
-    Returns
-    -------
-    (weights_dir, layout)
-        The directory that was found, and the layout that produced it.
-
-    Raises
-    ------
-    FileNotFoundError
-        If no registered layout resolves to an existing directory.
-    """
-    tried = []
-    for layout in _WEIGHTS_LAYOUTS:
-        tried.append(layout)
-        path = layout.resolve_weights_dir()
-        if path is not None:
-            return path, layout
-    msg = "No weights directory found. Tried:\n"
-    for L in tried:
-        env_state = (
-            f"{L.env_var}={os.environ.get(L.env_var)!r}"
-            if L.env_var else "no env var"
-        )
-        msg += f"  {L.name}: {env_state}, default={L.default_path}\n"
-    msg += (
-        "Pass weights_dir= explicitly, set the appropriate env var, "
-        "or register a custom WeightsLayout."
-    )
-    raise FileNotFoundError(msg)
-
-
-def _default_weights_dir() -> Path:
-    """Locate the first available weights directory via the layout registry."""
-    return discover_weights()[0]
-
-
-def _find_model_folder(
-    task_id: int,
-    weights_dir: Path,
-    *,
-    trainer: str | None = None,
-    plans: str | None = None,
-    model: str | None = None,
-) -> Path:
-    """Resolve task_id to a model folder path.
-
-    When ``trainer`` / ``plans`` / ``model`` are given, builds the exact
-    ``{trainer}__{plans}__{model}`` subfolder name (defaulting unspecified
-    fields to ``nnUNetTrainer`` / ``nnUNetPlans`` / ``3d_fullres``). When all
-    three are ``None``, picks the alphabetically first ``*__*__*`` subfolder
-    — correct for the common single-trainer case.
-
-    Explicit trainer disambiguation is needed when a Dataset folder ships
-    multiple trainer variants (e.g. TS's ``Dataset291`` has both
-    ``nnUNetTrainer__nnUNetPlans__3d_fullres`` and
-    ``nnUNetTrainerNoMirroring__nnUNetPlans__3d_fullres``).
-    """
-    matches = sorted(weights_dir.glob(f"Dataset{task_id}_*"))
-    if not matches:
-        raise FileNotFoundError(
-            f"No model found for task {task_id} in {weights_dir}."
-        )
-    dataset_dir = matches[0]
-
-    if trainer is not None or plans is not None or model is not None:
-        trainer_name = trainer or "nnUNetTrainer"
-        plans_name = plans or "nnUNetPlans"
-        model_name = model or "3d_fullres"
-        target = dataset_dir / f"{trainer_name}__{plans_name}__{model_name}"
-        if not target.exists():
-            available = "\n  ".join(
-                p.name for p in sorted(dataset_dir.glob("*__*__*"))
-            ) or "(none)"
-            raise FileNotFoundError(
-                f"Model folder not found: {target}\n"
-                f"Available trainer folders in {dataset_dir}:\n  {available}"
-            )
-        return target
-
-    trainer_dirs = sorted(dataset_dir.glob("*__*__*"))
-    if not trainer_dirs:
-        raise FileNotFoundError(f"No trainer folder found in {dataset_dir}.")
-    return trainer_dirs[0]
 
 
 @dataclass
@@ -379,144 +189,6 @@ class ModelBundle:
         """
         axes = (self.metadata or {}).get("inference_allowed_mirroring_axes")
         return tuple(axes) if axes else ()
-
-    @staticmethod
-    def _resolve_trainer_folder(path: Path) -> Path:
-        if (path / "plans.json").exists():
-            return path
-        trainer_dirs = sorted(path.glob("*__*__*"))
-        if trainer_dirs:
-            return trainer_dirs[0]
-        return path
-
-    @staticmethod
-    def from_folder(
-        path: str | Path,
-        folds: int | Iterable[int] | str = "all",
-        dtype: str | mx.Dtype | None = None,
-    ) -> ModelBundle:
-        """Load from a local model folder.
-
-        Parameters
-        ----------
-        path : str or Path
-            Path to the trainer folder (``.../nnUNetTrainer__nnUNetPlans__3d_fullres``)
-            or the dataset folder (``.../Dataset297_...``).
-        folds : int, iterable[int], or "all", default "all"
-            Which fold weights to load.
-
-            * ``int`` — single fold (length-1 bundle).
-            * ``iterable[int]`` — multi-fold ensemble in caller order.
-            * ``"all"`` — auto-detect every ``fold_*`` subdir (sorted).
-
-            The default loads whatever is on disk, which works for
-            single-fold release builds (e.g. TotalSegmentator) and
-            multi-fold trained models (e.g. MOOSE) without the caller
-            needing to know upfront.
-        dtype : str or mx.Dtype, optional
-            Cast weights to this precision on load. Pass ``"float16"`` /
-            ``"bfloat16"`` to save memory. None preserves source precision.
-
-        Returns
-        -------
-        ModelBundle
-            ``fold_weights`` has one entry per loaded fold.
-        """
-        path = ModelBundle._resolve_trainer_folder(Path(path).expanduser())
-        fold_ids = ModelBundle._normalize_folds(folds, path)
-
-        plans = json.loads((path / "plans.json").read_text())
-        dataset = json.loads((path / "dataset.json").read_text())
-
-        fold_weights: list[dict[str, mx.array]] = []
-        metadata: dict = {}
-        for i, f in enumerate(fold_ids):
-            w, meta = load_checkpoint_with_metadata(path, fold=f, dtype=dtype)
-            fold_weights.append(w)
-            if i == 0:
-                metadata = meta
-
-        return ModelBundle(
-            plans=plans,
-            dataset=dataset,
-            fold_weights=fold_weights,
-            metadata=metadata,
-            fold_ids=fold_ids,
-        )
-
-    @staticmethod
-    def _normalize_folds(
-        folds: int | Iterable[int] | str, path: Path
-    ) -> tuple[int, ...]:
-        if isinstance(folds, str):
-            if folds != "all":
-                raise ValueError(f"folds= must be int, iterable, or 'all'; got {folds!r}")
-            discovered = discover_folds(path)
-            if not discovered:
-                raise FileNotFoundError(f"No fold_* subdirs in {path}")
-            return discovered
-        if isinstance(folds, int):
-            return (folds,)
-        ids = tuple(int(f) for f in folds)
-        if not ids:
-            raise ValueError("folds= must contain at least one fold ID.")
-        return ids
-
-    @staticmethod
-    def from_task(
-        task_id: int,
-        folds: int | Iterable[int] | str = "all",
-        weights_dir: str | Path | None = None,
-        dtype: str | mx.Dtype | None = None,
-        *,
-        trainer: str | None = None,
-        plans: str | None = None,
-        model: str | None = None,
-    ) -> ModelBundle:
-        """Load by task ID from the weights directory.
-
-        See :meth:`from_folder` for ``folds`` and ``dtype`` semantics.
-
-        Parameters
-        ----------
-        task_id :
-            nnU-Net dataset/task ID (e.g. 297).
-        weights_dir :
-            Where to look for models. When ``None`` (default), the
-            :class:`WeightsLayout` registry is walked in declaration order
-            and the first directory that resolves wins — this finds
-            standard ``$nnUNet_results`` installs and TotalSegmentator
-            installs automatically. Pass an explicit path to bypass
-            discovery.
-        trainer, plans, model :
-            Override the trainer / plans / model subfolder names within
-            the resolved Dataset directory. Useful when a Dataset folder
-            contains multiple trainer variants (e.g. TS's ``Dataset291``
-            ships both ``nnUNetTrainer`` and ``nnUNetTrainerNoMirroring``)
-            and the alphabetical first-match picks the wrong one. When
-            all three are ``None``, the trainer-preference from the
-            resolved layout (if any) is used; otherwise the first match
-            on disk is used.
-        """
-        layout: WeightsLayout | None = None
-        if weights_dir is None:
-            resolved_dir, layout = discover_weights()
-            weights_dir = resolved_dir
-        weights_dir = Path(weights_dir).expanduser()
-
-        # If the layout had a trainer preference and the caller didn't
-        # override it, apply the layout's preference.
-        if layout is not None:
-            trainer = trainer if trainer is not None else layout.trainer
-            plans = plans if plans is not None else layout.plans
-            model = model if model is not None else layout.model
-
-        model_folder = _find_model_folder(
-            task_id, weights_dir,
-            trainer=trainer, plans=plans, model=model,
-        )
-        return ModelBundle.from_folder(model_folder, folds=folds, dtype=dtype)
-
 
 # ---------------------------------------------------------------------------
 # ShapeContext — precomputed per-shape state
@@ -957,9 +629,14 @@ class InferenceEngine:
     Build the layers directly — ``Predictor``, ``SlidingWindowEngine``,
     ``FoldEnsemble`` — and skip this facade.
 
+    A private compute core: build it from a :class:`ModelBundle` you construct
+    directly. End users go through ``ModelStore`` / ``build_model`` / ``segment``
+    (which read folders via ``ModelData.read_folder`` and own the bundle).
+
     Example
     -------
-    >>> bundle = ModelBundle.from_task(297)
+    >>> bundle = ModelBundle(plans=plans, dataset=dataset,
+    ...                      fold_weights=[weights], metadata={}, fold_ids=(0,))
     >>> engine = InferenceEngine(bundle)
     >>> logits = engine.predict(volume)  # (Z, Y, X) → (K, Z, Y, X)
     """

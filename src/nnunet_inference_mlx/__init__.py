@@ -30,10 +30,6 @@ from .engine import (
     ModelBundle,
     Predictor,
     SlidingWindowEngine,
-    WeightsLayout,
-    discover_weights,
-    list_weights_layouts,
-    register_weights_layout,
     softmax_inplace,
 )
 from .labels import (
@@ -111,14 +107,9 @@ __all__ = [
     "Predictor",
     "SlidingWindowEngine",
     "FoldEnsemble",
-    "InferenceEngine",          # back-compat facade
+    "InferenceEngine",          # private compute core
     "softmax_inplace",
     "sigmoid_inplace",
-    # Weights layout discovery (nnU-Net + TS by default; downstream extensible)
-    "WeightsLayout",
-    "discover_weights",
-    "list_weights_layouts",
-    "register_weights_layout",
     # Label-scheme post-processing
     "convert_logits_to_segmentation",
     "has_regions",
