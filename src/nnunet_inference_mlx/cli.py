@@ -96,13 +96,31 @@ def segment(
     reorient_to: str = typer.Option("LPS", "--reorient-to", help="Canonical orientation for inference."),
     reorient: bool = typer.Option(True, "--reorient/--no-reorient", help="Reorient to canonical before inference (and back after)."),
     peak_working_memory_mb: Optional[int] = typer.Option(None, "--peak-working-memory-mb", help="Inverse-resample slab budget; auto-tiers from RAM if unset."),
+    output_scaling: Optional[float] = typer.Option(None, "--output-scaling", help="Output resolution multiplier (2 = finer/half-spacing, 0.5 = coarser). Renders from logits; header fixed to same extent."),
+    output_spacing: Optional[float] = typer.Option(None, "--output-spacing", help="Output spacing in mm (isotropic). Alternative to --output-scaling."),
+    at_model_spacing: bool = typer.Option(False, "--at-model-spacing", help="Write at the model's native training spacing (no upsample back to the input grid)."),
 ) -> None:
-    """Run a named task on a volume and write the segmentation."""
+    """Run a named task on a volume and write the segmentation.
+
+    Output resolution: by default the segmentation is written on the input's
+    grid. --output-scaling / --output-spacing / --at-model-spacing (mutually
+    exclusive) change only the output *sampling* — the labels still occupy the
+    input's physical space. Note this is distinct from the model's own
+    resolution (e.g. 'total_fast' is a 3 mm model): a finer output grid resamples
+    the logits, it does not add detail the model never resolved. (Single-model
+    tasks only for now.)
+    """
     import numpy as np
 
     from .catalog import AmbiguousTaskError
     from .imageio import NiftiWriter
     from .segment import segment as run_segment
+
+    if sum(x is not None and x is not False
+           for x in (output_scaling, output_spacing, at_model_spacing or None)) > 1:
+        typer.secho("pass at most one of --output-scaling / --output-spacing / --at-model-spacing",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
 
     cfg: Config = ctx.obj
     store = _store(cfg)
@@ -127,6 +145,9 @@ def segment(
         spec, image, store=store, catalog=catalog,
         reorient_to=reorient_to if reorient else None,
         peak_working_memory_mb=peak_working_memory_mb,
+        output_spacing=output_spacing,
+        output_scaling=output_scaling,
+        at_model_spacing=at_model_spacing,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +155,8 @@ def segment(
     data = np.asarray(seg.data)
     labels = sorted(int(v) for v in np.unique(data) if v != 0)
     typer.secho(f"wrote  : {output}", fg=typer.colors.GREEN)
+    typer.echo(f"         {seg.geometry.shape_zyx} @ "
+               f"{tuple(round(s, 3) for s in seg.geometry.spacing_zyx)} mm")
     typer.echo(f"         {len(labels)} foreground labels (max {max(labels) if labels else 0}), "
                f"{int((data > 0).sum())} fg voxels")
 

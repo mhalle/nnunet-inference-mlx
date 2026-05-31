@@ -98,13 +98,23 @@ class LoadedModel:
         remove_small_components_mm3: float = 0.0,
         step_size: float = 0.5,
         use_mirroring: bool = False,
+        output_spacing: "float | tuple[float, float, float] | None" = None,
+        output_scaling: float | None = None,
+        at_model_spacing: bool = False,
     ) -> Segmentation:
         """Segment a single-channel :class:`Volume` → :class:`Segmentation`.
 
         The full pipeline, composed from the toolkit stages:
         ``to_model_frame → sliding_window → restore`` (logits are resampled
         back to the caller's grid, then argmax/paint — higher quality than
-        argmax-then-resample). The result is in the input's geometry.
+        argmax-then-resample).
+
+        Output resolution (mutually exclusive; default = the input grid):
+        ``output_spacing`` (absolute mm, scalar or (Z,Y,X)), ``output_scaling``
+        (resolution multiplier; 2 = finer, 0.5 = coarser), or
+        ``at_model_spacing`` (the model's native training grid — no inverse
+        resample beyond the model frame). The result always stays in the input's
+        orientation/space; only sampling density changes.
         """
         if self._engine is None:
             raise RuntimeError("LoadedModel has been closed")
@@ -112,13 +122,20 @@ class LoadedModel:
         from .postprocess import drop_small_components, restore
         from .preprocess import to_model_frame
 
+        if sum(x is not None and x is not False for x in
+               (output_spacing, output_scaling, at_model_spacing or None)) > 1:
+            raise ValueError("pass at most one of output_spacing / output_scaling / at_model_spacing")
+
         model_vol, plan = to_model_frame(
             volume, self.model_data,
             reorient_to=reorient_to, interpolation=interpolation,
         )
         prediction = sliding_window(self, model_vol,
                                     step_size=step_size, use_mirroring=use_mirroring)
+        target_spacing = self.model_data.target_spacing_zyx if at_model_spacing else output_spacing
         segmentation = restore(prediction, plan,
+                               target_spacing=target_spacing,
+                               target_scaling=output_scaling,
                                peak_working_memory_mb=peak_working_memory_mb)
         if remove_small_components_mm3 > 0:
             segmentation = drop_small_components(

@@ -24,6 +24,23 @@ each command builds an explicit request-scoped `ModelStore` + `TaskCatalog` (no
 global state). `typer` added to core deps; entry point `nnmlx`, also
 `python -m nnunet_inference_mlx`.
 
+### Added — output resolution control
+
+`segment` / `LoadedModel.segment` / `postprocess.restore` gain output-resolution
+knobs (mutually exclusive; default = the input grid):
+
+- `--output-scaling S` — resolution multiplier (2 = finer/half-spacing, 0.5 = coarser).
+- `--output-spacing MM` — absolute isotropic spacing.
+- `--at-model-spacing` — the model's native training grid (no upsample back).
+
+The labels are rendered **from the logits** at the requested grid (then argmax/
+paint), not nearest-neighbour-resampled from a finished label map — higher
+quality. The output header (spacing/shape/origin/direction) is recomputed over
+the same physical extent, so it still overlays the input; `scaling=1` is a true
+identity. Single-model tasks only for now (cascade/union raise). Downsampling
+stays Nyquist-limited. SITK is now a core dependency (segmenting == image I/O),
+so `uv run nnmlx segment …` works with no extra flags.
+
 A composable toolkit API with **no hidden state**: three nouns + one verb —
 `TaskCatalog` (name→recipe), `ModelStore` (id→model; read-through, bounded,
 freeable), `segment` — over frozen value types (`Geometry`/`Volume`/

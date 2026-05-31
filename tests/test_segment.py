@@ -123,3 +123,14 @@ class TestSegmentUnion:
         assert seg.geometry.shape_zyx == (28, 28, 28)
         # union output uses the unified schema's names
         assert seg.schema.names == {1: "x", 2: "y", 3: "z"}
+
+    def test_union_rejects_output_resampling(self, tmp_path):
+        store = _store(tmp_path, [1, 2])
+        spec = TaskSpec(
+            name="uni", source="ts", modality="CT", shape="label_union",
+            union=(UnionPart(weights_id=1, label_remap={1: 1}, name="p1"),
+                   UnionPart(weights_id=2, label_remap={1: 2}, name="p2")),
+            label_map={1: "x", 2: "y"},
+        )
+        with pytest.raises(NotImplementedError, match="output resampling"):
+            segment(spec, _volume(), store=store, output_scaling=2.0)

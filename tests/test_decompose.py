@@ -142,6 +142,66 @@ class TestPredictionAndToLabels:
         frac = np.abs(arr - np.round(arr))
         assert frac.max() > 1e-3, "model-frame values are integer-rounded; resample is not float"
 
+    def test_restore_identity_default(self):
+        # No override → input grid (unchanged behaviour).
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))
+        mv, plan = to_model_frame(vol, m.model_data)
+        seg = restore(sliding_window(m, mv), plan)
+        assert seg.geometry.shape_zyx == vol.geometry.shape_zyx
+        assert seg.geometry.spacing_zyx == vol.geometry.spacing_zyx
+
+    def test_restore_output_spacing_fixes_header_same_extent(self):
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))                 # 1.0 mm, extent 24 mm/axis
+        mv, plan = to_model_frame(vol, m.model_data)
+        pred = sliding_window(m, mv)
+        seg = restore(pred, plan, target_spacing=2.0)
+        assert seg.geometry.spacing_zyx == (2.0, 2.0, 2.0)
+        assert seg.geometry.shape_zyx == (12, 12, 12)   # 24 mm / 2 mm
+        # physical extent preserved
+        assert seg.geometry.physical_size_zyx == vol.geometry.physical_size_zyx
+
+    def test_restore_scaling_matches_equivalent_spacing(self):
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))
+        mv, plan = to_model_frame(vol, m.model_data)
+        pred = sliding_window(m, mv)
+        by_scale = restore(pred, plan, target_scaling=0.5)      # coarser ×0.5
+        by_spacing = restore(pred, plan, target_spacing=2.0)    # 1.0/0.5 = 2.0 mm
+        assert by_scale.geometry.shape_zyx == by_spacing.geometry.shape_zyx
+        assert by_scale.geometry.spacing_zyx == by_spacing.geometry.spacing_zyx
+        np.testing.assert_array_equal(np.asarray(by_scale.data), np.asarray(by_spacing.data))
+
+    def test_restore_scaling_one_is_identity(self):
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))
+        mv, plan = to_model_frame(vol, m.model_data)
+        pred = sliding_window(m, mv)
+        base = restore(pred, plan)
+        scaled = restore(pred, plan, target_scaling=1.0)
+        assert scaled.geometry.shape_zyx == base.geometry.shape_zyx
+        np.testing.assert_array_equal(np.asarray(scaled.data), np.asarray(base.data))
+
+    def test_restore_rejects_both_overrides(self):
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))
+        mv, plan = to_model_frame(vol, m.model_data)
+        pred = sliding_window(m, mv)
+        with pytest.raises(ValueError, match="not both"):
+            restore(pred, plan, target_spacing=2.0, target_scaling=2.0)
+
+    def test_segment_at_model_spacing(self):
+        # at_model_spacing → seg on the model's native (1.5 mm) grid.
+        m = build_model(_make_model_data())
+        seg = m.segment(_volume((24, 24, 24)), at_model_spacing=True)
+        assert seg.geometry.spacing_zyx == (1.5, 1.5, 1.5)
+
+    def test_segment_rejects_multiple_output_modes(self):
+        m = build_model(_make_model_data())
+        with pytest.raises(ValueError, match="at most one"):
+            m.segment(_volume((24, 24, 24)), output_spacing=2.0, output_scaling=2.0)
+
     def test_restore_rejects_mismatched_prediction(self):
         m = build_model(_make_model_data())
         mv, plan = to_model_frame(_volume((24, 24, 24)), m.model_data)

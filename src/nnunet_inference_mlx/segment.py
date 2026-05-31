@@ -38,19 +38,37 @@ def segment(
     catalog: "TaskCatalog | None" = None,
     reorient_to: str | None = "LPS",
     peak_working_memory_mb: int | None = None,
+    output_spacing: "float | tuple[float, float, float] | None" = None,
+    output_scaling: float | None = None,
+    at_model_spacing: bool = False,
 ) -> Segmentation:
     """Segment a :class:`Volume` with a named task (or recipe) → :class:`Segmentation`.
 
     ``task`` may be a recipe (:class:`TaskSpec`) or a name resolved via
     ``catalog`` (default: a catalog for the store's ecosystem). Models are
     fetched/built/cached through ``store``.
+
+    Output-resolution knobs (``output_spacing`` / ``output_scaling`` /
+    ``at_model_spacing``, mutually exclusive) are currently supported for
+    ``single`` tasks only; on cascade/union they raise (the output is assembled
+    from integer label maps, so high-quality logit-render at a new grid needs
+    more plumbing — tracked for a later step).
     """
     spec = task if isinstance(task, TaskSpec) else _resolve(task, catalog, store)
+    _resample = output_spacing is not None or output_scaling is not None or at_model_spacing
 
     if spec.shape == "single":
         return _segment_single(spec, image, store,
                               reorient_to=reorient_to,
-                              peak_working_memory_mb=peak_working_memory_mb)
+                              peak_working_memory_mb=peak_working_memory_mb,
+                              output_spacing=output_spacing,
+                              output_scaling=output_scaling,
+                              at_model_spacing=at_model_spacing)
+    if _resample:
+        raise NotImplementedError(
+            f"output resampling (output_spacing/output_scaling/at_model_spacing) is not "
+            f"yet supported for {spec.shape!r} tasks — only single-model tasks."
+        )
     if spec.shape == "cascade":
         return _segment_cascade(spec, image, store, catalog,
                               reorient_to=reorient_to,
@@ -107,10 +125,14 @@ def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
 # ---------------------------------------------------------------------------
 
 
-def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
+def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
+                    output_spacing=None, output_scaling=None, at_model_spacing=False) -> Segmentation:
     model = store.load(spec.single)
     return model.segment(image, reorient_to=reorient_to,
-                         peak_working_memory_mb=peak_working_memory_mb)
+                         peak_working_memory_mb=peak_working_memory_mb,
+                         output_spacing=output_spacing,
+                         output_scaling=output_scaling,
+                         at_model_spacing=at_model_spacing)
 
 
 def _segment_cascade(spec, image, store, catalog, *, reorient_to,
