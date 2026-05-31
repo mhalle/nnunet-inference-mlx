@@ -745,9 +745,11 @@ def reorient(image: "sitk.Image", code: str) -> "sitk.Image":
     Parameters
     ----------
     code :
-        Three-letter DICOM-style code, e.g. ``"LPS"`` (the nnU-Net /
-        TotalSegmentator canonical), ``"RAS"`` (FreeSurfer / NIfTI
-        convention), ``"SAR"`` (some oblique CT scans).
+        Three-letter DICOM-style code, e.g. ``"RAS"`` (the nnU-Net /
+        TotalSegmentator / nibabel canonical — the orientation the models were
+        trained on; the inference default), ``"LPS"`` (DICOM/SITK world
+        convention — **mirrors L↔R vs RAS, so do not feed it to the model**),
+        ``"SAR"`` (some oblique CT scans).
 
     Returns
     -------
@@ -759,7 +761,7 @@ def reorient(image: "sitk.Image", code: str) -> "sitk.Image":
     Round-trip pattern::
 
         orig = get_orientation(image)
-        canonical = reorient(image, "LPS")
+        canonical = reorient(image, "RAS")
         # ... inference / pipeline at canonical orientation ...
         result = reorient(seg, orig)
     """

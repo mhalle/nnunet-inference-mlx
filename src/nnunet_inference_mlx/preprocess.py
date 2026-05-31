@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from .model_data import ModelData
 
 
-def reorient(volume: Volume, code: str = "LPS") -> tuple[Volume, str]:
+def reorient(volume: Volume, code: str = "RAS") -> tuple[Volume, str]:
     """Reorient a single-channel :class:`Volume` to a DICOM orientation code.
 
     Returns the reoriented volume *and* the volume's original orientation
@@ -58,15 +58,18 @@ def to_model_frame(
     volume: Volume,
     model_data: "ModelData",
     *,
-    reorient_to: str | None = "LPS",
+    reorient_to: str | None = "RAS",
     interpolation: str = "linear",
 ) -> tuple[Volume, RestorePlan]:
     """Move a :class:`Volume` into the model's input frame.
 
-    Reorients to ``reorient_to`` (canonical, default ``"LPS"``) then resamples
-    to ``model_data.target_spacing_zyx``. Returns the model-frame volume and a
-    :class:`RestorePlan` capturing the inverse: the canonical source-spacing
-    grid the logits map back onto and the orientation to return to.
+    Reorients to ``reorient_to`` then resamples to ``model_data.target_spacing_zyx``.
+    The default ``"RAS"`` is the nnU-Net / TotalSegmentator canonical (nibabel's
+    ``as_closest_canonical``): the model is **not** left/right-equivariant, so it
+    must see data in the orientation it was trained on — feeding ``"LPS"`` mirrors
+    L↔R and silently swaps left/right labels. Returns the model-frame volume and a
+    :class:`RestorePlan` capturing the inverse (the canonical source-spacing grid
+    the logits map back onto, and the orientation to return to).
 
     ``reorient_to=None`` skips the reorient round-trip (only safe when the
     input is already canonical).

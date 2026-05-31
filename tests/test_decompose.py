@@ -105,7 +105,7 @@ class TestPredictionAndToLabels:
         mv, plan = to_model_frame(_volume((24, 24, 24)), m.model_data)
         assert mv.geometry.spacing_zyx == (1.5, 1.5, 1.5)
         assert plan.model_spacing_zyx == (1.5, 1.5, 1.5)
-        assert plan.inference_orientation == "LPS"
+        assert plan.inference_orientation == "RAS"   # nnU-Net/TS canonical (not LPS — that mirrors L/R)
 
     def test_sliding_window_returns_prediction(self):
         m = build_model(_make_model_data())

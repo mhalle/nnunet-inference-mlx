@@ -6,6 +6,21 @@ Lands the composable toolkit API and removes the old hidden-state surface. Still
 **pre-1.0** — breaking changes are expected, and 1.0 is gated on broader testing
 (real-weights integration coverage, more tasks/ecosystems exercised).
 
+### Fixed — left/right mirror in segmentation output (canonical orientation RAS, not LPS)
+
+The inference canonical orientation was wrongly set to **LPS**, which mirrors the
+volume left↔right vs **RAS** (nibabel's `as_closest_canonical`, what nnU-Net /
+TotalSegmentator train and serve in). Since the network is not L/R-equivariant,
+it saw a mirrored volume and produced **left/right-swapped labels** — structures
+in the right *places* but with `left`/`right` reversed. Confirmed against the TS
+mainline reference (`mlx-LEFT-lung` matched `ref-RIGHT-lung` at 0.93 Dice under
+LPS; 0.97 vs `ref-LEFT` under RAS) and by anatomy (liver landed on the patient's
+left). Default `reorient_to` is now `"RAS"` across `segment` / `LoadedModel` /
+`preprocess.to_model_frame` / the CLI. This was a **pre-existing** port bug
+(invisible to synthetic tests, which have no L/R semantics, and to old-vs-new
+parity, which shared the same flip); added a real-weights `@slow` regression
+(`test_real_weights.py`) asserting liver/spleen sit on the correct sides.
+
 ### Added — `nnmlx` CLI (Typer)
 
 A command-line shell over the toolkit, so real-weights runs are one command:

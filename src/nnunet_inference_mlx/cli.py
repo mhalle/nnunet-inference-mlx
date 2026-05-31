@@ -93,7 +93,7 @@ def segment(
     task: str = typer.Argument(..., help="Task name, e.g. 'total' or 'total_fast' (qualify as 'ts:total' if ambiguous)."),
     input: Path = typer.Argument(..., exists=True, help="Input NIfTI file or DICOM series directory."),
     output: Path = typer.Argument(..., help="Output NIfTI path for the segmentation."),
-    reorient_to: str = typer.Option("LPS", "--reorient-to", help="Canonical orientation for inference."),
+    reorient_to: str = typer.Option("RAS", "--reorient-to", help="Canonical orientation for inference (RAS = nnU-Net/TS convention; do not change unless you know the model's training orientation)."),
     reorient: bool = typer.Option(True, "--reorient/--no-reorient", help="Reorient to canonical before inference (and back after)."),
     peak_working_memory_mb: Optional[int] = typer.Option(None, "--peak-working-memory-mb", help="Inverse-resample slab budget; auto-tiers from RAM if unset."),
     output_scaling: Optional[float] = typer.Option(None, "--output-scaling", help="Output resolution multiplier (2 = finer/half-spacing, 0.5 = coarser). Renders from logits; header fixed to same extent."),

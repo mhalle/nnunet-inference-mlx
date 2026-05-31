@@ -36,7 +36,7 @@ def segment(
     *,
     store: "ModelStore",
     catalog: "TaskCatalog | None" = None,
-    reorient_to: str | None = "LPS",
+    reorient_to: str | None = "RAS",
     peak_working_memory_mb: int | None = None,
     output_spacing: "float | tuple[float, float, float] | None" = None,
     output_scaling: float | None = None,
