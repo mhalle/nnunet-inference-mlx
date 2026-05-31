@@ -15,7 +15,8 @@
   gain `--no-download`; `nnmlx segment` gains `--download/--no-download` (default on).
   Missing weights for the requested task are fetched before inference (`segment`'s new
   `required_weights_ids` resolves single/cascade/union ids). The *library* default stays
-  explicit (no auto-download) — only the executables mimic TS.
+  explicit (no auto-download) — only the executables mimic TS. `download_archive` shows a
+  tqdm byte-progress bar (auto-enabled on a TTY via `disable=None`, silent in pipes/tests).
 - **`ModelStore.download(ids, *, force=False, build=False)` contract** — idempotent
   "ensure present" (fetch only what's missing; a no-op for present ids — the disk-layer
   twin of `load`'s read-through), with `force` to re-fetch. Returns the ids actually

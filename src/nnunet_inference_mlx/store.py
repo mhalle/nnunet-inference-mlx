@@ -240,13 +240,21 @@ def download_archive(url: str, dest_path) -> None:
             "remote download needs the 'remote' extra: pip install "
             "'nnunet-inference-mlx[remote]'."
         ) from e
+    from tqdm import tqdm
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as r:
         r.raise_for_status()
-        with open(dest_path, "wb") as f:
+        total = int(r.headers.get("Content-Length", 0)) or None
+        # disable=None → tqdm shows a bar on a TTY (the CLI) and stays silent
+        # in pipes / tests, so no progress flag needs threading through.
+        with open(dest_path, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"  ↓ {dest_path.stem}", disable=None, leave=False,
+        ) as bar:
             for chunk in r.iter_bytes(chunk_size=1 << 20):
                 f.write(chunk)
+                bar.update(len(chunk))
 
 
 # ---------------------------------------------------------------------------

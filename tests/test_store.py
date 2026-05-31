@@ -372,3 +372,25 @@ class TestTotalSegFetch:
         from nnunet_inference_mlx.store import _totalsegmentator_fetch
         with pytest.raises(FileNotFoundError, match="no download URL"):
             _totalsegmentator_fetch(99999, tmp_path)
+
+
+class TestDownloadArchive:
+    def test_streams_bytes_with_progress(self, tmp_path, monkeypatch):
+        import httpx
+        import nnunet_inference_mlx.store as st
+
+        class _Resp:
+            headers = {"Content-Length": "6"}
+            def raise_for_status(self): pass
+            def iter_bytes(self, chunk_size=1 << 20):
+                yield b"abc"
+                yield b"def"
+
+        class _Stream:
+            def __enter__(self): return _Resp()
+            def __exit__(self, *a): return False
+
+        monkeypatch.setattr(httpx, "stream", lambda *a, **k: _Stream())
+        dest = tmp_path / "x.zip"
+        st.download_archive("https://example/x.zip", dest)
+        assert dest.read_bytes() == b"abcdef"   # tqdm-wrapped loop wrote all chunks
