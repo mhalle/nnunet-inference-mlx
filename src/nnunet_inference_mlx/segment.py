@@ -104,6 +104,20 @@ def _schema(spec: TaskSpec) -> LabelSchema:
     return LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
 
+def required_weights_ids(spec: TaskSpec, *, store=None, catalog=None) -> list:
+    """The weights ids a task needs — single id, cascade stages, or union parts.
+
+    For pre-download (e.g. CLI auto-download): ``store.download(required_weights_ids(spec))``.
+    """
+    if spec.shape == "single":
+        return [spec.single]
+    if spec.shape == "cascade":
+        return [wid for (wid, _crop, _dil) in _flatten_cascade(spec, catalog, store)]
+    if spec.shape == "label_union":
+        return [p.weights_id for p in spec.union]
+    return []
+
+
 def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
     """Flatten a (possibly nested-task) cascade to ``[(id, crop, dilation)]``."""
     if _depth > 8:
@@ -233,4 +247,4 @@ def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
     return Segmentation(data=mx.array(unified), geometry=image.geometry, schema=schema)
 
 
-__all__ = ["segment"]
+__all__ = ["segment", "required_weights_ids"]

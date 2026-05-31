@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **Native weight download is live for TotalSegmentator.** TS v2 weights are public
+  GitHub release zips, keyed per dataset id. A build-time generator
+  (`scripts/refresh_ts_weights.py`) extracts the id→URL map from TS's
+  `download_pretrained_weights` source into a shipped `data/ts_weights.json` (42
+  datasets; 1 license-gated, flagged) — TS is never imported at runtime, same
+  relationship as `ts_tasks.json`. The `totalsegmentator` store now has a default
+  `fetch` that downloads the URL → verifies → unpacks, so `store.download(id)` works
+  out of the box (verified end-to-end against GitHub). License-gated/unknown ids raise
+  actionably. `nnunet`/`moose` have no default fetch (place locally or inject one).
+- **CLIs auto-download by default (TS-like), opt-out.** `TotalSegmentator`/`totalseg-mlx`
+  gain `--no-download`; `nnmlx segment` gains `--download/--no-download` (default on).
+  Missing weights for the requested task are fetched before inference (`segment`'s new
+  `required_weights_ids` resolves single/cascade/union ids). The *library* default stays
+  explicit (no auto-download) — only the executables mimic TS.
 - **`ModelStore.download(ids, *, force=False, build=False)` contract** — idempotent
   "ensure present" (fetch only what's missing; a no-op for present ids — the disk-layer
   twin of `load`'s read-through), with `force` to re-fetch. Returns the ids actually

@@ -99,6 +99,7 @@ def segment(
     output_scaling: Optional[float] = typer.Option(None, "--output-scaling", help="Output resolution multiplier (2 = finer/half-spacing, 0.5 = coarser). Renders from logits; header fixed to same extent."),
     output_spacing: Optional[float] = typer.Option(None, "--output-spacing", help="Output spacing in mm (isotropic). Alternative to --output-scaling."),
     at_model_spacing: bool = typer.Option(False, "--at-model-spacing", help="Write at the model's native training spacing (no upsample back to the input grid)."),
+    download: bool = typer.Option(True, "--download/--no-download", help="Auto-download missing weights (default on)."),
 ) -> None:
     """Run a named task on a volume and write the segmentation.
 
@@ -136,6 +137,19 @@ def segment(
         raise typer.Exit(2)
 
     typer.echo(f"task   : {spec.qualified_name}  (shape={spec.shape})")
+
+    if download:
+        from .segment import required_weights_ids
+        need = [i for i in required_weights_ids(spec, store=store, catalog=catalog)
+                if i not in set(store.downloaded())]
+        if need:
+            typer.echo(f"download: fetching weights {need} ...")
+            try:
+                store.download(need)
+            except FileNotFoundError as e:
+                typer.secho(str(e), fg=typer.colors.RED, err=True)
+                raise typer.Exit(2)
+
     typer.echo(f"input  : {input}")
     image = _read_volume(input)
     typer.echo(f"         {image.geometry.shape_zyx} @ "

@@ -97,6 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v1o", "--v1_order", action="store_true", default=False)
     p.add_argument("-rmb", "--remove_small_blobs", action="store_true", default=False,
                    help="Remove small connected components (<0.2 ml) from the output.")
+    p.add_argument("--no_download", "--no-download", dest="no_download", action="store_true",
+                   default=False,
+                   help="Do not auto-download missing weights (default: download, like TS).")
     p.add_argument("-d", "--device", type=str, default="gpu",
                    help="Accepted for compatibility; the MLX backend always runs on Metal.")
     p.add_argument("-q", "--quiet", action="store_true", default=False)
@@ -187,6 +190,20 @@ def main(argv=None) -> int:
         out("Using 'fastest' option: resampling to lower resolution (6mm)")
     elif args.fast:
         out("Using 'fast' option: resampling to lower resolution (3mm)")
+
+    # Auto-download missing weights (default; --no-download disables — TS-like).
+    if not args.no_download:
+        from .segment import required_weights_ids
+        try:
+            need = [i for i in required_weights_ids(spec, store=store, catalog=catalog)
+                    if i not in set(store.downloaded())]
+            if need:
+                out(f"Downloading weights {need} ...")
+                store.download(need)
+                out("  Downloaded.")
+        except FileNotFoundError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
 
     reader = DicomReader() if args.input.is_dir() else NiftiReader()
     image = reader.read(args.input)

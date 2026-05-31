@@ -335,3 +335,40 @@ class TestVerifyAndUnpack:
         verify_and_unpack(arc, None, dest)
         assert (dest / "f.txt").exists()
         assert (dest / ".verified").read_text() == "unverified"
+
+
+# ---------------------------------------------------------------------------
+# totalsegmentator default fetch (manifest → URL); no network (mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestTotalSegFetch:
+    def test_manifest_has_core_datasets(self):
+        from nnunet_inference_mlx.store import _ts_weights_manifest
+        m = _ts_weights_manifest()
+        assert "297" in m and m["297"]["url"].endswith(".zip")
+        assert "291" in m and "github.com" in m["291"]["url"]
+
+    def test_default_fetch_wired_for_totalsegmentator_only(self):
+        assert ModelStore("totalsegmentator")._fetch is not None
+        assert ModelStore("nnunet")._fetch is None
+
+    def test_fetch_resolves_url_and_unpacks(self, tmp_path, monkeypatch):
+        import nnunet_inference_mlx.store as st
+        seen = {}
+        monkeypatch.setattr(st, "download_archive",
+                            lambda url, dest: (seen.update(url=url), open(dest, "wb").close()))
+        monkeypatch.setattr(st, "verify_and_unpack",
+                            lambda arc, sha, root: seen.update(root=str(root), sha=sha))
+        st._totalsegmentator_fetch(297, tmp_path)
+        assert "Dataset297" in seen["url"] and seen["root"] == str(tmp_path)
+
+    def test_fetch_gated_raises(self, tmp_path):
+        from nnunet_inference_mlx.store import _totalsegmentator_fetch
+        with pytest.raises(FileNotFoundError, match="license server"):
+            _totalsegmentator_fetch(920, tmp_path)
+
+    def test_fetch_unknown_id_raises(self, tmp_path):
+        from nnunet_inference_mlx.store import _totalsegmentator_fetch
+        with pytest.raises(FileNotFoundError, match="no download URL"):
+            _totalsegmentator_fetch(99999, tmp_path)

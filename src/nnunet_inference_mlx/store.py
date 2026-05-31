@@ -131,6 +131,52 @@ def _default_read(folder, *, folds="all", dtype=None, ecosystem="local", id=None
                                  ecosystem=ecosystem, id=id)
 
 
+# ---------------------------------------------------------------------------
+# Per-ecosystem default fetch (id → public download URL → verify → unpack)
+# ---------------------------------------------------------------------------
+
+_TS_WEIGHTS_MANIFEST = None  # lazy-loaded data/ts_weights.json {id: {url, sha256, gated}}
+
+
+def _ts_weights_manifest() -> dict:
+    global _TS_WEIGHTS_MANIFEST
+    if _TS_WEIGHTS_MANIFEST is None:
+        import json
+        from pathlib import Path
+        p = Path(__file__).parent / "data" / "ts_weights.json"
+        _TS_WEIGHTS_MANIFEST = json.loads(p.read_text()).get("weights", {})
+    return _TS_WEIGHTS_MANIFEST
+
+
+def _totalsegmentator_fetch(id, model_root) -> None:
+    """Download a TotalSegmentator dataset's public release zip into the model
+    root, verify (if a sha is recorded), and unpack. Used as the default fetch
+    for the ``totalsegmentator`` ecosystem so ``download`` works out of the box.
+    """
+    import tempfile
+    from pathlib import Path
+
+    entry = _ts_weights_manifest().get(str(id))
+    if entry is None:
+        raise FileNotFoundError(
+            f"no download URL known for dataset {id} (not in ts_weights.json). "
+            f"Regenerate the manifest or place the weights locally."
+        )
+    if entry.get("gated") or not entry.get("url"):
+        raise FileNotFoundError(
+            f"dataset {id} is distributed via the TotalSegmentator license server "
+            f"and is not auto-downloadable; obtain it through TotalSegmentator."
+        )
+    with tempfile.TemporaryDirectory() as td:
+        archive = Path(td) / f"Dataset{id}.zip"
+        download_archive(entry["url"], archive)
+        verify_and_unpack(archive, entry.get("sha256"), Path(model_root))
+
+
+# ecosystem → default fetch (None = not auto-downloadable; download() errors actionably)
+_DEFAULT_FETCH = {"totalsegmentator": _totalsegmentator_fetch}
+
+
 def _default_build(model_data: ModelData, options: BuildOptions):
     from .build import build_model  # phase 3
     return build_model(model_data, options)
@@ -258,7 +304,7 @@ class ModelStore:
         self.options = options
         self._read = read or _default_read
         self._build = build or _default_build
-        self._fetch = fetch
+        self._fetch = fetch or _DEFAULT_FETCH.get(ecosystem)
         resolve, model_dir, downloaded, _, _ = _ECOSYSTEMS[ecosystem]
         self._resolve_folder = resolve
         self._model_dir = model_dir
