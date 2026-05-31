@@ -175,13 +175,31 @@ def main(argv=None) -> int:
               f"Try `nnmlx tasks list`.", file=sys.stderr)
         return 2
 
-    log(f"[totalseg-mlx] task={spec.qualified_name} input={args.input}")
+    import time
+
+    # TS-style console output (stdout, unless --quiet).
+    def out(msg):
+        if not args.quiet:
+            print(msg, flush=True)
+
+    out("\nIf you use this tool please cite: https://pubs.rsna.org/doi/10.1148/ryai.230024\n")
+    if args.fastest:
+        out("Using 'fastest' option: resampling to lower resolution (6mm)")
+    elif args.fast:
+        out("Using 'fast' option: resampling to lower resolution (3mm)")
+
     reader = DicomReader() if args.input.is_dir() else NiftiReader()
     image = reader.read(args.input)
 
-    seg = segment(spec, image, store=store, catalog=catalog)
+    st = time.time()
+    seg = segment(spec, image, store=store, catalog=catalog, progress=out)
+    out(f"  Predicted in {time.time() - st:.2f}s")
+
     if args.remove_small_blobs:
+        out("Removing small blobs...")
+        st = time.time()
         seg = drop_small_components(seg, min_volume_mm3=200.0, in_place=True)
+        out(f"  Removed in {time.time() - st:.2f}s")
 
     data = np.asarray(seg.data)
     names = dict(seg.schema.names)                 # {label_id: roi_name}
@@ -189,20 +207,26 @@ def main(argv=None) -> int:
 
     # ----- save segmentations -----
     if not args.skip_saving:
+        out("Saving segmentations...")
+        st = time.time()
         if args.ml:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             sitk.WriteImage(array_to_sitk(data, seg.geometry), str(args.output))
-            log(f"[totalseg-mlx] wrote multilabel {args.output}")
         else:
             args.output.mkdir(parents=True, exist_ok=True)
-            n = 0
-            for lid, nm in sorted(names.items()):
-                if lid == 0 or (wanted and nm not in wanted):
-                    continue
+            classes = [(lid, nm) for lid, nm in sorted(names.items())
+                       if lid != 0 and (not wanted or nm in wanted)]
+            iterator = classes
+            if not args.quiet:
+                try:
+                    from tqdm import tqdm
+                    iterator = tqdm(classes, desc="  saving", unit="roi", leave=False)
+                except Exception:
+                    pass
+            for lid, nm in iterator:
                 mask = (data == lid).astype(np.uint8)
                 sitk.WriteImage(array_to_sitk(mask, seg.geometry), str(args.output / f"{nm}.nii.gz"))
-                n += 1
-            log(f"[totalseg-mlx] wrote {n} per-class masks to {args.output}/")
+        out(f"  Saved in {time.time() - st:.2f}s")
 
     # ----- statistics -----
     if args.statistics:

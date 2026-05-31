@@ -18,7 +18,7 @@ primitives (``remap_labels``/``paint_union``). No bridge to the old SITK
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import numpy as np
 
@@ -41,6 +41,7 @@ def segment(
     output_spacing: "float | tuple[float, float, float] | None" = None,
     output_scaling: float | None = None,
     at_model_spacing: bool = False,
+    progress: "Callable[[str], None] | None" = None,
 ) -> Segmentation:
     """Segment a :class:`Volume` with a named task (or recipe) → :class:`Segmentation`.
 
@@ -53,6 +54,10 @@ def segment(
     ``single`` tasks only; on cascade/union they raise (the output is assembled
     from integer label maps, so high-quality logit-render at a new grid needs
     more plumbing — tracked for a later step).
+
+    ``progress`` is an optional callback invoked with short human-readable phase
+    strings (e.g. ``"Predicting..."``, ``"Predicting part 2 of 5 ..."``) — used
+    by CLIs to report progress without the toolkit owning any console output.
     """
     spec = task if isinstance(task, TaskSpec) else _resolve(task, catalog, store)
     _resample = output_spacing is not None or output_scaling is not None or at_model_spacing
@@ -63,7 +68,8 @@ def segment(
                               peak_working_memory_mb=peak_working_memory_mb,
                               output_spacing=output_spacing,
                               output_scaling=output_scaling,
-                              at_model_spacing=at_model_spacing)
+                              at_model_spacing=at_model_spacing,
+                              progress=progress)
     if _resample:
         raise NotImplementedError(
             f"output resampling (output_spacing/output_scaling/at_model_spacing) is not "
@@ -72,11 +78,13 @@ def segment(
     if spec.shape == "cascade":
         return _segment_cascade(spec, image, store, catalog,
                               reorient_to=reorient_to,
-                              peak_working_memory_mb=peak_working_memory_mb)
+                              peak_working_memory_mb=peak_working_memory_mb,
+                              progress=progress)
     if spec.shape == "label_union":
         return _segment_union(spec, image, store,
                             reorient_to=reorient_to,
-                            peak_working_memory_mb=peak_working_memory_mb)
+                            peak_working_memory_mb=peak_working_memory_mb,
+                            progress=progress)
     raise ValueError(f"unhandled task shape: {spec.shape!r}")
 
 
@@ -126,8 +134,11 @@ def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
 
 
 def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
-                    output_spacing=None, output_scaling=None, at_model_spacing=False) -> Segmentation:
+                    output_spacing=None, output_scaling=None, at_model_spacing=False,
+                    progress=None) -> Segmentation:
     model = store.load(spec.single)
+    if progress:
+        progress("Predicting...")
     return model.segment(image, reorient_to=reorient_to,
                          peak_working_memory_mb=peak_working_memory_mb,
                          output_spacing=output_spacing,
@@ -136,7 +147,7 @@ def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
 
 
 def _segment_cascade(spec, image, store, catalog, *, reorient_to,
-                     peak_working_memory_mb) -> Segmentation:
+                     peak_working_memory_mb, progress=None) -> Segmentation:
     """coarse → crop FOV around target classes → fine → paste into full grid.
 
     Each stage runs the proven single-model pipeline (``model.segment``, which
@@ -156,6 +167,8 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
 
     for i, (wid, crop_classes, dilation) in enumerate(descriptors):
         model = store.load(wid)
+        if progress:
+            progress(f"Predicting stage {i + 1} of {len(descriptors)} ...")
         seg = model.segment(current, reorient_to=reorient_to,
                             peak_working_memory_mb=peak_working_memory_mb)
         if i == len(descriptors) - 1:
@@ -179,7 +192,8 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
     return paste(final_seg, image.geometry, cumulative)
 
 
-def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -> Segmentation:
+def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
+                   progress=None) -> Segmentation:
     """Run each part independently, remap into the unified space, paint by priority.
 
     Parts share the same input; later parts overwrite earlier ones at
@@ -206,8 +220,10 @@ def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb) -
         out_dtype = np.dtype(np.uint32)
 
     unified = np.zeros(image.geometry.shape_zyx, dtype=out_dtype)
-    for part in spec.union:
+    for i, part in enumerate(spec.union):
         model = store.load(part.weights_id)
+        if progress:
+            progress(f"Predicting part {i + 1} of {len(spec.union)} ...")
         seg = model.segment(image, reorient_to=reorient_to,
                            peak_working_memory_mb=peak_working_memory_mb)
         remapped = remap_labels(np.asarray(seg.data), dict(part.label_remap),

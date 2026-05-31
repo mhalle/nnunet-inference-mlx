@@ -17,6 +17,9 @@ dependencies = [
 
 [project.scripts]
 nnmlx = "nnunet_inference_mlx.cli:app"
+# TotalSegmentator-compatible CLI. Both names run the same drop-in front end;
+# `TotalSegmentator` lets existing command lines work verbatim under `uv run`.
+TotalSegmentator = "nnunet_inference_mlx.ts_cli:main"
 totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
 
 [project.optional-dependencies]

@@ -60,6 +60,15 @@ nora, dicom output, body_seg/force_split, save_probabilities, license, …) are
 accepted and ignored with a warning, so command lines don't break. The native,
 non-TS interface remains `nnmlx`.
 
+Entry points **`TotalSegmentator`** (a literal drop-in name — existing command
+lines run verbatim under `uv run`) and `totalseg-mlx` (same front end; doesn't
+shadow a real TS install). Console output **mimics TS**: citation line,
+`Using 'fast' option...`, `Predicting...` / `Predicting part i of N ...` (per
+union part), `  Predicted in Xs`, `Saving segmentations...` with a tqdm bar,
+`  Saved in Xs`. To support that, `segment()` / the per-shape runners gained an
+optional `progress` callback (invoked with short phase strings) so CLIs report
+progress without the toolkit owning any console output.
+
 ### Added — output resolution control
 
 `segment` / `LoadedModel.segment` / `postprocess.restore` gain output-resolution
