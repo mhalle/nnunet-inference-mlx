@@ -131,7 +131,7 @@ __all__ = [
     "save_segmentation_zyx",
     "predict_nifti",
     "predict_folder",
-    # Resampling + SITK-based predict_with_resampling (opt-in via [preprocessing] extra)
+    # Resampling primitives (SITK-backed; SITK is a core dependency)
     "get_orientation",
     "inverse_resample_argmax",
     "inverse_resample_paint",

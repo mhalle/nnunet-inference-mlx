@@ -27,8 +27,8 @@ def _require_sitk():
         return sitk
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "SimpleITK is required for image IO. Install with "
-            "`pip install nnunet-inference-mlx[preprocessing]`."
+            "SimpleITK is required for image IO (it is a core dependency; "
+            "`uv run` installs it). Install with `pip install SimpleITK`."
         ) from e
 
 

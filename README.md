@@ -25,12 +25,13 @@ uv add nnunet-inference-mlx              # recommended (uv)
 pip install nnunet-inference-mlx         # or pip
 ```
 
-Optional extras (install only what you need):
+`SimpleITK` is a core dependency (image I/O + resampling are part of
+segmenting); `uv run` installs everything needed. Optional extras add only
+peripheral features:
 
 | Extra | What it pulls in | Enables |
 |---|---|---|
-| `[preprocessing]` | `SimpleITK` | `predict_with_resampling`, SITK-image I/O, multi-stage workflows |
-| `[postprocessing]` | `connected-components-3d` | `remove_small_components` (multi-label dust) |
+| `[postprocessing]` | `connected-components-3d` | `segment --remove-small-components-mm3` (multi-label dust) |
 | `[remote]` | `requests`, `remotezip` | Fetching `.pth` checkpoints over HTTP range requests |
 | `[test]` | `pytest` | Running the test suite |
 

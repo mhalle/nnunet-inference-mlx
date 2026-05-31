@@ -10,6 +10,9 @@ dependencies = [
     "numpy",
     "tqdm",
     "typer>=0.12",
+    # SITK is core: reading/writing images and spacing-aware resampling are
+    # part of segmenting, which is what the package is for. `uv run` installs it.
+    "SimpleITK",
 ]
 
 [project.scripts]
@@ -18,9 +21,7 @@ nnmlx = "nnunet_inference_mlx.cli:app"
 [project.optional-dependencies]
 # Remote loading of .pth checkpoints over HTTP range requests.
 remote = ["requests", "remotezip"]
-# Spacing-aware resampling helpers + SITK-image I/O for predict_with_resampling.
-preprocessing = ["SimpleITK"]
-# Multi-label connected-component cleanup (remove_small_components).
+# Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
 test = ["pytest"]
 

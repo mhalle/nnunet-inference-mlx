@@ -20,13 +20,9 @@ live after inference, so doing the inverse on Metal avoids a host
 round-trip and lets us slab-stream the per-channel argmax in a single
 fused kernel.
 
-Opt-in via the ``preprocessing`` extra:
-
-    pip install nnunet-inference-mlx[preprocessing]
-
-That installs SimpleITK. The rest of the package keeps no hard
-dependency on SITK; consumers using their own resampling library
-(scipy, dask) can ignore this module entirely.
+Backed by SimpleITK, a core dependency (segmenting means reading/resampling
+images). Consumers using their own resampling library (scipy, dask) can
+ignore this module.
 """
 
 from __future__ import annotations
@@ -55,8 +51,8 @@ def _require_sitk():
         import SimpleITK as sitk_mod
     except ImportError as e:
         raise ImportError(
-            "SimpleITK is required for preprocessing helpers. Install with "
-            "`pip install nnunet-inference-mlx[preprocessing]`."
+            "SimpleITK is required for resampling helpers (it is a core "
+            "dependency; `uv run` installs it). Install with `pip install SimpleITK`."
         ) from e
 
     global _SITK_INTERP
