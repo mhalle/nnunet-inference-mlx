@@ -2,9 +2,33 @@
 
 ## [Unreleased] — 1.0 toolkit rearchitecture (branch `feature/medseg-rearch`)
 
-In progress: a composable toolkit API (`TaskCatalog` / `ModelStore` / `segment`,
-value types, `preprocess`/`infer`/`postprocess`/`geometry` namespaces) built
-alongside the old surface; not yet wired into `__init__.py` (Phase 5 cutover).
+A composable toolkit API with **no hidden state**: three nouns + one verb —
+`TaskCatalog` (name→recipe), `ModelStore` (id→model; read-through, bounded,
+freeable), `segment` — over frozen value types (`Geometry`/`Volume`/
+`Segmentation`/`Prediction`/`LabelSchema`/`RestorePlan`/`BuildOptions`) and
+pure-fn stage namespaces (`preprocess`/`infer`/`postprocess`/`geometry`). Now the
+package's public surface.
+
+### Removed — the old hidden-state surface (breaking; Phase 5 cutover)
+
+- **Module-global engine cache** (`engine_cache.py`: `cached_engine_from_*`,
+  `get_cached_engine`, `clear_engine_cache`, `resolve_moose_config_folder`) →
+  replaced by the owned, bounded `ModelStore`.
+- **Module-global task registry + dispatcher** (`tasks.py`: `register_task`/
+  `get_task`/`run_named_task`/`list_registered_tasks`/…) → replaced by the owned
+  `TaskCatalog` (lookup) + `segment()` (dispatch). The recipe vocabulary
+  (`TaskSpec`/`CascadeStep`/`UnionPart`/`AmbiguousTaskError`) is kept.
+- **Old SITK orchestration** `workflow.py` (`run_workflow`/`run_label_union_workflow`/
+  `Stage`/`ParallelStage`/`Bbox`/`compute_fg_bbox`/`crop_image`/`paste_segmentation`)
+  and `resampling.predict_with_resampling` → replaced by `segment` composing
+  `preprocess`/`infer`/`postprocess` + `geometry`.
+- **Weights-layout discovery** (`WeightsLayout`/`discover_weights`/
+  `register_weights_layout`) and `ModelBundle.from_folder`/`from_task` → folder
+  reading now lives in `ModelData.read_folder`.
+- Kept the low-level resampling primitives (`resample_image_to_target`,
+  `inverse_resample_*`, `reorient`, `get_orientation`), the label primitives
+  (`remap_labels`/`paint_union`/…), and `InferenceEngine` (now a private compute
+  core). Verified end-to-end on real TotalSegmentator weights via the new API.
 
 ### Changed — forward resample now runs in float32 (behavior change)
 

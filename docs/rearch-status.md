@@ -1,8 +1,14 @@
 # Rearchitecture — status & handoff
 
-**Branch:** `feature/medseg-rearch` (off `main`). **Tests:** 344 passed, 1 skipped,
-2 deselected (`uv run pytest -m "not slow"`, ~7s). All work committed. **Phase 3b
-is done** (decomposition); only **Phase 5** (cutover/delete) remains.
+**Branch:** `feature/medseg-rearch` (off `main`). **Tests:** 205 passed, 1 skipped,
+2 deselected (`uv run pytest -m "not slow"`, ~7s). All work committed. **Phases
+3b and 5 (code cutover, 5a–5e) are DONE.** New API is the public surface; the old
+hidden-state surface is deleted; verified end-to-end on real TS weights. Remaining:
+migrate `examples/` + `README` to the new API (doc task), and optional 5f (rehome
+step_size/use_mirroring). (Test count dropped 347→205 as the deleted-surface test
+files were removed — `test_engine_cache`/`test_workflow`/`test_label_union_workflow`/
+`test_predict_with_resampling_scheme`/`test_weights_layout*`/`test_canonical_orientation`,
+and `test_tasks`→`test_recipe`.)
 
 Read `docs/architecture-rearch.md` for the full target design + rationale. This
 file is the *where-we-are / what's-next* handoff.
@@ -198,26 +204,29 @@ Landed across commits `56f8ef6` / `76d5f11` / `0fb0e9a`:
 - `WeightsLayout`/`discover_weights`/`from_folder`/`from_dataset`/`from_task` → `engine.py`,
   `engine_cache.py`, and `model_data.read_folder` (delegates to `from_folder`).
 
-**Remaining ordered steps (each its own green commit):**
-- **5b** — relocate `ModelBundle.from_folder` folder-reading into `ModelData.read_folder`
-  (stop delegating). No test deletion; keeps `from_folder` until 5e.
-- **5c+5d** — delete the two hidden globals together (coupled): `engine_cache.py` whole +
-  `tasks.py` registry (`_REGISTRY`/`_load_builtin_registry`/`_resolve_key`/`register_task`/
-  `unregister_task`/`get_task`/`list_registered_tasks`/`list_tasks_by_modality`/
-  `_resolve_cascade_descriptors`/`_default_engine_factory`/`run_named_task`). KEEP
-  `TaskSpec`/`CascadeStep`/`UnionPart`/`WeightsId`/`_coerce_weights_id`/`_taskspec_from_dict`/
-  `_taskspec_to_dict`/`AmbiguousTaskError`. Remove their `__init__` exports. **Tests:** delete
-  `test_engine_cache.py`; split `test_tasks.py` → keep TaskSpec-validation/JSON-round-trip/
-  string-id-parsing (~3 classes) as `test_recipe.py`, drop registry/dispatch/moose-resolution
-  classes (`TestMooseEngineResolution`, the `run_named_task` dispatch tests, registry tests).
-- **5e** — delete `workflow.py` + `resampling.predict_with_resampling` + `engine.py`
-  `WeightsLayout`/`_WEIGHTS_LAYOUTS`/`register_weights_layout`/`discover_weights`/
-  `_find_model_folder`/`ModelBundle.from_folder`/`from_dataset`/`from_task`. Remove `__init__`
-  exports. **Tests:** delete `test_workflow.py`, `test_label_union_workflow.py`,
-  `test_predict_with_resampling_scheme.py`, `test_weights_layout*.py`; retire the
-  `predict_with_resampling` oracle assert in `test_decompose.py` (keep the rest).
-- **5f** (optional) — rehome `step_size`/`use_mirroring` into the per-call sliding-window so
-  `infer.sliding_window` drops the temporary engine-attr override.
+**Ordered steps — ALL DONE (5a–5e), each its own green commit:**
+- **5b DONE** — `ModelData.read_folder` reads folders directly (plans/dataset/weights+
+  metadata via `weights.discover_folds`/`load_checkpoint_with_metadata`); `ModelData`
+  now carries `metadata`, threaded by `build_model` (preserves mirroring axes +
+  resolves config — superseded the earlier stamp band-aid).
+- **5c+5d DONE** — deleted `engine_cache.py` whole + the `tasks.py` registry/dispatcher.
+  Kept the recipe vocabulary. Deleted `test_engine_cache.py`; split `test_tasks.py`
+  → `test_recipe.py` (validation/JSON-round-trip/string-id).
+- **5e DONE** — deleted `workflow.py` + `resampling.predict_with_resampling` (5e-1) and
+  `engine.py` `WeightsLayout`/`discover_weights`/`ModelBundle.from_folder`/`from_task`
+  (5e-2). (`ModelBundle.from_dataset` never existed.) Deleted `test_workflow.py`,
+  `test_label_union_workflow.py`, `test_predict_with_resampling_scheme.py`,
+  `test_weights_layout*.py`, `test_canonical_orientation.py`; retired the
+  `predict_with_resampling` oracle in `test_decompose.py` (kept geometry checks).
+
+**Remaining:**
+- **Examples/README migration (doc task)** — `examples/01–05` + `examples/README.md` +
+  root `README.md` still reference deleted symbols (`InferenceEngine`-cache, `run_workflow`,
+  `predict_with_resampling`, `cached_engine_*`, `run_named_task`). Rewrite to the new
+  `ModelStore`/`segment`/`TaskCatalog` API. Not import-tested, so suite is green regardless.
+- **5f (optional)** — rehome `step_size`/`use_mirroring` into the per-call sliding-window so
+  `infer.sliding_window` drops the temporary engine-attr override (needs touching the
+  `SlidingWindowEngine` internals).
 
 (Original detail retained below.)
 - Move `ModelBundle.from_folder` folder-reading orchestration INTO
