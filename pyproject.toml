@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 nnmlx = "nnunet_inference_mlx.cli:app"
+totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
 
 [project.optional-dependencies]
 # Remote loading of .pth checkpoints over HTTP range requests.

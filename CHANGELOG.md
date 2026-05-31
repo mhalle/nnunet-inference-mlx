@@ -39,6 +39,27 @@ each command builds an explicit request-scoped `ModelStore` + `TaskCatalog` (no
 global state). `typer` added to core deps; entry point `nnmlx`, also
 `python -m nnunet_inference_mlx`.
 
+### Added — `totalseg-mlx`, a TotalSegmentator-compatible CLI
+
+A drop-in front end mirroring TotalSegmentator's `TotalSegmentator` argparse
+(every flag parses), so existing TS command lines/scripts run on the MLX backend
+unchanged:
+
+```
+totalseg-mlx -i ct.nii.gz -o segmentations            # one mask per class (TS default)
+totalseg-mlx -i ct.nii.gz -o seg.nii.gz --ml          # single multilabel file
+totalseg-mlx -i ct.nii.gz -o seg --fast -rs liver spleen -s
+```
+
+Supported: `-i/-o`, `-ot nifti`, `-ml`, `-f/--fast` + `-ff/--fastest` (→ our
+`_fast`/`_fastest` tasks), `-ta/--task`, `-rs/--roi_subset`, `-rmb/--remove_small_blobs`,
+`-s/--statistics` (volume mm³ + mean intensity → `statistics.json`), `-ss/--skip_saving`,
+`-q/-v`, `--version`. Per-class output writes `{roi_name}.nii.gz` into the `-o`
+directory, exactly like TS. Flags the MLX backend doesn't implement (radiomics,
+nora, dicom output, body_seg/force_split, save_probabilities, license, …) are
+accepted and ignored with a warning, so command lines don't break. The native,
+non-TS interface remains `nnmlx`.
+
 ### Added — output resolution control
 
 `segment` / `LoadedModel.segment` / `postprocess.restore` gain output-resolution
