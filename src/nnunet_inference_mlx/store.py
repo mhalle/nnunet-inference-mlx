@@ -137,6 +137,69 @@ def _default_build(model_data: ModelData, options: BuildOptions):
 
 
 # ---------------------------------------------------------------------------
+# Download primitives (verify-before-use; pickle .pth = supply-chain surface)
+# ---------------------------------------------------------------------------
+
+_VERIFIED_MARKER = ".verified"
+
+
+def sha256_file(path, *, chunk: int = 1 << 20) -> str:
+    """Streaming SHA-256 of a file, as a lowercase hex digest."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def verify_and_unpack(archive_path, expected_sha256: str | None, dest_dir) -> None:
+    """Verify an archive's SHA-256 (if given) then unpack it into ``dest_dir``.
+
+    The integrity/provenance gate for remote weights: ``.pth`` checkpoints are
+    pickle (loading executes code), so a fetched archive is checked against the
+    recipe's ``weights_sha256`` *before* it is unpacked or used. A mismatch
+    raises and unpacks nothing. On success a ``.verified`` sidecar is written
+    so later presence checks need not re-hash large files. ``expected_sha256``
+    of ``None`` skips verification (locally-placed / unhashed weights).
+    """
+    from pathlib import Path
+    archive_path = Path(archive_path)
+    dest_dir = Path(dest_dir)
+    if expected_sha256:
+        actual = sha256_file(archive_path)
+        if actual.lower() != expected_sha256.lower():
+            raise ValueError(
+                f"sha256 mismatch for {archive_path.name}: expected "
+                f"{expected_sha256.lower()}, got {actual} — refusing to unpack."
+            )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    import zipfile
+    with zipfile.ZipFile(archive_path) as z:
+        z.extractall(dest_dir)
+    (dest_dir / _VERIFIED_MARKER).write_text((expected_sha256 or "unverified").lower())
+
+
+def download_archive(url: str, dest_path) -> None:
+    """Stream ``url`` to ``dest_path`` (needs the ``remote`` extra: requests)."""
+    from pathlib import Path
+    try:
+        import requests
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "remote download needs the 'remote' extra: pip install "
+            "'nnunet-inference-mlx[remote]'."
+        ) from e
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+
+
+# ---------------------------------------------------------------------------
 # ModelStore
 # ---------------------------------------------------------------------------
 
@@ -162,6 +225,12 @@ class ModelStore:
     read, build :
         Injectable transforms (folder→ModelData, ModelData→LoadedModel).
         Default to the real ones; tests pass fakes.
+    fetch :
+        Optional ``fetch(id, model_root)`` callable that retrieves model ``id``
+        into the model root, creating its folder (e.g. :func:`download_archive`
+        + :func:`verify_and_unpack`). ``None`` (default) means remote fetch
+        isn't configured for this ecosystem — ``download`` then requires the
+        weights already be present locally and raises actionably otherwise.
     """
 
     def __init__(
@@ -173,6 +242,7 @@ class ModelStore:
         options: BuildOptions = BuildOptions(),
         read: Callable | None = None,
         build: Callable | None = None,
+        fetch: Callable | None = None,
     ):
         if ecosystem not in _ECOSYSTEMS:
             raise ValueError(
@@ -184,6 +254,7 @@ class ModelStore:
         self.options = options
         self._read = read or _default_read
         self._build = build or _default_build
+        self._fetch = fetch
         resolve, model_dir, downloaded, _, _ = _ECOSYSTEMS[ecosystem]
         self._resolve_folder = resolve
         self._model_dir = model_dir
@@ -215,22 +286,46 @@ class ModelStore:
             return []
         return self._list_downloaded(root)
 
-    def download(self, ids, *, build: bool = False) -> None:
-        """Ensure ``ids`` are present locally (and built if ``build=True``).
+    def download(self, ids, *, force: bool = False, build: bool = False) -> list:
+        """Ensure ``ids`` are present on disk — fetch only what's needed.
 
-        Remote fetch is not yet wired — for now this asserts local presence
-        and raises with an actionable message if a model is missing. ``build``
-        additionally loads each into memory.
+        Idempotent: an id already present is skipped (a no-op), so this is safe
+        and cheap to call repeatedly — the disk-layer twin of :meth:`load`'s
+        read-through. An id is *needed* when it is absent, or when ``force`` is
+        set. ``force=True`` re-fetches even present ids (corruption / updated
+        weights). Returns the list of ids actually fetched.
+
+        The fetch itself is delegated to the store's ``fetch(id, dest_dir)``
+        (which should download + :func:`verify_and_unpack`, checking the
+        recipe's ``weights_sha256`` before unpacking). If no ``fetch`` is
+        configured, a missing id raises an actionable error rather than
+        silently doing nothing. ``build=True`` also loads each id into memory.
         """
+        root = self._require_root()
         present = set(self.downloaded())
-        missing = [i for i in _as_list(ids) if i not in present]
-        if missing:
+        wanted = _as_list(ids)
+        needed = [i for i in wanted if force or i not in present]
+
+        if needed and self._fetch is None:
             raise FileNotFoundError(
-                f"models {missing} not present under {self.model_root_dir} and "
-                f"remote download is not yet wired; place them locally."
+                f"models {needed} not present under {root} and no fetch is "
+                f"configured for ecosystem {self.ecosystem!r}. Place them locally, "
+                f"pass fetch= to ModelStore, or use the upstream downloader "
+                f"(e.g. `totalseg_download_weights -t <task>` for TotalSegmentator)."
             )
+
+        fetched = []
+        for i in needed:
+            if force and i in present:     # drop the stale copy before re-fetch
+                try:
+                    shutil.rmtree(self._model_dir(root, i), ignore_errors=True)
+                except FileNotFoundError:
+                    pass
+            self._fetch(i, root)           # fetch downloads + verify_and_unpack the
+            fetched.append(i)              # model's folder into the root
         if build:
-            self.load(ids)
+            self.load(wanted)
+        return fetched
 
     def delete_downloads(self, ids) -> None:
         """Delete the on-disk files for ``ids`` (destructive; re-fetch needed)."""
@@ -332,4 +427,10 @@ def _close(model) -> None:
         close()
 
 
-__all__ = ["ModelStore", "DEFAULT_MAX_MEMORY_MB"]
+__all__ = [
+    "ModelStore",
+    "DEFAULT_MAX_MEMORY_MB",
+    "sha256_file",
+    "verify_and_unpack",
+    "download_archive",
+]

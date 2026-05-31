@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **`ModelStore.download(ids, *, force=False, build=False)` contract** — idempotent
+  "ensure present" (fetch only what's missing; a no-op for present ids — the disk-layer
+  twin of `load`'s read-through), with `force` to re-fetch. Returns the ids actually
+  fetched. The fetch is an injectable `fetch(id, model_root)` seam; with none configured,
+  a missing id raises actionably (pointing at the upstream downloader) instead of silently
+  doing nothing. Added `verify_and_unpack(archive, sha256, dest)` (checks the archive's
+  SHA-256 against the recipe's `weights_sha256` *before* unpacking — `.pth` is pickle, so
+  this is a supply-chain gate, not just corruption detection; writes a `.verified` sidecar
+  to avoid re-hashing) + `download_archive(url, dest)` + `sha256_file`. CLI: `nnmlx models
+  download <ids> [--force]`. (The actual remote fetch / recipe URLs land with 0.11.)
 - **Confirmed RAS is nnU-Net v2's universal canonical** (not just TS): the installed
   nnU-Net readers reorient inputs to RAS (`SimpleITKIO.read_images(orientation="RAS")`,
   `NibabelIO` to RAS) and back on write. So the RAS default is correct for all

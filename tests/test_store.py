@@ -132,7 +132,7 @@ class TestColdLayer:
     def test_download_missing_raises(self, tmp_path):
         root = _nnunet_tree(tmp_path, [297])
         store = _store(root, {})
-        with pytest.raises(FileNotFoundError, match="remote download is not yet wired"):
+        with pytest.raises(FileNotFoundError, match="no fetch is configured"):
             store.download(999)
 
 
@@ -259,3 +259,79 @@ class TestMooseEcosystem:
         store = self._moose_store(root, {"Dataset123_Organs": 100})
         eng = store.load("Dataset123_Organs")
         assert eng.id == "Dataset123_Organs"
+
+
+# ---------------------------------------------------------------------------
+# download(): idempotent ensure-present + force; verify_and_unpack integrity
+# ---------------------------------------------------------------------------
+
+
+def _fake_fetch_factory(calls):
+    def fetch(i, root):
+        calls.append(i)
+        (root / f"Dataset{i}_X" / "nnUNetTrainer__nnUNetPlans__3d_fullres").mkdir(parents=True)
+    return fetch
+
+
+class TestDownload:
+    def test_idempotent_skips_present(self, tmp_path):
+        root = _nnunet_tree(tmp_path, [1])
+        calls = []
+        store = ModelStore("nnunet", model_root_dir=root, fetch=_fake_fetch_factory(calls))
+        assert store.download(1) == []          # already present → no-op
+        assert calls == []
+
+    def test_fetches_only_missing(self, tmp_path):
+        root = _nnunet_tree(tmp_path, [1])
+        calls = []
+        store = ModelStore("nnunet", model_root_dir=root, fetch=_fake_fetch_factory(calls))
+        assert store.download([1, 2]) == [2]    # 1 present, 2 fetched
+        assert calls == [2]
+        assert 2 in store.downloaded()
+
+    def test_force_refetches_present(self, tmp_path):
+        root = _nnunet_tree(tmp_path, [1])
+        calls = []
+        store = ModelStore("nnunet", model_root_dir=root, fetch=_fake_fetch_factory(calls))
+        assert store.download(1, force=True) == [1]
+        assert calls == [1]
+
+    def test_missing_without_fetch_raises_but_present_is_noop(self, tmp_path):
+        root = _nnunet_tree(tmp_path, [1])
+        store = ModelStore("nnunet", model_root_dir=root)   # no fetch configured
+        assert store.download(1) == []                      # present → fine
+        with pytest.raises(FileNotFoundError, match="no fetch is configured"):
+            store.download(2)
+
+
+class TestVerifyAndUnpack:
+    def _zip(self, path, name="Dataset9_X/plans.json", data="{}"):
+        import zipfile
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr(name, data)
+        return path
+
+    def test_sha_match_unpacks_and_marks(self, tmp_path):
+        from nnunet_inference_mlx.store import sha256_file, verify_and_unpack
+        arc = self._zip(tmp_path / "m.zip")
+        sha = sha256_file(arc)
+        dest = tmp_path / "out"
+        verify_and_unpack(arc, sha, dest)
+        assert (dest / "Dataset9_X" / "plans.json").exists()
+        assert (dest / ".verified").read_text() == sha
+
+    def test_sha_mismatch_raises_and_unpacks_nothing(self, tmp_path):
+        from nnunet_inference_mlx.store import verify_and_unpack
+        arc = self._zip(tmp_path / "m.zip")
+        dest = tmp_path / "out"
+        with pytest.raises(ValueError, match="sha256 mismatch"):
+            verify_and_unpack(arc, "0" * 64, dest)
+        assert not dest.exists()           # refused before creating anything
+
+    def test_no_sha_skips_verification(self, tmp_path):
+        from nnunet_inference_mlx.store import verify_and_unpack
+        arc = self._zip(tmp_path / "m.zip", name="f.txt", data="x")
+        dest = tmp_path / "out"
+        verify_and_unpack(arc, None, dest)
+        assert (dest / "f.txt").exists()
+        assert (dest / ".verified").read_text() == "unverified"

@@ -230,6 +230,28 @@ def models_list(ctx: typer.Context) -> None:
         typer.echo(str(i))
 
 
+@models_app.command("download")
+def models_download(
+    ctx: typer.Context,
+    ids: list[str] = typer.Argument(..., help="Model ids to ensure present (e.g. 297 291)."),
+    force: bool = typer.Option(False, "--force", help="Re-fetch even if already present."),
+) -> None:
+    """Ensure model ids are downloaded (idempotent; --force re-fetches).
+
+    Fetches only what's missing. Remote fetch must be configured for the
+    ecosystem; otherwise this reports what to do (e.g. run the upstream
+    downloader) for any missing id.
+    """
+    store = _store(ctx.obj)
+    parsed = [int(i) if i.isdigit() else i for i in ids]
+    try:
+        fetched = store.download(parsed, force=force)
+    except FileNotFoundError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    typer.echo(f"fetched: {fetched}" if fetched else "all present (nothing to fetch)")
+
+
 @models_app.command("loaded")
 def models_loaded(ctx: typer.Context) -> None:
     """Show currently resident (loaded) models and total memory."""
