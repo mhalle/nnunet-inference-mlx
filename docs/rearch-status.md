@@ -1,17 +1,65 @@
 # Rearchitecture — status & handoff
 
-**Branch:** `feature/medseg-rearch` (off `main`). **Tests:** 205 passed, 1 skipped,
-2 deselected (`uv run pytest -m "not slow"`, ~7s). All work committed. **Phases
-3b and 5 (code cutover, 5a–5e) are DONE.** New API is the public surface; the old
-hidden-state surface is deleted; verified end-to-end on real TS weights. Remaining:
-migrate `examples/` + `README` to the new API (doc task), and optional 5f (rehome
-step_size/use_mirroring). (Test count dropped 347→205 as the deleted-surface test
-files were removed — `test_engine_cache`/`test_workflow`/`test_label_union_workflow`/
-`test_predict_with_resampling_scheme`/`test_weights_layout*`/`test_canonical_orientation`,
-and `test_tasks`→`test_recipe`.)
+**Branch:** `feature/medseg-rearch` (off `main`, **nothing pushed to origin**).
+**Tests:** 249 passed, 1 skipped, 7 deselected (`uv run pytest -m "not slow"`, ~7s);
+real-weights `@slow` suite passes (`uv run pytest -m slow`). **Version `0.10.0`
+tagged** (`v0.10.0`), + 7 unpushed `0.10.x` follow-up commits on top.
 
-Read `docs/architecture-rearch.md` for the full target design + rationale. This
-file is the *where-we-are / what's-next* handoff.
+The rearchitecture is **complete** (Phases 1–5 done): the toolkit API is the public
+surface, the old hidden-state surface is deleted, and it's **validated against real
+TotalSegmentator** (97.7% voxel agreement, organ Dice 0.97). See the "0.10.x — since
+the tag" section below for everything after the tag (CLIs, download, perf, NN resample).
+
+Read `docs/architecture-rearch.md` for the full target design + rationale, and the
+auto-memory `project_rearch.md` for the running findings log. This file is the
+*where-we-are / what's-next* handoff.
+
+## 0.10.x — work since the v0.10.0 tag (all committed, unpushed)
+
+- **Two CLIs.** `nnmlx` (Typer, native: `segment` / `tasks` / `models`) and
+  `TotalSegmentator` + `totalseg-mlx` (argparse, **drop-in** — mirrors TS's flags
+  *and* progress output; per-class or `--ml` output). Both auto-download missing
+  weights by default (opt-out `--no-download` / `--download/--no-download`).
+- **SimpleITK is a core dep** (segmenting == image IO); `uv run` works flag-free.
+- **🔑 L/R MIRROR BUG FIXED** — canonical orientation is **RAS** (nnU-Net v2's own
+  readers reorient to RAS), not LPS. LPS mirrored left/right labels. Pre-existing;
+  invisible to synthetic tests. Guarded by `test_real_weights.py` (anatomy: liver
+  world-X < spleen).
+- **Accuracy validated vs real TS** (`total_fast`, CPU+MPS): 97.7% voxel agreement,
+  mean Dice 0.865 / organ Dice 0.97 on CT_Abdo. (`@slow` regression added.)
+- **Perf:** MLX network ~2.5× faster than PyTorch-MPS (6.3s vs 15.6s); but our
+  `restore` (logit interp, path B, memory-gather-bound) is the cost on large grids.
+  PyTorch-MPS WORKS now (TS's ConvTranspose3D warning is stale) → MLX is **comparable,
+  not faster, on the same GPU** (~20s tie on CT_Abdo); MLX uses ~7× less CPU. Don't
+  claim a speed win vs MPS.
+- **Native weight download (TS):** `scripts/refresh_ts_weights.py` → shipped
+  `data/ts_weights.json` (id→public GitHub URL; build-time, no runtime TS). Default
+  `totalsegmentator` store `fetch` = download (httpx) → `verify_and_unpack` (sha if
+  present) → unpack. `store.download(ids, force=, build=)` idempotent. Verified live.
+  HTTP client is **httpx** (not requests); `remote` extra = `["httpx"]`.
+- **Inverse-resample speed/quality dial** (the `restore` step):
+  `interpolation="linear"` (default, logit interp / path B, nnU-Net-grade) vs
+  `"nearest"` (label NN / path A, TS-style: **~75× faster**, 0.4s vs 32s, 98.5% agree).
+  CLI: `nnmlx segment --resample linear|nearest`; `totalseg-mlx` maps TS's
+  `--higher_order_resampling` (default NN like TS, `-ho`→linear). Plus a ~28% speedup
+  of the linear gather (flattened `mx.take` vs 3-axis fancy index, numerically identical).
+
+### Next levers (open, none blocking)
+- **Fused `mx.fast.metal_kernel`** for `restore`: trilinear+argmax inline, no K-channel
+  materialization — the big remaining win for the linear path (MLX has no grid_sample).
+- Populate **SHAs** in `ts_weights.json` (one download+hash pass) → turns on verify.
+- Auto-download an **MR/region/MOOSE** model → lights up the skip-guarded `@slow` tests
+  (region/multi-fold/MOOSE branches are code-complete but unvalidated on real data).
+- `5f`: per-call `step_size`/`use_mirroring` (engine rehome).
+- **Release/push decision**: `main` (at `bdf216d`, 0.9.3 groundwork, 5 ahead of
+  origin/main) doesn't contain 0.10. Decide merge-to-main vs push branch + `v0.10.0`.
+- Repro/scratch (uncommitted, in `~/tmp`): `compare_ctabdo_fast.py`, `compare_ts.py`,
+  `data/{CT_Abdo.nii.gz, ct.nii, ts_output.nii}`, `out/` (incl. stale pre-fix mirrored
+  segs worth deleting).
+
+Read `docs/architecture-rearch.md` for the full target design + rationale, and the
+auto-memory `project_rearch.md` for the running findings log. The sections below
+predate the v0.10.0 tag (Phase 1–5 detail) and remain accurate history.
 
 ## What this rearchitecture is
 
