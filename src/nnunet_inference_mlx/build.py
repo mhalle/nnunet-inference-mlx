@@ -101,20 +101,23 @@ class LoadedModel:
         output_spacing: "float | tuple[float, float, float] | None" = None,
         output_scaling: float | None = None,
         at_model_spacing: bool = False,
+        output_interpolation: str = "linear",
     ) -> Segmentation:
         """Segment a single-channel :class:`Volume` → :class:`Segmentation`.
 
         The full pipeline, composed from the toolkit stages:
-        ``to_model_frame → sliding_window → restore`` (logits are resampled
-        back to the caller's grid, then argmax/paint — higher quality than
-        argmax-then-resample).
+        ``to_model_frame → sliding_window → restore``.
+
+        ``output_interpolation`` controls the inverse resample: ``"linear"``
+        (default) interpolates the logits then argmax (higher fidelity, like
+        nnU-Net); ``"nearest"`` argmaxes at model spacing then NN-resamples the
+        label map (much faster on large grids, TS-style, stair-stepped).
 
         Output resolution (mutually exclusive; default = the input grid):
         ``output_spacing`` (absolute mm, scalar or (Z,Y,X)), ``output_scaling``
         (resolution multiplier; 2 = finer, 0.5 = coarser), or
-        ``at_model_spacing`` (the model's native training grid — no inverse
-        resample beyond the model frame). The result always stays in the input's
-        orientation/space; only sampling density changes.
+        ``at_model_spacing`` (the model's native training grid). The result
+        always stays in the input's orientation/space; only sampling changes.
         """
         if self._engine is None:
             raise RuntimeError("LoadedModel has been closed")
@@ -136,6 +139,7 @@ class LoadedModel:
         segmentation = restore(prediction, plan,
                                target_spacing=target_spacing,
                                target_scaling=output_scaling,
+                               interpolation=output_interpolation,
                                peak_working_memory_mb=peak_working_memory_mb)
         if remove_small_components_mm3 > 0:
             segmentation = drop_small_components(

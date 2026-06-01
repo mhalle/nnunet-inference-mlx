@@ -183,6 +183,33 @@ class TestPredictionAndToLabels:
         assert scaled.geometry.shape_zyx == base.geometry.shape_zyx
         np.testing.assert_array_equal(np.asarray(scaled.data), np.asarray(base.data))
 
+    def test_restore_nearest_label_path(self):
+        # path A: argmax at model spacing → NN-resample labels. Lands on input
+        # grid, valid label set, agrees closely with the logit path.
+        m = build_model(_make_model_data())
+        vol = _volume((24, 24, 24))
+        mv, plan = to_model_frame(vol, m.model_data)
+        pred = sliding_window(m, mv)
+        nn = restore(pred, plan, interpolation="nearest")
+        lin = restore(pred, plan, interpolation="linear")
+        assert nn.geometry.shape_zyx == vol.geometry.shape_zyx
+        assert int(nn.data.max()) <= 2
+        # nearest and linear differ only at boundaries → mostly agree
+        agree = float((np.asarray(nn.data) == np.asarray(lin.data)).mean())
+        assert agree > 0.5
+
+    def test_restore_rejects_bad_interpolation(self):
+        m = build_model(_make_model_data())
+        mv, plan = to_model_frame(_volume((24, 24, 24)), m.model_data)
+        pred = sliding_window(m, mv)
+        with pytest.raises(ValueError, match="linear.*nearest"):
+            restore(pred, plan, interpolation="cubic")
+
+    def test_segment_output_interpolation_nearest(self):
+        m = build_model(_make_model_data())
+        seg = m.segment(_volume((24, 24, 24)), output_interpolation="nearest")
+        assert seg.geometry.shape_zyx == (24, 24, 24)
+
     def test_restore_rejects_both_overrides(self):
         m = build_model(_make_model_data())
         vol = _volume((24, 24, 24))

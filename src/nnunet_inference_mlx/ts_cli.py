@@ -38,7 +38,6 @@ _UNSUPPORTED = {
     "preview": "PNG preview not supported",
     "roi_subset_robust": "robust-crop ROI selection not supported (use --roi_subset)",
     "robust_crop": "robust cropping not supported",
-    "higher_order_resampling": "higher-order resampling not supported",
     "radiomics": "radiomics not supported",
     "stats_include_incomplete": "incomplete-ROI stats flag ignored",
     "crop_path": "custom crop path not supported",
@@ -208,8 +207,12 @@ def main(argv=None) -> int:
     reader = DicomReader() if args.input.is_dir() else NiftiReader()
     image = reader.read(args.input)
 
+    # TS resamples the label map (NN) by default; --higher_order_resampling asks
+    # for higher-order → our logit-interp ("linear") path.
+    interp = "linear" if args.higher_order_resampling else "nearest"
     st = time.time()
-    seg = segment(spec, image, store=store, catalog=catalog, progress=out)
+    seg = segment(spec, image, store=store, catalog=catalog,
+                  output_interpolation=interp, progress=out)
     out(f"  Predicted in {time.time() - st:.2f}s")
 
     if args.remove_small_blobs:

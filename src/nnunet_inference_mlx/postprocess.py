@@ -114,23 +114,24 @@ def restore(
     *,
     target_spacing: "float | tuple[float, float, float] | None" = None,
     target_scaling: float | None = None,
+    interpolation: str = "linear",
     peak_working_memory_mb: int | None = None,
 ) -> Segmentation:
     """Inverse-resample model-frame logits back onto the caller's grid.
 
-    Resamples the per-class logits from the model spacing to
-    ``plan.inference_geometry`` (the canonical-orientation source-spacing
-    grid) — scheme-aware, argmax/paint fused into the slab loop — then
-    reorients from ``plan.inference_orientation`` to ``plan.source_orientation``.
+    ``interpolation="linear"`` (default, path B) resamples the per-class *logits*
+    to the output grid (scheme-aware, argmax/paint fused into the slab loop),
+    then reorients back — higher fidelity than resampling a finished label map,
+    matching vanilla nnU-Net. ``interpolation="nearest"`` (path A) is the fast
+    TS-style alternative: argmax at the model spacing, then nearest-neighbour
+    resample the *integer label map* — single-channel, ~no 117-channel gather, so
+    much faster on large grids, at the cost of stair-stepped boundaries.
 
-    With no override the result lands on the caller's input grid. Pass
-    ``target_spacing`` (absolute mm; scalar isotropic or (Z,Y,X)) or
-    ``target_scaling`` (resolution multiplier; 2 = finer, 0.5 = coarser) to
-    render the labels at a different resolution — *from the logits*, then argmax,
-    so it's higher quality than resampling a finished label map. The output
-    header is recomputed to the new spacing/shape over the same physical extent,
-    so it still overlays the input. (Aggressive downsampling is Nyquist-limited:
-    structures thinner than the new voxel are lost regardless.)
+    With no spacing override the result lands on the caller's input grid; pass
+    ``target_spacing`` (absolute mm; scalar or (Z,Y,X)) or ``target_scaling``
+    (multiplier; 2 = finer, 0.5 = coarser) to render at a different resolution
+    (header recomputed over the same physical extent). Downsampling is
+    Nyquist-limited regardless of method.
     """
     if tuple(prediction.geometry.spacing_zyx) != tuple(plan.model_spacing_zyx):
         raise ValueError(
@@ -138,6 +139,8 @@ def restore(
             f"plan.model_spacing_zyx {plan.model_spacing_zyx}; prediction was not "
             "produced by this plan's to_model_frame step."
         )
+    if interpolation not in ("linear", "nearest"):
+        raise ValueError(f"interpolation must be 'linear' or 'nearest'; got {interpolation!r}")
     from .imageio import array_to_sitk, sitk_to_segmentation
     from .resampling import (
         inverse_resample_argmax,
@@ -147,6 +150,21 @@ def restore(
 
     schema = prediction.schema
     grid = _resolve_output_grid(plan.inference_geometry, target_spacing, target_scaling)
+
+    # Path A (fast, TS-style): argmax at model spacing, then NN-resample the
+    # single-channel label map onto the output grid. Same orientation/origin as
+    # the prediction, so SITK's world-coordinate resample handles the spacing change.
+    if interpolation == "nearest":
+        import SimpleITK as sitk
+        labels_model = to_labels(prediction)                 # (Z,Y,X) at model spacing
+        src = array_to_sitk(np.asarray(labels_model.data), prediction.geometry)
+        ref = array_to_sitk(np.zeros(grid.shape_zyx, dtype=np.asarray(labels_model.data).dtype), grid)
+        out = sitk.Resample(src, ref, sitk.Transform(), sitk.sitkNearestNeighbor,
+                            0, src.GetPixelID())
+        if plan.source_orientation != plan.inference_orientation:
+            out = _reorient(out, plan.source_orientation)
+        return sitk_to_segmentation(out, schema)
+
     out_shape = grid.shape_zyx
     target_spacing_zyx = tuple(plan.model_spacing_zyx)
     acq_spacing = tuple(grid.spacing_zyx)

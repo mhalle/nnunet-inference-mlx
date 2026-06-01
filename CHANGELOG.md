@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **Fast nearest-neighbour inverse resample (path A), opt-in.** `restore` /
+  `LoadedModel.segment` / `segment` gain `interpolation`/`output_interpolation`
+  (`"linear"` default = logit interpolation, higher fidelity, like nnU-Net;
+  `"nearest"` = argmax-at-model-spacing then NN-resample the label map, like TS).
+  Profiling showed the default logit restore is memory-gather-bound (8-corner
+  fetch of K=117 logit channels): on `ct.nii` (512×512×165) it's ~32 s; the NN
+  path is **~0.4 s (≈75× faster)** with **98.5% agreement** (differs only at
+  boundaries). So MLX end-to-end with `--resample nearest` ≈ ~7 s vs ~43 s
+  (linear) / ~23 s (TS-MPS). CLIs: `nnmlx segment --resample linear|nearest`;
+  `totalseg-mlx` maps TS's `--higher_order_resampling` (default NN like TS, `-ho`
+  → logit interp).
 - **Native weight download is live for TotalSegmentator.** TS v2 weights are public
   GitHub release zips, keyed per dataset id. A build-time generator
   (`scripts/refresh_ts_weights.py`) extracts the id→URL map from TS's

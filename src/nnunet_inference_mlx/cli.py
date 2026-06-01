@@ -99,6 +99,7 @@ def segment(
     output_scaling: Optional[float] = typer.Option(None, "--output-scaling", help="Output resolution multiplier (2 = finer/half-spacing, 0.5 = coarser). Renders from logits; header fixed to same extent."),
     output_spacing: Optional[float] = typer.Option(None, "--output-spacing", help="Output spacing in mm (isotropic). Alternative to --output-scaling."),
     at_model_spacing: bool = typer.Option(False, "--at-model-spacing", help="Write at the model's native training spacing (no upsample back to the input grid)."),
+    resample: str = typer.Option("linear", "--resample", help="Inverse resample: 'linear' (logit interp, higher fidelity) or 'nearest' (label NN, much faster on large grids)."),
     download: bool = typer.Option(True, "--download/--no-download", help="Auto-download missing weights (default on)."),
 ) -> None:
     """Run a named task on a volume and write the segmentation.
@@ -162,6 +163,7 @@ def segment(
         output_spacing=output_spacing,
         output_scaling=output_scaling,
         at_model_spacing=at_model_spacing,
+        output_interpolation=resample,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)

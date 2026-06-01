@@ -41,6 +41,7 @@ def segment(
     output_spacing: "float | tuple[float, float, float] | None" = None,
     output_scaling: float | None = None,
     at_model_spacing: bool = False,
+    output_interpolation: str = "linear",
     progress: "Callable[[str], None] | None" = None,
 ) -> Segmentation:
     """Segment a :class:`Volume` with a named task (or recipe) → :class:`Segmentation`.
@@ -69,6 +70,7 @@ def segment(
                               output_spacing=output_spacing,
                               output_scaling=output_scaling,
                               at_model_spacing=at_model_spacing,
+                              output_interpolation=output_interpolation,
                               progress=progress)
     if _resample:
         raise NotImplementedError(
@@ -79,11 +81,13 @@ def segment(
         return _segment_cascade(spec, image, store, catalog,
                               reorient_to=reorient_to,
                               peak_working_memory_mb=peak_working_memory_mb,
+                              output_interpolation=output_interpolation,
                               progress=progress)
     if spec.shape == "label_union":
         return _segment_union(spec, image, store,
                             reorient_to=reorient_to,
                             peak_working_memory_mb=peak_working_memory_mb,
+                            output_interpolation=output_interpolation,
                             progress=progress)
     raise ValueError(f"unhandled task shape: {spec.shape!r}")
 
@@ -149,7 +153,7 @@ def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
 
 def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
                     output_spacing=None, output_scaling=None, at_model_spacing=False,
-                    progress=None) -> Segmentation:
+                    output_interpolation="linear", progress=None) -> Segmentation:
     model = store.load(spec.single)
     if progress:
         progress("Predicting...")
@@ -157,11 +161,13 @@ def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
                          peak_working_memory_mb=peak_working_memory_mb,
                          output_spacing=output_spacing,
                          output_scaling=output_scaling,
-                         at_model_spacing=at_model_spacing)
+                         at_model_spacing=at_model_spacing,
+                         output_interpolation=output_interpolation)
 
 
 def _segment_cascade(spec, image, store, catalog, *, reorient_to,
-                     peak_working_memory_mb, progress=None) -> Segmentation:
+                     peak_working_memory_mb, output_interpolation="linear",
+                     progress=None) -> Segmentation:
     """coarse → crop FOV around target classes → fine → paste into full grid.
 
     Each stage runs the proven single-model pipeline (``model.segment``, which
@@ -184,7 +190,8 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
         if progress:
             progress(f"Predicting stage {i + 1} of {len(descriptors)} ...")
         seg = model.segment(current, reorient_to=reorient_to,
-                            peak_working_memory_mb=peak_working_memory_mb)
+                            peak_working_memory_mb=peak_working_memory_mb,
+                            output_interpolation=output_interpolation)
         if i == len(descriptors) - 1:
             final_seg = seg
             break
@@ -207,7 +214,7 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
 
 
 def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
-                   progress=None) -> Segmentation:
+                   output_interpolation="linear", progress=None) -> Segmentation:
     """Run each part independently, remap into the unified space, paint by priority.
 
     Parts share the same input; later parts overwrite earlier ones at
@@ -239,7 +246,8 @@ def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
         if progress:
             progress(f"Predicting part {i + 1} of {len(spec.union)} ...")
         seg = model.segment(image, reorient_to=reorient_to,
-                           peak_working_memory_mb=peak_working_memory_mb)
+                           peak_working_memory_mb=peak_working_memory_mb,
+                           output_interpolation=output_interpolation)
         remapped = remap_labels(np.asarray(seg.data), dict(part.label_remap),
                                 out_dtype=out_dtype)
         paint_union(unified, remapped)
