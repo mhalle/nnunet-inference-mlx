@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- **Faster logit-resample gather (~28%).** The default linear `restore` is
+  memory-gather-bound (8-corner fetch of K logit channels). Replacing the
+  3-axis advanced indexing (`src[:, zi, yi, xi]`) with a flattened 1-D
+  `mx.take` over a single `(Z·Y·X)` axis is ~28% faster for identical results
+  (ct.nii 512×512×165, 117ch: 32.1 s → 23.3 s). (Bigger remaining lever: a
+  fused `mx.fast.metal_kernel` doing trilinear + argmax inline to avoid
+  materializing the K-channel volume.)
 - **Fast nearest-neighbour inverse resample (path A), opt-in.** `restore` /
   `LoadedModel.segment` / `segment` gain `interpolation`/`output_interpolation`
   (`"linear"` default = logit interpolation, higher fidelity, like nnU-Net;

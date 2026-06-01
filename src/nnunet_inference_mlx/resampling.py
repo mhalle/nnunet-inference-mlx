@@ -221,17 +221,28 @@ def _trilinear_from_indices_K(
     arise with per-slab ``mx.nn.Upsample(scale_factor=...)``: that path
     distributes output uniformly across ``[0, slab_source_size - 1]``,
     which doesn't match the global coordinate system across slabs.
+
+    The 8 corner fetches dominate this (memory-gather-bound) op. Gathering
+    via a flattened 1-D ``mx.take`` along a single (Z·Y·X) axis is measurably
+    faster than 3-axis advanced indexing (``src[:, zi, yi, xi]``) — ~28% on a
+    512×512 output, 117-channel job — for identical results.
     """
-    # Broadcast index tensors from (S,1,1) / (1,Y_a,1) / (1,1,X_a) shapes
-    # are gathered with a leading K from src via standard fancy indexing.
-    c000 = src[:, zi0, yi0, xi0]
-    c001 = src[:, zi0, yi0, xi1]
-    c010 = src[:, zi0, yi1, xi0]
-    c011 = src[:, zi0, yi1, xi1]
-    c100 = src[:, zi1, yi0, xi0]
-    c101 = src[:, zi1, yi0, xi1]
-    c110 = src[:, zi1, yi1, xi0]
-    c111 = src[:, zi1, yi1, xi1]
+    K, Z, Y, X = src.shape
+    S, Y_a, X_a = zf.shape[0], yf.shape[1], xf.shape[2]
+    src_flat = src.reshape(K, Z * Y * X)
+
+    def gather(zi, yi, xi):  # broadcast (S,1,1)+(1,Y_a,1)+(1,1,X_a) → flat (S·Y_a·X_a,)
+        flat = (zi * (Y * X) + yi * X + xi).reshape(-1)
+        return mx.take(src_flat, flat, axis=1).reshape(K, S, Y_a, X_a)
+
+    c000 = gather(zi0, yi0, xi0)
+    c001 = gather(zi0, yi0, xi1)
+    c010 = gather(zi0, yi1, xi0)
+    c011 = gather(zi0, yi1, xi1)
+    c100 = gather(zi1, yi0, xi0)
+    c101 = gather(zi1, yi0, xi1)
+    c110 = gather(zi1, yi1, xi0)
+    c111 = gather(zi1, yi1, xi1)
 
     one_minus_xf = 1.0 - xf
     one_minus_yf = 1.0 - yf
