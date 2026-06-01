@@ -58,7 +58,7 @@ class LoadedModel:
         volume: Volume,
         *,
         reorient_to: str | None = "RAS",
-        interpolation: str = "linear",
+        interpolation: str = "auto",
         step_size: float = 0.5,
         use_mirroring: bool = False,
     ) -> Prediction:
@@ -93,7 +93,7 @@ class LoadedModel:
         volume: Volume,
         *,
         reorient_to: str | None = "RAS",
-        interpolation: str = "linear",
+        interpolation: str = "auto",
         peak_working_memory_mb: int | None = None,
         remove_small_components_mm3: float = 0.0,
         step_size: float = 0.5,

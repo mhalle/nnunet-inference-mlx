@@ -122,6 +122,123 @@ def resample_image_to_target(
 
 
 # ---------------------------------------------------------------------------
+# Forward resample — MLX per-axis (anti-aliased cubic down / linear up)
+# ---------------------------------------------------------------------------
+#
+# Axis-aligned spacing change (the forward image resample, after reorient to a
+# canonical orientation) done on Metal. Per-axis policy keyed on the resample
+# factor ``f = out_spacing/in_spacing``:
+#   * f > 1 (downsampling): factor-scaled Catmull-Rom cubic — the kernel
+#     support stretches with f so it averages the whole output-voxel footprint,
+#     i.e. genuine anti-aliasing. Plain linear at large factors undersamples
+#     (2 taps vs an f-voxel footprint) and aliases thin/high-contrast structure.
+#   * f <= 1 (upsampling / near-identity): linear. Anti-aliasing doesn't apply,
+#     and cubic's negative lobes ring/overshoot across high-contrast edges —
+#     e.g. inventing ±140 HU haloes between the sparse slices of thick-slice CT
+#     when the through-plane axis is upsampled to the model grid. Linear is
+#     monotone → never invents values outside the data. This is nnU-Net's
+#     separate-z idea, generalized to a per-axis decision.
+# Corner-aligned (c = j * f), matching SITK's resample and the inverse restore,
+# so forward/inverse round-trips. One Metal kernel pass per axis (separable):
+# ~4f taps/axis, vs (4f)^3 for a fused 3D kernel — sub-second on 418 M voxels.
+
+_RESAMPLE_1D_SRC = r"""
+  uint elem = thread_position_in_grid.x;
+  int N_in=ip[0], N_out=ip[1], M=ip[2], n_taps=ip[3], mode=ip[4];
+  if ((int)elem >= N_out*M) return;
+  int j=(int)elem/M, m=(int)elem%M;
+  float f=fp[0], scale=fp[1], support=fp[2];
+  float c=(float)j*f;
+  int base=(int)metal::floor(c-support+1.0f);
+  float acc=0.0f, wsum=0.0f;
+  for (int t=0;t<n_taps;t++){
+    int k=base+t; float x=((float)k-c)/scale, ax=metal::fabs(x), w;
+    if (mode==1){ // Catmull-Rom cubic (a=-0.5)
+      if (ax<1.0f) w=1.5f*ax*ax*ax-2.5f*ax*ax+1.0f;
+      else if (ax<2.0f) w=-0.5f*ax*ax*ax+2.5f*ax*ax-4.0f*ax+2.0f;
+      else w=0.0f;
+    } else { // triangle / linear
+      w = ax<1.0f ? (1.0f-ax) : 0.0f;
+    }
+    int kc = k<0 ? 0 : (k>=N_in ? N_in-1 : k);
+    acc += w*arr[(long)kc*M+m]; wsum += w;
+  }
+  out[elem]=acc/(wsum+1e-8f);
+"""
+
+_RESAMPLE_1D_KERNEL = None
+
+
+def _get_resample_1d_kernel():
+    global _RESAMPLE_1D_KERNEL
+    if _RESAMPLE_1D_KERNEL is None:
+        _RESAMPLE_1D_KERNEL = mx.fast.metal_kernel(
+            name="resample1d_axis",
+            input_names=["arr", "ip", "fp"],
+            output_names=["out"],
+            source=_RESAMPLE_1D_SRC,
+        )
+    return _RESAMPLE_1D_KERNEL
+
+
+def _resample_axis_mlx(a: mx.array, axis: int, n_out: int, f: float,
+                       aa_threshold: float) -> mx.array:
+    cubic = f > aa_threshold
+    scale = f if cubic else 1.0
+    support = (2.0 if cubic else 1.0) * scale
+    n_taps = int(np.floor(2.0 * support)) + 2
+    a = mx.moveaxis(a, axis, 0)
+    shp = a.shape
+    n_in = shp[0]
+    m = 1
+    for s in shp[1:]:
+        m *= int(s)
+    a2 = mx.reshape(a, (n_in, m))
+    ip = mx.array([n_in, n_out, m, n_taps, 1 if cubic else 0], dtype=mx.int32)
+    fp = mx.array([float(f), float(scale), float(support)], dtype=mx.float32)
+    (o,) = _get_resample_1d_kernel()(
+        inputs=[a2, ip, fp],
+        grid=(n_out * m, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n_out, m)],
+        output_dtypes=[mx.float32],
+    )
+    return mx.moveaxis(mx.reshape(o, (n_out, *shp[1:])), 0, axis)
+
+
+def resample_volume_mlx(
+    volume_zyx: "mx.array | np.ndarray",
+    out_shape_zyx: tuple[int, int, int],
+    src_spacing_zyx: tuple[float, float, float],
+    tgt_spacing_zyx: tuple[float, float, float],
+    *,
+    aa_threshold: float = 1.05,
+) -> mx.array:
+    """Per-axis Metal resample: anti-aliased cubic on downsampling axes, linear
+    on upsampling/near-identity axes (see module notes above).
+
+    ``aa_threshold`` is the factor above which an axis switches to anti-aliased
+    cubic (default 1.05 — anything meaningfully downsampling). Returns a float32
+    ``mx.array`` of shape ``out_shape_zyx``.
+    """
+    if not isinstance(volume_zyx, mx.array):
+        volume_zyx = mx.array(np.asarray(volume_zyx, dtype=np.float32))
+    a = volume_zyx.astype(mx.float32)
+    lo, hi = mx.min(a), mx.max(a)
+    for ax in range(3):
+        f = float(tgt_spacing_zyx[ax]) / float(src_spacing_zyx[ax])
+        a = _resample_axis_mlx(a, ax, int(out_shape_zyx[ax]), f, aa_threshold)
+    # Clamped cubic: Catmull-Rom's negative lobes can ring slightly past the
+    # data range at sharp edges (e.g. ~26 HU below the air floor on CT). Clip
+    # to the input's value range — removes out-of-range overshoot/undershoot
+    # while keeping cubic's interior sharpness. (Linear axes never ring; this
+    # only ever clips the cubic ones.)
+    a = mx.clip(a, lo, hi)
+    mx.eval(a)
+    return a
+
+
+# ---------------------------------------------------------------------------
 # Inverse resample — MLX on the Metal side, slab + channel-stream
 # ---------------------------------------------------------------------------
 
@@ -981,6 +1098,82 @@ def get_orientation(image: "sitk.Image") -> str:
     )
 
 
+# Per-letter voxel-axis direction in SITK's LPS world frame.
+_LETTER_DIR = {
+    "L": (1.0, 0.0, 0.0), "R": (-1.0, 0.0, 0.0),
+    "P": (0.0, 1.0, 0.0), "A": (0.0, -1.0, 0.0),
+    "S": (0.0, 0.0, 1.0), "I": (0.0, 0.0, -1.0),
+}
+
+
+def _code_direction(code: str) -> np.ndarray:
+    """3x3 direction matrix (columns = voxel-axis world dirs) for a DICOM code."""
+    code = code.upper()
+    if len(code) != 3 or any(c not in _LETTER_DIR for c in code):
+        raise ValueError(f"invalid orientation code {code!r}")
+    return np.array([_LETTER_DIR[c] for c in code], dtype=np.float64).T
+
+
+def reorient_array_mlx(
+    arr_zyx: "mx.array | np.ndarray",
+    *,
+    direction_xyz: tuple[float, ...],
+    spacing_zyx: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    target_code: str,
+):
+    """Reorient a (Z, Y, X) array to a DICOM-style ``target_code`` on the GPU.
+
+    Pure axis permutation + flips (no interpolation), derived from the direction
+    cosines — bit-identical to ``sitk.DICOMOrient`` but done as ``mx.transpose`` /
+    ``mx.flip`` on Metal (~0.46 s vs ~3 s on a 418 M-voxel CPU shuffle, since
+    reorientation is memory-bandwidth-bound and the GPU has ~10× the bandwidth).
+
+    Returns ``(out_zyx: mx.array, new_geometry: Geometry)``. Handles any
+    axis-aligned input/target orientation (RAS/LPS and the rest).
+    """
+    from .values import Geometry
+
+    if not isinstance(arr_zyx, mx.array):
+        arr_zyx = mx.array(np.asarray(arr_zyx))
+    D = np.array(direction_xyz, dtype=np.float64).reshape(3, 3)
+    sp_xyz = np.array(tuple(reversed(spacing_zyx)), dtype=np.float64)
+    org = np.array(origin_xyz, dtype=np.float64)
+    size_xyz = np.array((arr_zyx.shape[2], arr_zyx.shape[1], arr_zyx.shape[0]), dtype=np.float64)
+
+    Tt = _code_direction(target_code)
+    M = D.T @ Tt                                  # M[i,j] = D[:,i]·Tt[:,j]
+    perm = np.argmax(np.abs(M), axis=0)           # output voxel axis j <- input axis perm[j]
+    signs = np.sign(M[perm, np.arange(3)])
+
+    # SITK axis a corresponds to numpy axis (2-a). Build the numpy transpose order.
+    np_perm = [0, 0, 0]
+    for j in range(3):
+        np_perm[2 - j] = int(2 - perm[j])
+    out = mx.transpose(arr_zyx, np_perm)
+    for j in range(3):
+        if signs[j] < 0:
+            ax = 2 - j
+            out = out[tuple(slice(None, None, -1) if k == ax else slice(None)
+                            for k in range(out.ndim))]
+    out = mx.contiguous(out)
+
+    new_sp_xyz = sp_xyz[perm]
+    in_idx = np.zeros(3)
+    for j in range(3):
+        if signs[j] < 0:
+            in_idx[perm[j]] = size_xyz[perm[j]] - 1
+    new_org = org + D @ (sp_xyz * in_idx)
+
+    new_geom = Geometry(
+        spacing_zyx=tuple(reversed(new_sp_xyz.tolist())),
+        shape_zyx=(out.shape[0], out.shape[1], out.shape[2]),
+        origin_xyz=tuple(new_org.tolist()),
+        direction_xyz=tuple(Tt.reshape(-1).tolist()),
+    )
+    return out, new_geom
+
+
 def reorient(image: "sitk.Image", code: str) -> "sitk.Image":
     """Reorient ``image`` so its voxel axes map to the given DICOM code.
 
@@ -1020,6 +1213,8 @@ def reorient(image: "sitk.Image", code: str) -> "sitk.Image":
 
 __all__ = [
     "resample_image_to_target",
+    "resample_volume_mlx",
+    "reorient_array_mlx",
     "inverse_resample_argmax",
     "inverse_resample_paint",
     "get_orientation",

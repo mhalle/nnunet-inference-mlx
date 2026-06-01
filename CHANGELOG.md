@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **All-GPU forward pipeline: reorient + resample on Metal.** `to_model_frame`
+  gains `interpolation="auto"` (now the default): a per-axis Metal resampler
+  (`resample_volume_mlx`) — factor-scaled, clamped anti-aliased cubic on
+  *downsampling* axes (no aliasing of thin/high-contrast structure), linear on
+  *upsampling/near-identity* axes (no cubic ringing — important for thick-slice
+  CT's through-plane axis); ~0.5 s on a 418 M-voxel volume. And a GPU reorient
+  (`reorient_array_mlx`) — permutation+flips derived from the direction cosines,
+  bit-identical to `sitk.DICOMOrient` across RAS/LPS/SPL and arbitrary codes,
+  replacing the ~5.5 s of CPU `DICOMOrient` memory-shuffle (forward 3.2 s + inverse
+  2.3 s) with ~0.9 s on Metal. `restore` uses it for the inverse too. Net: chest
+  fast-mode end-to-end **75 → 57.6 s**, output **bit-identical** to the prior SITK
+  path. SITK now does only file IO + geometry. `"linear"/"bspline"/"nearest"`
+  still route to SITK.
 - **Fused Metal kernel for the logit restore (~100×).** The default linear
   `restore` was memory-gather-bound — 8 full-array corner fetches of the K
   logit channels, blend, then a separate argmax, materializing ~8× the

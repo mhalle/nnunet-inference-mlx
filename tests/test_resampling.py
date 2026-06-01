@@ -198,6 +198,92 @@ class TestInverseResampleArgmax:
         assert out.shape == (4, 4, 4)
 
 
+class TestMlxForwardResampler:
+    """Per-axis Metal forward resampler: AA-cubic down, linear up.
+
+    The headline guarantees: anti-aliased (no aliasing) when downsampling, and
+    **no cubic ringing/overshoot** when upsampling — the thick-slice CT case,
+    where the through-plane axis is upsampled to the model grid.
+    """
+
+    def test_shape_and_spacing(self):
+        from nnunet_inference_mlx.resampling import resample_volume_mlx
+        arr = np.random.randn(40, 60, 60).astype(np.float32)
+        src = (1.0, 1.0, 1.0); tgt = (2.0, 1.5, 1.5)
+        out_shape = tuple(max(1, round(arr.shape[i] * src[i] / tgt[i])) for i in range(3))
+        out = np.asarray(resample_volume_mlx(arr, out_shape, src, tgt))
+        assert out.shape == out_shape
+
+    def test_no_ringing_on_upsampled_thick_axis(self):
+        # Thick-slice CT: bone slab (+1000) amid air (-1000) along a 5 mm axis,
+        # fine 0.7 mm in-plane, resampled to 1.5 mm iso. The thick axis is
+        # UPSAMPLED (5->1.5) -> must use linear -> NO overshoot past [-1000,1000].
+        # (Cubic would ring to ±~1140; that's the regression this guards.)
+        from nnunet_inference_mlx.resampling import resample_volume_mlx
+        v = np.full((40, 80, 80), -1000.0, np.float32)
+        v[15:25] = 1000.0
+        src = (5.0, 0.7, 0.7); tgt = (1.5, 1.5, 1.5)
+        out_shape = tuple(max(1, round(v.shape[i] * src[i] / tgt[i])) for i in range(3))
+        out = np.asarray(resample_volume_mlx(v, out_shape, src, tgt))
+        assert out.max() <= 1000.5, f"overshoot above input max: {out.max()}"
+        assert out.min() >= -1000.5, f"overshoot below input min: {out.min()}"
+
+    def test_downsample_is_antialiased_not_just_2tap(self):
+        # On a high-frequency pattern, AA-cubic downsampling should differ from a
+        # naive 2-tap linear point-sample (it averages the footprint).
+        from nnunet_inference_mlx.resampling import resample_volume_mlx, resample_image_to_target
+        rng = np.random.default_rng(0)
+        v = rng.standard_normal((64, 64, 64)).astype(np.float32)
+        src = (1.0, 1.0, 1.0); tgt = (4.0, 4.0, 4.0)     # 4x downsample
+        out_shape = (16, 16, 16)
+        aa = np.asarray(resample_volume_mlx(v, out_shape, src, tgt))
+        assert aa.shape == out_shape
+        img = SimpleITK.GetImageFromArray(v); img.SetSpacing((1.0, 1.0, 1.0))
+        lin = SimpleITK.GetArrayFromImage(resample_image_to_target(img, tgt, interpolation="linear"))
+        assert not np.allclose(aa, lin)   # anti-aliased != naive linear
+
+    def test_downsample_sharp_edges_no_out_of_range_ring(self):
+        # Catmull-Rom rings (over/undershoots) at SHARP edges — random data
+        # won't trigger it; a bone/air step will. The clamped-cubic output must
+        # stay within the input value range (no sub-air / super-bone ringing).
+        from nnunet_inference_mlx.resampling import resample_volume_mlx
+        v = np.full((64, 64, 64), -1024.0, np.float32)
+        v[20:44, 20:44, 20:44] = 1500.0          # sharp bone cube in air
+        src = (1.0, 1.0, 1.0); tgt = (4.0, 4.0, 4.0)
+        out = np.asarray(resample_volume_mlx(v, (16, 16, 16), src, tgt))
+        assert out.min() >= -1024.0 - 1e-3, f"undershoot below air floor: {out.min()}"
+        assert out.max() <= 1500.0 + 1e-3, f"overshoot above bone: {out.max()}"
+
+
+class TestGpuReorient:
+    """GPU reorient (transpose+flip) must be bit-identical to SITK DICOMOrient.
+
+    This is the orientation path — the place a bug silently swaps left/right —
+    so it's pinned bit-exact against SITK across a battery of input orientations
+    and the two world targets (RAS=NIfTI, LPS=DICOM), incl. arbitrary codes.
+    """
+
+    @pytest.mark.parametrize("inp", ["RAS", "LPS", "SPL", "PIR", "AIL", "RPI"])
+    @pytest.mark.parametrize("tgt", ["RAS", "LPS", "SPL"])
+    def test_bit_exact_vs_sitk_dicomorient(self, inp, tgt):
+        from nnunet_inference_mlx.imageio import geometry_from_sitk
+        from nnunet_inference_mlx.resampling import reorient_array_mlx
+        base = SimpleITK.GetImageFromArray(
+            (np.arange(20 * 24 * 28).reshape(20, 24, 28) % 101).astype(np.float32))
+        base.SetSpacing((0.7, 0.9, 1.3)); base.SetOrigin((11.0, -22.0, 33.0))
+        src = SimpleITK.DICOMOrient(base, inp)
+        ref = SimpleITK.DICOMOrient(src, tgt)
+        g = geometry_from_sitk(src)
+        out, geom = reorient_array_mlx(
+            SimpleITK.GetArrayFromImage(src),
+            direction_xyz=g.direction_xyz, spacing_zyx=g.spacing_zyx,
+            origin_xyz=g.origin_xyz, target_code=tgt)
+        np.testing.assert_array_equal(np.asarray(out), SimpleITK.GetArrayFromImage(ref))
+        np.testing.assert_allclose(geom.spacing_zyx, tuple(reversed(ref.GetSpacing())), atol=1e-6)
+        np.testing.assert_allclose(geom.origin_xyz, ref.GetOrigin(), atol=1e-4)
+        np.testing.assert_allclose(geom.direction_xyz, ref.GetDirection(), atol=1e-6)
+
+
 class TestFusedKernelEquivalence:
     """The fused Metal kernel (default) must agree with the pure-MLX slab path.
 

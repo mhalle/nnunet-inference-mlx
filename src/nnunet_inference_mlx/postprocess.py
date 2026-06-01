@@ -141,11 +141,11 @@ def restore(
         )
     if interpolation not in ("linear", "nearest"):
         raise ValueError(f"interpolation must be 'linear' or 'nearest'; got {interpolation!r}")
-    from .imageio import array_to_sitk, sitk_to_segmentation
+    from .imageio import array_to_sitk, geometry_from_sitk, sitk_to_segmentation
     from .resampling import (
         inverse_resample_argmax,
         inverse_resample_paint,
-        reorient as _reorient,
+        reorient_array_mlx,
     )
 
     schema = prediction.schema
@@ -162,7 +162,12 @@ def restore(
         out = sitk.Resample(src, ref, sitk.Transform(), sitk.sitkNearestNeighbor,
                             0, src.GetPixelID())
         if plan.source_orientation != plan.inference_orientation:
-            out = _reorient(out, plan.source_orientation)
+            og = geometry_from_sitk(out)
+            oa, ogeom = reorient_array_mlx(
+                sitk.GetArrayFromImage(out), direction_xyz=og.direction_xyz,
+                spacing_zyx=og.spacing_zyx, origin_xyz=og.origin_xyz,
+                target_code=plan.source_orientation)
+            out = array_to_sitk(np.asarray(oa), ogeom)
         return sitk_to_segmentation(out, schema)
 
     out_shape = grid.shape_zyx
@@ -185,9 +190,16 @@ def restore(
             peak_working_memory_mb=peak_working_memory_mb,
         )
 
-    seg_img = array_to_sitk(seg_zyx, grid)
     if plan.source_orientation != plan.inference_orientation:
-        seg_img = _reorient(seg_img, plan.source_orientation)
+        # GPU reorient back to the input orientation (transpose+flip, ~6x faster
+        # than SITK DICOMOrient on a large label map).
+        oa, ogeom = reorient_array_mlx(
+            seg_zyx, direction_xyz=grid.direction_xyz,
+            spacing_zyx=grid.spacing_zyx, origin_xyz=grid.origin_xyz,
+            target_code=plan.source_orientation)
+        seg_img = array_to_sitk(np.asarray(oa), ogeom)
+    else:
+        seg_img = array_to_sitk(seg_zyx, grid)
     return sitk_to_segmentation(seg_img, schema)
 
 
