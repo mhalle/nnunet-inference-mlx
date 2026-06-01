@@ -2,13 +2,23 @@
 
 ## [Unreleased]
 
-- **Faster logit-resample gather (~28%).** The default linear `restore` is
-  memory-gather-bound (8-corner fetch of K logit channels). Replacing the
-  3-axis advanced indexing (`src[:, zi, yi, xi]`) with a flattened 1-D
-  `mx.take` over a single `(Z·Y·X)` axis is ~28% faster for identical results
-  (ct.nii 512×512×165, 117ch: 32.1 s → 23.3 s). (Bigger remaining lever: a
-  fused `mx.fast.metal_kernel` doing trilinear + argmax inline to avoid
-  materializing the K-channel volume.)
+- **Fused Metal kernel for the logit restore (~100×).** The default linear
+  `restore` was memory-gather-bound — 8 full-array corner fetches of the K
+  logit channels, blend, then a separate argmax, materializing ~8× the
+  K-channel output transiently. A single `mx.fast.metal_kernel` now does the
+  whole inverse resample with one thread per *output* voxel: trilinear-
+  interpolate all K channels inline (only the 8 source corners per channel)
+  and reduce to one integer label on the fly. Nothing K-channel-sized is
+  materialized, so there's no slab budget to tune (`peak_working_memory_mb`
+  is ignored on this path). On ct.nii (512×512×165, 117ch) restore drops
+  **24.7 s → 0.25 s (~98×)**; end-to-end `segment` **43 s → 11.5 s**. The
+  pure-MLX slab path is retained as a fallback (`use_fused_kernel=False`, or
+  automatic on kernel error). Region models get the same treatment via a
+  fused threshold-paint kernel. Numerics: same separable blend op-order as
+  the slab path → bit-identical on synthetic logits; on real smooth fields a
+  handful of boundary voxels (~4e-5) flip on FMA-contraction rounding,
+  negligible next to MLX↔PyTorch divergence. (Supersedes the earlier ~28%
+  flattened-`mx.take` gather, an interim win on the now-fallback slab path.)
 - **Fast nearest-neighbour inverse resample (path A), opt-in.** `restore` /
   `LoadedModel.segment` / `segment` gain `interpolation`/`output_interpolation`
   (`"linear"` default = logit interpolation, higher fidelity, like nnU-Net;
