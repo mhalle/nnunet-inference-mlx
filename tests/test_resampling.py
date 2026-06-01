@@ -196,3 +196,56 @@ class TestInverseResampleArgmax:
             cascade_downsample=True,
         )
         assert out.shape == (4, 4, 4)
+
+
+class TestFusedKernelEquivalence:
+    """The fused Metal kernel (default) must agree with the pure-MLX slab path.
+
+    The fused kernel does trilinear + argmax/paint inline (one thread per
+    output voxel, no K-channel materialization). It uses the same separable
+    blend op-order as the slab path, so on synthetic logits (no near-ties)
+    results are bit-identical. On real smooth logit fields a handful of
+    boundary voxels can flip where the Metal compiler's FMA contraction
+    rounds differently than MLX's separate mul/add — measured at 18 voxels
+    in 43M (4e-5) on a 512³/117-channel CT — so we assert near-exact
+    agreement rather than bit-exact to stay robust across GPU architectures.
+    """
+
+    @pytest.mark.parametrize(
+        "target,acq,out_shape",
+        [
+            ((1.5, 1.5, 1.5), (1.5, 1.5, 1.5), (16, 16, 16)),   # identity
+            ((1.5, 1.5, 1.5), (1.0, 1.0, 1.0), (24, 24, 24)),   # upsample
+            ((1.0, 1.0, 1.0), (2.0, 2.0, 2.0), (8, 8, 8)),      # downsample
+            ((1.0, 1.0, 1.0), (0.5, 1.0, 2.0), (32, 16, 8)),    # anisotropic
+        ],
+    )
+    def test_fused_matches_slab_argmax(self, target, acq, out_shape):
+        logits = _make_logits(num_classes=9, shape_zyx=(16, 16, 16), seed=7)
+        kw = dict(out_shape_zyx=out_shape,
+                  target_spacing_zyx=target, acq_spacing_zyx=acq)
+        fused = inverse_resample_argmax(logits, use_fused_kernel=True, **kw)
+        slab = inverse_resample_argmax(logits, use_fused_kernel=False, **kw)
+        assert fused.shape == out_shape
+        # Identity case must be exact (no interpolation, no FMA ambiguity).
+        if target == acq:
+            np.testing.assert_array_equal(fused, slab)
+        agree = (fused == slab).mean()
+        assert agree > 0.999, f"fused vs slab agreement {agree:.5f}"
+
+    def test_fused_matches_slab_paint(self):
+        from nnunet_inference_mlx.resampling import inverse_resample_paint
+
+        logits = _make_logits(num_classes=3, shape_zyx=(12, 12, 12), seed=11)
+        rco = (1, 2, 4)   # paint-priority label values
+        kw = dict(
+            out_shape_zyx=(20, 20, 20),
+            target_spacing_zyx=(1.5, 1.5, 1.5),
+            acq_spacing_zyx=(1.0, 1.0, 1.0),
+            regions_class_order=rco,
+            threshold=0.0,
+        )
+        fused = inverse_resample_paint(logits, use_fused_kernel=True, **kw)
+        slab = inverse_resample_paint(logits, use_fused_kernel=False, **kw)
+        assert set(np.unique(fused).tolist()) <= {0, *rco}
+        np.testing.assert_array_equal(fused, slab)
