@@ -611,7 +611,180 @@ _FUSED_PAINT_SRC = r"""
     out[elem] = label;
 """
 
+# --- Tricubic (clamped Catmull-Rom) variant -------------------------------
+# Same one-thread-per-output-voxel fused argmax, but reconstructs each channel
+# with a 4x4x4 Catmull-Rom kernel (64 taps) instead of 2x2x2 trilinear (8 taps).
+# At large *upsample* factors (e.g. fast 3 mm -> 0.65 mm = ~4.6x) trilinear's
+# 2-tap support reconstructs each wide inter-sample gap as a straight ramp, so
+# the argmax boundary is piecewise-linear (faceted); the cubic's 4-tap support
+# follows curvature -> smoother label boundaries. Catmull-Rom is a partition of
+# unity (the 4 weights sum to 1 at any fraction), and a per-voxel constant scale
+# is argmax-invariant anyway, so no normalization is needed even at clamped
+# edges. Cost ~ 64/8 = 8x the trilinear read traffic (still gather-bound; a few
+# seconds at chest-fast scale, vs ~1.3 s trilinear).
+_CUBIC_HEADER = r"""
+inline float cr_w(float d) {              // Catmull-Rom kernel (a = -0.5)
+    float ad = metal::fabs(d);
+    if (ad < 1.0f) return 1.5f*ad*ad*ad - 2.5f*ad*ad + 1.0f;
+    if (ad < 2.0f) return -0.5f*ad*ad*ad + 2.5f*ad*ad - 4.0f*ad + 2.0f;
+    return 0.0f;
+}
+
+inline void cubic_setup(
+    int z, int y, int x,
+    float s2t_z, float s2t_y, float s2t_x,
+    int Z_t, int Y_t, int X_t,
+    thread int* zi, thread int* yi, thread int* xi,
+    thread float* wz, thread float* wy, thread float* wx)
+{
+    float zc = metal::clamp((float)z * s2t_z, 0.0f, (float)(Z_t - 1));
+    float yc = metal::clamp((float)y * s2t_y, 0.0f, (float)(Y_t - 1));
+    float xc = metal::clamp((float)x * s2t_x, 0.0f, (float)(X_t - 1));
+    int z0 = (int)metal::floor(zc);
+    int y0 = (int)metal::floor(yc);
+    int x0 = (int)metal::floor(xc);
+    for (int i = 0; i < 4; i++) {
+        int zt = z0 - 1 + i; zi[i] = metal::clamp(zt, 0, Z_t - 1); wz[i] = cr_w(zc - (float)zt);
+        int yt = y0 - 1 + i; yi[i] = metal::clamp(yt, 0, Y_t - 1); wy[i] = cr_w(yc - (float)yt);
+        int xt = x0 - 1 + i; xi[i] = metal::clamp(xt, 0, X_t - 1); wx[i] = cr_w(xc - (float)xt);
+    }
+}
+
+inline float sample_channel_cubic(
+    const device float* logits, long off,
+    thread const int* zi, thread const int* yi, thread const int* xi,
+    thread const float* wz, thread const float* wy, thread const float* wx,
+    int Y_t, int X_t)
+{
+    int plane = Y_t * X_t;
+    float acc = 0.0f;
+    for (int kz = 0; kz < 4; kz++) {
+        long zbase = off + (long)zi[kz] * plane;
+        for (int ky = 0; ky < 4; ky++) {
+            long ybase = zbase + (long)yi[ky] * X_t;
+            float wzy = wz[kz] * wy[ky];
+            for (int kx = 0; kx < 4; kx++) {
+                acc += wzy * wx[kx] * logits[ybase + xi[kx]];
+            }
+        }
+    }
+    return acc;
+}
+"""
+
+_FUSED_ARGMAX_CUBIC_SRC = r"""
+    uint elem = thread_position_in_grid.x;
+    int n_out = iparams[7];
+    if ((int)elem >= n_out) return;
+
+    int K = iparams[0], Z_t = iparams[1], Y_t = iparams[2], X_t = iparams[3];
+    int Y_a = iparams[5], X_a = iparams[6];
+    float s2t_z = fparams[0], s2t_y = fparams[1], s2t_x = fparams[2];
+
+    int x = (int)elem % X_a;
+    int y = ((int)elem / X_a) % Y_a;
+    int z = (int)elem / (X_a * Y_a);
+
+    int zi[4], yi[4], xi[4]; float wz[4], wy[4], wx[4];
+    cubic_setup(z, y, x, s2t_z, s2t_y, s2t_x, Z_t, Y_t, X_t, zi, yi, xi, wz, wy, wx);
+
+    long chan_stride = (long)Z_t * (long)Y_t * (long)X_t;
+    float best = -INFINITY; int best_k = 0;
+    for (int k = 0; k < K; k++) {
+        float v = sample_channel_cubic(logits, (long)k * chan_stride,
+                                       zi, yi, xi, wz, wy, wx, Y_t, X_t);
+        if (v > best) { best = v; best_k = k; }
+    }
+    out[elem] = (uint32_t)best_k;
+"""
+
+# --- Lanczos-3 (windowed-sinc) variant ------------------------------------
+# Near-ideal band-limited reconstruction: a 6x6x6 separable windowed-sinc
+# (a=3) kernel (216 taps). This is the "is linear actually lossy?" probe — if
+# Lanczos-3 and linear produce ~the same labels, the logit field is band-limited
+# at the model grid and linear is provably near-optimal (nothing for a sharper
+# sinc approximation to recover). Weights are normalized per axis (Lanczos is
+# not exactly a partition of unity). ~216/8 = 27x the trilinear read traffic.
+_LANCZOS_HEADER = r"""
+inline float lanczos3_w(float x) {
+    float ax = metal::fabs(x);
+    if (ax < 1e-6f) return 1.0f;
+    if (ax >= 3.0f) return 0.0f;
+    float pix = 3.14159265358979f * x;
+    return 3.0f * metal::sin(pix) * metal::sin(pix / 3.0f) / (pix * pix);
+}
+
+inline void lanczos_setup(
+    int z, int y, int x,
+    float s2t_z, float s2t_y, float s2t_x,
+    int Z_t, int Y_t, int X_t,
+    thread int* zi, thread int* yi, thread int* xi,
+    thread float* wz, thread float* wy, thread float* wx)
+{
+    float zc = metal::clamp((float)z * s2t_z, 0.0f, (float)(Z_t - 1));
+    float yc = metal::clamp((float)y * s2t_y, 0.0f, (float)(Y_t - 1));
+    float xc = metal::clamp((float)x * s2t_x, 0.0f, (float)(X_t - 1));
+    int z0 = (int)metal::floor(zc), y0 = (int)metal::floor(yc), x0 = (int)metal::floor(xc);
+    float sz = 0.0f, sy = 0.0f, sx = 0.0f;
+    for (int i = 0; i < 6; i++) {
+        int zt = z0 - 2 + i; zi[i] = metal::clamp(zt, 0, Z_t - 1); wz[i] = lanczos3_w(zc - (float)zt); sz += wz[i];
+        int yt = y0 - 2 + i; yi[i] = metal::clamp(yt, 0, Y_t - 1); wy[i] = lanczos3_w(yc - (float)yt); sy += wy[i];
+        int xt = x0 - 2 + i; xi[i] = metal::clamp(xt, 0, X_t - 1); wx[i] = lanczos3_w(xc - (float)xt); sx += wx[i];
+    }
+    for (int i = 0; i < 6; i++) { wz[i] /= sz; wy[i] /= sy; wx[i] /= sx; }
+}
+
+inline float sample_channel_lanczos(
+    const device float* logits, long off,
+    thread const int* zi, thread const int* yi, thread const int* xi,
+    thread const float* wz, thread const float* wy, thread const float* wx,
+    int Y_t, int X_t)
+{
+    int plane = Y_t * X_t;
+    float acc = 0.0f;
+    for (int kz = 0; kz < 6; kz++) {
+        long zbase = off + (long)zi[kz] * plane;
+        for (int ky = 0; ky < 6; ky++) {
+            long ybase = zbase + (long)yi[ky] * X_t;
+            float wzy = wz[kz] * wy[ky];
+            for (int kx = 0; kx < 6; kx++) {
+                acc += wzy * wx[kx] * logits[ybase + xi[kx]];
+            }
+        }
+    }
+    return acc;
+}
+"""
+
+_FUSED_ARGMAX_LANCZOS_SRC = r"""
+    uint elem = thread_position_in_grid.x;
+    int n_out = iparams[7];
+    if ((int)elem >= n_out) return;
+
+    int K = iparams[0], Z_t = iparams[1], Y_t = iparams[2], X_t = iparams[3];
+    int Y_a = iparams[5], X_a = iparams[6];
+    float s2t_z = fparams[0], s2t_y = fparams[1], s2t_x = fparams[2];
+
+    int x = (int)elem % X_a;
+    int y = ((int)elem / X_a) % Y_a;
+    int z = (int)elem / (X_a * Y_a);
+
+    int zi[6], yi[6], xi[6]; float wz[6], wy[6], wx[6];
+    lanczos_setup(z, y, x, s2t_z, s2t_y, s2t_x, Z_t, Y_t, X_t, zi, yi, xi, wz, wy, wx);
+
+    long chan_stride = (long)Z_t * (long)Y_t * (long)X_t;
+    float best = -INFINITY; int best_k = 0;
+    for (int k = 0; k < K; k++) {
+        float v = sample_channel_lanczos(logits, (long)k * chan_stride,
+                                         zi, yi, xi, wz, wy, wx, Y_t, X_t);
+        if (v > best) { best = v; best_k = k; }
+    }
+    out[elem] = (uint32_t)best_k;
+"""
+
 _FUSED_ARGMAX_KERNEL = None
+_FUSED_ARGMAX_CUBIC_KERNEL = None
+_FUSED_ARGMAX_LANCZOS_KERNEL = None
 _FUSED_PAINT_KERNEL = None
 _FUSED_TG = 256
 
@@ -627,6 +800,32 @@ def _get_fused_argmax_kernel():
             source=_FUSED_ARGMAX_SRC,
         )
     return _FUSED_ARGMAX_KERNEL
+
+
+def _get_fused_argmax_cubic_kernel():
+    global _FUSED_ARGMAX_CUBIC_KERNEL
+    if _FUSED_ARGMAX_CUBIC_KERNEL is None:
+        _FUSED_ARGMAX_CUBIC_KERNEL = mx.fast.metal_kernel(
+            name="fused_resample_argmax_cubic",
+            input_names=["logits", "iparams", "fparams"],
+            output_names=["out"],
+            header=_CUBIC_HEADER,
+            source=_FUSED_ARGMAX_CUBIC_SRC,
+        )
+    return _FUSED_ARGMAX_CUBIC_KERNEL
+
+
+def _get_fused_argmax_lanczos_kernel():
+    global _FUSED_ARGMAX_LANCZOS_KERNEL
+    if _FUSED_ARGMAX_LANCZOS_KERNEL is None:
+        _FUSED_ARGMAX_LANCZOS_KERNEL = mx.fast.metal_kernel(
+            name="fused_resample_argmax_lanczos",
+            input_names=["logits", "iparams", "fparams"],
+            output_names=["out"],
+            header=_LANCZOS_HEADER,
+            source=_FUSED_ARGMAX_LANCZOS_SRC,
+        )
+    return _FUSED_ARGMAX_LANCZOS_KERNEL
 
 
 def _get_fused_paint_kernel():
@@ -657,6 +856,56 @@ def _fused_resample_argmax(
     s2t = [acq_spacing_zyx[i] / target_spacing_zyx[i] for i in range(3)]
     fparams = mx.array(s2t, dtype=mx.float32)
     (out,) = _get_fused_argmax_kernel()(
+        inputs=[logits_target, iparams, fparams],
+        grid=(n_out, 1, 1),
+        threadgroup=(_FUSED_TG, 1, 1),
+        output_shapes=[(Z_a, Y_a, X_a)],
+        output_dtypes=[mx.uint32],
+    )
+    mx.eval(out)
+    return np.asarray(out).astype(out_dtype, copy=False)
+
+
+def _fused_resample_argmax_cubic(
+    logits_target: mx.array,            # (K, Z_t, Y_t, X_t)
+    out_shape_zyx: tuple[int, int, int],
+    target_spacing_zyx: tuple[float, float, float],
+    acq_spacing_zyx: tuple[float, float, float],
+    out_dtype: np.dtype,
+) -> np.ndarray:
+    """One-launch fused tricubic (Catmull-Rom) + argmax — smoother inverse."""
+    K, Z_t, Y_t, X_t = logits_target.shape
+    Z_a, Y_a, X_a = out_shape_zyx
+    n_out = Z_a * Y_a * X_a
+    iparams = mx.array([K, Z_t, Y_t, X_t, Z_a, Y_a, X_a, n_out], dtype=mx.int32)
+    s2t = [acq_spacing_zyx[i] / target_spacing_zyx[i] for i in range(3)]
+    fparams = mx.array(s2t, dtype=mx.float32)
+    (out,) = _get_fused_argmax_cubic_kernel()(
+        inputs=[logits_target, iparams, fparams],
+        grid=(n_out, 1, 1),
+        threadgroup=(_FUSED_TG, 1, 1),
+        output_shapes=[(Z_a, Y_a, X_a)],
+        output_dtypes=[mx.uint32],
+    )
+    mx.eval(out)
+    return np.asarray(out).astype(out_dtype, copy=False)
+
+
+def _fused_resample_argmax_lanczos(
+    logits_target: mx.array,            # (K, Z_t, Y_t, X_t)
+    out_shape_zyx: tuple[int, int, int],
+    target_spacing_zyx: tuple[float, float, float],
+    acq_spacing_zyx: tuple[float, float, float],
+    out_dtype: np.dtype,
+) -> np.ndarray:
+    """One-launch fused Lanczos-3 (windowed-sinc) + argmax — near-ideal probe."""
+    K, Z_t, Y_t, X_t = logits_target.shape
+    Z_a, Y_a, X_a = out_shape_zyx
+    n_out = Z_a * Y_a * X_a
+    iparams = mx.array([K, Z_t, Y_t, X_t, Z_a, Y_a, X_a, n_out], dtype=mx.int32)
+    s2t = [acq_spacing_zyx[i] / target_spacing_zyx[i] for i in range(3)]
+    fparams = mx.array(s2t, dtype=mx.float32)
+    (out,) = _get_fused_argmax_lanczos_kernel()(
         inputs=[logits_target, iparams, fparams],
         grid=(n_out, 1, 1),
         threadgroup=(_FUSED_TG, 1, 1),
@@ -869,6 +1118,7 @@ def inverse_resample_argmax(
     peak_working_memory_mb: int | None = None,
     cascade_downsample: bool | None = None,
     use_fused_kernel: bool = True,
+    interpolation: str = "linear",
     verbose: bool = False,
 ) -> np.ndarray:
     """Resample target-spacing logits to acquisition spacing and argmax.
@@ -964,6 +1214,16 @@ def inverse_resample_argmax(
     # pure-MLX slab loop if the kernel is unavailable or errors.
     if use_fused_kernel:
         try:
+            if interpolation == "cubic":
+                return _fused_resample_argmax_cubic(
+                    logits_target, out_shape_zyx,
+                    target_spacing_zyx, acq_spacing_zyx, out_dtype,
+                )
+            if interpolation == "lanczos":
+                return _fused_resample_argmax_lanczos(
+                    logits_target, out_shape_zyx,
+                    target_spacing_zyx, acq_spacing_zyx, out_dtype,
+                )
             return _fused_resample_argmax(
                 logits_target, out_shape_zyx,
                 target_spacing_zyx, acq_spacing_zyx, out_dtype,

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -208,8 +209,12 @@ def main(argv=None) -> int:
     image = reader.read(args.input)
 
     # TS resamples the label map (NN) by default; --higher_order_resampling asks
-    # for higher-order → our logit-interp ("linear") path.
+    # for higher-order → our logit-interp ("linear") path. MLX_OUTPUT_INTERP
+    # overrides (linear | cubic | nearest) for experimenting with the inverse:
+    # "cubic" = tricubic Catmull-Rom logit upsample (smoother boundaries at
+    # large upsample factors, e.g. fast mode), ~17x the linear restore cost.
     interp = "linear" if args.higher_order_resampling else "nearest"
+    interp = os.environ.get("MLX_OUTPUT_INTERP", interp).lower()
     st = time.time()
     seg = segment(spec, image, store=store, catalog=catalog,
                   output_interpolation=interp, progress=out)

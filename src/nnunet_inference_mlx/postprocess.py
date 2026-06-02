@@ -139,8 +139,8 @@ def restore(
             f"plan.model_spacing_zyx {plan.model_spacing_zyx}; prediction was not "
             "produced by this plan's to_model_frame step."
         )
-    if interpolation not in ("linear", "nearest"):
-        raise ValueError(f"interpolation must be 'linear' or 'nearest'; got {interpolation!r}")
+    if interpolation not in ("linear", "nearest", "cubic", "lanczos"):
+        raise ValueError(f"interpolation must be 'linear', 'cubic', 'lanczos' or 'nearest'; got {interpolation!r}")
     from .imageio import array_to_sitk, geometry_from_sitk, sitk_to_segmentation
     from .resampling import (
         inverse_resample_argmax,
@@ -188,6 +188,7 @@ def restore(
             prediction.data, out_shape, target_spacing_zyx, acq_spacing,
             out_dtype=out_dtype,
             peak_working_memory_mb=peak_working_memory_mb,
+            interpolation=interpolation,   # "linear" (trilinear) or "cubic" (Catmull-Rom)
         )
 
     if plan.source_orientation != plan.inference_orientation:
