@@ -33,6 +33,7 @@ def sliding_window(
     *,
     step_size: float = 0.5,
     use_mirroring: bool = False,
+    batch_size: int | None = None,
 ) -> Prediction:
     """Run the model over a (single-channel) model-frame volume → Prediction.
 
@@ -52,12 +53,14 @@ def sliding_window(
     vol_np = np.asarray(volume.data[..., 0]).astype(np.float32, copy=False)
 
     sw = engine.sliding_window  # the SlidingWindowEngine (public accessor)
-    saved = (sw.step_size, sw.use_mirroring)
+    saved = (sw.step_size, sw.use_mirroring, sw._batch_size)
     sw.step_size, sw.use_mirroring = float(step_size), bool(use_mirroring)
+    if batch_size is not None:                        # else keep auto-chosen default
+        sw._batch_size = int(batch_size)
     try:
         logits = engine.predict_logits(vol_np)        # (K, Z, Y, X) mx.array
     finally:
-        sw.step_size, sw.use_mirroring = saved
+        sw.step_size, sw.use_mirroring, sw._batch_size = saved
 
     if model.model_data.num_folds > 1:
         activation = "sigmoid" if model.schema.is_region_model else "softmax"

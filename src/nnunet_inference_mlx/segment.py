@@ -42,6 +42,8 @@ def segment(
     output_scaling: float | None = None,
     at_model_spacing: bool = False,
     output_interpolation: str = "linear",
+    step_size: float = 0.5,
+    batch_size: int | None = None,
     progress: "Callable[[str], None] | None" = None,
 ) -> Segmentation:
     """Segment a :class:`Volume` with a named task (or recipe) → :class:`Segmentation`.
@@ -71,24 +73,33 @@ def segment(
                               output_scaling=output_scaling,
                               at_model_spacing=at_model_spacing,
                               output_interpolation=output_interpolation,
+                              step_size=step_size, batch_size=batch_size,
                               progress=progress)
+    if spec.shape == "label_union":
+        # Union supports output-resolution knobs: each part restores to the same
+        # output grid (same input + same output_spacing), then paint_union runs
+        # on that grid. Each part is itself a high-fidelity logit-render restore.
+        return _segment_union(spec, image, store,
+                            reorient_to=reorient_to,
+                            peak_working_memory_mb=peak_working_memory_mb,
+                            output_spacing=output_spacing,
+                            output_scaling=output_scaling,
+                            at_model_spacing=at_model_spacing,
+                            output_interpolation=output_interpolation,
+                            step_size=step_size, batch_size=batch_size,
+                            progress=progress)
     if _resample:
         raise NotImplementedError(
             f"output resampling (output_spacing/output_scaling/at_model_spacing) is not "
-            f"yet supported for {spec.shape!r} tasks — only single-model tasks."
+            f"yet supported for {spec.shape!r} tasks — only single-model and label_union tasks."
         )
     if spec.shape == "cascade":
         return _segment_cascade(spec, image, store, catalog,
                               reorient_to=reorient_to,
                               peak_working_memory_mb=peak_working_memory_mb,
                               output_interpolation=output_interpolation,
+                              step_size=step_size, batch_size=batch_size,
                               progress=progress)
-    if spec.shape == "label_union":
-        return _segment_union(spec, image, store,
-                            reorient_to=reorient_to,
-                            peak_working_memory_mb=peak_working_memory_mb,
-                            output_interpolation=output_interpolation,
-                            progress=progress)
     raise ValueError(f"unhandled task shape: {spec.shape!r}")
 
 
@@ -153,7 +164,8 @@ def _flatten_cascade(spec: TaskSpec, catalog, store, _depth: int = 0):
 
 def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
                     output_spacing=None, output_scaling=None, at_model_spacing=False,
-                    output_interpolation="linear", progress=None) -> Segmentation:
+                    output_interpolation="linear", step_size=0.5, batch_size=None,
+                    progress=None) -> Segmentation:
     model = store.load(spec.single)
     if progress:
         progress("Predicting...")
@@ -162,11 +174,13 @@ def _segment_single(spec, image, store, *, reorient_to, peak_working_memory_mb,
                          output_spacing=output_spacing,
                          output_scaling=output_scaling,
                          at_model_spacing=at_model_spacing,
-                         output_interpolation=output_interpolation)
+                         output_interpolation=output_interpolation,
+                         step_size=step_size, batch_size=batch_size)
 
 
 def _segment_cascade(spec, image, store, catalog, *, reorient_to,
                      peak_working_memory_mb, output_interpolation="linear",
+                     step_size=0.5, batch_size=None,
                      progress=None) -> Segmentation:
     """coarse → crop FOV around target classes → fine → paste into full grid.
 
@@ -191,7 +205,8 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
             progress(f"Predicting stage {i + 1} of {len(descriptors)} ...")
         seg = model.segment(current, reorient_to=reorient_to,
                             peak_working_memory_mb=peak_working_memory_mb,
-                            output_interpolation=output_interpolation)
+                            output_interpolation=output_interpolation,
+                            step_size=step_size, batch_size=batch_size)
         if i == len(descriptors) - 1:
             final_seg = seg
             break
@@ -214,13 +229,17 @@ def _segment_cascade(spec, image, store, catalog, *, reorient_to,
 
 
 def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
-                   output_interpolation="linear", progress=None) -> Segmentation:
+                   output_spacing=None, output_scaling=None, at_model_spacing=False,
+                   output_interpolation="linear", step_size=0.5, batch_size=None,
+                   progress=None) -> Segmentation:
     """Run each part independently, remap into the unified space, paint by priority.
 
     Parts share the same input; later parts overwrite earlier ones at
     overlapping voxels (``paint_union``). Each part's ``model.segment`` returns
-    a segmentation in the input's grid, so the remapped arrays line up for the
-    paint without any further resampling.
+    a segmentation on the same output grid (same input + same output-resolution
+    knobs), so the remapped arrays line up for the paint without any further
+    resampling. With ``output_spacing``/``output_scaling``/``at_model_spacing``
+    set, that shared grid is the requested one instead of the input grid.
     """
     import mlx.core as mx
 
@@ -240,19 +259,30 @@ def _segment_union(spec, image, store, *, reorient_to, peak_working_memory_mb,
     else:
         out_dtype = np.dtype(np.uint32)
 
-    unified = np.zeros(image.geometry.shape_zyx, dtype=out_dtype)
+    # The shared output grid (input grid by default, or the requested
+    # output_spacing/scaling/model grid) is set by the first part's restore;
+    # all parts use the same input + knobs, so they land on the same grid.
+    unified = None
+    out_geometry = image.geometry
     for i, part in enumerate(spec.union):
         model = store.load(part.weights_id)
         if progress:
             progress(f"Predicting part {i + 1} of {len(spec.union)} ...")
         seg = model.segment(image, reorient_to=reorient_to,
                            peak_working_memory_mb=peak_working_memory_mb,
-                           output_interpolation=output_interpolation)
+                           output_spacing=output_spacing,
+                           output_scaling=output_scaling,
+                           at_model_spacing=at_model_spacing,
+                           output_interpolation=output_interpolation,
+                           step_size=step_size, batch_size=batch_size)
+        if unified is None:
+            unified = np.zeros(seg.geometry.shape_zyx, dtype=out_dtype)
+            out_geometry = seg.geometry
         remapped = remap_labels(np.asarray(seg.data), dict(part.label_remap),
                                 out_dtype=out_dtype)
         paint_union(unified, remapped)
 
-    return Segmentation(data=mx.array(unified), geometry=image.geometry, schema=schema)
+    return Segmentation(data=mx.array(unified), geometry=out_geometry, schema=schema)
 
 
 __all__ = ["segment", "required_weights_ids"]

@@ -61,6 +61,7 @@ class LoadedModel:
         interpolation: str = "auto",
         step_size: float = 0.5,
         use_mirroring: bool = False,
+        batch_size: int | None = None,
     ) -> Prediction:
         """Per-class model output at the model's native (training) spacing.
 
@@ -86,7 +87,8 @@ class LoadedModel:
             reorient_to=reorient_to, interpolation=interpolation,
         )
         return sliding_window(self, model_vol,
-                              step_size=step_size, use_mirroring=use_mirroring)
+                              step_size=step_size, use_mirroring=use_mirroring,
+                              batch_size=batch_size)
 
     def segment(
         self,
@@ -98,6 +100,7 @@ class LoadedModel:
         remove_small_components_mm3: float = 0.0,
         step_size: float = 0.5,
         use_mirroring: bool = False,
+        batch_size: int | None = None,
         output_spacing: "float | tuple[float, float, float] | None" = None,
         output_scaling: float | None = None,
         at_model_spacing: bool = False,
@@ -134,7 +137,8 @@ class LoadedModel:
             reorient_to=reorient_to, interpolation=interpolation,
         )
         prediction = sliding_window(self, model_vol,
-                                    step_size=step_size, use_mirroring=use_mirroring)
+                                    step_size=step_size, use_mirroring=use_mirroring,
+                                    batch_size=batch_size)
         target_spacing = self.model_data.target_spacing_zyx if at_model_spacing else output_spacing
         segmentation = restore(prediction, plan,
                                target_spacing=target_spacing,

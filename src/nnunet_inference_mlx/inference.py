@@ -429,23 +429,20 @@ def choose_batch_size(
     num_classes: int = 105,
     dtype_bytes: int = 4,
 ) -> int:
-    """Choose batch size that fits within Metal buffer limits.
+    """Auto batch size for sliding-window inference: 1.
 
-    With mx.compile, MLX fuses operations and reuses memory for
-    intermediates. Empirically, peak memory per patch is ~3x the naive
-    activation estimate (calibrated on M2 17GB: batch=2 works for 25
-    classes at 128^3, batch=3 OOMs).
+    batch=1 is empirically the fastest for nnU-Net 3D conv on Apple Silicon,
+    measured on both M2 16GB and M1 Max 64GB (e.g. full chest at 1.5mm: b=1
+    8:33 vs auto/b=8 ~11:30, ~35% faster at b=1). 3D conv here is
+    memory-bandwidth-bound and a single patch already saturates the GPU, so
+    larger batches only multiply the activation footprint and bus traffic
+    without adding usable parallelism -- they run slower, not faster. The old
+    heuristic sized the batch to fit the Metal buffer (scaling *up* with
+    available memory), which optimizes the wrong thing and picks a slower batch
+    on large-memory machines. Callers can still force a batch explicitly (it
+    bypasses this); the helpers below are kept for that buffer-fit estimate.
     """
-    max_buffer_bytes = _get_metal_max_buffer_bytes()
-    act_bytes = _estimate_activation_bytes(patch_size, bytes_per_element=dtype_bytes)
-    # With mx.compile, real peak is ~3x naive estimate
-    real_peak_bytes = act_bytes * 3
-    output_bytes = int(np.prod(patch_size)) * num_classes * dtype_bytes
-    per_patch_bytes = real_peak_bytes + output_bytes
-    # Stay at 85% of Metal max buffer (mx.compile enables memory reuse)
-    usable_bytes = max_buffer_bytes * 0.85
-    batch = max(1, int(usable_bytes / per_patch_bytes))
-    return min(batch, 8)
+    return 1
 
 
 def _get_metal_max_buffer_bytes() -> int:

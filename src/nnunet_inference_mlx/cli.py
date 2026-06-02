@@ -100,6 +100,8 @@ def segment(
     output_spacing: Optional[float] = typer.Option(None, "--output-spacing", help="Output spacing in mm (isotropic). Alternative to --output-scaling."),
     at_model_spacing: bool = typer.Option(False, "--at-model-spacing", help="Write at the model's native training spacing (no upsample back to the input grid)."),
     resample: str = typer.Option("linear", "--resample", help="Inverse resample: 'linear' (logit interp, higher fidelity) or 'nearest' (label NN, much faster on large grids)."),
+    batch_size: Optional[int] = typer.Option(None, "--batch-size", "-b", help="Sliding-window patches per forward pass. Higher better utilizes large GPUs (try 2-4 on M-series Max/Ultra); None = auto from RAM."),
+    tile_step_size: float = typer.Option(0.5, "--tile-step-size", help="Sliding-window step as a fraction of patch size (0.5 = 50%% overlap). Higher = fewer patches = faster, slightly coarser at tile seams."),
     download: bool = typer.Option(True, "--download/--no-download", help="Auto-download missing weights (default on)."),
 ) -> None:
     """Run a named task on a volume and write the segmentation.
@@ -164,17 +166,24 @@ def segment(
         output_scaling=output_scaling,
         at_model_spacing=at_model_spacing,
         output_interpolation=resample,
+        step_size=tile_step_size,
+        batch_size=batch_size,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     NiftiWriter().write(output, seg)
-    data = np.asarray(seg.data)
-    labels = sorted(int(v) for v in np.unique(data) if v != 0)
     typer.secho(f"wrote  : {output}", fg=typer.colors.GREEN)
     typer.echo(f"         {seg.geometry.shape_zyx} @ "
                f"{tuple(round(s, 3) for s in seg.geometry.spacing_zyx)} mm")
-    typer.echo(f"         {len(labels)} foreground labels (max {max(labels) if labels else 0}), "
-               f"{int((data > 0).sum())} fg voxels")
+    # Label/voxel summary is cosmetic — never fail the (already-written) output
+    # over it (e.g. a broken numpy install where np.unique can't import numpy.ma).
+    try:
+        data = np.asarray(seg.data)
+        labels = sorted(int(v) for v in np.unique(data) if v != 0)
+        typer.echo(f"         {len(labels)} foreground labels (max {max(labels) if labels else 0}), "
+                   f"{int((data > 0).sum())} fg voxels")
+    except Exception as e:
+        typer.echo(f"         (label summary unavailable: {type(e).__name__})")
 
 
 # ---------------------------------------------------------------------------
