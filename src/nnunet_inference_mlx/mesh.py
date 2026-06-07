@@ -167,14 +167,17 @@ def _suppress_low_confidence_blobs(
 
       1. ``margin(V) = top1_logit(V) − top2_logit(V) < threshold`` —
          the argmax decision at V is uncertain.
-      2. V's label appears in **at most 2** of its 6 axis-aligned
-         neighbors — V is a minority feature.
+      2. **None** of V's 6 axis-aligned neighbors share V's label —
+         V is a topologically isolated voxel.
 
-    "Minority + uncertain" is the operational definition of a noise-
-    driven argmax flip that the meshing then amplifies into an
-    octahedron spike. Isolated 1-voxel blobs (all 6 neighbors agree)
-    and 1×N strips (5 same, 1 same-as-V) both qualify. Larger
-    structures with ≥ 3 same-label neighbors are left alone.
+    The "fully isolated" criterion is the safe one: it only catches
+    voxels whose label has zero connectivity to its neighborhood
+    (the classic 1-voxel argmax-flip blob), and never breaks
+    elongated structures. A 1-voxel-wide rib has each voxel
+    connected to one or two same-label neighbors along its length,
+    so its voxels are not isolated and the rule leaves them alone.
+    Trade-off: 2+ voxel noise clusters (where each voxel has ≥ 1
+    same-label neighbor) are *not* suppressed by this rule.
 
     Relabel target: the majority label among V's 6 neighbors. If
     multiple labels tie, the smallest-numbered tied label is used —
@@ -208,9 +211,9 @@ def _suppress_low_confidence_blobs(
     # Count how many neighbors share the center's label.
     n_same = (nbrs == center[..., None]).sum(axis=-1).astype(np.int8)
     low_confidence = margin[1:-1, 1:-1, 1:-1] < np.float32(threshold)
-    is_minority = n_same <= 2
+    is_isolated = (n_same == 0)
 
-    suppress = low_confidence & is_minority
+    suppress = low_confidence & is_isolated
     if not suppress.any():
         return labels
 
