@@ -1,30 +1,35 @@
-"""Logit-based surface extraction (Phase B MVP).
+"""Logit-based surface extraction.
 
 Reads a K-channel logit volume at training spacing and emits a SurfaceNets
 dual mesh whose vertex positions come from edge-crossing interpolation in
 the *continuous* logit field — not from a discretized label map.
 
-No smoothing pass; no full case-table state machine; no non-manifold
-detection. The MVP we agreed for testing whether logit-based surfaces are
-viable, before investing in any of that machinery.
+Algorithm in three lines:
 
-The algorithm in three lines:
   1. Argmax per voxel → label per voxel.
   2. For each grid edge whose endpoint labels differ, linearly interpolate
      ``logit_i - logit_j`` (the two dominant labels) to find t ∈ [0, 1]
      where it crosses zero.
-  3. For each boundary cell (a cell whose 8 corners don't all share a
-     label), emit one dual vertex at the centroid of its crossed-edge
-     points. For each crossed grid edge, emit one quad connecting the
-     dual vertices of the 4 cells incident to that edge, oriented so the
-     face normal points Label0 → Label1 per the VTK BoundaryLabels rule.
+  3. For each boundary cell, compute the connected components of crossed
+     cell-edges (face-based connectivity, smaller-label-through-middle
+     saddle disambiguation). Emit one dual vertex per component, placed
+     at the centroid of that component's crossing points. For each
+     crossed grid edge, emit one quad connecting the dual vertices of
+     the 4 cells incident to that edge — selecting the component vertex
+     that the corresponding cell-edge belongs to in each cell.
 
-Vertices live in *training-grid index coordinates* (fractional voxel
-indices). World-mm conversion is the caller's responsibility — same
-convention as :class:`Mesh.points` documents.
+The component split is what fixes the non-manifold edges that a single-
+vertex-per-cell rule generates at saddle cells (8 corners arranged so the
+boundary surface inside the cell is two disjoint patches). VTK's
+``vtkSurfaceNets3D`` does the same thing with its case-table machinery;
+we do it via per-cell face-based connectivity with a saddle-resolution
+rule that depends only on the face's labels (so two cells sharing a face
+always agree about how to connect crossings on that face).
 """
 
 from __future__ import annotations
+
+from functools import lru_cache
 
 import numpy as np
 
@@ -59,10 +64,11 @@ def surfacenets_logits(
     Notes
     -----
     Volume-boundary closure: grid edges on the outermost voxel layer
-    have fewer than 4 incident cells, so this MVP does not emit quads for
-    them. Objects that don't touch the volume boundary produce closed
-    surfaces; objects clipped by the volume have an open "ring" at the
-    clip. Pad the input with a background border if you need closure.
+    have fewer than 4 incident cells, so this implementation does not
+    emit quads for them. Objects that don't touch the volume boundary
+    produce closed surfaces; objects clipped by the volume have an open
+    "ring" at the clip. Pad the input with a background border if you
+    need closure.
     """
     if logits.ndim != 4:
         raise ValueError(f"logits must be 4-D (K, Z, Y, X); got ndim={logits.ndim}")
@@ -83,12 +89,15 @@ def surfacenets_logits(
     y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
     z_crossed, z_t = _edge_crossings(logits, labels, axis=0)
 
+    edge_comp, n_comp = _cell_components(labels)
+
     cell_to_vertex, points = _cell_dual_vertices(
-        x_crossed, x_t, y_crossed, y_t, z_crossed, z_t,
+        edge_comp, n_comp,
+        x_t, y_t, z_t,
     )
 
     quads, boundary_labels = _emit_quads(
-        x_crossed, y_crossed, z_crossed, cell_to_vertex, labels,
+        x_crossed, y_crossed, z_crossed, cell_to_vertex, edge_comp, labels,
     )
 
     return Mesh(
@@ -117,10 +126,6 @@ def _edge_crossings(
       * ``t`` — float32 array of the same shape, with the sub-voxel
         position in [0, 1] where ``logit_i - logit_j`` crosses zero (i at
         endpoint a, j at endpoint b).
-
-    Computation is vectorized over the whole field; the t value is set to
-    0 where the edge is not crossed (harmless because the cell sweep
-    weighs t by ``crossed``).
     """
     sl_a = [slice(None)] * 3
     sl_b = [slice(None)] * 3
@@ -144,11 +149,9 @@ def _edge_crossings(
     logit_L0_b = np.take_along_axis(logits_b, L0_idx, axis=0)[0]
     logit_L1_b = np.take_along_axis(logits_b, L1_idx, axis=0)[0]
 
-    d0 = logit_L0_a - logit_L1_a   # ≥ 0 at endpoint a (L0 dominant there)
-    d1 = logit_L0_b - logit_L1_b   # ≤ 0 at endpoint b (L1 dominant there)
+    d0 = logit_L0_a - logit_L1_a
+    d1 = logit_L0_b - logit_L1_b
     denom = d0 - d1
-    # Degenerate (both d0 and d1 effectively zero) → fall back to midpoint;
-    # at real-world logit magnitudes this branch is never taken.
     safe_denom = np.where(denom > 1e-30, denom, 1.0)
     t = np.where(denom > 1e-30, d0 / safe_denom, 0.5).astype(np.float32)
     t = np.where(crossed, t, np.float32(0.0))
@@ -156,89 +159,338 @@ def _edge_crossings(
 
 
 # ---------------------------------------------------------------------------
-# Dual vertex per boundary cell
+# Cell connectivity: components of crossed cell-edges
+# ---------------------------------------------------------------------------
+#
+# Corners of a cell are indexed 0..7 from (dz, dy, dx) ∈ {0,1}³ as
+# ``index = dz*4 + dy*2 + dx``.
+#
+# Edges 0..11:
+#   0..3   X-edges, indexed by (dz, dy):  (0,0), (0,1), (1,0), (1,1)
+#   4..7   Y-edges, indexed by (dz, dx):  (0,0), (0,1), (1,0), (1,1)
+#   8..11  Z-edges, indexed by (dy, dx):  (0,0), (0,1), (1,0), (1,1)
+
+
+_EDGE_CORNERS = (
+    (0, 1), (2, 3), (4, 5), (6, 7),     # X-edges 0..3
+    (0, 2), (1, 3), (4, 6), (5, 7),     # Y-edges 4..7
+    (0, 4), (1, 5), (2, 6), (3, 7),     # Z-edges 8..11
+)
+
+
+# For each of the 6 faces: cyclic ordering of (4 corners) and the (4 edges
+# between consecutive corners). ``face_edges[k]`` is the edge between
+# ``face_corners[k]`` and ``face_corners[(k + 1) % 4]``.
+_FACES = (
+    ((0, 1, 3, 2), (0, 5, 1, 4)),       # z=0 bottom
+    ((4, 5, 7, 6), (2, 7, 3, 6)),       # z=1 top
+    ((0, 1, 5, 4), (0, 9, 2, 8)),       # y=0 back
+    ((2, 3, 7, 6), (1, 11, 3, 10)),     # y=1 front
+    ((0, 2, 6, 4), (4, 10, 6, 8)),      # x=0 left
+    ((1, 3, 7, 5), (5, 11, 7, 9)),      # x=1 right
+)
+
+
+@lru_cache(maxsize=4096)
+def _cell_case(corner_labels: tuple) -> tuple:
+    """For one cell configuration, return ``(n_components, edge_to_component)``.
+
+    ``corner_labels`` is an 8-tuple of integer labels at the 8 cell
+    corners (in canonical 0..7 order). Returns a 12-tuple where element
+    ``e`` is ``-1`` if cell-edge ``e`` is not crossed, else an integer
+    in ``[0, n_components)`` identifying which boundary patch in the
+    cell that crossing belongs to.
+
+    Connectivity rule
+    -----------------
+    Two crossed edges are in the same component iff:
+
+      1. They cross between the **same label pair**, *and*
+      2. They are connected through some face of the cell (per-face
+         connectivity below).
+
+    The first rule is the key fix for triple/higher junctions: at a cell
+    along a triple line where labels A, B, C meet, the A↔B boundary
+    surface and the B↔C boundary surface are topologically distinct
+    patches — they share only a 1D curve where they meet. Lumping their
+    crossings into one component creates non-manifold edges in the dual
+    mesh.
+
+    Per-face connectivity (within a single label pair):
+      * 2 same-pair crossings: connected.
+      * 3 same-pair crossings: all connected.
+      * 4 same-pair crossings: the only configuration that produces this
+        is a 2-color saddle; the boundary is two segments and we apply
+        the deterministic "smaller-label-through-middle" rule (depends
+        only on face labels, so two cells sharing the face always
+        agree).
+
+    Cached: a real volume has at most a few thousand distinct cell
+    configurations even when it has millions of cells.
+    """
+    edge_pair: list[tuple] = [None] * 12  # type: ignore[list-item]
+    crossed = [False] * 12
+    for e, (a, b) in enumerate(_EDGE_CORNERS):
+        la, lb = corner_labels[a], corner_labels[b]
+        if la != lb:
+            crossed[e] = True
+            edge_pair[e] = (la, lb) if la < lb else (lb, la)
+    if not any(crossed):
+        return (0, (-1,) * 12)
+
+    # Union-find on 12 edges.
+    parent = list(range(12))
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for face_corners, face_edges in _FACES:
+        face_crossed = [e for e in face_edges if crossed[e]]
+        if len(face_crossed) <= 1:
+            continue
+
+        # Group face crossings by label pair; connect only within a group.
+        groups: dict[tuple, list[int]] = {}
+        for e in face_crossed:
+            groups.setdefault(edge_pair[e], []).append(e)
+
+        for pair, es in groups.items():
+            if len(es) <= 1:
+                continue
+            if len(es) <= 3:
+                # Chain-connect — works for 2 (single union) and 3
+                # (triangle = same component).
+                for k in range(len(es) - 1):
+                    union(es[k], es[k + 1])
+                continue
+            # len == 4: only possible if all 4 face edges cross between
+            # the same pair, i.e. a 2-color saddle. Apply the
+            # deterministic split.
+            L = tuple(corner_labels[c] for c in face_corners)
+            if L[0] == L[2] and L[1] == L[3] and L[0] != L[1]:
+                if L[0] < L[1]:
+                    union(face_edges[0], face_edges[1])
+                    union(face_edges[2], face_edges[3])
+                else:
+                    union(face_edges[0], face_edges[3])
+                    union(face_edges[1], face_edges[2])
+            else:
+                # Defensive: not a 2-color saddle (shouldn't reach here);
+                # fall back to single component.
+                for k in range(3):
+                    union(es[k], es[k + 1])
+
+    roots = sorted({find(e) for e in range(12) if crossed[e]})
+    root_to_comp = {r: i for i, r in enumerate(roots)}
+    edge_to_comp = tuple(
+        root_to_comp[find(e)] if crossed[e] else -1
+        for e in range(12)
+    )
+    return (len(roots), edge_to_comp)
+
+
+def _cell_components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-cell component info for every cell in the volume.
+
+    Returns
+    -------
+    edge_components :
+        ``(Zm1, Ym1, Xm1, 12) int8`` — component ID per cell-edge, or
+        ``-1`` for uncrossed edges (and for interior cells with no
+        crossings at all).
+    n_components :
+        ``(Zm1, Ym1, Xm1) int8`` — number of components in each cell
+        (0 for interior cells).
+
+    Strategy: gather the 8 corner labels per cell into one
+    ``(Zm1, Ym1, Xm1, 8)`` array, find the unique 8-tuples across the
+    *boundary* cells, run :func:`_cell_case` once per unique config, and
+    scatter the result back. This collapses the Python work from
+    "millions of cells" to "thousands of unique configurations."
+    """
+    # Stack 8 corner labels per cell.
+    c000 = labels[:-1, :-1, :-1]
+    c001 = labels[:-1, :-1, 1:]
+    c010 = labels[:-1, 1:, :-1]
+    c011 = labels[:-1, 1:, 1:]
+    c100 = labels[1:, :-1, :-1]
+    c101 = labels[1:, :-1, 1:]
+    c110 = labels[1:, 1:, :-1]
+    c111 = labels[1:, 1:, 1:]
+    corners = np.stack(
+        [c000, c001, c010, c011, c100, c101, c110, c111], axis=-1
+    )
+
+    Zm1, Ym1, Xm1 = corners.shape[:3]
+    edge_components = np.full((Zm1, Ym1, Xm1, 12), -1, dtype=np.int8)
+    n_components = np.zeros((Zm1, Ym1, Xm1), dtype=np.int8)
+
+    # Boundary mask: at least one corner differs from corner-0.
+    ref = corners[..., :1]
+    is_boundary = (corners != ref).any(axis=-1)
+    if not is_boundary.any():
+        return edge_components, n_components
+
+    # Look up unique configurations and scatter back.
+    flat_corners = corners.reshape(-1, 8)
+    flat_boundary = is_boundary.reshape(-1)
+    bc = flat_corners[flat_boundary]                       # (N_b, 8)
+    unique_cfgs, inverse = np.unique(bc, axis=0, return_inverse=True)
+
+    nb = unique_cfgs.shape[0]
+    n_per_cfg = np.zeros(nb, dtype=np.int8)
+    edge_per_cfg = np.full((nb, 12), -1, dtype=np.int8)
+    for i in range(nb):
+        cfg = tuple(int(v) for v in unique_cfgs[i])
+        n, et = _cell_case(cfg)
+        n_per_cfg[i] = n
+        edge_per_cfg[i] = et
+
+    # Scatter.
+    flat_n = np.zeros(flat_corners.shape[0], dtype=np.int8)
+    flat_edge = np.full((flat_corners.shape[0], 12), -1, dtype=np.int8)
+    flat_n[flat_boundary] = n_per_cfg[inverse]
+    flat_edge[flat_boundary] = edge_per_cfg[inverse]
+
+    n_components = flat_n.reshape(Zm1, Ym1, Xm1)
+    edge_components = flat_edge.reshape(Zm1, Ym1, Xm1, 12)
+    return edge_components, n_components
+
+
+# ---------------------------------------------------------------------------
+# Dual vertices: one per (cell, component); all coincident in position
 # ---------------------------------------------------------------------------
 
 
 def _cell_dual_vertices(
-    x_crossed: np.ndarray, x_t: np.ndarray,
-    y_crossed: np.ndarray, y_t: np.ndarray,
-    z_crossed: np.ndarray, z_t: np.ndarray,
+    edge_comp: np.ndarray,                              # (Zm1, Ym1, Xm1, 12)
+    n_comp: np.ndarray,                                 # (Zm1, Ym1, Xm1)
+    x_t: np.ndarray, y_t: np.ndarray, z_t: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """For each cell, dual vertex = centroid of crossed-edge crossings.
+    """Emit one vertex per (cell, component); return the lookup and points.
+
+    All components within a cell share the same *position* — the centroid
+    of all crossings in the cell — but each gets its own vertex ID. This
+    makes label-pair surfaces visually meet at triple lines while keeping
+    the topology multi-material.
+
+    Accumulation is per-cell (the same vectorized pattern as the v1
+    single-vertex implementation); the multi-component aspect is just
+    "how many vertex IDs to allocate per cell" and "broadcast the same
+    position to all slots."
 
     Returns
     -------
     cell_to_vertex :
-        ``(Zm1, Ym1, Xm1) int64``. ``-1`` for non-boundary cells; for
-        boundary cells, the compact vertex index into ``points``.
+        ``(Zm1, Ym1, Xm1, MAX_COMP) int64`` — global vertex ID for each
+        cell-component slot; ``-1`` where the slot is unused.
     points :
-        ``(N, 3) float32``. Position in training-grid index coords,
-        (Z, Y, X) component order.
+        ``(N_total, 3) float32`` — positions in training-grid index
+        coords, in (Z, Y, X) component order.
     """
-    Z = x_crossed.shape[0]
-    Y = x_crossed.shape[1]
-    Xm1 = x_crossed.shape[2]
-    Zm1 = Z - 1
-    Ym1 = Y - 1
+    Zm1, Ym1, Xm1 = n_comp.shape
+    max_comp = int(n_comp.max()) if n_comp.size else 0
+    if max_comp == 0:
+        return (
+            np.full((Zm1, Ym1, Xm1, 1), -1, dtype=np.int64),
+            np.zeros((0, 3), dtype=np.float32),
+        )
 
+    # Per-cell crossing-centroid accumulation (vectorized over the whole
+    # volume — same shape as the v1 implementation, no per-component axis).
     sum_pos = np.zeros((Zm1, Ym1, Xm1, 3), dtype=np.float32)
     count = np.zeros((Zm1, Ym1, Xm1), dtype=np.int32)
 
-    # 4 X-edges per cell, indexed by (dz, dy) ∈ {0,1}²; t runs along X.
+    # 4 X-edges per cell, indexed by (dz, dy); t runs along X.
     for dz in (0, 1):
         for dy in (0, 1):
-            c = x_crossed[dz:Zm1 + dz, dy:Ym1 + dy, :Xm1].astype(np.float32)
-            t = x_t[dz:Zm1 + dz, dy:Ym1 + dy, :Xm1]
-            sum_pos[..., 0] += c * np.float32(dz)
-            sum_pos[..., 1] += c * np.float32(dy)
-            sum_pos[..., 2] += c * t
-            count += c.astype(np.int32)
+            c = x_t[dz:Zm1 + dz, dy:Ym1 + dy, :Xm1]                    # 0 if uncrossed
+            crossed = (
+                edge_comp[..., 0 + 2 * dz + dy] >= 0
+            ).astype(np.float32)
+            sum_pos[..., 0] += crossed * np.float32(dz)
+            sum_pos[..., 1] += crossed * np.float32(dy)
+            sum_pos[..., 2] += crossed * c
+            count += crossed.astype(np.int32)
 
     # 4 Y-edges per cell, indexed by (dz, dx); t runs along Y.
     for dz in (0, 1):
         for dx in (0, 1):
-            c = y_crossed[dz:Zm1 + dz, :Ym1, dx:Xm1 + dx].astype(np.float32)
-            t = y_t[dz:Zm1 + dz, :Ym1, dx:Xm1 + dx]
-            sum_pos[..., 0] += c * np.float32(dz)
-            sum_pos[..., 1] += c * t
-            sum_pos[..., 2] += c * np.float32(dx)
-            count += c.astype(np.int32)
+            c = y_t[dz:Zm1 + dz, :Ym1, dx:Xm1 + dx]
+            crossed = (
+                edge_comp[..., 4 + 2 * dz + dx] >= 0
+            ).astype(np.float32)
+            sum_pos[..., 0] += crossed * np.float32(dz)
+            sum_pos[..., 1] += crossed * c
+            sum_pos[..., 2] += crossed * np.float32(dx)
+            count += crossed.astype(np.int32)
 
     # 4 Z-edges per cell, indexed by (dy, dx); t runs along Z.
     for dy in (0, 1):
         for dx in (0, 1):
-            c = z_crossed[:Zm1, dy:Ym1 + dy, dx:Xm1 + dx].astype(np.float32)
-            t = z_t[:Zm1, dy:Ym1 + dy, dx:Xm1 + dx]
-            sum_pos[..., 0] += c * t
-            sum_pos[..., 1] += c * np.float32(dy)
-            sum_pos[..., 2] += c * np.float32(dx)
-            count += c.astype(np.int32)
+            c = z_t[:Zm1, dy:Ym1 + dy, dx:Xm1 + dx]
+            crossed = (
+                edge_comp[..., 8 + 2 * dy + dx] >= 0
+            ).astype(np.float32)
+            sum_pos[..., 0] += crossed * c
+            sum_pos[..., 1] += crossed * np.float32(dy)
+            sum_pos[..., 2] += crossed * np.float32(dx)
+            count += crossed.astype(np.int32)
 
-    is_boundary = count > 0
     safe_count = np.maximum(count, 1).astype(np.float32)
-    local_pos = sum_pos / safe_count[..., None]
+    local_pos = sum_pos / safe_count[..., None]                          # (Zm1, Ym1, Xm1, 3)
 
-    # Cell (a, b, c)'s base corner is at voxel (a, b, c); add it to local.
+    # For multi-component cells (triple junctions, etc.) the centroid-of-
+    # crossings is biased by the asymmetric distribution of crossings
+    # across label pairs, which makes adjacent multi-component cells' verts
+    # zig-zag along a triple line. Replacing the centroid with the cell
+    # center for these cells turns the triple line into a straight-line
+    # path through fixed grid positions — visually smooth, no bias.
+    # Binary cells (the vast majority) keep their crossings centroid.
+    multi = n_comp > 1
+    if multi.any():
+        local_pos[multi] = np.float32(0.5)
+
+    # Add cell base position.
     z_grid = np.arange(Zm1, dtype=np.float32)[:, None, None]
     y_grid = np.arange(Ym1, dtype=np.float32)[None, :, None]
     x_grid = np.arange(Xm1, dtype=np.float32)[None, None, :]
-
     vertex_pos = np.empty((Zm1, Ym1, Xm1, 3), dtype=np.float32)
     vertex_pos[..., 0] = local_pos[..., 0] + z_grid
     vertex_pos[..., 1] = local_pos[..., 1] + y_grid
     vertex_pos[..., 2] = local_pos[..., 2] + x_grid
 
-    n_boundary = int(is_boundary.sum())
-    cell_to_vertex = np.full((Zm1, Ym1, Xm1), -1, dtype=np.int64)
-    cell_to_vertex[is_boundary] = np.arange(n_boundary, dtype=np.int64)
+    # Allocate IDs to component slots used by each cell. The "used" mask
+    # is ``slot < n_comp[..., None]``: cell (a, b, c) uses slots
+    # ``0 .. n_comp[a, b, c] - 1``.
+    slot = np.arange(max_comp, dtype=np.int8)[None, None, None, :]
+    used = slot < n_comp[..., None]                                      # (Zm1, Ym1, Xm1, K)
+    n_total = int(used.sum())
+    cell_to_vertex = np.full((Zm1, Ym1, Xm1, max_comp), -1, dtype=np.int64)
+    cell_to_vertex[used] = np.arange(n_total, dtype=np.int64)
 
-    points = vertex_pos[is_boundary]
+    # Points: broadcast vertex_pos to every used slot. (Multiple slots in
+    # the same cell read the same position — that's the coincidence rule.)
+    pos_broadcast = np.broadcast_to(
+        vertex_pos[:, :, :, None, :],
+        (Zm1, Ym1, Xm1, max_comp, 3),
+    )
+    points = np.ascontiguousarray(pos_broadcast[used])                   # (N_total, 3)
     return cell_to_vertex, points
 
 
 # ---------------------------------------------------------------------------
-# Quad emission
+# Quad emission with per-cell component routing
 # ---------------------------------------------------------------------------
 
 
@@ -246,71 +498,86 @@ def _emit_quads(
     x_crossed: np.ndarray,
     y_crossed: np.ndarray,
     z_crossed: np.ndarray,
-    cell_to_vertex: np.ndarray,
+    cell_to_vertex: np.ndarray,        # (Zm1, Ym1, Xm1, MAX_COMP)
+    edge_comp: np.ndarray,             # (Zm1, Ym1, Xm1, 12)
     labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Emit one quad per crossed *interior* grid edge.
 
-    An edge is "interior" iff all 4 cells incident to it exist within the
-    volume (i.e., the edge isn't on the outermost voxel layer along the
-    two axes orthogonal to the edge).
+    For each grid edge, the 4 incident cells each have a *cell-edge index*
+    in 0..11 that corresponds to the same grid edge. We look up the
+    component for that cell-edge index, and use the matching vertex from
+    that cell's ``cell_to_vertex`` slot.
     """
     quad_lists: list[np.ndarray] = []
     label_lists: list[np.ndarray] = []
     Z, Y, X = labels.shape
 
-    # ----- X-edges. Interior: z ∈ [1, Z-2], y ∈ [1, Y-2] -----
-    # x_crossed shape (Z, Y, X-1). Incident cells around an X-edge form a
-    # 2×2 square in the Y-Z plane:
-    #   A = (z-1, y-1, x)   C = (z-1, y, x)
-    #   B = (z,   y-1, x)   D = (z,   y, x)
-    # Viewed from +X (with +Y right, +Z up): A bottom-left, C bottom-right,
-    # D top-right, B top-left. CCW from +X → +X normal: [A, C, D, B].
+    # ----- X-edges. Interior z ∈ [1, Z-2], y ∈ [1, Y-2] -----
+    # 4 incident cells with their cell-edge index for this grid X-edge:
+    #   A=(z-1, y-1, x): cell-edge 3 (X-edge at top, dy=1)
+    #   B=(z,   y-1, x): cell-edge 1 (X-edge at bottom, dy=1)
+    #   C=(z-1, y,   x): cell-edge 2 (X-edge at top, dy=0)
+    #   D=(z,   y,   x): cell-edge 0 (X-edge at bottom, dy=0)
     if Z >= 3 and Y >= 3 and X >= 2:
         _append_axis(
             interior=x_crossed[1:Z - 1, 1:Y - 1, :],
             i_lbl=labels[1:Z - 1, 1:Y - 1, :-1],
             j_lbl=labels[1:Z - 1, 1:Y - 1, 1:],
-            v_A=cell_to_vertex[0:Z - 2, 0:Y - 2, :X - 1],
-            v_B=cell_to_vertex[1:Z - 1, 0:Y - 2, :X - 1],
-            v_C=cell_to_vertex[0:Z - 2, 1:Y - 1, :X - 1],
-            v_D=cell_to_vertex[1:Z - 1, 1:Y - 1, :X - 1],
+            cells=(
+                ("A", 0, slice(0, Z - 2), slice(0, Y - 2), slice(0, X - 1), 3),
+                ("B", 0, slice(1, Z - 1), slice(0, Y - 2), slice(0, X - 1), 1),
+                ("C", 0, slice(0, Z - 2), slice(1, Y - 1), slice(0, X - 1), 2),
+                ("D", 0, slice(1, Z - 1), slice(1, Y - 1), slice(0, X - 1), 0),
+            ),
+            cell_to_vertex=cell_to_vertex,
+            edge_comp=edge_comp,
             pos_winding=("A", "C", "D", "B"),
             quad_lists=quad_lists, label_lists=label_lists,
         )
 
-    # ----- Y-edges. Interior: z ∈ [1, Z-2], x ∈ [1, X-2] -----
-    # y_crossed shape (Z, Y-1, X). Incident cells:
-    #   A = (z-1, y, x-1)   C = (z-1, y, x)
-    #   B = (z,   y, x-1)   D = (z,   y, x)
-    # Viewed from +Y the natural CCW order is [A, B, D, C] (+Y is the
-    # middle axis of the right-handed XYZ frame, so the parity flips).
+    # ----- Y-edges. Interior z ∈ [1, Z-2], x ∈ [1, X-2] -----
+    # 4 incident cells and their cell-edge indices for this grid Y-edge:
+    #   A=(z-1, y, x-1): cell-edge 7 (Y-edge at top, dx=1)
+    #   B=(z,   y, x-1): cell-edge 5 (Y-edge at bottom, dx=1)
+    #   C=(z-1, y, x):   cell-edge 6 (Y-edge at top, dx=0)
+    #   D=(z,   y, x):   cell-edge 4 (Y-edge at bottom, dx=0)
     if Z >= 3 and Y >= 2 and X >= 3:
         _append_axis(
             interior=y_crossed[1:Z - 1, :, 1:X - 1],
             i_lbl=labels[1:Z - 1, :-1, 1:X - 1],
             j_lbl=labels[1:Z - 1, 1:, 1:X - 1],
-            v_A=cell_to_vertex[0:Z - 2, :Y - 1, 0:X - 2],
-            v_B=cell_to_vertex[1:Z - 1, :Y - 1, 0:X - 2],
-            v_C=cell_to_vertex[0:Z - 2, :Y - 1, 1:X - 1],
-            v_D=cell_to_vertex[1:Z - 1, :Y - 1, 1:X - 1],
+            cells=(
+                ("A", 0, slice(0, Z - 2), slice(0, Y - 1), slice(0, X - 2), 7),
+                ("B", 0, slice(1, Z - 1), slice(0, Y - 1), slice(0, X - 2), 5),
+                ("C", 0, slice(0, Z - 2), slice(0, Y - 1), slice(1, X - 1), 6),
+                ("D", 0, slice(1, Z - 1), slice(0, Y - 1), slice(1, X - 1), 4),
+            ),
+            cell_to_vertex=cell_to_vertex,
+            edge_comp=edge_comp,
             pos_winding=("A", "B", "D", "C"),
             quad_lists=quad_lists, label_lists=label_lists,
         )
 
-    # ----- Z-edges. Interior: y ∈ [1, Y-2], x ∈ [1, X-2] -----
-    # z_crossed shape (Z-1, Y, X). Incident cells:
-    #   A = (z, y-1, x-1)   C = (z, y-1, x)
-    #   B = (z, y,   x-1)   D = (z, y,   x)
+    # ----- Z-edges. Interior y ∈ [1, Y-2], x ∈ [1, X-2] -----
+    # 4 incident cells and their cell-edge indices for this grid Z-edge:
+    #   A=(z, y-1, x-1): cell-edge 11 (Z-edge at dy=1, dx=1)
+    #   B=(z, y,   x-1): cell-edge 9  (Z-edge at dy=0, dx=1)
+    #   C=(z, y-1, x):   cell-edge 10 (Z-edge at dy=1, dx=0)
+    #   D=(z, y,   x):   cell-edge 8  (Z-edge at dy=0, dx=0)
     if Z >= 2 and Y >= 3 and X >= 3:
         _append_axis(
             interior=z_crossed[:, 1:Y - 1, 1:X - 1],
             i_lbl=labels[:-1, 1:Y - 1, 1:X - 1],
             j_lbl=labels[1:, 1:Y - 1, 1:X - 1],
-            v_A=cell_to_vertex[:Z - 1, 0:Y - 2, 0:X - 2],
-            v_B=cell_to_vertex[:Z - 1, 1:Y - 1, 0:X - 2],
-            v_C=cell_to_vertex[:Z - 1, 0:Y - 2, 1:X - 1],
-            v_D=cell_to_vertex[:Z - 1, 1:Y - 1, 1:X - 1],
+            cells=(
+                ("A", 0, slice(0, Z - 1), slice(0, Y - 2), slice(0, X - 2), 11),
+                ("B", 0, slice(0, Z - 1), slice(1, Y - 1), slice(0, X - 2), 9),
+                ("C", 0, slice(0, Z - 1), slice(0, Y - 2), slice(1, X - 1), 10),
+                ("D", 0, slice(0, Z - 1), slice(1, Y - 1), slice(1, X - 1), 8),
+            ),
+            cell_to_vertex=cell_to_vertex,
+            edge_comp=edge_comp,
             pos_winding=("A", "C", "D", "B"),
             quad_lists=quad_lists, label_lists=label_lists,
         )
@@ -325,32 +592,40 @@ def _append_axis(
     interior: np.ndarray,
     i_lbl: np.ndarray,
     j_lbl: np.ndarray,
-    v_A: np.ndarray, v_B: np.ndarray, v_C: np.ndarray, v_D: np.ndarray,
-    pos_winding: tuple[str, str, str, str],
+    cells: tuple,               # ((tag, _pad, sz, sy, sx, edge_idx), ...) for A, B, C, D
+    cell_to_vertex: np.ndarray, # (Zm1, Ym1, Xm1, MAX_COMP)
+    edge_comp: np.ndarray,      # (Zm1, Ym1, Xm1, 12)
+    pos_winding: tuple,
     quad_lists: list[np.ndarray],
     label_lists: list[np.ndarray],
 ) -> None:
-    """Mask interior crossings, assemble per-edge quads + BoundaryLabels.
+    """Mask interior crossings, look up per-cell component vertices, emit
+    quads + BoundaryLabels.
 
-    ``pos_winding`` is the four-letter vertex sequence that yields the
-    +axis-direction face normal. The negative-direction winding is
-    obtained by swapping winding slots 1 and 3 (same dual sense reflected).
+    For each incident cell, the corresponding cell-edge index identifies
+    which component of that cell the grid edge belongs to; we use the
+    matching vertex from ``cell_to_vertex[cell, component]``.
     """
     if not interior.any():
         return
     mask = interior
-    v_A_f = v_A[mask]
-    v_B_f = v_B[mask]
-    v_C_f = v_C[mask]
-    v_D_f = v_D[mask]
+
+    # For each of the 4 incident cells, look up the component vertex.
+    v_lookup: dict[str, np.ndarray] = {}
+    for tag, _pad, sz, sy, sx, edge_idx in cells:
+        cell_ctv = cell_to_vertex[sz, sy, sx, :]            # (..., MAX_COMP)
+        cell_ec = edge_comp[sz, sy, sx, edge_idx]           # (...,) component id, -1 if uncrossed
+        # Crossed grid edges → all 4 incident cells must be boundary cells
+        # on this edge → component IDs are ≥ 0 there. We still defensively
+        # clip to 0 to keep indexing valid for masked-out cells.
+        k = np.where(cell_ec >= 0, cell_ec, 0).astype(np.intp)
+        vert = np.take_along_axis(cell_ctv, k[..., None], axis=-1)[..., 0]
+        v_lookup[tag] = vert[mask]
+
     i_f = i_lbl[mask]
     j_f = j_lbl[mask]
 
-    # VTK BoundaryLabels rule:
-    #   - if background (0) is one of the pair, it goes in slot 1
-    #   - else, sort ascending
-    # Flip the natural winding when the rule puts j into slot 0 (so the
-    # quad normal still points Label0 → Label1).
+    # VTK BoundaryLabels rule (background last; else sorted ascending).
     swap_for_zero = (i_f == 0) & (j_f != 0)
     swap_for_sort = (i_f != 0) & (j_f != 0) & (j_f < i_f)
     flip = swap_for_zero | swap_for_sort
@@ -358,10 +633,9 @@ def _append_axis(
     label0 = np.where(flip, j_f, i_f)
     label1 = np.where(flip, i_f, j_f)
 
-    lut = {"A": v_A_f, "B": v_B_f, "C": v_C_f, "D": v_D_f}
-    q_pos = np.stack([lut[name] for name in pos_winding], axis=-1)
+    q_pos = np.stack([v_lookup[name] for name in pos_winding], axis=-1)
     neg_winding = (pos_winding[0], pos_winding[3], pos_winding[2], pos_winding[1])
-    q_neg = np.stack([lut[name] for name in neg_winding], axis=-1)
+    q_neg = np.stack([v_lookup[name] for name in neg_winding], axis=-1)
 
     q = np.where(flip[:, None], q_neg, q_pos)
     quad_lists.append(q)
