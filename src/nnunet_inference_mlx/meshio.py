@@ -311,8 +311,61 @@ def mesh_smooth(
         smoothed_pts_xyz.astype(np.float32), mesh.geometry,
     )
 
+    # Smoothing invalidates any per-vertex normals the input carried —
+    # they were computed at the pre-smoothing positions and are no
+    # longer aligned with the moved vertices. Renderers will recompute
+    # mesh-averaged normals on the fly; if the caller wants them baked,
+    # ``mesh_compute_normals`` does that explicitly.
     from dataclasses import replace
-    return replace(mesh, points=new_points)
+    return replace(mesh, points=new_points, normals=None)
+
+
+def mesh_compute_normals(mesh: Mesh) -> Mesh:
+    """Bake mesh-averaged per-vertex normals via ``vtkPolyDataNormals``.
+
+    Returns a new :class:`Mesh` with ``normals`` set to the area-weighted
+    average of the incident face normals for each vertex — the same
+    operator that gives Phong/Gouraud-smooth shading in VTK and Slicer
+    renderers. Use after :func:`mesh_smooth` if you need normals
+    pre-baked into a file rather than computed at render time.
+
+    Quads, boundary labels, and the geometry/schema are preserved
+    unchanged; only ``normals`` changes.
+
+    Requires the ``vtk`` package (lazy-imported).
+    """
+    try:
+        import vtk
+        from vtk.util.numpy_support import vtk_to_numpy
+    except ImportError as e:
+        raise ImportError(
+            "mesh_compute_normals requires the 'vtk' package; install with "
+            "`pip install vtk`."
+        ) from e
+
+    pd = mesh_to_vtk_polydata(mesh)
+    pdn = vtk.vtkPolyDataNormals()
+    pdn.SetInputData(pd)
+    pdn.ComputePointNormalsOn()
+    pdn.ComputeCellNormalsOff()
+    pdn.SplittingOff()
+    pdn.ConsistencyOff()
+    pdn.AutoOrientNormalsOff()
+    pdn.Update()
+
+    n_xyz_world = vtk_to_numpy(pdn.GetOutput().GetPointData().GetNormals())
+    # Rotate world (X, Y, Z) normals back into grid (Z, Y, X) component
+    # order via the inverse of the geometry's direction matrix
+    # (orthogonal — transpose is the inverse).
+    direction = np.asarray(mesh.geometry.direction_xyz, dtype=np.float32).reshape(3, 3)
+    rotated_back = n_xyz_world.astype(np.float32) @ direction
+    new_normals = np.ascontiguousarray(rotated_back[:, ::-1])
+    # Normalize defensively.
+    mag = np.linalg.norm(new_normals, axis=1, keepdims=True)
+    new_normals = new_normals / np.maximum(mag, np.float32(1e-10))
+
+    from dataclasses import replace
+    return replace(mesh, normals=new_normals.astype(np.float32))
 
 
 __all__ = [
@@ -320,4 +373,5 @@ __all__ = [
     "mesh_from_npz",
     "mesh_to_vtk_polydata",
     "mesh_smooth",
+    "mesh_compute_normals",
 ]
