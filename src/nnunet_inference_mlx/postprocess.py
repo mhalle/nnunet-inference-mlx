@@ -215,6 +215,7 @@ def to_mesh(
     project_to_surface: bool = False,
     emit_normals: bool = False,
     confidence_threshold: float = 0.0,
+    drop_components_below_mm3: float = 0.0,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh from the prediction's logits.
 
@@ -248,6 +249,12 @@ def to_mesh(
         single-voxel "blob" octahedron artifacts. 0.0 (default) leaves
         labels untouched; values in 0.5–1.5 typically clean the noise
         floor without suppressing real thin features.
+    drop_components_below_mm3 :
+        Drop connected components of any label whose physical volume is
+        below this threshold (26-conn, multi-label aware). Catches
+        noise clusters too large for ``confidence_threshold`` to reach.
+        ``200.0`` matches TS's ``--remove_small_blobs``. Requires
+        ``cc3d``; 0.0 (default) is a no-op.
 
     See :func:`mesh.surfacenets_logits` for algorithm details, the
     triple-junction rule, and volume-boundary closure caveats.
@@ -265,6 +272,7 @@ def to_mesh(
         project_to_surface=project_to_surface,
         emit_normals=emit_normals,
         confidence_threshold=confidence_threshold,
+        drop_components_below_mm3=drop_components_below_mm3,
     )
 
 

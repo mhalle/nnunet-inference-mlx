@@ -44,6 +44,7 @@ def surfacenets_logits(
     project_to_surface: bool = False,
     emit_normals: bool = False,
     confidence_threshold: float = 0.0,
+    drop_components_below_mm3: float = 0.0,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh directly from K-channel logits.
 
@@ -80,6 +81,15 @@ def surfacenets_logits(
         no suppression) preserves the v8 behavior; values in the
         0.5–1.5 range typically clean up the noise floor without
         suppressing real thin features.
+    drop_components_below_mm3 :
+        Drop connected components of any label whose physical volume
+        is below this threshold (in mm³). 26-connected, multi-label
+        aware (same logic as
+        :func:`postprocessing.remove_small_components`). Catches noise
+        clusters too large for the confidence rule (which only handles
+        fully isolated voxels). Requires the ``cc3d`` package; raises
+        ``ImportError`` if invoked without it. Default ``0.0`` (off).
+        TotalSegmentator's ``--remove_small_blobs`` uses ``200.0``.
 
     Returns
     -------
@@ -116,6 +126,13 @@ def surfacenets_logits(
         labels = _suppress_low_confidence_blobs(
             labels, logits, float(confidence_threshold),
         )
+    if drop_components_below_mm3 > 0.0:
+        from .postprocessing import remove_small_components
+        labels = remove_small_components(
+            labels, geometry.spacing_zyx,
+            min_volume_mm3=float(drop_components_below_mm3),
+            in_place=False,
+        ).astype(np.int32, copy=False)
 
     x_crossed, x_t = _edge_crossings(logits, labels, axis=2)
     y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
