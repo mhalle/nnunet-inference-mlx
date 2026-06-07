@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal, Mapping, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +311,146 @@ class Prediction:
 
 
 # ---------------------------------------------------------------------------
+# Mesh — surface geometry extracted from a Prediction
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class Mesh:
+    """A multi-material surface mesh: vertices, quad faces, per-face label pairs.
+
+    Sibling of :class:`Segmentation` — both are produced from a
+    :class:`Prediction`; ``Segmentation`` is a voxel labelmap, ``Mesh`` is the
+    surface separating the labels. The surface is the SurfaceNets dual: one
+    vertex per boundary cell, one quad per crossed cell-edge.
+
+    Conventions
+    -----------
+    * ``points`` live in the *training-grid index coordinate system* of
+      ``geometry`` — fractional indices, sub-voxel precise. World-mm
+      conversion is ``apply_geometry(points, geometry)``; kept in grid
+      coords so cross-task ``mesh_concat`` is a clean vstack without affine
+      reconciliation (every task shares the same grid for its source).
+    * ``boundary_labels`` per face follows the vtkSurfaceNets3D convention:
+      a 2-component (Label0, Label1) tuple where the quad normal points
+      Label0 → Label1. If background (label 0) is involved it goes in slot 1;
+      otherwise the pair is sorted ascending.
+    * Quads, not triangles. With smoothing disabled (the smooth-field case)
+      faces are planar and quads are the natural primary form. Callers that
+      need triangles can ``triangulate()`` at the boundary.
+
+    All arrays are numpy on host — surface meshes are sparse, downstream
+    consumers (VTK, Slicer, glTF) live host-side.
+
+    Parameters
+    ----------
+    points :
+        ``(N, 3) float32`` vertex positions in training-grid index coords.
+    quads :
+        ``(M, 4) int32`` face vertex indices into ``points``.
+    boundary_labels :
+        ``(M, 2) int32`` label pair per face, VTK convention.
+    geometry :
+        The grid the points are indexed against. Carries world-mm placement.
+    schema :
+        Label name lookup. For multi-task meshes this is the *global* schema;
+        ``boundary_labels`` are in the same global namespace.
+    normals :
+        Optional ``(N, 3) float32`` per-vertex normals. ``None`` unless the
+        caller requested field-gradient normals at extraction time.
+    stencils :
+        Optional ``(offsets, connectivity)`` CSR pair — per-vertex adjacency
+        for downstream constrained smoothing. ``None`` unless requested.
+    """
+
+    points: np.ndarray
+    quads: np.ndarray
+    boundary_labels: np.ndarray
+    geometry: Geometry
+    schema: LabelSchema
+    normals: np.ndarray | None = None
+    stencils: tuple[np.ndarray, np.ndarray] | None = None
+
+    def __post_init__(self) -> None:
+        if self.points.ndim != 2 or self.points.shape[1] != 3:
+            raise ValueError(
+                f"Mesh.points must be (N, 3); got shape {self.points.shape}"
+            )
+        if self.quads.ndim != 2 or self.quads.shape[1] != 4:
+            raise ValueError(
+                f"Mesh.quads must be (M, 4); got shape {self.quads.shape}"
+            )
+        if self.boundary_labels.ndim != 2 or self.boundary_labels.shape[1] != 2:
+            raise ValueError(
+                f"Mesh.boundary_labels must be (M, 2); got shape "
+                f"{self.boundary_labels.shape}"
+            )
+        if self.quads.shape[0] != self.boundary_labels.shape[0]:
+            raise ValueError(
+                f"Mesh has {self.quads.shape[0]} quads but "
+                f"{self.boundary_labels.shape[0]} boundary_labels rows"
+            )
+        if self.normals is not None:
+            if self.normals.shape != self.points.shape:
+                raise ValueError(
+                    f"Mesh.normals shape {self.normals.shape} != points shape "
+                    f"{self.points.shape}"
+                )
+        if self.stencils is not None:
+            offsets, connectivity = self.stencils
+            if offsets.ndim != 1 or connectivity.ndim != 1:
+                raise ValueError("Mesh.stencils offsets and connectivity must be 1-D")
+            if offsets.shape[0] != self.points.shape[0] + 1:
+                raise ValueError(
+                    f"Mesh.stencils offsets length {offsets.shape[0]} != "
+                    f"num_points + 1 = {self.points.shape[0] + 1}"
+                )
+
+    @property
+    def num_points(self) -> int:
+        return int(self.points.shape[0])
+
+    @property
+    def num_quads(self) -> int:
+        return int(self.quads.shape[0])
+
+    @property
+    def is_empty(self) -> bool:
+        return self.num_points == 0 and self.num_quads == 0
+
+    @property
+    def has_normals(self) -> bool:
+        return self.normals is not None
+
+    @property
+    def has_stencils(self) -> bool:
+        return self.stencils is not None
+
+    @classmethod
+    def empty(
+        cls,
+        geometry: Geometry,
+        schema: LabelSchema,
+        *,
+        with_normals: bool = False,
+        with_stencils: bool = False,
+    ) -> "Mesh":
+        """Construct an empty mesh — useful as a ``mesh_concat`` accumulator seed."""
+        return cls(
+            points=np.zeros((0, 3), dtype=np.float32),
+            quads=np.zeros((0, 4), dtype=np.int32),
+            boundary_labels=np.zeros((0, 2), dtype=np.int32),
+            geometry=geometry,
+            schema=schema,
+            normals=(np.zeros((0, 3), dtype=np.float32) if with_normals else None),
+            stencils=(
+                (np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int32))
+                if with_stencils else None
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
 # RestorePlan — the inverse-transform recipe (returned, never hidden)
 # ---------------------------------------------------------------------------
 
@@ -376,6 +517,7 @@ __all__ = [
     "Volume",
     "Segmentation",
     "Prediction",
+    "Mesh",
     "RestorePlan",
     "BuildOptions",
 ]

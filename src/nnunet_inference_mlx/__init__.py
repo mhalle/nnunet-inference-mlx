@@ -17,12 +17,14 @@ from .values import (
     BuildOptions,
     Geometry,
     LabelSchema,
+    Mesh,
     Prediction,
     Region,
     RestorePlan,
     Segmentation,
     Volume,
 )
+from .meshio import mesh_from_npz, mesh_to_npz
 
 from .engine import (
     FoldEnsemble,
@@ -36,6 +38,7 @@ from .labels import (
     convert_logits_to_segmentation,
     has_regions,
     label_dtype,
+    mesh_concat,
     paint_union,
     regions_class_order,
     remap_labels,
@@ -87,10 +90,14 @@ __all__ = [
     "Volume",
     "Segmentation",
     "Prediction",
+    "Mesh",
     "LabelSchema",
     "Region",
     "RestorePlan",
     "BuildOptions",
+    # mesh serialization
+    "mesh_to_npz",
+    "mesh_from_npz",
     # image IO (format plug-ins)
     "NiftiReader",
     "DicomReader",
@@ -114,6 +121,7 @@ __all__ = [
     "convert_logits_to_segmentation",
     "has_regions",
     "label_dtype",
+    "mesh_concat",
     "paint_union",
     "regions_class_order",
     "remap_labels",

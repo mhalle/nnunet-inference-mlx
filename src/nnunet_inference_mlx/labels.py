@@ -284,6 +284,116 @@ def paint_union(target: np.ndarray, source: np.ndarray) -> np.ndarray:
     return target
 
 
+def mesh_concat(target: "Mesh", source: "Mesh") -> "Mesh":
+    """Concatenate two surface meshes that share a geometry and a schema.
+
+    The mesh analog of :func:`paint_union` — the composite primitive for
+    cross-task surface assembly. Both meshes must already be in the same
+    *global* label namespace (``boundary_labels`` carry global label values)
+    and share the same training-grid geometry; ``mesh_concat`` is then a
+    clean ``vstack`` of points plus an index-offset on the source's quads
+    so they refer to the concatenated point buffer.
+
+    Unlike ``paint_union``, this is *not* in-place. ``Mesh`` is frozen; a new
+    ``Mesh`` is returned. The expected accumulator pattern is::
+
+        mesh = Mesh.empty(geometry, schema)
+        for task in tasks:
+            prediction = run_inference(task)
+            mesh = mesh_concat(mesh, to_mesh(prediction))
+
+    Parameters
+    ----------
+    target :
+        The accumulator mesh. Often ``Mesh.empty(...)`` on the first call.
+    source :
+        The mesh to append. Its ``quads`` indices are offset by
+        ``target.num_points`` so they point into the concatenated points.
+
+    Returns
+    -------
+    Mesh
+        A new mesh with concatenated points, quads, and boundary_labels.
+
+    Raises
+    ------
+    ValueError
+        If geometries differ, schemas differ by identity, or one mesh has
+        normals/stencils while the other does not.
+
+    Notes
+    -----
+    No vertex deduplication is performed at the seam. Two tasks that
+    produce surfaces along the same physical region will produce two
+    parallel sub-voxel-spaced sheets; deduplication is a downstream concern
+    if/when it matters for the use case.
+    """
+    if target.geometry != source.geometry:
+        raise ValueError(
+            f"mesh_concat geometry mismatch: target {target.geometry} "
+            f"vs source {source.geometry}"
+        )
+    if target.schema is not source.schema:
+        # Identity check: per the multi-task pattern, every per-task mesh is
+        # produced with the same global schema object. Distinct schemas mean
+        # the caller hasn't unified the label namespace and concatenation
+        # would silently mix label IDs.
+        raise ValueError(
+            "mesh_concat schemas differ by identity; both meshes must carry "
+            "the same global LabelSchema. Apply class_map at to_mesh time."
+        )
+    if target.has_normals != source.has_normals:
+        raise ValueError(
+            "mesh_concat normals mismatch: one mesh has normals, the other "
+            "does not. Pass emit_normals consistently."
+        )
+    if target.has_stencils != source.has_stencils:
+        raise ValueError(
+            "mesh_concat stencils mismatch: one mesh has stencils, the other "
+            "does not. Pass emit_stencils consistently."
+        )
+
+    # Fast path: one side empty → return the other (preserve identity).
+    if source.is_empty:
+        return target
+    if target.is_empty:
+        return source
+
+    n_target_pts = target.num_points
+    points = np.concatenate([target.points, source.points], axis=0)
+    quads = np.concatenate(
+        [target.quads, source.quads + np.int32(n_target_pts)], axis=0
+    )
+    boundary_labels = np.concatenate(
+        [target.boundary_labels, source.boundary_labels], axis=0
+    )
+
+    normals = None
+    if target.has_normals:
+        normals = np.concatenate([target.normals, source.normals], axis=0)
+
+    stencils = None
+    if target.has_stencils:
+        t_off, t_conn = target.stencils
+        s_off, s_conn = source.stencils
+        # CSR concat: source's offsets shift by len(t_conn); skip source's
+        # leading 0 since target's tail value already covers it.
+        new_off = np.concatenate([t_off, s_off[1:] + t_off[-1]])
+        new_conn = np.concatenate([t_conn, s_conn + np.int32(n_target_pts)])
+        stencils = (new_off, new_conn)
+
+    from .values import Mesh
+    return Mesh(
+        points=points,
+        quads=quads,
+        boundary_labels=boundary_labels,
+        geometry=target.geometry,
+        schema=target.schema,
+        normals=normals,
+        stencils=stencils,
+    )
+
+
 __all__ = [
     "has_regions",
     "regions_class_order",
@@ -292,4 +402,5 @@ __all__ = [
     "sigmoid_inplace",
     "remap_labels",
     "paint_union",
+    "mesh_concat",
 ]
