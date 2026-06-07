@@ -1,16 +1,22 @@
-"""postprocess — turn a :class:`Prediction` into a :class:`Segmentation`.
+"""postprocess — turn a :class:`Prediction` into a :class:`Segmentation` or a :class:`Mesh`.
 
-Two conversions, both scheme-aware (argmax for standard models, threshold +
-paint-priority for region models):
+Three conversions of the model's per-class output:
 
 * ``to_labels(prediction)`` — labels at the prediction's *own* grid (no
-  resample). The cheap "what did the model say here" view.
+  resample). Scheme-aware (argmax for standard models, threshold +
+  paint-priority for region models). The cheap "what did the model say
+  here" view.
 * ``restore(prediction, plan)`` — the full inverse: resample the per-class
   logits back to the caller's grid (via the proven slab-streaming
   ``inverse_resample_*``), then reorient to the original orientation. This
-  resamples *logits then argmaxes* (higher quality than argmax-then-resample-
-  labels), which is why ``segment`` is ``predict → restore`` rather than
-  ``predict → to_labels → resample``.
+  resamples *logits then argmaxes* (higher quality than argmax-then-
+  resample-labels), which is why ``segment`` is ``predict → restore``
+  rather than ``predict → to_labels → resample``.
+* ``to_mesh(prediction)`` — surface mesh at the prediction's *own* grid,
+  via SurfaceNets-from-logits. Sibling of ``to_labels`` (same input, same
+  grid; just produces a surface instead of a labelmap). No inverse
+  resample — meshes live at the network's training spacing, which is the
+  only spacing the model actually resolves at.
 
 Plus ``drop_small_components`` for connected-component cleanup.
 """
@@ -20,7 +26,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from .values import LabelSchema, Prediction, RestorePlan, Segmentation
+from .values import LabelSchema, Mesh, Prediction, RestorePlan, Segmentation
 
 
 def _label_dtype(schema: LabelSchema) -> np.dtype:
@@ -203,6 +209,34 @@ def restore(
     return sitk_to_segmentation(seg_img, schema)
 
 
+def to_mesh(prediction: Prediction) -> Mesh:
+    """Extract a SurfaceNets dual mesh from the prediction's logits.
+
+    Sibling of :func:`to_labels` — same input (a :class:`Prediction` at
+    the network's training spacing), same grid (no resample), produces a
+    surface mesh instead of a label map. Vertex positions come from
+    sub-voxel edge-crossing interpolation in the continuous logit field;
+    quads carry the VTK ``(Label0, Label1)`` convention so the mesh drops
+    straight into VTK-side pipelines (see :func:`meshio.mesh_to_vtk_polydata`).
+
+    Standard schema only — region-model meshing is not yet supported (it
+    needs a different "is this label dominant here" rule and is gated on
+    a region-model port; raises ``NotImplementedError`` until then).
+
+    See :func:`mesh.surfacenets_logits` for algorithm details, the
+    triple-junction rule, and volume-boundary closure caveats.
+    """
+    if prediction.schema.is_region_model:
+        raise NotImplementedError(
+            "to_mesh does not yet support region-based label schemas; "
+            "only standard argmax schemas are handled."
+        )
+    from .mesh import surfacenets_logits
+
+    logits = np.asarray(prediction.data)
+    return surfacenets_logits(logits, prediction.geometry, prediction.schema)
+
+
 def drop_small_components(
     segmentation: Segmentation,
     *,
@@ -224,4 +258,4 @@ def drop_small_components(
     return segmentation.with_data(mx.array(cleaned))
 
 
-__all__ = ["to_labels", "restore", "drop_small_components"]
+__all__ = ["to_labels", "restore", "to_mesh", "drop_small_components"]
