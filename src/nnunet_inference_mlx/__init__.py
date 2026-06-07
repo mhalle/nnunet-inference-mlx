@@ -24,6 +24,7 @@ from .values import (
     Segmentation,
     Volume,
 )
+from .mesh import surfacenets_logits
 from .meshio import mesh_from_npz, mesh_to_npz
 
 from .engine import (
@@ -95,7 +96,8 @@ __all__ = [
     "Region",
     "RestorePlan",
     "BuildOptions",
-    # mesh serialization
+    # mesh extraction + serialization
+    "surfacenets_logits",
     "mesh_to_npz",
     "mesh_from_npz",
     # image IO (format plug-ins)

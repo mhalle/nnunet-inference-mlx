@@ -331,10 +331,17 @@ class Mesh:
       conversion is ``apply_geometry(points, geometry)``; kept in grid
       coords so cross-task ``mesh_concat`` is a clean vstack without affine
       reconciliation (every task shares the same grid for its source).
+    * Component order is **(Z, Y, X)** to match the rest of the toolkit —
+      ``points[i] = (Z_i, Y_i, X_i)``. This is a left-handed permutation
+      of standard ``(X, Y, Z)``; downstream consumers expecting Cartesian
+      conventions (VTK, glTF, PLY, ``np.cross`` for geometric normals)
+      must swap to ``(X, Y, Z)`` first. The ``meshio`` exporters do this
+      transparently at write time.
     * ``boundary_labels`` per face follows the vtkSurfaceNets3D convention:
       a 2-component (Label0, Label1) tuple where the quad normal points
-      Label0 → Label1. If background (label 0) is involved it goes in slot 1;
-      otherwise the pair is sorted ascending.
+      Label0 → Label1 *after* the ``(Z, Y, X) → (X, Y, Z)`` swap. If
+      background (label 0) is involved it goes in slot 1; otherwise the
+      pair is sorted ascending.
     * Quads, not triangles. With smoothing disabled (the smooth-field case)
       faces are planar and quads are the natural primary form. Callers that
       need triangles can ``triangulate()`` at the boundary.
