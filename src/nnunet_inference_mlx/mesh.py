@@ -43,6 +43,7 @@ def surfacenets_logits(
     *,
     project_to_surface: bool = False,
     emit_normals: bool = False,
+    confidence_margin: float = 0.0,
     confidence_threshold: float = 0.0,
     drop_components_below_mm3: float = 0.0,
 ) -> Mesh:
@@ -70,6 +71,33 @@ def surfacenets_logits(
         (where ``(i, j)`` is that vertex's label pair). Independent of
         mesh discretization; usually visibly smoother than VTK's
         averaged-face-normal computation. Off by default.
+    confidence_margin :
+        Logit-margin floor for the *spike-voxel* edge filter. A voxel
+        is classified as a spike when both:
+
+          1. its top-1 vs top-2 logit margin is below ``confidence_margin``;
+          2. none of its 6 axis-aligned neighbors share its label.
+
+        Any grid edge incident to a spike voxel is dropped from the
+        boundary topology, so the surrounding octahedron mesh never
+        materializes. The voxel itself keeps its argmax (this knob
+        does not relabel) and remains a corner of every adjacent cell;
+        it just doesn't contribute crossings on its 6 outgoing edges.
+
+        The dual condition (low margin **and** topological isolation)
+        is what makes this safe on soft-tissue boundaries: organ
+        surface voxels typically have many same-label neighbors and
+        are protected even when their margin is low. The continuous
+        logit info is consulted (via ``margin``) and the discrete
+        topological neighborhood is consulted (via ``n_same == 0``);
+        an edge is dropped only when both signals agree.
+
+        Operates non-destructively — unlike ``confidence_threshold``,
+        which relabels spike voxels to a neighbor majority — and so
+        composes cleanly with the geometric refinements above. Values
+        0.5–2.0 typically clean the chest noise floor without
+        affecting anatomic surfaces; ``0.0`` (default) leaves the
+        topology criterion as plain ``argmax labels differ``.
     confidence_threshold :
         Logit-margin floor (in raw logit units) for treating an argmax
         decision as confident. Voxels whose top-1 vs top-2 logit margin
@@ -134,11 +162,32 @@ def surfacenets_logits(
             in_place=False,
         ).astype(np.int32, copy=False)
 
-    x_crossed, x_t = _edge_crossings(logits, labels, axis=2)
-    y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
-    z_crossed, z_t = _edge_crossings(logits, labels, axis=0)
+    # Compute per-voxel spike mask only when the edge-level rule is on.
+    # Spike = (low top1−top2 margin) AND (no 6-connected same-label
+    # neighbor) — same dual condition as `_suppress_low_confidence_blobs`,
+    # but applied as an edge filter instead of a voxel relabel so the
+    # argmax stays intact and only the artifact topology is dropped.
+    spike_mask: np.ndarray | None = None
+    if confidence_margin > 0.0:
+        margin_vol = _compute_margin(labels, logits)
+        spike_mask = _compute_spike_mask(
+            labels, margin_vol, float(confidence_margin),
+        )
+        del margin_vol
 
-    edge_comp, n_comp, comp_pairs = _cell_components(labels, logits)
+    x_crossed, x_t = _edge_crossings(
+        logits, labels, axis=2, spike_mask=spike_mask,
+    )
+    y_crossed, y_t = _edge_crossings(
+        logits, labels, axis=1, spike_mask=spike_mask,
+    )
+    z_crossed, z_t = _edge_crossings(
+        logits, labels, axis=0, spike_mask=spike_mask,
+    )
+
+    edge_comp, n_comp, comp_pairs = _cell_components(
+        labels, logits, x_crossed, y_crossed, z_crossed,
+    )
 
     cell_to_vertex, points = _cell_dual_vertices(
         edge_comp, n_comp,
@@ -165,6 +214,67 @@ def surfacenets_logits(
         schema=schema,
         normals=normals,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-voxel logit margin (shared between confidence_threshold and
+# confidence_margin paths)
+# ---------------------------------------------------------------------------
+
+
+def _compute_margin(labels: np.ndarray, logits: np.ndarray) -> np.ndarray:
+    """Per-voxel ``top1_logit − top2_logit`` (float32, shape ``labels.shape``).
+
+    Top-1 is read directly from ``labels`` (the argmax); top-2 is the
+    max over remaining channels via mask-and-max. The masked copy is
+    ~K× the labels volume (3 GB at K=109, TS-fast chest) — we only
+    pay it where we actually need margin.
+    """
+    winner_idx = labels.astype(np.intp)[None]
+    winner_logit = np.take_along_axis(logits, winner_idx, axis=0)[0]
+    masked = logits.copy()
+    np.put_along_axis(masked, winner_idx, np.float32(-np.inf), axis=0)
+    second_logit = masked.max(axis=0)
+    return (winner_logit - second_logit).astype(np.float32, copy=False)
+
+
+def _compute_spike_mask(
+    labels: np.ndarray, margin: np.ndarray, threshold: float,
+) -> np.ndarray:
+    """Per-voxel bool mask: True where the voxel is a low-confidence
+    *and* topologically-isolated argmax flip — i.e. a "spike voxel"
+    whose label has no 6-connected same-label support and whose
+    top-1 vs top-2 logit margin sits below ``threshold``.
+
+    Volume-boundary voxels (no full 6-neighbor support to evaluate)
+    are always False — a spike at the volume edge can't be
+    distinguished from a legitimate boundary-clipped object.
+
+    This is the topology-criterion analog of the per-voxel relabel in
+    :func:`_suppress_low_confidence_blobs`, but applied as an edge
+    filter in the downstream pipeline (we never touch ``labels``).
+    The argmax decision at the spike voxel is preserved; only the
+    outgoing topology contribution is suppressed.
+    """
+    Z, Y, X = labels.shape
+    spike = np.zeros(labels.shape, dtype=bool)
+    if Z < 3 or Y < 3 or X < 3:
+        return spike
+
+    center = labels[1:-1, 1:-1, 1:-1]
+    nbrs = np.stack([
+        labels[ :-2, 1:-1, 1:-1],
+        labels[2:,   1:-1, 1:-1],
+        labels[1:-1,  :-2, 1:-1],
+        labels[1:-1, 2:,   1:-1],
+        labels[1:-1, 1:-1,  :-2],
+        labels[1:-1, 1:-1, 2:  ],
+    ], axis=-1)
+    n_same = (nbrs == center[..., None]).sum(axis=-1)
+    low_confidence = margin[1:-1, 1:-1, 1:-1] < np.float32(threshold)
+    is_isolated = (n_same == 0)
+    spike[1:-1, 1:-1, 1:-1] = low_confidence & is_isolated
+    return spike
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +315,7 @@ def _suppress_low_confidence_blobs(
     if Z < 3 or Y < 3 or X < 3:
         return labels
 
-    # Per-voxel logit margin: top-1 vs top-2 via mask-and-remax.
-    winner_idx = labels.astype(np.intp)[None]
-    winner_logit = np.take_along_axis(logits, winner_idx, axis=0)[0]
-    masked = logits.copy()
-    np.put_along_axis(masked, winner_idx, np.float32(-np.inf), axis=0)
-    second_logit = masked.max(axis=0)
-    del masked
-    margin = winner_logit - second_logit
+    margin = _compute_margin(labels, logits)
 
     # Interior block + 6 axis-aligned neighbors.
     center = labels[1:-1, 1:-1, 1:-1]
@@ -272,11 +375,15 @@ def _edge_crossings(
     logits: np.ndarray,
     labels: np.ndarray,
     axis: int,
+    *,
+    spike_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """For grid edges along ``axis`` (0=Z, 1=Y, 2=X), return:
 
       * ``crossed`` — bool array (one element shorter than ``labels`` on
-        ``axis``), True where the endpoint dominant labels differ;
+        ``axis``), True where the endpoint dominant labels differ
+        *and* (when ``spike_mask`` is provided) neither endpoint is a
+        spike voxel;
       * ``t`` — float32 array of the same shape, with the sub-voxel
         position in [0, 1] where ``logit_i - logit_j`` crosses zero (i at
         endpoint a, j at endpoint b).
@@ -288,6 +395,16 @@ def _edge_crossings(
     L0 = labels[tuple(sl_a)]
     L1 = labels[tuple(sl_b)]
     crossed = (L0 != L1)
+    if spike_mask is not None:
+        # Drop edges incident to a spike voxel (low-confidence + isolated).
+        # The spike voxel's argmax is preserved in `labels`, but its
+        # outgoing topology is suppressed so the surrounding octahedron
+        # mesh never materializes. Non-spike argmax-flip edges are
+        # untouched — soft-tissue organ surfaces stay intact because
+        # their interior voxels have same-label neighbors.
+        spike_a = spike_mask[tuple(sl_a)]
+        spike_b = spike_mask[tuple(sl_b)]
+        crossed = crossed & ~(spike_a | spike_b)
 
     sl_a_log = [slice(None)] * 4
     sl_b_log = [slice(None)] * 4
@@ -345,15 +462,23 @@ _FACES = (
 )
 
 
-@lru_cache(maxsize=8192)
-def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
+@lru_cache(maxsize=131072)
+def _cell_case(
+    corner_labels: tuple, crossed_mask: int, saddle_flips: int = 0,
+) -> tuple:
     """For one cell configuration, return ``(n_components, edge_to_component)``.
 
     ``corner_labels`` is an 8-tuple of integer labels at the 8 cell
-    corners (in canonical 0..7 order). ``saddle_flips`` is a 6-bit int
-    where bit ``f`` set means "flip the saddle rule on face ``f``" —
-    used by the logit-magnitude asymptotic decider, computed by the
-    caller before this function runs. Returns a 12-tuple where element
+    corners (in canonical 0..7 order). ``crossed_mask`` is a 12-bit int
+    where bit ``e`` set means "cell-edge ``e`` is committed to a boundary
+    crossing." In the absence of an edge-level confidence rule this is
+    just ``(la != lb)`` per edge and is fully determined by
+    ``corner_labels``; with ``confidence_margin > 0`` the caller may
+    drop bits where the edge fails the margin test, and those edges no
+    longer induce topology even if the corner labels differ.
+    ``saddle_flips`` is a 6-bit int where bit ``f`` set means "flip the
+    saddle rule on face ``f``" — used by the logit-magnitude asymptotic
+    decider, computed by the caller. Returns a 12-tuple where element
     ``e`` is ``-1`` if cell-edge ``e`` is not crossed, else an integer
     in ``[0, n_components)`` identifying which boundary patch in the
     cell that crossing belongs to.
@@ -377,16 +502,17 @@ def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
         the label-based rule, the corresponding bit in ``saddle_flips``
         is set and we use the flipped configuration instead.
 
-    Cached: a real volume has at most a few thousand distinct cell
-    configurations even when it has millions of cells. Adding the
-    saddle_flips bitfield multiplies the cache space by up to 64 per
-    label config, but in practice most configs have 0 saddle faces.
+    Cached: a real volume has at most a few tens of thousands of
+    distinct cell configurations even when it has millions of cells.
+    The cache key combines label config, crossed_mask, and saddle_flips;
+    in the common no-confidence-margin path crossed_mask is determined
+    by corner_labels so the effective cache space is unchanged.
     """
     edge_pair: list[tuple] = [None] * 12  # type: ignore[list-item]
     crossed = [False] * 12
     for e, (a, b) in enumerate(_EDGE_CORNERS):
-        la, lb = corner_labels[a], corner_labels[b]
-        if la != lb:
+        if (crossed_mask >> e) & 1:
+            la, lb = corner_labels[a], corner_labels[b]
             crossed[e] = True
             edge_pair[e] = (la, lb) if la < lb else (lb, la)
     if not any(crossed):
@@ -470,7 +596,11 @@ def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
 
 
 def _cell_components(
-    labels: np.ndarray, logits: np.ndarray,
+    labels: np.ndarray,
+    logits: np.ndarray,
+    x_crossed: np.ndarray,
+    y_crossed: np.ndarray,
+    z_crossed: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-cell component info for every cell in the volume.
 
@@ -486,16 +616,25 @@ def _cell_components(
 
     Strategy:
       1. Stack the 8 corner labels per cell into ``(Zm1, Ym1, Xm1, 8)``.
-      2. Compute the per-cell saddle-flip bitfield from the logit
-         asymptotic decider (vectorized).
-      3. Find unique ``(labels, saddle_flips)`` configurations across
-         boundary cells, run :func:`_cell_case` once per unique config,
-         scatter the result back.
+      2. Pack the per-cell 12-bit ``crossed_mask`` from the three
+         per-axis ``crossed`` arrays. A cell is a boundary cell iff its
+         mask is nonzero — which is the principled definition under
+         ``confidence_margin > 0`` (an all-zero mask cell has no
+         committed topology even if its corner labels differ).
+      3. Compute the per-cell saddle-flip bitfield from the logit
+         asymptotic decider (vectorized), gated on all-four-face-edges
+         being crossed (no saddle disambiguation if some face edges
+         are confidence-suppressed).
+      4. Find unique ``(corner_labels, crossed_mask, saddle_flips)``
+         configurations across boundary cells, run :func:`_cell_case`
+         once per unique config, scatter the result back.
 
-    Step 3 keeps the Python work at "unique configs" rather than "all
-    cells" even with the saddle-flip bitfield added — most label configs
-    have 0 saddle faces, so the saddle bits only multiply cache space by
-    a small factor.
+    Step 4 keeps the Python work at "unique configs" rather than "all
+    cells". With ``confidence_margin = 0`` the crossed_mask is fully
+    determined by corner_labels so the unique-config count is unchanged;
+    with ``confidence_margin > 0`` it grows by a small factor (the
+    number of distinct partial-crossed patterns observed in the volume,
+    typically ~2-3×).
     """
     # Stack 8 corner labels per cell.
     c000 = labels[:-1, :-1, :-1]
@@ -514,36 +653,40 @@ def _cell_components(
     edge_components = np.full((Zm1, Ym1, Xm1, 12), -1, dtype=np.int8)
     n_components = np.zeros((Zm1, Ym1, Xm1), dtype=np.int8)
 
-    # Boundary mask: at least one corner differs from corner-0.
-    ref = corners[..., :1]
-    is_boundary = (corners != ref).any(axis=-1)
+    # Per-cell 12-bit crossed mask.
+    cell_crossed_mask = _per_cell_crossed_mask(x_crossed, y_crossed, z_crossed)
+    is_boundary = cell_crossed_mask != 0
     if not is_boundary.any():
         comp_pairs = np.zeros((Zm1, Ym1, Xm1, 1, 2), dtype=np.int32)
         return edge_components, n_components, comp_pairs
 
     # Saddle-flip bitfield (logit asymptotic decider).
-    saddle_flips = _compute_saddle_flips(corners, logits, is_boundary)
+    saddle_flips = _compute_saddle_flips(
+        corners, logits, is_boundary, cell_crossed_mask,
+    )
 
-    # Unique (label_config, saddle_flips) configurations.
+    # Unique (label_config, crossed_mask, saddle_flips) configurations.
     flat_corners = corners.reshape(-1, 8)
+    flat_mask = cell_crossed_mask.reshape(-1)
     flat_saddle = saddle_flips.reshape(-1)
     flat_boundary = is_boundary.reshape(-1)
     bc = flat_corners[flat_boundary]                       # (N_b, 8)
-    bs = flat_saddle[flat_boundary]                        # (N_b,)
-    combined = np.concatenate([bc, bs[:, None]], axis=1)   # (N_b, 9)
+    bm = flat_mask[flat_boundary].astype(np.int32)         # (N_b,) widened for stacking
+    bs = flat_saddle[flat_boundary].astype(np.int32)       # (N_b,)
+    combined = np.concatenate(
+        [bc, bm[:, None], bs[:, None]], axis=1,
+    )                                                       # (N_b, 10)
     unique_cfgs, inverse = np.unique(combined, axis=0, return_inverse=True)
 
     nb = unique_cfgs.shape[0]
     n_per_cfg = np.zeros(nb, dtype=np.int8)
     edge_per_cfg = np.full((nb, 12), -1, dtype=np.int8)
-    # First pass: compute components per unique config; track the global
-    # maximum component count so the per-cell pair array can be sized to
-    # match what ``_cell_dual_vertices`` will allocate.
     case_results = []
     for i in range(nb):
         cfg = tuple(int(v) for v in unique_cfgs[i, :8])
-        saddle = int(unique_cfgs[i, 8])
-        n, et, pairs = _cell_case(cfg, saddle)
+        mask = int(unique_cfgs[i, 8])
+        saddle = int(unique_cfgs[i, 9])
+        n, et, pairs = _cell_case(cfg, mask, saddle)
         n_per_cfg[i] = n
         edge_per_cfg[i] = et
         case_results.append(pairs)
@@ -569,8 +712,55 @@ def _cell_components(
     return edge_components, n_components, comp_pairs
 
 
+def _per_cell_crossed_mask(
+    x_crossed: np.ndarray,   # (Z,   Y,   X-1) bool
+    y_crossed: np.ndarray,   # (Z,   Y-1, X)   bool
+    z_crossed: np.ndarray,   # (Z-1, Y,   X)   bool
+) -> np.ndarray:
+    """Pack the per-cell 12-bit ``crossed`` mask.
+
+    Bit layout matches :data:`_EDGE_CORNERS`:
+
+      bits 0..3   X-edges, indexed by (dz, dy):  (0,0), (0,1), (1,0), (1,1)
+      bits 4..7   Y-edges, indexed by (dz, dx):  (0,0), (0,1), (1,0), (1,1)
+      bits 8..11  Z-edges, indexed by (dy, dx):  (0,0), (0,1), (1,0), (1,1)
+
+    Returns ``(Z-1, Y-1, X-1) uint16``.
+    """
+    Zm1 = z_crossed.shape[0]
+    Ym1 = y_crossed.shape[1]
+    Xm1 = x_crossed.shape[2]
+    mask = np.zeros((Zm1, Ym1, Xm1), dtype=np.uint16)
+    # X-edges (4 per cell)
+    mask |= x_crossed[:Zm1,     :Ym1,    :].astype(np.uint16) << 0
+    mask |= x_crossed[:Zm1,     1:Ym1+1, :].astype(np.uint16) << 1
+    mask |= x_crossed[1:Zm1+1,  :Ym1,    :].astype(np.uint16) << 2
+    mask |= x_crossed[1:Zm1+1,  1:Ym1+1, :].astype(np.uint16) << 3
+    # Y-edges (4 per cell)
+    mask |= y_crossed[:Zm1,     :, :Xm1     ].astype(np.uint16) << 4
+    mask |= y_crossed[:Zm1,     :, 1:Xm1+1  ].astype(np.uint16) << 5
+    mask |= y_crossed[1:Zm1+1,  :, :Xm1     ].astype(np.uint16) << 6
+    mask |= y_crossed[1:Zm1+1,  :, 1:Xm1+1  ].astype(np.uint16) << 7
+    # Z-edges (4 per cell)
+    mask |= z_crossed[:, :Ym1,    :Xm1     ].astype(np.uint16) << 8
+    mask |= z_crossed[:, :Ym1,    1:Xm1+1  ].astype(np.uint16) << 9
+    mask |= z_crossed[:, 1:Ym1+1, :Xm1     ].astype(np.uint16) << 10
+    mask |= z_crossed[:, 1:Ym1+1, 1:Xm1+1  ].astype(np.uint16) << 11
+    return mask
+
+
+# Precomputed per-face bitmask of cell-edges that belong to that face;
+# used by `_compute_saddle_flips` to test "all 4 face edges crossed."
+_FACE_EDGE_BITS = tuple(
+    sum(1 << e for e in face_edges) for _, face_edges in _FACES
+)
+
+
 def _compute_saddle_flips(
-    corners: np.ndarray, logits: np.ndarray, boundary_mask: np.ndarray,
+    corners: np.ndarray,
+    logits: np.ndarray,
+    boundary_mask: np.ndarray,
+    cell_crossed_mask: np.ndarray,
 ) -> np.ndarray:
     """Per-cell 6-bit bitfield; bit ``f`` set means the asymptotic
     decider disagrees with the label-rule saddle resolution on face ``f``.
@@ -589,6 +779,13 @@ def _compute_saddle_flips(
     middle iff A < B. If the asymptotic and label rules agree, no flip.
     If they disagree, flip the rule on that face.
 
+    A face is only a true saddle if *all 4 of its cell-edges are
+    crossed*. With ``confidence_margin > 0`` an apparent (A,B,A,B)
+    label pattern can have one or more face edges confidence-suppressed,
+    in which case the face is not a saddle and the flip bit must stay
+    clear (else the case-table dispatch would consult a flip rule that
+    doesn't apply).
+
     Returns ``(Zm1, Ym1, Xm1) uint8`` (only the low 6 bits are used).
     """
     Zm1, Ym1, Xm1 = corners.shape[:3]
@@ -601,9 +798,13 @@ def _compute_saddle_flips(
         c3_lbl = corners[..., face_corners_cyclic[3]]
 
         # 2-color saddle: (A, B, A, B) around the face cycle.
+        face_bits = np.uint16(_FACE_EDGE_BITS[face_idx])
+        face_fully_crossed = (
+            (cell_crossed_mask & face_bits) == face_bits
+        )
         is_saddle = (
             (c0_lbl == c2_lbl) & (c1_lbl == c3_lbl) & (c0_lbl != c1_lbl)
-            & boundary_mask
+            & boundary_mask & face_fully_crossed
         )
         if not is_saddle.any():
             continue

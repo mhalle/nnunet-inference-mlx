@@ -214,6 +214,7 @@ def to_mesh(
     *,
     project_to_surface: bool = False,
     emit_normals: bool = False,
+    confidence_margin: float = 0.0,
     confidence_threshold: float = 0.0,
     drop_components_below_mm3: float = 0.0,
 ) -> Mesh:
@@ -241,6 +242,18 @@ def to_mesh(
         gradient ``∇(logit_i − logit_j)``. Independent of mesh
         discretization; usually visibly smoother than VTK's
         averaged-face-normal computation.
+    confidence_margin :
+        Margin threshold for the spike-voxel edge filter. A voxel is
+        a spike if (top1−top2 logit margin < confidence_margin) AND
+        (no 6-connected same-label neighbor) — the same dual condition
+        as ``confidence_threshold``, but applied as a *non-destructive*
+        edge filter (the voxel keeps its argmax; only its outgoing
+        crossings are dropped, killing the octahedron spike topology).
+        Composes cleanly with the geometric refinements above. Values
+        0.5–2.0 typically clean the noise floor on TS-fast logits;
+        0.0 (default) leaves the topology criterion at plain argmax.
+        Recommended over ``confidence_threshold`` because it does
+        not perturb the label volume.
     confidence_threshold :
         Logit-margin floor for treating an argmax decision as confident.
         Voxels whose top-1 vs top-2 margin falls below this AND whose
@@ -271,6 +284,7 @@ def to_mesh(
         logits, prediction.geometry, prediction.schema,
         project_to_surface=project_to_surface,
         emit_normals=emit_normals,
+        confidence_margin=confidence_margin,
         confidence_threshold=confidence_threshold,
         drop_components_below_mm3=drop_components_below_mm3,
     )
