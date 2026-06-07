@@ -40,6 +40,9 @@ def surfacenets_logits(
     logits: np.ndarray,
     geometry: Geometry,
     schema: LabelSchema,
+    *,
+    project_to_surface: bool = False,
+    emit_normals: bool = False,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh directly from K-channel logits.
 
@@ -52,6 +55,19 @@ def surfacenets_logits(
         The training-grid geometry. Attached to the returned mesh.
     schema :
         Label name lookup. ``boundary_labels`` are in this schema's space.
+    project_to_surface :
+        If True, after centroid placement do one Newton step toward the
+        boundary level set ``logit_i - logit_j = 0`` for each *binary*
+        cell vertex. Pushes the vertex onto the actual decision surface
+        rather than the centroid of its crossings. Multi-component
+        cells are left at the cell center (so the no-gap property at
+        triple junctions is preserved). Off by default.
+    emit_normals :
+        If True, compute per-vertex normals from the logit-field
+        gradient ``∇(logit_i - logit_j)`` at each vertex position
+        (where ``(i, j)`` is that vertex's label pair). Independent of
+        mesh discretization; usually visibly smoother than VTK's
+        averaged-face-normal computation. Off by default.
 
     Returns
     -------
@@ -89,12 +105,20 @@ def surfacenets_logits(
     y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
     z_crossed, z_t = _edge_crossings(logits, labels, axis=0)
 
-    edge_comp, n_comp = _cell_components(labels, logits)
+    edge_comp, n_comp, comp_pairs = _cell_components(labels, logits)
 
     cell_to_vertex, points = _cell_dual_vertices(
         edge_comp, n_comp,
         x_t, y_t, z_t,
     )
+
+    normals: np.ndarray | None = None
+    if project_to_surface or emit_normals:
+        points, normals = _gradient_refine(
+            points, cell_to_vertex, n_comp, comp_pairs, logits,
+            project=project_to_surface,
+            emit_normals=emit_normals,
+        )
 
     quads, boundary_labels = _emit_quads(
         x_crossed, y_crossed, z_crossed, cell_to_vertex, edge_comp, labels,
@@ -106,6 +130,7 @@ def surfacenets_logits(
         boundary_labels=boundary_labels.astype(np.int32, copy=False),
         geometry=geometry,
         schema=schema,
+        normals=normals,
     )
 
 
@@ -236,7 +261,7 @@ def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
             crossed[e] = True
             edge_pair[e] = (la, lb) if la < lb else (lb, la)
     if not any(crossed):
-        return (0, (-1,) * 12)
+        return (0, (-1,) * 12, ())
 
     # Union-find on 12 edges.
     parent = list(range(12))
@@ -300,12 +325,24 @@ def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
         root_to_comp[find(e)] if crossed[e] else -1
         for e in range(12)
     )
-    return (len(roots), edge_to_comp)
+    # Per-component label pair — pick any edge in the component, take
+    # its sorted (label_a, label_b). All edges in a component share
+    # the same pair by construction.
+    comp_pairs: list[tuple] = [None] * len(roots)   # type: ignore[list-item]
+    for e in range(12):
+        if not crossed[e]:
+            continue
+        k = root_to_comp[find(e)]
+        if comp_pairs[k] is None:
+            a, b = _EDGE_CORNERS[e]
+            la, lb = corner_labels[a], corner_labels[b]
+            comp_pairs[k] = (la, lb) if la < lb else (lb, la)
+    return (len(roots), edge_to_comp, tuple(comp_pairs))
 
 
 def _cell_components(
     labels: np.ndarray, logits: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-cell component info for every cell in the volume.
 
     Returns
@@ -352,7 +389,8 @@ def _cell_components(
     ref = corners[..., :1]
     is_boundary = (corners != ref).any(axis=-1)
     if not is_boundary.any():
-        return edge_components, n_components
+        comp_pairs = np.zeros((Zm1, Ym1, Xm1, 1, 2), dtype=np.int32)
+        return edge_components, n_components, comp_pairs
 
     # Saddle-flip bitfield (logit asymptotic decider).
     saddle_flips = _compute_saddle_flips(corners, logits, is_boundary)
@@ -369,21 +407,37 @@ def _cell_components(
     nb = unique_cfgs.shape[0]
     n_per_cfg = np.zeros(nb, dtype=np.int8)
     edge_per_cfg = np.full((nb, 12), -1, dtype=np.int8)
+    # First pass: compute components per unique config; track the global
+    # maximum component count so the per-cell pair array can be sized to
+    # match what ``_cell_dual_vertices`` will allocate.
+    case_results = []
     for i in range(nb):
         cfg = tuple(int(v) for v in unique_cfgs[i, :8])
         saddle = int(unique_cfgs[i, 8])
-        n, et = _cell_case(cfg, saddle)
+        n, et, pairs = _cell_case(cfg, saddle)
         n_per_cfg[i] = n
         edge_per_cfg[i] = et
+        case_results.append(pairs)
+    max_slots = max(1, int(n_per_cfg.max()))
+    pairs_per_cfg = np.zeros((nb, max_slots, 2), dtype=np.int32)
+    for i, pairs in enumerate(case_results):
+        for k, (a, b) in enumerate(pairs):
+            pairs_per_cfg[i, k, 0] = a
+            pairs_per_cfg[i, k, 1] = b
 
     flat_n = np.zeros(flat_corners.shape[0], dtype=np.int8)
     flat_edge = np.full((flat_corners.shape[0], 12), -1, dtype=np.int8)
+    flat_pairs = np.zeros(
+        (flat_corners.shape[0], max_slots, 2), dtype=np.int32
+    )
     flat_n[flat_boundary] = n_per_cfg[inverse]
     flat_edge[flat_boundary] = edge_per_cfg[inverse]
+    flat_pairs[flat_boundary] = pairs_per_cfg[inverse]
 
     n_components = flat_n.reshape(Zm1, Ym1, Xm1)
     edge_components = flat_edge.reshape(Zm1, Ym1, Xm1, 12)
-    return edge_components, n_components
+    comp_pairs = flat_pairs.reshape(Zm1, Ym1, Xm1, max_slots, 2)
+    return edge_components, n_components, comp_pairs
 
 
 def _compute_saddle_flips(
@@ -724,6 +778,173 @@ def _append_axis(
     q = np.where(flip[:, None], q_neg, q_pos)
     quad_lists.append(q)
     label_lists.append(np.stack([label0, label1], axis=-1))
+
+
+# ---------------------------------------------------------------------------
+# Gradient-refined vertex placement and field-gradient normals
+# ---------------------------------------------------------------------------
+
+
+def _gradient_refine(
+    points: np.ndarray,                # (N, 3) global (Z, Y, X) grid coords
+    cell_to_vertex: np.ndarray,        # (Zm1, Ym1, Xm1, MAX_COMP) int64
+    n_comp: np.ndarray,                # (Zm1, Ym1, Xm1) int8
+    comp_pairs: np.ndarray,            # (Zm1, Ym1, Xm1, MAX_COMP, 2) int32
+    logits: np.ndarray,                # (K, Z, Y, X) float32
+    *,
+    project: bool,
+    emit_normals: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Refine vertex positions and/or emit field-gradient normals.
+
+    For each vertex we know:
+      - its host cell ``(a, b, c)`` and component slot ``k``;
+      - its label pair ``(i, j)`` from ``comp_pairs[a, b, c, k]``.
+
+    The boundary surface for this vertex is the locus
+    ``f(x) = logit_i(x) - logit_j(x) = 0``. We evaluate ``f`` and
+    ``∇f`` at the vertex position via trilinear interp of the 8
+    surrounding corner logits.
+
+    ``project`` does one Newton step ``x ← x − f · ∇f / |∇f|²`` for
+    *binary cells only* (single-component) — multi-component vertices
+    are left at the cell center so the no-gap property at triple
+    junctions is preserved.
+
+    ``emit_normals`` returns ``normals[v] = ∇(L_{Label1} − L_{Label0})``
+    normalized at the (possibly refined) vertex position. Matches the
+    VTK convention ``normal → Label0 → Label1``: for ascending-sorted
+    pair ``(p0, p1)`` and Label0 = p0 (the non-bg slot), the desired
+    normal is ``∇(L_{p1} − L_{p0}) = −∇f``. For pairs with background
+    in them, Label0 = non-bg, Label1 = 0; same algebra still gives
+    ``−∇f``.
+    """
+    Zm1, Ym1, Xm1, MAX_COMP = cell_to_vertex.shape
+    K, Z, Y, X = logits.shape
+    n_total = int(points.shape[0])
+    if n_total == 0:
+        normals = np.zeros((0, 3), dtype=np.float32) if emit_normals else None
+        return points, normals
+
+    # Per-vertex info: cell (a, b, c), component k, label pair (i, j).
+    used = (cell_to_vertex >= 0)
+    z_arr, y_arr, x_arr, k_arr = np.nonzero(used)
+    # Re-order so vertex IDs match np.arange order (which matches
+    # C-order over `used` — np.nonzero already gives that order).
+    vert_ids = cell_to_vertex[z_arr, y_arr, x_arr, k_arr]
+    # Map global vertex ID → row in our per-vertex arrays.
+    order = np.argsort(vert_ids, kind="stable")
+    z_arr = z_arr[order]
+    y_arr = y_arr[order]
+    x_arr = x_arr[order]
+    k_arr = k_arr[order]
+
+    pair = comp_pairs[z_arr, y_arr, x_arr, k_arr]          # (N, 2)
+    i_arr = pair[:, 0].astype(np.intp)
+    j_arr = pair[:, 1].astype(np.intp)
+
+    # Local position (u, v, w) ∈ [0, 1] within the cell.
+    cell_base = np.stack([z_arr, y_arr, x_arr], axis=-1).astype(np.float32)
+    local = points - cell_base                              # (N, 3) in (Z, Y, X)
+    np.clip(local, np.float32(0.0), np.float32(1.0), out=local)
+
+    # Gather f = logit_i - logit_j at the 8 cube corners for each vertex.
+    f_corners = np.empty((8, n_total), dtype=np.float32)
+    for corner_idx in range(8):
+        dz = (corner_idx >> 2) & 1
+        dy = (corner_idx >> 1) & 1
+        dx = corner_idx & 1
+        zs = z_arr + dz
+        ys = y_arr + dy
+        xs = x_arr + dx
+        l_i = logits[i_arr, zs, ys, xs]
+        l_j = logits[j_arr, zs, ys, xs]
+        f_corners[corner_idx] = l_i - l_j
+
+    if project:
+        # Binary cells (single component) get a Newton step.
+        n_at_cell = n_comp[z_arr, y_arr, x_arr]
+        is_binary = (n_at_cell == 1)
+        if is_binary.any():
+            f_val = _trilinear_eval(f_corners, local)
+            grad = _trilinear_grad(f_corners, local)        # (3, N)
+            grad_sq = (grad ** 2).sum(axis=0)
+            safe = np.maximum(grad_sq, np.float32(1e-10))
+            step_scale = (-f_val / safe).astype(np.float32) # (N,) Newton: x ← x − f/|∇f|² · ∇f
+            # Step in (Z, Y, X) order; clamp local position to [0, 1].
+            step_local = step_scale[:, None] * grad.T       # (N, 3)
+            new_local = np.where(is_binary[:, None], local + step_local, local)
+            np.clip(new_local, np.float32(0.0), np.float32(1.0), out=new_local)
+            local = new_local
+            points = cell_base + local
+
+    normals: np.ndarray | None = None
+    if emit_normals:
+        grad = _trilinear_grad(f_corners, local)            # (3, N)
+        # normal = ∇(L_j - L_i) = −∇f, matching VTK Label0 → Label1 convention.
+        n = -grad.T                                          # (N, 3)
+        mag = np.linalg.norm(n, axis=1, keepdims=True)
+        mag = np.maximum(mag, np.float32(1e-10))
+        normals = (n / mag).astype(np.float32)
+
+    return np.ascontiguousarray(points.astype(np.float32)), normals
+
+
+def _trilinear_eval(f_corners: np.ndarray, local: np.ndarray) -> np.ndarray:
+    """Trilinear interpolation of ``f`` at local (u, v, w) ∈ [0, 1]³.
+
+    ``f_corners`` is (8, N): one value per cube corner per vertex,
+    indexed by corner id ``4*dz + 2*dy + dx``. ``local`` is (N, 3) with
+    components in (Z, Y, X) order, i.e. ``local[:, 0] = u``,
+    ``local[:, 1] = v``, ``local[:, 2] = w``.
+    """
+    u = local[:, 0]; v = local[:, 1]; w = local[:, 2]
+    nu = 1.0 - u; nv = 1.0 - v; nw = 1.0 - w
+    return (
+        f_corners[0] * nu * nv * nw +
+        f_corners[1] * nu * nv * w +
+        f_corners[2] * nu * v * nw +
+        f_corners[3] * nu * v * w +
+        f_corners[4] * u * nv * nw +
+        f_corners[5] * u * nv * w +
+        f_corners[6] * u * v * nw +
+        f_corners[7] * u * v * w
+    )
+
+
+def _trilinear_grad(f_corners: np.ndarray, local: np.ndarray) -> np.ndarray:
+    """Gradient ``∇f`` at local (u, v, w) — closed form for trilinear.
+
+    Each component is bilinear in the other two coordinates of paired-
+    corner differences:
+
+        ∂f/∂u = Σ (f[4+i] − f[i]) · w_v(v) · w_w(w)
+        ∂f/∂v = Σ (f[2+i] − f[i]) · w_u(u) · w_w(w)
+        ∂f/∂w = Σ (f[1+i] − f[i]) · w_u(u) · w_v(v)
+
+    Returns (3, N) in (u, v, w) = (Z, Y, X) order.
+    """
+    u = local[:, 0]; v = local[:, 1]; w = local[:, 2]
+    nu = 1.0 - u; nv = 1.0 - v; nw = 1.0 - w
+    dfdu = (
+        (f_corners[4] - f_corners[0]) * nv * nw +
+        (f_corners[5] - f_corners[1]) * nv * w +
+        (f_corners[6] - f_corners[2]) * v * nw +
+        (f_corners[7] - f_corners[3]) * v * w
+    )
+    dfdv = (
+        (f_corners[2] - f_corners[0]) * nu * nw +
+        (f_corners[3] - f_corners[1]) * nu * w +
+        (f_corners[6] - f_corners[4]) * u * nw +
+        (f_corners[7] - f_corners[5]) * u * w
+    )
+    dfdw = (
+        (f_corners[1] - f_corners[0]) * nu * nv +
+        (f_corners[3] - f_corners[2]) * nu * v +
+        (f_corners[5] - f_corners[4]) * u * nv +
+        (f_corners[7] - f_corners[6]) * u * v
+    )
+    return np.stack([dfdu, dfdv, dfdw], axis=0).astype(np.float32)
 
 
 __all__ = ["surfacenets_logits"]

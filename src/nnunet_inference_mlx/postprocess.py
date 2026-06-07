@@ -209,7 +209,12 @@ def restore(
     return sitk_to_segmentation(seg_img, schema)
 
 
-def to_mesh(prediction: Prediction) -> Mesh:
+def to_mesh(
+    prediction: Prediction,
+    *,
+    project_to_surface: bool = False,
+    emit_normals: bool = False,
+) -> Mesh:
     """Extract a SurfaceNets dual mesh from the prediction's logits.
 
     Sibling of :func:`to_labels` — same input (a :class:`Prediction` at
@@ -223,6 +228,18 @@ def to_mesh(prediction: Prediction) -> Mesh:
     needs a different "is this label dominant here" rule and is gated on
     a region-model port; raises ``NotImplementedError`` until then).
 
+    Parameters
+    ----------
+    project_to_surface :
+        If True, do one Newton step toward ``logit_i = logit_j`` per
+        binary-cell vertex — places it on the actual decision surface
+        instead of the centroid of its edge crossings.
+    emit_normals :
+        If True, attach per-vertex normals computed from the logit
+        gradient ``∇(logit_i − logit_j)``. Independent of mesh
+        discretization; usually visibly smoother than VTK's
+        averaged-face-normal computation.
+
     See :func:`mesh.surfacenets_logits` for algorithm details, the
     triple-junction rule, and volume-boundary closure caveats.
     """
@@ -234,7 +251,11 @@ def to_mesh(prediction: Prediction) -> Mesh:
     from .mesh import surfacenets_logits
 
     logits = np.asarray(prediction.data)
-    return surfacenets_logits(logits, prediction.geometry, prediction.schema)
+    return surfacenets_logits(
+        logits, prediction.geometry, prediction.schema,
+        project_to_surface=project_to_surface,
+        emit_normals=emit_normals,
+    )
 
 
 def drop_small_components(
