@@ -240,4 +240,84 @@ def mesh_to_vtk_polydata(mesh: Mesh):
     return pd
 
 
-__all__ = ["mesh_to_npz", "mesh_from_npz", "mesh_to_vtk_polydata"]
+# ---------------------------------------------------------------------------
+# Constrained Laplacian smoothing (lazy VTK)
+# ---------------------------------------------------------------------------
+
+
+def _world_xyz_to_grid_zyx(
+    points_xyz: np.ndarray, geometry: Geometry,
+) -> np.ndarray:
+    """Inverse of :func:`_points_to_world_xyz`. Used after VTK smoothing
+    to bring vertex positions back into the toolkit's (Z, Y, X) index
+    coord convention."""
+    direction = np.asarray(geometry.direction_xyz, dtype=np.float32).reshape(3, 3)
+    origin = np.asarray(geometry.origin_xyz, dtype=np.float32)
+    spacing_xyz = np.asarray(geometry.spacing_zyx[::-1], dtype=np.float32)
+    centered = points_xyz - origin[None, :]
+    rotated = centered @ np.linalg.inv(direction).T
+    indices_xyz = rotated / spacing_xyz[None, :]
+    return np.ascontiguousarray(indices_xyz[:, ::-1])
+
+
+def mesh_smooth(
+    mesh: Mesh,
+    *,
+    iterations: int = 2,
+    relaxation: float = 0.1,
+    constraint_voxels: float = 0.5,
+) -> Mesh:
+    """Apply ``vtkConstrainedSmoothingFilter`` to a Mesh's vertices.
+
+    Returns a new :class:`Mesh` with smoothed vertex positions; quads,
+    boundary labels, geometry, and schema are preserved unchanged.
+
+    The smoother "borrows bandwidth" from neighboring cells — at saddle
+    junctions and other locally-ambiguous configurations the cell-by-cell
+    SurfaceNets dual vertex placement is intrinsically noisy (Nyquist:
+    the boundary surface has sub-grid features the corner labels can't
+    resolve), and constrained Laplacian relaxation pulls them toward
+    the local consensus position from neighbors that aren't ambiguous.
+
+    Defaults are deliberately *light* (2 iterations, relaxation 0.1,
+    constraint distance = half a voxel): enough to remove visible
+    junction noise without rounding off real anatomy. Tune up if needed.
+
+    Requires the ``vtk`` package (lazy-imported, raises ``ImportError``
+    with an install hint if missing).
+    """
+    try:
+        import vtk
+        from vtk.util.numpy_support import vtk_to_numpy
+    except ImportError as e:
+        raise ImportError(
+            "mesh_smooth requires the 'vtk' package; install with "
+            "`pip install vtk` or add it to your project deps."
+        ) from e
+
+    pd = mesh_to_vtk_polydata(mesh)
+
+    sm = vtk.vtkConstrainedSmoothingFilter()
+    sm.SetInputData(pd)
+    sm.SetNumberOfIterations(int(iterations))
+    sm.SetRelaxationFactor(float(relaxation))
+    sm.SetConstraintStrategyToConstraintDistance()
+    voxel_mm = float(min(mesh.geometry.spacing_zyx))
+    sm.SetConstraintDistance(float(constraint_voxels) * voxel_mm)
+    sm.Update()
+
+    smoothed_pts_xyz = vtk_to_numpy(sm.GetOutput().GetPoints().GetData())
+    new_points = _world_xyz_to_grid_zyx(
+        smoothed_pts_xyz.astype(np.float32), mesh.geometry,
+    )
+
+    from dataclasses import replace
+    return replace(mesh, points=new_points)
+
+
+__all__ = [
+    "mesh_to_npz",
+    "mesh_from_npz",
+    "mesh_to_vtk_polydata",
+    "mesh_smooth",
+]

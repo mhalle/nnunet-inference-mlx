@@ -89,7 +89,7 @@ def surfacenets_logits(
     y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
     z_crossed, z_t = _edge_crossings(logits, labels, axis=0)
 
-    edge_comp, n_comp = _cell_components(labels)
+    edge_comp, n_comp = _cell_components(labels, logits)
 
     cell_to_vertex, points = _cell_dual_vertices(
         edge_comp, n_comp,
@@ -191,12 +191,15 @@ _FACES = (
 )
 
 
-@lru_cache(maxsize=4096)
-def _cell_case(corner_labels: tuple) -> tuple:
+@lru_cache(maxsize=8192)
+def _cell_case(corner_labels: tuple, saddle_flips: int = 0) -> tuple:
     """For one cell configuration, return ``(n_components, edge_to_component)``.
 
     ``corner_labels`` is an 8-tuple of integer labels at the 8 cell
-    corners (in canonical 0..7 order). Returns a 12-tuple where element
+    corners (in canonical 0..7 order). ``saddle_flips`` is a 6-bit int
+    where bit ``f`` set means "flip the saddle rule on face ``f``" —
+    used by the logit-magnitude asymptotic decider, computed by the
+    caller before this function runs. Returns a 12-tuple where element
     ``e`` is ``-1`` if cell-edge ``e`` is not crossed, else an integer
     in ``[0, n_components)`` identifying which boundary patch in the
     cell that crossing belongs to.
@@ -209,24 +212,21 @@ def _cell_case(corner_labels: tuple) -> tuple:
       2. They are connected through some face of the cell (per-face
          connectivity below).
 
-    The first rule is the key fix for triple/higher junctions: at a cell
-    along a triple line where labels A, B, C meet, the A↔B boundary
-    surface and the B↔C boundary surface are topologically distinct
-    patches — they share only a 1D curve where they meet. Lumping their
-    crossings into one component creates non-manifold edges in the dual
-    mesh.
-
     Per-face connectivity (within a single label pair):
       * 2 same-pair crossings: connected.
       * 3 same-pair crossings: all connected.
       * 4 same-pair crossings: the only configuration that produces this
-        is a 2-color saddle; the boundary is two segments and we apply
-        the deterministic "smaller-label-through-middle" rule (depends
-        only on face labels, so two cells sharing the face always
-        agree).
+        is a 2-color saddle; the boundary is two segments. We default
+        to "smaller-label-through-middle" (depends only on the face's
+        labels, so two cells sharing the face always agree). When the
+        caller's asymptotic decider says the logit field disagrees with
+        the label-based rule, the corresponding bit in ``saddle_flips``
+        is set and we use the flipped configuration instead.
 
     Cached: a real volume has at most a few thousand distinct cell
-    configurations even when it has millions of cells.
+    configurations even when it has millions of cells. Adding the
+    saddle_flips bitfield multiplies the cache space by up to 64 per
+    label config, but in practice most configs have 0 saddle faces.
     """
     edge_pair: list[tuple] = [None] * 12  # type: ignore[list-item]
     crossed = [False] * 12
@@ -254,7 +254,7 @@ def _cell_case(corner_labels: tuple) -> tuple:
         if ra != rb:
             parent[ra] = rb
 
-    for face_corners, face_edges in _FACES:
+    for face_idx, (face_corners, face_edges) in enumerate(_FACES):
         face_crossed = [e for e in face_edges if crossed[e]]
         if len(face_crossed) <= 1:
             continue
@@ -274,11 +274,15 @@ def _cell_case(corner_labels: tuple) -> tuple:
                     union(es[k], es[k + 1])
                 continue
             # len == 4: only possible if all 4 face edges cross between
-            # the same pair, i.e. a 2-color saddle. Apply the
-            # deterministic split.
+            # the same pair, i.e. a 2-color saddle.
             L = tuple(corner_labels[c] for c in face_corners)
             if L[0] == L[2] and L[1] == L[3] and L[0] != L[1]:
-                if L[0] < L[1]:
+                # Default rule: smaller label through the face middle.
+                # If the asymptotic decider (encoded in saddle_flips)
+                # contradicts the label rule for this face, flip.
+                flip = bool((saddle_flips >> face_idx) & 1)
+                smaller_through = (L[0] < L[1]) ^ flip
+                if smaller_through:
                     union(face_edges[0], face_edges[1])
                     union(face_edges[2], face_edges[3])
                 else:
@@ -299,7 +303,9 @@ def _cell_case(corner_labels: tuple) -> tuple:
     return (len(roots), edge_to_comp)
 
 
-def _cell_components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _cell_components(
+    labels: np.ndarray, logits: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-cell component info for every cell in the volume.
 
     Returns
@@ -312,11 +318,18 @@ def _cell_components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         ``(Zm1, Ym1, Xm1) int8`` — number of components in each cell
         (0 for interior cells).
 
-    Strategy: gather the 8 corner labels per cell into one
-    ``(Zm1, Ym1, Xm1, 8)`` array, find the unique 8-tuples across the
-    *boundary* cells, run :func:`_cell_case` once per unique config, and
-    scatter the result back. This collapses the Python work from
-    "millions of cells" to "thousands of unique configurations."
+    Strategy:
+      1. Stack the 8 corner labels per cell into ``(Zm1, Ym1, Xm1, 8)``.
+      2. Compute the per-cell saddle-flip bitfield from the logit
+         asymptotic decider (vectorized).
+      3. Find unique ``(labels, saddle_flips)`` configurations across
+         boundary cells, run :func:`_cell_case` once per unique config,
+         scatter the result back.
+
+    Step 3 keeps the Python work at "unique configs" rather than "all
+    cells" even with the saddle-flip bitfield added — most label configs
+    have 0 saddle faces, so the saddle bits only multiply cache space by
+    a small factor.
     """
     # Stack 8 corner labels per cell.
     c000 = labels[:-1, :-1, :-1]
@@ -341,22 +354,28 @@ def _cell_components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if not is_boundary.any():
         return edge_components, n_components
 
-    # Look up unique configurations and scatter back.
+    # Saddle-flip bitfield (logit asymptotic decider).
+    saddle_flips = _compute_saddle_flips(corners, logits, is_boundary)
+
+    # Unique (label_config, saddle_flips) configurations.
     flat_corners = corners.reshape(-1, 8)
+    flat_saddle = saddle_flips.reshape(-1)
     flat_boundary = is_boundary.reshape(-1)
     bc = flat_corners[flat_boundary]                       # (N_b, 8)
-    unique_cfgs, inverse = np.unique(bc, axis=0, return_inverse=True)
+    bs = flat_saddle[flat_boundary]                        # (N_b,)
+    combined = np.concatenate([bc, bs[:, None]], axis=1)   # (N_b, 9)
+    unique_cfgs, inverse = np.unique(combined, axis=0, return_inverse=True)
 
     nb = unique_cfgs.shape[0]
     n_per_cfg = np.zeros(nb, dtype=np.int8)
     edge_per_cfg = np.full((nb, 12), -1, dtype=np.int8)
     for i in range(nb):
-        cfg = tuple(int(v) for v in unique_cfgs[i])
-        n, et = _cell_case(cfg)
+        cfg = tuple(int(v) for v in unique_cfgs[i, :8])
+        saddle = int(unique_cfgs[i, 8])
+        n, et = _cell_case(cfg, saddle)
         n_per_cfg[i] = n
         edge_per_cfg[i] = et
 
-    # Scatter.
     flat_n = np.zeros(flat_corners.shape[0], dtype=np.int8)
     flat_edge = np.full((flat_corners.shape[0], 12), -1, dtype=np.int8)
     flat_n[flat_boundary] = n_per_cfg[inverse]
@@ -365,6 +384,77 @@ def _cell_components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     n_components = flat_n.reshape(Zm1, Ym1, Xm1)
     edge_components = flat_edge.reshape(Zm1, Ym1, Xm1, 12)
     return edge_components, n_components
+
+
+def _compute_saddle_flips(
+    corners: np.ndarray, logits: np.ndarray, boundary_mask: np.ndarray,
+) -> np.ndarray:
+    """Per-cell 6-bit bitfield; bit ``f`` set means the asymptotic
+    decider disagrees with the label-rule saddle resolution on face ``f``.
+
+    The asymptotic decider for a 2-color saddle face with labels A, B:
+    take the bilinear value of ``logit_A - logit_B`` at the face center.
+    By bilinear interpolation that's ``(1/4) * sum over 4 face corners
+    of (logit_A[corner] - logit_B[corner])``; sign is what matters.
+
+      * sum > 0 → A is connected through the face's middle (interior
+        of the cell), so smaller-label connectivity holds iff A < B.
+      * sum < 0 → B through the middle; smaller-label rule holds iff
+        B < A, i.e. A > B.
+
+    The label-only "smaller through middle" rule says A is through
+    middle iff A < B. If the asymptotic and label rules agree, no flip.
+    If they disagree, flip the rule on that face.
+
+    Returns ``(Zm1, Ym1, Xm1) uint8`` (only the low 6 bits are used).
+    """
+    Zm1, Ym1, Xm1 = corners.shape[:3]
+    saddle_flips = np.zeros((Zm1, Ym1, Xm1), dtype=np.uint8)
+
+    for face_idx, (face_corners_cyclic, _) in enumerate(_FACES):
+        c0_lbl = corners[..., face_corners_cyclic[0]]
+        c1_lbl = corners[..., face_corners_cyclic[1]]
+        c2_lbl = corners[..., face_corners_cyclic[2]]
+        c3_lbl = corners[..., face_corners_cyclic[3]]
+
+        # 2-color saddle: (A, B, A, B) around the face cycle.
+        is_saddle = (
+            (c0_lbl == c2_lbl) & (c1_lbl == c3_lbl) & (c0_lbl != c1_lbl)
+            & boundary_mask
+        )
+        if not is_saddle.any():
+            continue
+
+        A_lbl = c0_lbl
+        B_lbl = c1_lbl
+
+        # Sum of (logit_A - logit_B) over the 4 face corners — gather
+        # corner logits for the two labels involved.
+        sum_diff = np.zeros((Zm1, Ym1, Xm1), dtype=np.float32)
+        for corner_idx in face_corners_cyclic:
+            dz = (corner_idx >> 2) & 1
+            dy = (corner_idx >> 1) & 1
+            dx = corner_idx & 1
+            sub = logits[:, dz:dz + Zm1, dy:dy + Ym1, dx:dx + Xm1]   # (K, Zm1, Ym1, Xm1)
+            A_idx = A_lbl.astype(np.intp)[None]
+            B_idx = B_lbl.astype(np.intp)[None]
+            l_A = np.take_along_axis(sub, A_idx, axis=0)[0]
+            l_B = np.take_along_axis(sub, B_idx, axis=0)[0]
+            sum_diff += (l_A - l_B)
+
+        # Label rule says: A through middle iff A < B.
+        # Asymptotic says:  A through middle iff sum_diff > 0.
+        label_says_A_through = A_lbl < B_lbl
+        asymp_says_A_through = sum_diff > 0
+        disagree = is_saddle & (label_says_A_through != asymp_says_A_through)
+
+        if disagree.any():
+            saddle_flips = np.where(
+                disagree,
+                saddle_flips | np.uint8(1 << face_idx),
+                saddle_flips,
+            )
+    return saddle_flips
 
 
 # ---------------------------------------------------------------------------

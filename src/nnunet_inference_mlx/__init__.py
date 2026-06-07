@@ -25,7 +25,7 @@ from .values import (
     Volume,
 )
 from .mesh import surfacenets_logits
-from .meshio import mesh_from_npz, mesh_to_npz, mesh_to_vtk_polydata
+from .meshio import mesh_from_npz, mesh_smooth, mesh_to_npz, mesh_to_vtk_polydata
 
 from .engine import (
     FoldEnsemble,
@@ -101,6 +101,7 @@ __all__ = [
     "mesh_to_npz",
     "mesh_from_npz",
     "mesh_to_vtk_polydata",
+    "mesh_smooth",
     # image IO (format plug-ins)
     "NiftiReader",
     "DicomReader",
