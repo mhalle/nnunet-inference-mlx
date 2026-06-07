@@ -425,35 +425,29 @@ def _compute_saddle_flips(
         if not is_saddle.any():
             continue
 
-        A_lbl = c0_lbl
-        B_lbl = c1_lbl
+        # Saddle cells are RARE (≪ 1% of the volume in real TS data);
+        # gather logits only at those cells via flat fancy indexing
+        # instead of slicing the whole K-channel volume per face corner.
+        sz, sy, sx = np.nonzero(is_saddle)
+        A_at_cell = c0_lbl[sz, sy, sx].astype(np.intp)
+        B_at_cell = c1_lbl[sz, sy, sx].astype(np.intp)
 
-        # Sum of (logit_A - logit_B) over the 4 face corners — gather
-        # corner logits for the two labels involved.
-        sum_diff = np.zeros((Zm1, Ym1, Xm1), dtype=np.float32)
+        sum_diff = np.zeros(sz.shape[0], dtype=np.float32)
         for corner_idx in face_corners_cyclic:
             dz = (corner_idx >> 2) & 1
             dy = (corner_idx >> 1) & 1
             dx = corner_idx & 1
-            sub = logits[:, dz:dz + Zm1, dy:dy + Ym1, dx:dx + Xm1]   # (K, Zm1, Ym1, Xm1)
-            A_idx = A_lbl.astype(np.intp)[None]
-            B_idx = B_lbl.astype(np.intp)[None]
-            l_A = np.take_along_axis(sub, A_idx, axis=0)[0]
-            l_B = np.take_along_axis(sub, B_idx, axis=0)[0]
-            sum_diff += (l_A - l_B)
+            zs, ys, xs = sz + dz, sy + dy, sx + dx
+            sum_diff += logits[A_at_cell, zs, ys, xs] - logits[B_at_cell, zs, ys, xs]
 
-        # Label rule says: A through middle iff A < B.
-        # Asymptotic says:  A through middle iff sum_diff > 0.
-        label_says_A_through = A_lbl < B_lbl
+        # Label rule: A through middle iff A < B.
+        # Asymptotic:  A through middle iff sum_diff > 0.
+        label_says_A_through = c0_lbl[sz, sy, sx] < c1_lbl[sz, sy, sx]
         asymp_says_A_through = sum_diff > 0
-        disagree = is_saddle & (label_says_A_through != asymp_says_A_through)
-
+        disagree = label_says_A_through != asymp_says_A_through
         if disagree.any():
-            saddle_flips = np.where(
-                disagree,
-                saddle_flips | np.uint8(1 << face_idx),
-                saddle_flips,
-            )
+            fz, fy, fx = sz[disagree], sy[disagree], sx[disagree]
+            saddle_flips[fz, fy, fx] |= np.uint8(1 << face_idx)
     return saddle_flips
 
 
