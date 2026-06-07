@@ -99,7 +99,7 @@ def segment(
     output_scaling: Optional[float] = typer.Option(None, "--output-scaling", help="Output resolution multiplier (2 = finer/half-spacing, 0.5 = coarser). Renders from logits; header fixed to same extent."),
     output_spacing: Optional[float] = typer.Option(None, "--output-spacing", help="Output spacing in mm (isotropic). Alternative to --output-scaling."),
     at_model_spacing: bool = typer.Option(False, "--at-model-spacing", help="Write at the model's native training spacing (no upsample back to the input grid)."),
-    resample: str = typer.Option("linear", "--resample", help="Inverse resample: 'linear' (logit interp, higher fidelity) or 'nearest' (label NN, much faster on large grids)."),
+    resample: str = typer.Option("linear", "--resample", help="Inverse resample: 'linear' (logit interp, path B, higher fidelity), 'nearest' (label NN, fastest, stair-stepped), or 'onehot' (one-hot label interp via the same kernel as 'linear' - smooth but resampled after argmax; for direct path-A-vs-B comparison)."),
     batch_size: Optional[int] = typer.Option(None, "--batch-size", "-b", help="Sliding-window patches per forward pass. Higher better utilizes large GPUs (try 2-4 on M-series Max/Ultra); None = auto from RAM."),
     tile_step_size: float = typer.Option(0.5, "--tile-step-size", help="Sliding-window step as a fraction of patch size (0.5 = 50%% overlap). Higher = fewer patches = faster, slightly coarser at tile seams."),
     download: bool = typer.Option(True, "--download/--no-download", help="Auto-download missing weights (default on)."),

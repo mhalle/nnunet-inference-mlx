@@ -127,6 +127,14 @@ def restore(
     resample the *integer label map* — single-channel, ~no 117-channel gather, so
     much faster on large grids, at the cost of stair-stepped boundaries.
 
+    ``interpolation="onehot"`` is a third, intermediate option for direct
+    comparison: argmax at model spacing (like ``"nearest"``), but then resample
+    the one-hot label indicators with the *same* trilinear kernel as ``"linear"``
+    and argmax again. It smooths boundaries like ``"linear"`` but works from the
+    hardened labels, so it isolates the cost of resampling after vs before the
+    argmax (label-space one-hot vs logit-space path B). Applies to argmax
+    (non-region) models; region models always use the paint inverse.
+
     With no spacing override the result lands on the caller's input grid; pass
     ``target_spacing`` (absolute mm; scalar or (Z,Y,X)) or ``target_scaling``
     (multiplier; 2 = finer, 0.5 = coarser) to render at a different resolution
@@ -139,8 +147,8 @@ def restore(
             f"plan.model_spacing_zyx {plan.model_spacing_zyx}; prediction was not "
             "produced by this plan's to_model_frame step."
         )
-    if interpolation not in ("linear", "nearest", "cubic", "lanczos"):
-        raise ValueError(f"interpolation must be 'linear', 'cubic', 'lanczos' or 'nearest'; got {interpolation!r}")
+    if interpolation not in ("linear", "nearest", "cubic", "lanczos", "onehot"):
+        raise ValueError(f"interpolation must be 'linear', 'cubic', 'lanczos', 'onehot' or 'nearest'; got {interpolation!r}")
     from .imageio import array_to_sitk, geometry_from_sitk, sitk_to_segmentation
     from .resampling import (
         inverse_resample_argmax,

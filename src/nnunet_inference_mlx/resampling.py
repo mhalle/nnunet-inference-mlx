@@ -1209,6 +1209,22 @@ def inverse_resample_argmax(
             verbose=verbose,
         )
 
+    # "onehot" (label-space, path A done smoothly): argmax the logits FIRST,
+    # one-hot encode, then resample the indicators with the SAME trilinear+
+    # argmax kernel as "linear". The ONLY difference from "linear" is that we
+    # resample AFTER the argmax (hard labels) instead of BEFORE (soft logits),
+    # so "onehot" vs "linear" isolates exactly the path-A-vs-path-B correctness
+    # question on an otherwise identical interpolation. Peak memory matches the
+    # logits (the one-hot field is the same (K,Z,Y,X) shape, at model spacing).
+    if interpolation == "onehot":
+        K = logits_target.shape[0]
+        labels_t = mx.argmax(logits_target, axis=0)
+        logits_target = (
+            mx.arange(K, dtype=mx.int32)[:, None, None, None]
+            == labels_t[None].astype(mx.int32)
+        ).astype(mx.float32)
+        interpolation = "linear"   # same kernel; the one-hot input is the change
+
     # Fast path: a single fused Metal kernel (trilinear + argmax inline, no
     # K-channel materialization, ~100× the slab path). Falls back to the
     # pure-MLX slab loop if the kernel is unavailable or errors.
