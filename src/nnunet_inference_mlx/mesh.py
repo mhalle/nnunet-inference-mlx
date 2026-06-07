@@ -881,8 +881,16 @@ def _gradient_refine(
     normals: np.ndarray | None = None
     if emit_normals:
         grad = _trilinear_grad(f_corners, local)            # (3, N)
-        # normal = ∇(L_j - L_i) = −∇f, matching VTK Label0 → Label1 convention.
-        n = -grad.T                                          # (N, 3)
+        # The VTK BoundaryLabels rule puts background in slot 1; non-bg
+        # pairs are sorted ascending. The "normal points Label0 → Label1"
+        # convention then has different sign in terms of our sorted-pair
+        # f = L_{pair[0]} − L_{pair[1]}:
+        #   * pair (a, b) both non-zero: Label0=a, Label1=b → normal = −∇f
+        #   * pair (0, b):               Label0=b, Label1=0 → normal = +∇f
+        # i_arr is the smaller member of the sorted pair, so i_arr == 0
+        # exactly captures the bg-involving case.
+        sign = np.where(i_arr == 0, np.float32(1.0), np.float32(-1.0))
+        n = (sign[:, None] * grad.T).astype(np.float32)
         mag = np.linalg.norm(n, axis=1, keepdims=True)
         mag = np.maximum(mag, np.float32(1e-10))
         normals = (n / mag).astype(np.float32)
