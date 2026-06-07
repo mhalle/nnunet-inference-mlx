@@ -214,6 +214,7 @@ def to_mesh(
     *,
     project_to_surface: bool = False,
     emit_normals: bool = False,
+    confidence_threshold: float = 0.0,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh from the prediction's logits.
 
@@ -239,6 +240,14 @@ def to_mesh(
         gradient ``∇(logit_i − logit_j)``. Independent of mesh
         discretization; usually visibly smoother than VTK's
         averaged-face-normal computation.
+    confidence_threshold :
+        Logit-margin floor for treating an argmax decision as confident.
+        Voxels whose top-1 vs top-2 margin falls below this AND whose
+        6-connected neighbors unanimously carry the same other label
+        are relabeled to that neighbor. Targeted fix for sub-Nyquist
+        single-voxel "blob" octahedron artifacts. 0.0 (default) leaves
+        labels untouched; values in 0.5–1.5 typically clean the noise
+        floor without suppressing real thin features.
 
     See :func:`mesh.surfacenets_logits` for algorithm details, the
     triple-junction rule, and volume-boundary closure caveats.
@@ -255,6 +264,7 @@ def to_mesh(
         logits, prediction.geometry, prediction.schema,
         project_to_surface=project_to_surface,
         emit_normals=emit_normals,
+        confidence_threshold=confidence_threshold,
     )
 
 

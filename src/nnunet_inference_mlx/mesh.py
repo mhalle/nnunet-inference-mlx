@@ -43,6 +43,7 @@ def surfacenets_logits(
     *,
     project_to_surface: bool = False,
     emit_normals: bool = False,
+    confidence_threshold: float = 0.0,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh directly from K-channel logits.
 
@@ -68,6 +69,17 @@ def surfacenets_logits(
         (where ``(i, j)`` is that vertex's label pair). Independent of
         mesh discretization; usually visibly smoother than VTK's
         averaged-face-normal computation. Off by default.
+    confidence_threshold :
+        Logit-margin floor (in raw logit units) for treating an argmax
+        decision as confident. Voxels whose top-1 vs top-2 logit margin
+        falls below this AND whose 6-connected neighbors *unanimously*
+        carry the same other label are relabeled to that neighbor label.
+        Targeted fix for sub-Nyquist single-voxel "blob" artifacts —
+        argmax flips driven by logit noise that the discretization
+        amplifies into octahedron spikes on the mesh. 0.0 (default,
+        no suppression) preserves the v8 behavior; values in the
+        0.5–1.5 range typically clean up the noise floor without
+        suppressing real thin features.
 
     Returns
     -------
@@ -100,6 +112,10 @@ def surfacenets_logits(
 
     logits = np.ascontiguousarray(logits, dtype=np.float32)
     labels = np.argmax(logits, axis=0).astype(np.int32)
+    if confidence_threshold > 0.0:
+        labels = _suppress_low_confidence_blobs(
+            labels, logits, float(confidence_threshold),
+        )
 
     x_crossed, x_t = _edge_crossings(logits, labels, axis=2)
     y_crossed, y_t = _edge_crossings(logits, labels, axis=1)
@@ -132,6 +148,99 @@ def surfacenets_logits(
         schema=schema,
         normals=normals,
     )
+
+
+# ---------------------------------------------------------------------------
+# Low-confidence single-voxel blob suppression
+# ---------------------------------------------------------------------------
+
+
+def _suppress_low_confidence_blobs(
+    labels: np.ndarray,
+    logits: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Targeted fix for sub-Nyquist argmax-flip artifacts.
+
+    A voxel V is *suppressed* (relabeled to the dominant neighbor's
+    label) when both:
+
+      1. ``margin(V) = top1_logit(V) − top2_logit(V) < threshold`` —
+         the argmax decision at V is uncertain.
+      2. V's label appears in **at most 2** of its 6 axis-aligned
+         neighbors — V is a minority feature.
+
+    "Minority + uncertain" is the operational definition of a noise-
+    driven argmax flip that the meshing then amplifies into an
+    octahedron spike. Isolated 1-voxel blobs (all 6 neighbors agree)
+    and 1×N strips (5 same, 1 same-as-V) both qualify. Larger
+    structures with ≥ 3 same-label neighbors are left alone.
+
+    Relabel target: the majority label among V's 6 neighbors. If
+    multiple labels tie, the smallest-numbered tied label is used —
+    a deterministic choice that defaults to background (label 0)
+    when bg is among the ties (the practically common case).
+    """
+    Z, Y, X = labels.shape
+    if Z < 3 or Y < 3 or X < 3:
+        return labels
+
+    # Per-voxel logit margin: top-1 vs top-2 via mask-and-remax.
+    winner_idx = labels.astype(np.intp)[None]
+    winner_logit = np.take_along_axis(logits, winner_idx, axis=0)[0]
+    masked = logits.copy()
+    np.put_along_axis(masked, winner_idx, np.float32(-np.inf), axis=0)
+    second_logit = masked.max(axis=0)
+    del masked
+    margin = winner_logit - second_logit
+
+    # Interior block + 6 axis-aligned neighbors.
+    center = labels[1:-1, 1:-1, 1:-1]
+    nbrs = np.stack([
+        labels[ :-2, 1:-1, 1:-1],
+        labels[2:,   1:-1, 1:-1],
+        labels[1:-1,  :-2, 1:-1],
+        labels[1:-1, 2:,   1:-1],
+        labels[1:-1, 1:-1,  :-2],
+        labels[1:-1, 1:-1, 2:  ],
+    ], axis=-1)                                     # (Zm2, Ym2, Xm2, 6)
+
+    # Count how many neighbors share the center's label.
+    n_same = (nbrs == center[..., None]).sum(axis=-1).astype(np.int8)
+    low_confidence = margin[1:-1, 1:-1, 1:-1] < np.float32(threshold)
+    is_minority = n_same <= 2
+
+    suppress = low_confidence & is_minority
+    if not suppress.any():
+        return labels
+
+    # Majority label among the 6 neighbors. Use mode-via-sort:
+    # sort the 6 neighbors per voxel, then find the longest run.
+    nbrs_sorted = np.sort(nbrs, axis=-1)              # (Zm2, Ym2, Xm2, 6)
+    # Run-length encoding: a new run starts wherever the sorted value
+    # changes vs its predecessor; treat slot 0 as always a new run.
+    new_run = np.concatenate([
+        np.ones(nbrs_sorted.shape[:-1] + (1,), dtype=np.int8),
+        (nbrs_sorted[..., 1:] != nbrs_sorted[..., :-1]).astype(np.int8),
+    ], axis=-1)
+    run_id = np.cumsum(new_run, axis=-1) - 1          # 0..k-1 per voxel
+    # Count voxels per run (only 6 possible slot ids).
+    counts = np.zeros(nbrs_sorted.shape[:-1] + (6,), dtype=np.int8)
+    for slot in range(6):
+        counts[..., slot] = (run_id == slot).sum(axis=-1)
+    best_slot = counts.argmax(axis=-1)                # (Zm2, Ym2, Xm2)
+    # The majority label is at sorted index = first occurrence of best_slot.
+    # By construction that's the first slot whose run_id == best_slot;
+    # find it via argmax-of-(run_id == best_slot).
+    is_best = (run_id == best_slot[..., None])
+    first_idx = is_best.argmax(axis=-1)               # (Zm2, Ym2, Xm2)
+    majority = np.take_along_axis(
+        nbrs_sorted, first_idx[..., None], axis=-1
+    )[..., 0]
+
+    new_labels = labels.copy()
+    new_labels[1:-1, 1:-1, 1:-1] = np.where(suppress, majority, center)
+    return new_labels
 
 
 # ---------------------------------------------------------------------------
