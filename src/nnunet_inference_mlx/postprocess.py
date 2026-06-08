@@ -279,9 +279,12 @@ def to_mesh(
         )
     from .mesh import surfacenets_logits
 
-    logits = np.asarray(prediction.data)
+    # Pass the mx.array through directly — surfacenets_logits runs
+    # the K-channel dense ops (argmax, top-2 margin, edge crossings,
+    # etc.) on the GPU. Wrapping in np.asarray here would round-trip
+    # a 3 GB copy back to MLX inside surfacenets_logits.
     return surfacenets_logits(
-        logits, prediction.geometry, prediction.schema,
+        prediction.data, prediction.geometry, prediction.schema,
         project_to_surface=project_to_surface,
         emit_normals=emit_normals,
         confidence_margin=confidence_margin,
