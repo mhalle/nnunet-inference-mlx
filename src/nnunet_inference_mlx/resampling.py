@@ -402,6 +402,42 @@ def _kchannel_trilinear_full(
     return out
 
 
+def _cascade_kchannel_to_target(
+    src: mx.array,
+    out_shape: tuple[int, int, int],
+    src_spacing: tuple[float, float, float],
+    out_spacing: tuple[float, float, float],
+) -> mx.array:
+    """Cascade 2× K-channel downsamples until source-ratio ≤ 2×, then final step.
+
+    Same anti-aliasing rationale as :func:`_cascade_then_slab` but
+    produces a K-channel logit volume at the target grid (no argmax).
+    Used by the user-facing :func:`postprocess.resample_prediction`.
+
+    For each cascade step the source-to-output ratio per axis is at
+    most 2×, so the trilinear kernel's 2³-voxel support matches the
+    output voxel's physical footprint and aliasing is bounded.
+    """
+    cur = src
+    cur_spacing = tuple(float(s) for s in src_spacing)
+    while any(o > 2.001 * c for c, o in zip(cur_spacing, out_spacing)):
+        next_spacing = tuple(
+            min(2.0 * c, o) for c, o in zip(cur_spacing, out_spacing)
+        )
+        next_shape = tuple(
+            max(1, int(round(n * c / s)))
+            for n, c, s in zip(cur.shape[1:], cur_spacing, next_spacing)
+        )
+        cur = _kchannel_trilinear_full(cur, next_shape, cur_spacing, next_spacing)
+        cur_spacing = next_spacing
+    # Final step to exact target (if needed).
+    if tuple(cur.shape[1:]) != tuple(out_shape) or any(
+        abs(a - b) > 1e-6 for a, b in zip(cur_spacing, out_spacing)
+    ):
+        cur = _kchannel_trilinear_full(cur, out_shape, cur_spacing, out_spacing)
+    return cur
+
+
 def _cascade_then_slab(
     logits_target: mx.array,
     out_shape_zyx: tuple[int, int, int],

@@ -1,6 +1,6 @@
 """postprocess — turn a :class:`Prediction` into a :class:`Segmentation` or a :class:`Mesh`.
 
-Three conversions of the model's per-class output:
+Conversions of the model's per-class output:
 
 * ``to_labels(prediction)`` — labels at the prediction's *own* grid (no
   resample). Scheme-aware (argmax for standard models, threshold +
@@ -14,19 +14,23 @@ Three conversions of the model's per-class output:
   rather than ``predict → to_labels → resample``.
 * ``to_mesh(prediction)`` — surface mesh at the prediction's *own* grid,
   via SurfaceNets-from-logits. Sibling of ``to_labels`` (same input, same
-  grid; just produces a surface instead of a labelmap). No inverse
-  resample — meshes live at the network's training spacing, which is the
-  only spacing the model actually resolves at.
+  grid; just produces a surface instead of a labelmap).
+* ``resample_prediction(prediction, ...)`` — trilinear K-channel resample
+  of the logit volume to a target grid. Lets the user choose the
+  segmentation/mesh resolution independently of the network's training
+  spacing. Composes naturally with ``to_labels`` / ``to_mesh``.
 
 Plus ``drop_small_components`` for connected-component cleanup.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import mlx.core as mx
 import numpy as np
 
-from .values import LabelSchema, Mesh, Prediction, RestorePlan, Segmentation
+from .values import Geometry, LabelSchema, Mesh, Prediction, RestorePlan, Segmentation
 
 
 def _label_dtype(schema: LabelSchema) -> np.dtype:
@@ -291,6 +295,156 @@ def to_mesh(
         confidence_threshold=confidence_threshold,
         drop_components_below_mm3=drop_components_below_mm3,
     )
+
+
+def resample_prediction(
+    prediction: Prediction,
+    *,
+    output_spacing_zyx: tuple[float, float, float] | None = None,
+    output_shape_zyx: tuple[int, int, int] | None = None,
+    scale: float | tuple[float, float, float] | None = None,
+    cascade_for_aliasing: bool = True,
+    memory_ceiling_gb: float = 12.0,
+) -> Prediction:
+    """Trilinear-resample the K-channel logit volume to a target grid.
+
+    Specify exactly one target form:
+
+    * ``output_spacing_zyx`` — target voxel spacing in mm (Z, Y, X).
+      Output shape derived to preserve the prediction's physical extent.
+    * ``output_shape_zyx`` — exact target voxel counts (Z, Y, X). Output
+      spacing derived from the input's physical extent.
+    * ``scale`` — multiplier on the input shape. ``scale > 1`` upsamples
+      (finer, denser); ``scale < 1`` downsamples (coarser, smaller).
+      Scalar (uniform) or 3-tuple (per-axis).
+
+    For aggressive downsamples (target spacing more than 2× the source
+    per axis) the resample cascades through intermediate 2× steps to
+    avoid trilinear undersampling — the same pattern
+    :func:`restore` uses for logits-to-acquisition-spacing. Set
+    ``cascade_for_aliasing=False`` to skip (faster, but aliases on
+    heavy downsamples).
+
+    Composes naturally:
+
+        # Mesh at finer-than-training resolution
+        hi = resample_prediction(prediction, scale=2.0)
+        mesh = to_mesh(hi, confidence_margin=1.0, ...)
+
+        # Quick coarse preview
+        lo = resample_prediction(prediction, scale=0.5)
+        seg = to_labels(lo)
+
+        # Or aim at a specific clinical voxel size
+        clin = resample_prediction(prediction, output_spacing_zyx=(1.5, 1.5, 1.5))
+
+    Parameters
+    ----------
+    memory_ceiling_gb :
+        Refuse to run if the **peak** in-flight memory would exceed
+        this. The trilinear gather materializes 8 K-channel intermediate
+        arrays (one per cube corner) during compute, so peak memory is
+        about **9× the output prediction size**. For chest TS-fast at
+        ``scale=(1.5, 1, 1)`` (output 4.6 GB) peak is ~37 GB — well
+        beyond M2 17 GB unified memory, and the OS gets killed before
+        Python sees a clean exception. Default ceiling 12 GB
+        corresponds to ~1.3 GB output, conservative for M2 17 GB.
+        Bump if you have more RAM, but be careful: the failure mode
+        is a *machine crash*, not a Python error. The path forward
+        for legitimately-large outputs is the slab-streaming variant
+        (not yet implemented).
+
+    Returns
+    -------
+    Prediction
+        A new prediction at the target grid. Schema, activation, and
+        geometry origin/direction are unchanged; only ``spacing_zyx``,
+        ``shape_zyx``, and ``data`` change.
+    """
+    n_set = sum(x is not None for x in (output_spacing_zyx, output_shape_zyx, scale))
+    if n_set != 1:
+        raise ValueError(
+            "specify exactly one of output_spacing_zyx, output_shape_zyx, or "
+            f"scale; got {n_set}"
+        )
+
+    src_spacing = tuple(float(s) for s in prediction.geometry.spacing_zyx)
+    src_shape = tuple(int(n) for n in prediction.geometry.shape_zyx)
+
+    if output_spacing_zyx is not None:
+        tgt_spacing = tuple(float(s) for s in output_spacing_zyx)
+        if len(tgt_spacing) != 3 or any(s <= 0 for s in tgt_spacing):
+            raise ValueError(f"output_spacing_zyx must be 3 positive floats; got {output_spacing_zyx!r}")
+        tgt_shape = tuple(
+            max(1, int(round(n * s_in / s_out)))
+            for n, s_in, s_out in zip(src_shape, src_spacing, tgt_spacing)
+        )
+    elif output_shape_zyx is not None:
+        tgt_shape = tuple(int(n) for n in output_shape_zyx)
+        if len(tgt_shape) != 3 or any(n < 1 for n in tgt_shape):
+            raise ValueError(f"output_shape_zyx must be 3 positive ints; got {output_shape_zyx!r}")
+        tgt_spacing = tuple(
+            s_in * n_in / n_out
+            for s_in, n_in, n_out in zip(src_spacing, src_shape, tgt_shape)
+        )
+    else:
+        if isinstance(scale, (int, float)):
+            sc = (float(scale), float(scale), float(scale))
+        else:
+            sc = tuple(float(s) for s in scale)  # type: ignore[arg-type]
+        if len(sc) != 3 or any(s <= 0 for s in sc):
+            raise ValueError(f"scale must be a positive scalar or 3-tuple; got {scale!r}")
+        tgt_shape = tuple(max(1, int(round(n * s))) for n, s in zip(src_shape, sc))
+        tgt_spacing = tuple(s_in / s for s_in, s in zip(src_spacing, sc))
+
+    # No-op fast path.
+    if tgt_shape == src_shape and all(
+        abs(a - b) < 1e-6 for a, b in zip(tgt_spacing, src_spacing)
+    ):
+        return prediction
+
+    K = int(prediction.data.shape[0])
+    output_bytes = K * tgt_shape[0] * tgt_shape[1] * tgt_shape[2] * 4
+    # Trilinear gather materializes 8 K-channel corner arrays + the final
+    # blend during compute. Conservative peak factor of 9 — empirically
+    # an output of 4.6 GB peaks well above 30 GB and kernel-panics M2
+    # 17 GB. Refusing here is the only safe behavior because the failure
+    # mode below the limit is a system-wide OOM, not a Python exception.
+    PEAK_FACTOR = 9
+    peak_bytes = output_bytes * PEAK_FACTOR
+    ceiling_bytes = int(memory_ceiling_gb * (1024 ** 3))
+    if peak_bytes > ceiling_bytes:
+        raise MemoryError(
+            f"Resampled prediction is {output_bytes / (1024**3):.2f} GB "
+            f"(K={K}, shape={tgt_shape}, fp32); the trilinear gather "
+            f"peaks at ~{peak_bytes / (1024**3):.1f} GB during compute "
+            f"(8 K-channel intermediate arrays + final blend), exceeding "
+            f"the {memory_ceiling_gb:g} GB peak ceiling. Pick a smaller "
+            f"scale, use the per-axis scale form to upsample only the "
+            f"coarsest axis, or downsample. The streaming variant "
+            f"(slab-by-slab; see roadmap) is the path for large outputs."
+        )
+
+    from .resampling import _cascade_kchannel_to_target, _kchannel_trilinear_full
+
+    needs_cascade = cascade_for_aliasing and any(
+        s_out > 2.001 * s_in for s_in, s_out in zip(src_spacing, tgt_spacing)
+    )
+    if needs_cascade:
+        new_data = _cascade_kchannel_to_target(
+            prediction.data, tgt_shape, src_spacing, tgt_spacing,
+        )
+    else:
+        new_data = _kchannel_trilinear_full(
+            prediction.data, tgt_shape, src_spacing, tgt_spacing,
+        )
+
+    new_geometry = replace(
+        prediction.geometry,
+        spacing_zyx=tgt_spacing,
+        shape_zyx=tgt_shape,
+    )
+    return replace(prediction, data=new_data, geometry=new_geometry)
 
 
 def drop_small_components(
