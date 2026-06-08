@@ -15,6 +15,7 @@ MLX inference for [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) models on Apple 
 - **Path-B inverse resampling.** Trilinear interpolation on the K-channel logit volume with argmax-at-the-end, slab-streamed in unified memory. Smoother boundaries than label-NN, affordable at K≥100 because we slab.
 - **Region-based labels** (BraTS-style sigmoid heads with paint-priority order). Auto-detected from `dataset.json`.
 - **Multi-label component cleanup** via [cc3d](https://github.com/seung-lab/connected-components-3d). ~10× faster than SITK, ~90× faster than scipy.
+- **Surface mesh extraction from logits.** Multi-material SurfaceNets dual mesh straight from the K-channel logit volume — no labelmap step. Vertex positions from sub-voxel logit-field interpolation, gradient-field normals, slab-streamed upsampling to arbitrary output resolution. See [docs/mesh-pipeline.md](docs/mesh-pipeline.md).
 - **Pluggable weights-folder discovery** (`WeightsLayout` registry). Built-in layouts for nnU-Net and TotalSegmentator; downstream packages register their own.
 - **6× faster than PyTorch CPU**, ~1.4× faster than PyTorch MPS on the same hardware. Identical voxel output to upstream nnU-Net.
 
@@ -190,6 +191,53 @@ totalsegmentator(input="scan.nii.gz", output="output/", device="mlx")
 ```
 
 The `-d mlx` flag dispatches to this package's engine. No weight conversion required — checkpoints in `~/.totalsegmentator/nnunet/results` are read directly.
+
+## Surface mesh extraction (SurfaceNets from logits)
+
+Generate a multi-material **dual mesh** directly from the K-channel logit
+volume — no labelmap intermediate. Vertex positions are sub-voxel
+interpolations of the continuous logit field; normals come from the
+field gradient; quads carry VTK's `BoundaryLabels` convention so the
+result drops straight into Slicer.
+
+```python
+from nnunet_inference_mlx import (
+    NiftiReader, TaskCatalog, ModelStore,
+    infer, preprocess, postprocess,
+    mesh_cleanup, mesh_to_vtk_polydata,
+)
+
+image = NiftiReader().read("scan.nii.gz")
+spec = TaskCatalog("totalsegmentator").get("total_fast")
+model = ModelStore("totalsegmentator").load(spec.single)
+
+vol, _ = preprocess.to_model_frame(image, model.model_data, reorient_to="RAS")
+prediction = infer.sliding_window(model, vol)
+
+# Mesh at native model spacing
+mesh = postprocess.to_mesh(
+    prediction,
+    confidence_margin=1.0,            # drop edges at isolated low-margin voxels
+    drop_components_below_mm3=50.0,   # small-component filter
+    project_to_surface=True,          # Newton step onto decision surface
+    emit_normals=True,                # field-gradient normals
+)
+mesh = mesh_cleanup(mesh)             # mesh-side polish (drop tiny regions + smooth)
+
+import vtk
+w = vtk.vtkXMLPolyDataWriter()
+w.SetFileName("scan_mesh.vtp"); w.SetInputData(mesh_to_vtk_polydata(mesh)); w.Write()
+```
+
+For higher-resolution output: `to_mesh(prediction, scale=1.25, ...)` activates
+**memory-bounded slab streaming** — meshes at 1.25× the model's native grid
+without ever materialising the upsampled K-channel volume. See `examples/07_mesh_multitask.py`
+for the multi-task TS-full pattern (`ts:total` = 117-class union of 5 sub-models).
+
+📖 Full docs: [**docs/mesh-pipeline.md**](docs/mesh-pipeline.md) — the recipe,
+memory model, multi-task pattern, and known limitations.
+📁 Examples: [`06_mesh_output.py`](examples/06_mesh_output.py) (single-task)
+and [`07_mesh_multitask.py`](examples/07_mesh_multitask.py) (TS-full).
 
 ## Benchmarks
 

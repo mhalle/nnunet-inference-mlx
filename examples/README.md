@@ -10,6 +10,8 @@ docstring at the top. Run with `uv run` so dependencies are present.
 | [`03_logits_and_resolution.py`](03_logits_and_resolution.py) | First-class logits (`LoadedModel.predict` → `Prediction`), `postprocess` conversions, and output-resolution control |
 | [`04_cascade_and_union.py`](04_cascade_and_union.py) | Multi-model tasks — the TS `total` label-union (and cascade recipes) via the same `segment` one-liner |
 | [`05_toolkit_namespaces.py`](05_toolkit_namespaces.py) | Compose the pipeline by hand: `preprocess.to_model_frame → infer.sliding_window → postprocess.restore` |
+| [`06_mesh_output.py`](06_mesh_output.py) | **CT → SurfaceNets mesh** (single-task) with the recommended cleanup recipe (`confidence_margin`, `cc3d`, `project_to_surface`, `mesh_cleanup`). Optional `scale` arg for memory-bounded upsampling. See [`docs/mesh-pipeline.md`](../docs/mesh-pipeline.md) for the design |
+| [`07_mesh_multitask.py`](07_mesh_multitask.py) | **Multi-task TS-full meshes** — per-sub-task VTPs at the global TS-117 label namespace. The pattern for `label_union` tasks where `mesh_concat` doesn't apply |
 
 ## Running them
 
