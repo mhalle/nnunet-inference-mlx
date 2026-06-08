@@ -1782,6 +1782,26 @@ def surfacenets_logits_at_target(
             in_place=False,
         ).astype(np.int32, copy=False)
 
+    # If labels were modified (confidence_threshold relabel OR cc3d-style
+    # small-component drop), the per-axis crossed booleans computed in
+    # Pass 1 are now STALE. They reflect the original labels, not the
+    # post-relabel ones, so changes (e.g., a spike voxel demoted to
+    # background) wouldn't actually shrink the mesh — we'd still emit
+    # quads at the old crossings.
+    #
+    # Recompute the boolean crossed masks from the new labels. The t
+    # values stay stale for edges whose label *pair* changed (the
+    # interpolation was done with the original L0/L1), but the topology
+    # is now correct. For the spike-removal case this is the right
+    # trade-off: surfaces around relabeled noise voxels go away cleanly,
+    # at the cost of sub-voxel vertex-placement error on edges whose
+    # pair shifted (typically negligible — small components are dropped
+    # to background, t is irrelevant for newly-uncrossed edges).
+    if confidence_threshold > 0.0 or drop_components_below_mm3 > 0.0:
+        x_crossed = labels[:, :, :-1] != labels[:, :, 1:]
+        y_crossed = labels[:, :-1, :] != labels[:, 1:, :]
+        z_crossed = labels[:-1, :, :] != labels[1:, :, :]
+
     # Apply spike-mask gate to crossings post-hoc.
     if confidence_margin > 0.0:
         spike_mask = _compute_spike_mask(
