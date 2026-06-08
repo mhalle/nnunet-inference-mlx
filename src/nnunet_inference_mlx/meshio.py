@@ -368,10 +368,130 @@ def mesh_compute_normals(mesh: Mesh) -> Mesh:
     return replace(mesh, normals=new_normals.astype(np.float32))
 
 
+def mesh_cleanup(
+    mesh: Mesh,
+    *,
+    min_region_cells: int = 200,
+    smooth_iters: int = 30,
+    smooth_passband: float = 0.05,
+) -> Mesh:
+    """Mesh-side cleanup pass: drop tiny disconnected regions, then
+    low-pass smooth.
+
+    Two VTK filters in sequence:
+
+      1. ``vtkPolyDataConnectivityFilter`` keeps only connected regions
+         with at least ``min_region_cells`` faces. Drops floating
+         disconnected debris and small "spike clusters" that survive
+         the voxel-side `confidence_margin` / `drop_components_below_mm3`
+         filters (those see the spike's voxels as face-connected to
+         the main organ, so they aren't removed at the labelmap level —
+         but the SurfaceNets mesh of the spike forms a small isolated
+         protrusion that connectivity does separate from the main bulk).
+
+      2. ``vtkWindowedSincPolyDataFilter`` is a volume-preserving low-
+         pass filter that flattens high-frequency protrusions (residual
+         pyramid spikes, single-voxel surface bumps) without shrinking
+         the bulk of the mesh — unlike Laplacian smoothing, which
+         shrinks. Aggressive (30 iter, passband 0.05) by default.
+
+    Both filters preserve the ``BoundaryLabels`` cell-data and the quad
+    topology. ``Normals`` are re-baked via :func:`mesh_compute_normals`
+    after smoothing so shading stays consistent with the new positions.
+
+    Recommended as a final pass on upsampled meshes from
+    :func:`postprocess.to_mesh` with ``output_spacing_zyx`` / ``scale``
+    upsamples — particularly for thin/curved structures like ribs or
+    vessels, where 1-voxel spike clusters survive the per-voxel rules.
+
+    Requires the ``vtk`` package (lazy-imported).
+    """
+    try:
+        import vtk
+        from vtk.util.numpy_support import vtk_to_numpy
+    except ImportError as e:
+        raise ImportError(
+            "mesh_cleanup requires the 'vtk' package; install with "
+            "`pip install vtk`."
+        ) from e
+    from dataclasses import replace
+
+    pd = mesh_to_vtk_polydata(mesh)
+
+    # ---- 1. Connectivity: identify and drop small isolated regions ---------
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(pd)
+    conn.SetExtractionModeToAllRegions()
+    conn.Update()
+    sizes = vtk_to_numpy(conn.GetRegionSizes())
+    keep_ids = [int(i) for i, s in enumerate(sizes) if int(s) >= min_region_cells]
+
+    if not keep_ids:
+        # Pathological: every region is below threshold. Return empty mesh.
+        return Mesh.empty(mesh.geometry, mesh.schema, with_normals=mesh.has_normals)
+
+    conn_keep = vtk.vtkPolyDataConnectivityFilter()
+    conn_keep.SetInputData(pd)
+    conn_keep.SetExtractionModeToSpecifiedRegions()
+    for rid in keep_ids:
+        conn_keep.AddSpecifiedRegion(rid)
+    conn_keep.Update()
+
+    # ---- 2. Clean: strip unreferenced points after region drop -------------
+    cleanp = vtk.vtkCleanPolyData()
+    cleanp.SetInputConnection(conn_keep.GetOutputPort())
+    cleanp.PointMergingOn()
+    cleanp.Update()
+
+    # ---- 3. WindowedSinc: low-pass smooth (volume-preserving) --------------
+    smooth = vtk.vtkWindowedSincPolyDataFilter()
+    smooth.SetInputConnection(cleanp.GetOutputPort())
+    smooth.SetNumberOfIterations(int(smooth_iters))
+    smooth.SetPassBand(float(smooth_passband))
+    smooth.NonManifoldSmoothingOff()
+    smooth.NormalizeCoordinatesOn()
+    smooth.BoundarySmoothingOff()
+    smooth.FeatureEdgeSmoothingOff()
+    smooth.Update()
+    cleaned_pd = smooth.GetOutput()
+
+    # ---- 4. Read back into a Mesh ------------------------------------------
+    pts_xyz = vtk_to_numpy(cleaned_pd.GetPoints().GetData()).astype(np.float32)
+    new_points = _world_xyz_to_grid_zyx(pts_xyz, mesh.geometry)
+
+    polys = cleaned_pd.GetPolys()
+    n_cells = cleaned_pd.GetNumberOfCells()
+    if n_cells == 0:
+        return Mesh.empty(mesh.geometry, mesh.schema, with_normals=mesh.has_normals)
+    connectivity = vtk_to_numpy(polys.GetConnectivityArray()).astype(np.int32)
+    new_quads = connectivity.reshape(n_cells, 4)
+
+    cd = cleaned_pd.GetCellData()
+    bl_vtk = cd.GetArray("BoundaryLabels")
+    if bl_vtk is None:
+        raise RuntimeError(
+            "mesh_cleanup: BoundaryLabels cell-data lost during VTK pipeline; "
+            "this should not happen with the standard filters."
+        )
+    new_bl = vtk_to_numpy(bl_vtk).reshape(n_cells, -1).astype(np.int32)
+
+    new_mesh = replace(
+        mesh,
+        points=np.ascontiguousarray(new_points.astype(np.float32)),
+        quads=np.ascontiguousarray(new_quads),
+        boundary_labels=np.ascontiguousarray(new_bl),
+        normals=None,  # smoothed positions invalidate prior normals
+    )
+    if mesh.has_normals:
+        new_mesh = mesh_compute_normals(new_mesh)
+    return new_mesh
+
+
 __all__ = [
     "mesh_to_npz",
     "mesh_from_npz",
     "mesh_to_vtk_polydata",
     "mesh_smooth",
     "mesh_compute_normals",
+    "mesh_cleanup",
 ]

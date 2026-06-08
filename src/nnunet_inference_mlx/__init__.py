@@ -26,8 +26,8 @@ from .values import (
 )
 from .mesh import surfacenets_logits
 from .meshio import (
-    mesh_compute_normals, mesh_from_npz, mesh_smooth, mesh_to_npz,
-    mesh_to_vtk_polydata,
+    mesh_cleanup, mesh_compute_normals, mesh_from_npz, mesh_smooth,
+    mesh_to_npz, mesh_to_vtk_polydata,
 )
 
 from .engine import (
@@ -106,6 +106,7 @@ __all__ = [
     "mesh_to_vtk_polydata",
     "mesh_smooth",
     "mesh_compute_normals",
+    "mesh_cleanup",
     # image IO (format plug-ins)
     "NiftiReader",
     "DicomReader",
