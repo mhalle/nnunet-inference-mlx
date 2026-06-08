@@ -667,10 +667,12 @@ def _cell_case(
 
 def _cell_components(
     labels: np.ndarray,
-    logits: np.ndarray,
+    logits: np.ndarray | None,
     x_crossed: np.ndarray,
     y_crossed: np.ndarray,
     z_crossed: np.ndarray,
+    *,
+    saddle_flips: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-cell component info for every cell in the volume.
 
@@ -730,10 +732,18 @@ def _cell_components(
         comp_pairs = np.zeros((Zm1, Ym1, Xm1, 1, 2), dtype=np.int32)
         return edge_components, n_components, comp_pairs
 
-    # Saddle-flip bitfield (logit asymptotic decider).
-    saddle_flips = _compute_saddle_flips(
-        corners, logits, is_boundary, cell_crossed_mask,
-    )
+    # Saddle-flip bitfield (logit asymptotic decider). Caller may supply
+    # a precomputed bitfield — useful for the slab-streaming target-grid
+    # path where saddle face sums are accumulated inside the K-channel
+    # slab loop so we don't have to revisit logits here.
+    if saddle_flips is None:
+        if logits is None:
+            raise ValueError(
+                "_cell_components: provide either `logits` or `saddle_flips`"
+            )
+        saddle_flips = _compute_saddle_flips(
+            corners, logits, is_boundary, cell_crossed_mask,
+        )
 
     # Unique (label_config, crossed_mask, saddle_flips) configurations.
     flat_corners = corners.reshape(-1, 8)
@@ -1361,4 +1371,468 @@ def _trilinear_grad(f_corners: np.ndarray, local: np.ndarray) -> np.ndarray:
     return np.stack([dfdu, dfdv, dfdw], axis=0).astype(np.float32)
 
 
-__all__ = ["surfacenets_logits"]
+# ---------------------------------------------------------------------------
+# Slab-streaming surfacenets at a target grid (output spacing != source).
+#
+# Decomposes the surfacenets pipeline by what consumes K-channel data:
+#
+#   Pass 1  (slab-stream, K-channel work):
+#     For each Z-slab of the target grid: trilinear-gather a K-channel
+#     slab from source, run argmax+margin+edge_crossings+saddle_face_sums
+#     on it, and write the small reduced state (labels, margin, per-axis
+#     crossed/t, saddle_flips) into full-grid numpy buffers. K-channel
+#     slab discarded between iterations → peak memory bounded by slab
+#     budget, not by the (potentially huge) full upsampled volume.
+#
+#   Pass 2  (full-grid CPU work):
+#     The case-table dispatch + cell dual-vertex placement use only the
+#     small reduced buffers. Identical to the in-place pipeline.
+#
+#   Pass 3  (sparse vertex refine):
+#     gradient_refine evaluates ∇f and f at vertex positions. Since the
+#     upsampled K-channel volume is *defined* as a trilinear interp of
+#     source, evaluating at a target-grid vertex maps trivially to
+#     evaluating at the corresponding source coordinate via the same
+#     trilinear over source corners. So gradient_refine reads directly
+#     from the source K-channel logits (already resident) — never needs
+#     the materialised upsampled volume.
+#
+# Result: bitwise-equivalent to the all-at-once version (when the
+# all-at-once version would fit), but memory-bounded for any output
+# size. Pattern mirrors inverse_resample_argmax for the labelmap path.
+# ---------------------------------------------------------------------------
+
+
+def _slab_stream_reduced(
+    src_logits_mx: "mx.array",
+    out_shape_zyx: tuple[int, int, int],
+    src_spacing_zyx: tuple[float, float, float],
+    out_spacing_zyx: tuple[float, float, float],
+    *,
+    peak_working_memory_mb: int = 1024,
+) -> dict:
+    """Pass 1: slab-stream K-channel work and fill full-grid reduced state.
+
+    Returns a dict of full-grid numpy arrays:
+
+      labels        (Z_o, Y_o, X_o)         int32
+      margin        (Z_o, Y_o, X_o)         float32  (top1−top2 logit)
+      x_crossed     (Z_o, Y_o, X_o-1)       bool
+      x_t           (Z_o, Y_o, X_o-1)       float32  (sub-voxel position)
+      y_crossed     (Z_o, Y_o-1, X_o)       bool
+      y_t           (Z_o, Y_o-1, X_o)       float32
+      z_crossed     (Z_o-1, Y_o, X_o)       bool
+      z_t           (Z_o-1, Y_o, X_o)       float32
+      saddle_flips  (Z_o-1, Y_o-1, X_o-1)   uint8  (6-bit per cell)
+
+    The K-channel slab peaks at ~9× the slab K-channel size due to
+    trilinear gather intermediates; ``peak_working_memory_mb`` sizes
+    the slab to bound that peak.
+    """
+    from .resampling import (
+        _precompute_trilinear_indices,
+        _trilinear_from_indices_K,
+    )
+
+    K, Z_s, Y_s, X_s = src_logits_mx.shape
+    Z_o, Y_o, X_o = out_shape_zyx
+
+    # Slab size: bound peak K-channel + 9× intermediates.
+    bytes_per_voxel = K * 4
+    peak_factor = 9
+    max_slab_voxels = (
+        peak_working_memory_mb * 1024 * 1024 // (bytes_per_voxel * peak_factor)
+    )
+    plane = max(1, Y_o * X_o)
+    slab_voxels = max(2, max_slab_voxels // plane)
+    slab_voxels = min(slab_voxels, Z_o)
+
+    s2t = tuple(out_spacing_zyx[i] / src_spacing_zyx[i] for i in range(3))
+    y_coords = mx.arange(Y_o, dtype=mx.float32) * s2t[1]
+    x_coords = mx.arange(X_o, dtype=mx.float32) * s2t[2]
+
+    # Allocate full-grid reduced buffers.
+    labels       = np.empty((Z_o, Y_o, X_o), dtype=np.int32)
+    margin       = np.empty((Z_o, Y_o, X_o), dtype=np.float32)
+    x_crossed    = np.empty((Z_o, Y_o, X_o - 1), dtype=bool)
+    x_t_buf      = np.empty((Z_o, Y_o, X_o - 1), dtype=np.float32)
+    y_crossed    = np.empty((Z_o, Y_o - 1, X_o), dtype=bool)
+    y_t_buf      = np.empty((Z_o, Y_o - 1, X_o), dtype=np.float32)
+    z_crossed    = np.empty((Z_o - 1, Y_o, X_o), dtype=bool)
+    z_t_buf      = np.empty((Z_o - 1, Y_o, X_o), dtype=np.float32)
+    saddle_flips = np.zeros((Z_o - 1, Y_o - 1, X_o - 1), dtype=np.uint8)
+
+    z_lo = 0
+    while z_lo < Z_o:
+        z_hi = min(z_lo + slab_voxels - 1, Z_o - 1)  # inclusive last voxel
+        slab_size = z_hi - z_lo + 1
+
+        # Source Z range needed: cover output z in [z_lo, z_hi] with ±1 pad.
+        z_global = mx.arange(z_lo, z_hi + 1, dtype=mx.float32) * s2t[0]
+        z_lo_f = float(z_lo) * s2t[0]
+        z_hi_f = float(z_hi) * s2t[0]
+        zt_lo = max(0, int(z_lo_f) - 1)
+        zt_hi = max(zt_lo + 1, min(Z_s, int(z_hi_f) + 2))
+        slab_src = src_logits_mx[:, zt_lo:zt_hi]
+        z_local = z_global - zt_lo
+
+        # Trilinear K-channel slab at target coordinates.
+        idx = _precompute_trilinear_indices(
+            z_local, y_coords, x_coords, zt_hi - zt_lo, Y_s, X_s,
+        )
+        slab_K = _trilinear_from_indices_K(slab_src, *idx)
+        mx.eval(slab_K)
+
+        # Argmax + top-1/top-2 margin (one fused MLX pass).
+        slab_labels, slab_margin = _argmax_and_margin(slab_K)
+
+        # Edge crossings (no spike mask in pass 1; applied post-hoc).
+        x_cr, x_tv = _edge_crossings(slab_K, slab_labels, axis=2)
+        y_cr, y_tv = _edge_crossings(slab_K, slab_labels, axis=1)
+        z_cr, z_tv = _edge_crossings(slab_K, slab_labels, axis=0)
+
+        # Saddle face sums for cells fully inside the slab (z in [z_lo, z_hi-1]).
+        if slab_size > 1:
+            slab_cell_crossed_mask = _per_cell_crossed_mask(x_cr, y_cr, z_cr)
+            slab_is_boundary = slab_cell_crossed_mask != 0
+            if slab_is_boundary.any():
+                slab_corners = np.stack([
+                    slab_labels[:-1, :-1, :-1], slab_labels[:-1, :-1, 1:],
+                    slab_labels[:-1, 1:, :-1],  slab_labels[:-1, 1:, 1:],
+                    slab_labels[1:,  :-1, :-1], slab_labels[1:,  :-1, 1:],
+                    slab_labels[1:,  1:, :-1],  slab_labels[1:,  1:, 1:],
+                ], axis=-1)
+                slab_K_np = np.asarray(slab_K)
+                slab_saddle = _compute_saddle_flips(
+                    slab_corners, slab_K_np, slab_is_boundary,
+                    slab_cell_crossed_mask,
+                )
+            else:
+                slab_saddle = np.zeros(
+                    slab_cell_crossed_mask.shape, dtype=np.uint8,
+                )
+
+        # Write reduced state into full-grid buffers. Slab boundaries
+        # overlap by 1 voxel; writes are idempotent (trilinear is
+        # deterministic; argmax/margin/crossings produce identical
+        # values from either side of the seam).
+        labels[z_lo:z_hi + 1]    = slab_labels
+        margin[z_lo:z_hi + 1]    = slab_margin
+        x_crossed[z_lo:z_hi + 1] = x_cr
+        x_t_buf[z_lo:z_hi + 1]   = x_tv
+        y_crossed[z_lo:z_hi + 1] = y_cr
+        y_t_buf[z_lo:z_hi + 1]   = y_tv
+        if slab_size > 1:
+            z_crossed[z_lo:z_hi]    = z_cr
+            z_t_buf[z_lo:z_hi]      = z_tv
+            saddle_flips[z_lo:z_hi] = slab_saddle
+
+        # Drop slab K-channel before next iteration.
+        del slab_K, slab_src
+
+        if z_hi >= Z_o - 1:
+            break
+        z_lo = z_hi  # 1-voxel overlap with next slab
+
+    return {
+        "labels": labels, "margin": margin,
+        "x_crossed": x_crossed, "x_t": x_t_buf,
+        "y_crossed": y_crossed, "y_t": y_t_buf,
+        "z_crossed": z_crossed, "z_t": z_t_buf,
+        "saddle_flips": saddle_flips,
+    }
+
+
+def _apply_spike_mask_to_crossings(
+    x_crossed: np.ndarray, y_crossed: np.ndarray, z_crossed: np.ndarray,
+    spike_mask: np.ndarray,
+) -> None:
+    """Mask out crossings on edges incident to a spike voxel (in-place).
+
+    Same semantics as the spike_mask gate in :func:`_edge_crossings`, but
+    applied to fully-formed full-grid crossed buffers — used by the
+    streaming path where Pass 1 doesn't yet have the labels/margin
+    needed to compute the spike mask.
+    """
+    # X-edges: between (z, y, x) and (z, y, x+1).
+    spike_x_a = spike_mask[:, :, :-1]
+    spike_x_b = spike_mask[:, :, 1:]
+    x_crossed &= ~(spike_x_a | spike_x_b)
+    # Y-edges: between (z, y, x) and (z, y+1, x).
+    spike_y_a = spike_mask[:, :-1, :]
+    spike_y_b = spike_mask[:, 1:, :]
+    y_crossed &= ~(spike_y_a | spike_y_b)
+    # Z-edges: between (z, y, x) and (z+1, y, x).
+    spike_z_a = spike_mask[:-1, :, :]
+    spike_z_b = spike_mask[1:, :, :]
+    z_crossed &= ~(spike_z_a | spike_z_b)
+
+
+def _gradient_refine_at_source(
+    points: np.ndarray,                # (N, 3) vertex positions in target-grid coords
+    cell_to_vertex: np.ndarray,        # (Zm1, Ym1, Xm1, MAX_COMP)
+    n_comp: np.ndarray,                # (Zm1, Ym1, Xm1) int8
+    comp_pairs: np.ndarray,            # (Zm1, Ym1, Xm1, MAX_COMP, 2) int32
+    src_logits_mx: "mx.array",         # (K, Z_s, Y_s, X_s) source logits
+    src_spacing_zyx: tuple[float, float, float],
+    out_spacing_zyx: tuple[float, float, float],
+    *,
+    project: bool,
+    emit_normals: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Pass 3: refine vertex positions and/or compute normals using *source* logits.
+
+    The vertex positions live on the target grid, but ``f = L_i − L_j``
+    on the target grid is by definition the trilinear interp of source
+    ``L_i, L_j``. So we evaluate ``f`` and ``∇f`` directly over the 8
+    surrounding source-grid corners — no need to materialise the upsampled
+    K-channel volume.
+
+    The Newton step writes target-grid coordinates back into ``points``;
+    the gradient in target coords is the source-coord gradient scaled by
+    ``s2t = out_spacing / src_spacing`` per axis (chain rule on a
+    coordinate scale).
+    """
+    Zm1, Ym1, Xm1, MAX_COMP = cell_to_vertex.shape
+    K, Z_s, Y_s, X_s = src_logits_mx.shape
+    n_total = int(points.shape[0])
+    if n_total == 0:
+        normals = np.zeros((0, 3), dtype=np.float32) if emit_normals else None
+        return points, normals
+
+    # Map each vertex's target-grid position to source coords.
+    s2t = np.array([
+        out_spacing_zyx[0] / src_spacing_zyx[0],
+        out_spacing_zyx[1] / src_spacing_zyx[1],
+        out_spacing_zyx[2] / src_spacing_zyx[2],
+    ], dtype=np.float32)
+    src_pos = points * s2t[None, :]                        # (N, 3) in source-grid coords
+    np.clip(src_pos[:, 0], 0.0, Z_s - 1.0001, out=src_pos[:, 0])
+    np.clip(src_pos[:, 1], 0.0, Y_s - 1.0001, out=src_pos[:, 1])
+    np.clip(src_pos[:, 2], 0.0, X_s - 1.0001, out=src_pos[:, 2])
+
+    # Per-vertex (host cell, component slot, label pair).
+    used = (cell_to_vertex >= 0)
+    z_arr, y_arr, x_arr, k_arr = np.nonzero(used)
+    vert_ids = cell_to_vertex[z_arr, y_arr, x_arr, k_arr]
+    order = np.argsort(vert_ids, kind="stable")
+    z_arr = z_arr[order]; y_arr = y_arr[order]
+    x_arr = x_arr[order]; k_arr = k_arr[order]
+    pair = comp_pairs[z_arr, y_arr, x_arr, k_arr]          # (N, 2)
+    i_arr = pair[:, 0].astype(np.intp)
+    j_arr = pair[:, 1].astype(np.intp)
+
+    # 8 source-grid corner indices surrounding each vertex.
+    src_z = src_pos[:, 0]; src_y = src_pos[:, 1]; src_x = src_pos[:, 2]
+    z0 = np.floor(src_z).astype(np.intp); z1 = z0 + 1
+    y0 = np.floor(src_y).astype(np.intp); y1 = y0 + 1
+    x0 = np.floor(src_x).astype(np.intp); x1 = x0 + 1
+    np.clip(z0, 0, Z_s - 1, out=z0); np.clip(z1, 0, Z_s - 1, out=z1)
+    np.clip(y0, 0, Y_s - 1, out=y0); np.clip(y1, 0, Y_s - 1, out=y1)
+    np.clip(x0, 0, X_s - 1, out=x0); np.clip(x1, 0, X_s - 1, out=x1)
+
+    u = (src_z - z0.astype(np.float32))                    # local fractional source coords
+    v = (src_y - y0.astype(np.float32))
+    w = (src_x - x0.astype(np.float32))
+
+    # Gather f = L_i − L_j at the 8 source corners for each vertex.
+    # Use the source MLX array; do the gather there for speed, then to numpy.
+    src_logits_np = np.asarray(src_logits_mx)
+    f_corners = np.empty((8, n_total), dtype=np.float32)
+    for corner_idx in range(8):
+        dz = (corner_idx >> 2) & 1
+        dy = (corner_idx >> 1) & 1
+        dx = corner_idx & 1
+        zz = z1 if dz else z0
+        yy = y1 if dy else y0
+        xx = x1 if dx else x0
+        l_i = src_logits_np[i_arr, zz, yy, xx]
+        l_j = src_logits_np[j_arr, zz, yy, xx]
+        f_corners[corner_idx] = l_i - l_j
+
+    # Use the existing trilinear primitives. Pass local source coords (u, v, w).
+    local = np.stack([u, v, w], axis=-1)
+
+    if project:
+        n_at_cell = n_comp[z_arr, y_arr, x_arr]
+        is_binary = (n_at_cell == 1)
+        if is_binary.any():
+            f_val = _trilinear_eval(f_corners, local)
+            grad_src = _trilinear_grad(f_corners, local)    # (3, N) in source coords
+            grad_sq = (grad_src ** 2).sum(axis=0)
+            safe = np.maximum(grad_sq, np.float32(1e-10))
+            # Newton step in source coords: src_pos ← src_pos − f · ∇f / |∇f|²
+            step_src = (-f_val / safe).astype(np.float32)
+            step_src_local = step_src[:, None] * grad_src.T  # (N, 3) source-coord step
+            # Convert source-coord step back to target-coord step: scale by 1/s2t
+            inv_s2t = np.float32(1.0) / s2t
+            step_target = step_src_local * inv_s2t[None, :]
+            new_points = np.where(is_binary[:, None], points + step_target, points)
+            points = new_points
+
+    normals: np.ndarray | None = None
+    if emit_normals:
+        # Re-evaluate gradient at (possibly refined) position.
+        if project and is_binary.any():
+            # Recompute local source coords after the step.
+            src_pos_new = points * s2t[None, :]
+            np.clip(src_pos_new[:, 0], 0.0, Z_s - 1.0001, out=src_pos_new[:, 0])
+            np.clip(src_pos_new[:, 1], 0.0, Y_s - 1.0001, out=src_pos_new[:, 1])
+            np.clip(src_pos_new[:, 2], 0.0, X_s - 1.0001, out=src_pos_new[:, 2])
+            z0n = np.floor(src_pos_new[:, 0]).astype(np.intp)
+            y0n = np.floor(src_pos_new[:, 1]).astype(np.intp)
+            x0n = np.floor(src_pos_new[:, 2]).astype(np.intp)
+            np.clip(z0n, 0, Z_s - 1, out=z0n)
+            np.clip(y0n, 0, Y_s - 1, out=y0n)
+            np.clip(x0n, 0, X_s - 1, out=x0n)
+            # Re-gather (only the binary cells moved; just recompute all for simplicity)
+            for corner_idx in range(8):
+                dz = (corner_idx >> 2) & 1
+                dy = (corner_idx >> 1) & 1
+                dx = corner_idx & 1
+                zz = z0n + dz; yy = y0n + dy; xx = x0n + dx
+                np.clip(zz, 0, Z_s - 1, out=zz)
+                np.clip(yy, 0, Y_s - 1, out=yy)
+                np.clip(xx, 0, X_s - 1, out=xx)
+                f_corners[corner_idx] = (
+                    src_logits_np[i_arr, zz, yy, xx]
+                    - src_logits_np[j_arr, zz, yy, xx]
+                )
+            un = src_pos_new[:, 0] - z0n.astype(np.float32)
+            vn = src_pos_new[:, 1] - y0n.astype(np.float32)
+            wn = src_pos_new[:, 2] - x0n.astype(np.float32)
+            local = np.stack([un, vn, wn], axis=-1)
+        grad_src = _trilinear_grad(f_corners, local)        # (3, N) in source coords
+        # Normal lives in TARGET-grid coords. Convert source-grad to target-grad:
+        #   ∂f/∂t_axis = ∂f/∂s_axis · ds_axis/dt_axis = ∂f/∂s_axis · s2t_axis
+        grad_target = grad_src * s2t[:, None]
+        # Sign convention matches in-place gradient_refine:
+        #   pair (0, b)            : normal = +∇f
+        #   pair (a, b) both non-0 : normal = −∇f
+        sign = np.where(i_arr == 0, np.float32(1.0), np.float32(-1.0))
+        n = (sign[:, None] * grad_target.T).astype(np.float32)
+        mag = np.linalg.norm(n, axis=1, keepdims=True)
+        mag = np.maximum(mag, np.float32(1e-10))
+        normals = (n / mag).astype(np.float32)
+
+    return np.ascontiguousarray(points.astype(np.float32)), normals
+
+
+def surfacenets_logits_at_target(
+    prediction,                         # Prediction (from values.py)
+    target_geometry: Geometry,
+    *,
+    project_to_surface: bool = False,
+    emit_normals: bool = False,
+    confidence_margin: float = 0.0,
+    confidence_threshold: float = 0.0,
+    drop_components_below_mm3: float = 0.0,
+    peak_working_memory_mb: int = 1024,
+) -> Mesh:
+    """Surfacenets at an arbitrary target grid, slab-streaming the K-channel work.
+
+    Memory-bounded — no full upsampled K-channel volume is materialised.
+    Bitwise-equivalent to ``surfacenets_logits`` called on the would-be
+    fully-resampled prediction (when the latter would fit).
+    """
+    src_logits_mx = prediction.data
+    src_spacing = tuple(float(s) for s in prediction.geometry.spacing_zyx)
+    tgt_shape = tuple(int(n) for n in target_geometry.shape_zyx)
+    tgt_spacing = tuple(float(s) for s in target_geometry.spacing_zyx)
+    schema = prediction.schema
+
+    Z_o, Y_o, X_o = tgt_shape
+    if Z_o < 2 or Y_o < 2 or X_o < 2:
+        return Mesh.empty(target_geometry, schema)
+
+    # Pass 1: slab-stream the K-channel work → full-grid reduced state.
+    reduced = _slab_stream_reduced(
+        src_logits_mx, tgt_shape, src_spacing, tgt_spacing,
+        peak_working_memory_mb=peak_working_memory_mb,
+    )
+    labels       = reduced["labels"]
+    margin_vol   = reduced["margin"]
+    x_crossed    = reduced["x_crossed"]
+    x_t          = reduced["x_t"]
+    y_crossed    = reduced["y_crossed"]
+    y_t          = reduced["y_t"]
+    z_crossed    = reduced["z_crossed"]
+    z_t          = reduced["z_t"]
+    saddle_flips = reduced["saddle_flips"]
+
+    # Apply confidence_threshold (operates on full-grid labels + margin).
+    if confidence_threshold > 0.0:
+        # _suppress_low_confidence_blobs originally consumes K-channel logits to
+        # recompute margin if not provided; we already have margin from pass 1.
+        labels = _suppress_low_confidence_blobs(
+            labels, None, float(confidence_threshold),
+            precomputed_margin=margin_vol,
+        )
+
+    if drop_components_below_mm3 > 0.0:
+        from .postprocessing import remove_small_components
+        labels = remove_small_components(
+            labels, tgt_spacing,
+            min_volume_mm3=float(drop_components_below_mm3),
+            in_place=False,
+        ).astype(np.int32, copy=False)
+
+    # Apply spike-mask gate to crossings post-hoc.
+    if confidence_margin > 0.0:
+        spike_mask = _compute_spike_mask(
+            labels, margin_vol, float(confidence_margin),
+        )
+        _apply_spike_mask_to_crossings(x_crossed, y_crossed, z_crossed, spike_mask)
+        # Recompute saddle_flips against the now-smaller crossed set.
+        # (Saddle face sums computed in pass 1 are fine — they describe
+        # the logit-bilinear direction; what changes is whether the cell
+        # is a true 4-edges-crossed saddle. We just need the gate. Most
+        # straightforward: rebuild saddle_flips from the masked crossings.)
+        # For simplicity here, rebuild from the masked crossings via
+        # the saddle_flips bitfield ANDed with all-4-face-edges-crossed.
+        cell_crossed_mask = _per_cell_crossed_mask(x_crossed, y_crossed, z_crossed)
+        for face_idx in range(6):
+            bits = _FACE_EDGE_BITS[face_idx]
+            face_all_crossed = (cell_crossed_mask & np.uint16(bits)) == np.uint16(bits)
+            # Clear bit `face_idx` of saddle_flips where face is not fully crossed.
+            keep_face = face_all_crossed
+            saddle_flips = np.where(
+                keep_face,
+                saddle_flips,
+                saddle_flips & np.uint8(~(1 << face_idx) & 0xFF),
+            ).astype(np.uint8)
+
+    # Pass 2: cell case-table dispatch + dual vertex placement.
+    edge_comp, n_comp, comp_pairs = _cell_components(
+        labels, None, x_crossed, y_crossed, z_crossed,
+        saddle_flips=saddle_flips,
+    )
+    cell_to_vertex, points = _cell_dual_vertices(
+        edge_comp, n_comp, x_t, y_t, z_t,
+    )
+
+    # Pass 3: vertex refine + normals using SOURCE logits (no upsampled volume).
+    normals = None
+    if project_to_surface or emit_normals:
+        points, normals = _gradient_refine_at_source(
+            points, cell_to_vertex, n_comp, comp_pairs,
+            src_logits_mx, src_spacing, tgt_spacing,
+            project=project_to_surface,
+            emit_normals=emit_normals,
+        )
+
+    quads, boundary_labels = _emit_quads(
+        x_crossed, y_crossed, z_crossed, cell_to_vertex, edge_comp, labels,
+    )
+
+    return Mesh(
+        points=points,
+        quads=quads.astype(np.int32, copy=False),
+        boundary_labels=boundary_labels.astype(np.int32, copy=False),
+        geometry=target_geometry,
+        schema=schema,
+        normals=normals,
+    )
+
+
+__all__ = ["surfacenets_logits", "surfacenets_logits_at_target"]

@@ -221,6 +221,10 @@ def to_mesh(
     confidence_margin: float = 0.0,
     confidence_threshold: float = 0.0,
     drop_components_below_mm3: float = 0.0,
+    output_spacing_zyx: tuple[float, float, float] | None = None,
+    output_shape_zyx: tuple[int, int, int] | None = None,
+    scale: float | tuple[float, float, float] | None = None,
+    peak_working_memory_mb: int = 1024,
 ) -> Mesh:
     """Extract a SurfaceNets dual mesh from the prediction's logits.
 
@@ -273,6 +277,16 @@ def to_mesh(
         ``200.0`` matches TS's ``--remove_small_blobs``. Requires
         ``cc3d``; 0.0 (default) is a no-op.
 
+    Output resolution:
+        If any of ``output_spacing_zyx``, ``output_shape_zyx``, or
+        ``scale`` is specified, the mesh is extracted at a target grid
+        different from the prediction's own. Internally this uses the
+        slab-streaming pipeline (``surfacenets_logits_at_target``) which
+        never materialises the full upsampled K-channel volume — so
+        upsampling to arbitrarily large output grids is memory-bounded
+        by ``peak_working_memory_mb`` (default 1 GB), unlike
+        :func:`resample_prediction` which peaks at ~9× the output size.
+
     See :func:`mesh.surfacenets_logits` for algorithm details, the
     triple-junction rule, and volume-boundary closure caveats.
     """
@@ -281,12 +295,41 @@ def to_mesh(
             "to_mesh does not yet support region-based label schemas; "
             "only standard argmax schemas are handled."
         )
-    from .mesh import surfacenets_logits
 
-    # Pass the mx.array through directly — surfacenets_logits runs
-    # the K-channel dense ops (argmax, top-2 margin, edge crossings,
-    # etc.) on the GPU. Wrapping in np.asarray here would round-trip
-    # a 3 GB copy back to MLX inside surfacenets_logits.
+    # Resolve target geometry if any resampling parameter was specified.
+    n_set = sum(
+        x is not None for x in (output_spacing_zyx, output_shape_zyx, scale)
+    )
+    if n_set > 1:
+        raise ValueError(
+            "specify at most one of output_spacing_zyx, output_shape_zyx, "
+            f"or scale; got {n_set}"
+        )
+    if n_set == 1:
+        target_geometry = _resolve_mesh_target_geometry(
+            prediction.geometry,
+            output_spacing_zyx=output_spacing_zyx,
+            output_shape_zyx=output_shape_zyx,
+            scale=scale,
+        )
+        if target_geometry.shape_zyx != prediction.geometry.shape_zyx or any(
+            abs(a - b) > 1e-6
+            for a, b in zip(target_geometry.spacing_zyx,
+                            prediction.geometry.spacing_zyx)
+        ):
+            from .mesh import surfacenets_logits_at_target
+            return surfacenets_logits_at_target(
+                prediction, target_geometry,
+                project_to_surface=project_to_surface,
+                emit_normals=emit_normals,
+                confidence_margin=confidence_margin,
+                confidence_threshold=confidence_threshold,
+                drop_components_below_mm3=drop_components_below_mm3,
+                peak_working_memory_mb=peak_working_memory_mb,
+            )
+
+    # Native-grid path.
+    from .mesh import surfacenets_logits
     return surfacenets_logits(
         prediction.data, prediction.geometry, prediction.schema,
         project_to_surface=project_to_surface,
@@ -295,6 +338,55 @@ def to_mesh(
         confidence_threshold=confidence_threshold,
         drop_components_below_mm3=drop_components_below_mm3,
     )
+
+
+def _resolve_mesh_target_geometry(
+    src_geometry: Geometry,
+    *,
+    output_spacing_zyx: tuple[float, float, float] | None = None,
+    output_shape_zyx: tuple[int, int, int] | None = None,
+    scale: float | tuple[float, float, float] | None = None,
+) -> Geometry:
+    """Build the target Geometry from one of the three parameter forms.
+
+    Mirror of the same logic in :func:`resample_prediction`; kept here
+    so to_mesh's streaming path doesn't have to materialise the
+    intermediate Prediction.
+    """
+    src_spacing = tuple(float(s) for s in src_geometry.spacing_zyx)
+    src_shape = tuple(int(n) for n in src_geometry.shape_zyx)
+
+    if output_spacing_zyx is not None:
+        tgt_spacing = tuple(float(s) for s in output_spacing_zyx)
+        if len(tgt_spacing) != 3 or any(s <= 0 for s in tgt_spacing):
+            raise ValueError(
+                f"output_spacing_zyx must be 3 positive floats; got {output_spacing_zyx!r}"
+            )
+        tgt_shape = tuple(
+            max(1, int(round(n * s_in / s_out)))
+            for n, s_in, s_out in zip(src_shape, src_spacing, tgt_spacing)
+        )
+    elif output_shape_zyx is not None:
+        tgt_shape = tuple(int(n) for n in output_shape_zyx)
+        if len(tgt_shape) != 3 or any(n < 1 for n in tgt_shape):
+            raise ValueError(
+                f"output_shape_zyx must be 3 positive ints; got {output_shape_zyx!r}"
+            )
+        tgt_spacing = tuple(
+            s_in * n_in / n_out
+            for s_in, n_in, n_out in zip(src_spacing, src_shape, tgt_shape)
+        )
+    else:
+        if isinstance(scale, (int, float)):
+            sc = (float(scale), float(scale), float(scale))
+        else:
+            sc = tuple(float(s) for s in scale)  # type: ignore[arg-type]
+        if len(sc) != 3 or any(s <= 0 for s in sc):
+            raise ValueError(f"scale must be a positive scalar or 3-tuple; got {scale!r}")
+        tgt_shape = tuple(max(1, int(round(n * s))) for n, s in zip(src_shape, sc))
+        tgt_spacing = tuple(s_in / s for s_in, s in zip(src_spacing, sc))
+
+    return replace(src_geometry, spacing_zyx=tgt_spacing, shape_zyx=tgt_shape)
 
 
 def resample_prediction(
