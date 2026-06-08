@@ -1437,7 +1437,12 @@ def _slab_stream_reduced(
     K, Z_s, Y_s, X_s = src_logits_mx.shape
     Z_o, Y_o, X_o = out_shape_zyx
 
-    # Slab size: bound peak K-channel + 9× intermediates.
+    # Slab size: bound peak K-channel + ~9× intermediates (8 corner
+    # gathers in the trilinear blend + final blend held simultaneously).
+    # Tried lowering this factor to 3× empirically — bigger slabs swapped
+    # against system memory and ran 4× slower despite ~3× fewer iterations,
+    # so the conservative 9× estimate stays. (MLX lazy eval doesn't fuse
+    # away the corner intermediates on M2 in practice.)
     bytes_per_voxel = K * 4
     peak_factor = 9
     max_slab_voxels = (
