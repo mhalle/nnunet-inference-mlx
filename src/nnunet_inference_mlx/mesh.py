@@ -944,8 +944,14 @@ def _cell_dual_vertices(
             np.zeros((0, 3), dtype=np.float32),
         )
 
-    # Per-cell crossing-centroid accumulation (vectorized over the whole
-    # volume — same shape as the v1 implementation, no per-component axis).
+    # Per-cell crossing-centroid accumulation. NOTE: a tested MLX
+    # port of this 12-pass accumulation was 4.3× faster in isolation
+    # (110 ms vs 480 ms on chest TS-fast) but a ~1 s end-to-end
+    # regression when integrated — the MLX graph compile/eval costs
+    # interleave badly with the other MLX stages (argmax, edge
+    # crossings) and the variance grew. Kept on CPU until the rest
+    # of the pipeline is unified into a single fused MLX graph
+    # (Phase 3+ work).
     sum_pos = np.zeros((Zm1, Ym1, Xm1, 3), dtype=np.float32)
     count = np.zeros((Zm1, Ym1, Xm1), dtype=np.int32)
 
