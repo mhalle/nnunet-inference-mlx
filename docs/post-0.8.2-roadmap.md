@@ -90,7 +90,7 @@ Can ship alongside the orchestrator above as a single 0.9.0 release, or split in
 
 ### 0.9.3 — MOOSE compatibility (audit-grounded)
 
-MOOSE (Multi-organ objective segmentation, ENHANCE-PET) ships nnU-Netv2-trained models for whole-body CT/PET/MR segmentation. **This section is grounded in a source audit of MOOSE v3.1.6** (`~/Dropbox/development/moose/MOOSE`), not from memory — the TS audit taught us that auditing materially changes the plan.
+MOOSE (Multi-organ objective segmentation, ENHANCE-PET) ships nnU-Netv2-trained models for whole-body CT/PET/MR segmentation. **This section is grounded in a source audit of MOOSE v3.1.6** (`~/Dropbox/development/medseg/upstream/MOOSE`), not from memory — the TS audit taught us that auditing materially changes the plan.
 
 **Audit findings (MOOSE v3.1.6):**
 

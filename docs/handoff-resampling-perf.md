@@ -48,7 +48,7 @@ Nothing was committed this session. Two repos:
   assert the RAS reframe (it had encoded the bug). One **pre-existing** failure
   remains: `test_different_qform_sform_roundtrip` (qform-restore, unrelated).
 
-(The `TotalSegmentator` fork at `~/Dropbox/development/total-segmentator/TotalSegmentator`,
+(The `TotalSegmentator` fork at `~/Dropbox/development/medseg/upstream/TotalSegmentator`,
 branch `feature/mlx-backend`, lib pinned to `nnunet-inference-mlx@4771d79`, is the
 repro env for upstream MLX-via-TS — not ours to commit; only an untracked `uv.lock`.)
 
