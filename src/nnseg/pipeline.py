@@ -32,8 +32,11 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "mps", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
-            folds=(0,), progress=None):
+            folds=(0,), accumulate: str = "auto", progress=None):
     """Segment a NIfTI path (or nibabel image) with a task from the toolkit's catalog.
+
+    ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
+    device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
 
     Returns ``(labels_img, schema, timings)``: a nibabel image of the labels in the *input's*
     orientation on the requested grid (``"input"`` = the input grid, a number = isotropic at
@@ -66,7 +69,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     for i, (wid, remap, pname) in enumerate(parts):
         t = time.perf_counter()
         say(f"loading {pname} ({wid})")
-        model = TorchModel(resolve_model_folder(wid, model_root=model_root), folds=folds, device=device, dtype=dtype)
+        model = TorchModel(resolve_model_folder(wid, model_root=model_root), folds=folds, device=device,
+                           dtype=dtype, accumulate=accumulate)
         T[f"load:{pname}"] = time.perf_counter() - t
         t = time.perf_counter()
         key = model.spacing_zyx
@@ -81,6 +85,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
         t = time.perf_counter()
         say(f"predicting {pname} ({i + 1}/{len(parts)})")
         logits = model.predict_logits(x)
+        say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}")
         T[f"network:{pname}"] = time.perf_counter() - t
         t = time.perf_counter()
         logits = logits.to(device)

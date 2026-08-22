@@ -17,6 +17,8 @@ def main(argv=None) -> int:
                    help="logit interpolation for the restore: linear = sub-voxel boundaries; nearest = TotalSegmentator semantics")
     s.add_argument("--device", default="mps")
     s.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    s.add_argument("--accumulate", choices=("auto", "device", "host"), default="auto",
+                   help="sliding-window accumulator placement: auto (from free device memory), device (fastest, needs headroom), host")
     s.add_argument("--model-root", default=None)
     s.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -24,7 +26,7 @@ def main(argv=None) -> int:
         from .pipeline import segment
         import nibabel as nib
         img, schema, T = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
-                                 grid=args.spacing if args.spacing else "input", interp=args.interp,
+                                 grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
                                  progress=None if args.quiet else (lambda m: print(f"  {m}", file=sys.stderr, flush=True)))
         nib.save(img, args.output)
         if not args.quiet:
