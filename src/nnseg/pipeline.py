@@ -88,15 +88,25 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
         say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}")
         T[f"network:{pname}"] = time.perf_counter() - t
         t = time.perf_counter()
+        # free the network before the restore: on a memory-tight device the weights and the
+        # cached activations are dead weight while the logits need to be resident
+        lut = _lut(model.K, remap)
+        del model
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device == "cuda":
+            torch.cuda.empty_cache()
         logits = logits.to(device)
         lg.to_labels(logits, out_grid, frame.mapping(out_grid), interp=interp, outside=outside,
-                     lut=_lut(model.K, remap), paint=len(parts) > 1, out=labels, backend="auto")
+                     lut=lut, paint=len(parts) > 1, out=labels, backend="auto")
         if device == "mps":
             torch.mps.synchronize()
         T[f"restore:{pname}"] = time.perf_counter() - t
-        del logits, model
+        del logits
         if device == "mps":
             torch.mps.empty_cache()
+        elif device == "cuda":
+            torch.cuda.empty_cache()
 
     t = time.perf_counter()
     arr_xyz = np.ascontiguousarray(labels.cpu().numpy().T)

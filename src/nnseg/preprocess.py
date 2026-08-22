@@ -32,7 +32,7 @@ def forward_resample(data_xyz: np.ndarray, spacing_xyz, new_spacing_xyz, *, conv
     zoom = np.asarray(spacing_xyz, dtype=np.float64) / np.asarray(new_spacing_xyz, dtype=np.float64)
     new_shape = tuple(int(round(o * z)) for o, z in zip(data_xyz.shape, zoom))
     # exactly TS's resample_img_torch: float32 in, shape-based corner mapping, spline prefilter, edge mode
-    arr = np.ascontiguousarray(data_xyz).astype(np.float32)[None]
+    arr = np.ascontiguousarray(data_xyz, dtype=np.float32)[None]        # no copy when already float32 C-order
     out = resample_data_or_seg_to_shape_gpu(arr, new_shape, is_seg=False, device=device,
                                             convention=convention, order=order, mode="nearest", anti_alias=False)
     out = np.asarray(out)[0]
@@ -56,11 +56,16 @@ def to_model_frame(img_can, model, *, convention: str = "corner", device="mps") 
     (CT: clip to the 0.5 / 99.5 percentiles, z-score). No crop-to-nonzero (TS-style).
     """
     spacing_xyz = tuple(float(z) for z in img_can.header.get_zooms()[:3])
-    data_xyz = img_can.get_fdata(dtype=np.float64)
+    # float32, not TotalSegmentator's float64 get_fdata: the resampler casts to float32 anyway,
+    # and on a whole-body native grid the float64 copy alone is 3.3 GB of host memory.
+    data_xyz = np.asanyarray(img_can.dataobj).astype(np.float32, copy=False)
+    source_shape_xyz = data_xyz.shape
     model_spacing_xyz = tuple(model.spacing_zyx[::-1])
     res_xyz, new_shape_xyz = forward_resample(data_xyz, spacing_xyz, model_spacing_xyz, convention=convention, device=device)
+    del data_xyz
     x_zyx = normalize(np.ascontiguousarray(res_xyz.T), model.normalization_schemes, model.intensity_properties(0))
-    source = Grid(tuple(int(s) for s in data_xyz.shape[::-1]), spacing_xyz[::-1], (0.0, 0.0, 0.0))
+    del res_xyz
+    source = Grid(tuple(int(s) for s in source_shape_xyz[::-1]), spacing_xyz[::-1], (0.0, 0.0, 0.0))
     frame = Frame(source=source, model_shape=tuple(x_zyx.shape), model_spacing=tuple(model.spacing_zyx),
                   convention=convention, affine_canonical=np.asarray(img_can.affine))
     return torch.from_numpy(x_zyx)[None], frame
