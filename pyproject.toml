@@ -21,6 +21,7 @@ nnmlx = "nnunet_inference_mlx.cli:app"
 # `TotalSegmentator` lets existing command lines work verbatim under `uv run`.
 TotalSegmentator = "nnunet_inference_mlx.ts_cli:main"
 totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
+nnseg = "nnseg.cli:main"
 
 [project.optional-dependencies]
 # Remote weight download (store.download / download_archive).
@@ -28,16 +29,23 @@ remote = ["httpx"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
 test = ["pytest"]
+# The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader, the nnU-Net fork at
+# resample-gpu-v1 (editable, path source below), labelgrid (path source), nibabel for TS-style IO.
+torch = ["torch>=2.7", "nnunetv2", "labelgrid", "nibabel", "scipy"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nnunet_inference_mlx"]
+packages = ["src/nnunet_inference_mlx", "src/nnseg"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
+
+[tool.uv.sources]
+nnunetv2 = { path = "../upstream/nnUNet", editable = true }
+labelgrid = { path = "../labelgrid", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
