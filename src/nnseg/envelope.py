@@ -79,6 +79,21 @@ def envelope_of(mask_zyx: np.ndarray, *, margin_voxels) -> Envelope:
     return Envelope(lo, hi, shape)
 
 
+def worth_cropping(env: Envelope, *, min_saving: float = 0.05) -> Envelope:
+    """Collapse a barely-cropping box back to the whole grid.
+
+    A crop that still covers most of the grid buys almost no network time but re-tiles the
+    sliding window - shifting patch seams - which is the *only* thing that perturbs labels
+    (near-tie churn at the new seams). Below ``min_saving`` fractional saving the crop is not
+    worth that, so run the whole grid instead: the envelope becomes strictly no-op-or-win. This
+    is common on MR, whose tight FOV leaves little air to remove (CT crops are far below the
+    threshold, so this never fires there).
+    """
+    if env.is_whole() or (1.0 - env.fraction) < min_saving:
+        return Envelope((0, 0, 0), env.shape, env.shape)
+    return env
+
+
 def margin_in_voxels(margin_mm: float, spacing_zyx) -> tuple[int, int, int]:
     return tuple(int(np.ceil(float(margin_mm) / float(s))) for s in spacing_zyx)
 

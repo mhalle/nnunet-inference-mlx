@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .envelope import Envelope, body_mask, body_threshold, envelope_of, label_roi, margin_in_voxels
+from .envelope import (Envelope, body_mask, body_threshold, envelope_of, label_roi,
+                       margin_in_voxels, worth_cropping)
 from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
@@ -136,7 +137,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
         hi = [min(n, v) for n, v in zip(shape, hi)]
         if any(h <= l for l, h in zip(lo, hi)):               # empty -> fall back to whole grid
             return Envelope((0, 0, 0), shape, shape)
-        return Envelope(tuple(lo), tuple(hi), shape)
+        # a box that barely crops only re-tiles the window (churn, ~no speedup): run whole instead
+        return worth_cropping(Envelope(tuple(lo), tuple(hi), shape))
 
     def predict_into(model, x, frame, ogrid, env, *, lut, paint, out):
         crop = x[(slice(None), *env.slices)] if not env.is_whole() else x

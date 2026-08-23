@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip("scipy")
-from nnseg.envelope import body_mask, envelope_of, margin_in_voxels
+from nnseg.envelope import Envelope, body_mask, envelope_of, margin_in_voxels
 
 
 def _ct(shape=(20, 30, 40)):
@@ -111,3 +111,28 @@ def test_body_threshold_mr_ignores_stray_ct_properties():
     t = body_threshold(x, normalization_schemes=("ZScoreNormalization",),
                        intensity_properties={"percentile_00_5": -700.0, "mean": 100.0, "std": 250.0})
     assert -1.0 < t < 2.0                        # Otsu, not the (-700-100)/250 HU value
+
+
+def test_worth_cropping_collapses_a_near_whole_box():
+    from nnseg.envelope import worth_cropping
+    shape = (100, 100, 100)
+    near = Envelope((0, 0, 0), (100, 100, 98), shape)     # crops 2% -> below the 5% default
+    assert 0.97 < near.fraction < 0.99
+    assert worth_cropping(near).is_whole()
+
+
+def test_worth_cropping_keeps_a_real_crop():
+    from nnseg.envelope import worth_cropping
+    shape = (100, 100, 100)
+    real = Envelope((0, 0, 0), (100, 100, 70), shape)     # crops 30%
+    out = worth_cropping(real)
+    assert out is real and not out.is_whole()
+
+
+def test_worth_cropping_passes_through_whole_and_respects_min_saving():
+    from nnseg.envelope import worth_cropping
+    shape = (10, 10, 10)
+    assert worth_cropping(Envelope((0, 0, 0), shape, shape)).is_whole()   # already whole
+    box = Envelope((0, 0, 0), (10, 10, 8), shape)                          # exactly 20% saving
+    assert not worth_cropping(box, min_saving=0.05).is_whole()             # 20% >= 5% -> kept
+    assert worth_cropping(box, min_saving=0.25).is_whole()                 # 20% < 25% -> collapsed
