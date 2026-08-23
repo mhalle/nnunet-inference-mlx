@@ -81,3 +81,15 @@ def envelope_of(mask_zyx: np.ndarray, *, margin_voxels) -> Envelope:
 
 def margin_in_voxels(margin_mm: float, spacing_zyx) -> tuple[int, int, int]:
     return tuple(int(np.ceil(float(margin_mm) / float(s))) for s in spacing_zyx)
+
+
+def label_roi(labels_zyx: np.ndarray, classes, *, margin_voxels) -> Envelope:
+    """Bounding box of any of ``classes`` in a labelmap, padded by ``margin_voxels``.
+
+    The cascade counterpart of the body envelope: a coarse model labels everything, and the
+    fine model runs only inside the box of the organ(s) it refines. An absent class yields the
+    whole grid, so a coarse-model miss (e.g. adrenal on some chests) falls back to the full
+    volume rather than an empty crop - the same fail-safe as the body envelope.
+    """
+    want = np.isin(labels_zyx, np.asarray(list(classes), dtype=labels_zyx.dtype))
+    return envelope_of(want, margin_voxels=margin_voxels)

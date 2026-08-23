@@ -34,6 +34,22 @@ class UnionPart:
 
 
 @dataclass(frozen=True)
+class CascadeStep:
+    """One stage of a cascade. All but the last exist to crop the next: run the model, take the
+    bounding box of ``crop_to_classes`` in its output, dilate by ``dilation_mm``, and restrict
+    the following stage to that box. The last stage (``crop_to_classes`` empty) is the target
+    whose labels become the result.
+
+    A stage either runs a model (``weights_id``) or reuses another task's output as the crop
+    source (``crop_from_task``, e.g. teeth cropping from craniofacial_structures)."""
+
+    weights_id: WeightsId | None = None
+    crop_to_classes: tuple[int, ...] = ()
+    dilation_mm: float = 10.0
+    crop_from_task: str | None = None
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     name: str
     source: str = "ts"
@@ -41,18 +57,27 @@ class TaskSpec:
     shape: str = "single"
     single: WeightsId | None = None
     union: tuple[UnionPart, ...] = ()
-    cascade: tuple = ()
+    cascade: tuple[CascadeStep, ...] = ()
     label_map: Mapping[int, str] = field(default_factory=dict)
 
     @property
     def parts(self) -> list[tuple[WeightsId, Mapping[int, int] | None, str]]:
-        """``(weights id, local->global remap or None, part name)`` in paint order."""
+        """``(weights id, local->global remap or None, part name)`` in paint order (single / union)."""
         if self.single is not None:
             return [(self.single, None, self.name)]
         if self.union:
             return [(p.weights_id, dict(p.label_remap), p.name or str(p.weights_id)) for p in self.union]
         raise NotImplementedError(
-            f"task {self.name!r} is a {self.shape!r} task; nnseg runs single and label_union tasks so far")
+            f"task {self.name!r} is a {self.shape!r} task; use .cascade for cascade tasks")
+
+    @property
+    def weights_ids(self) -> list[WeightsId]:
+        """Every model the task needs, for provisioning - single, union parts, or cascade stages."""
+        if self.single is not None:
+            return [self.single]
+        if self.union:
+            return [p.weights_id for p in self.union]
+        return [st.weights_id for st in self.cascade if st.weights_id is not None]
 
 
 class TaskCatalog:
@@ -80,10 +105,15 @@ class TaskCatalog:
                                     label_remap={int(k): int(v) for k, v in p.get("label_remap", {}).items()},
                                     name=p.get("name", ""))
                           for p in d.get("union") or ())
+            cascade = tuple(CascadeStep(weights_id=st.get("weights_id"),
+                                        crop_to_classes=tuple(st.get("crop_to_classes") or ()),
+                                        dilation_mm=float(st.get("dilation_mm", 10.0)),
+                                        crop_from_task=st.get("crop_from_task"))
+                            for st in d.get("cascade") or ())
             self._specs[d["name"]] = TaskSpec(
                 name=d["name"], source=d.get("source", "ts"), modality=d.get("modality", "CT"),
                 shape=d.get("shape", "single"), single=d.get("single"), union=union,
-                cascade=tuple(d.get("cascade") or ()),
+                cascade=cascade,
                 label_map={int(k): str(v) for k, v in (d.get("label_map") or {}).items()})
 
     def get(self, name: str) -> TaskSpec:

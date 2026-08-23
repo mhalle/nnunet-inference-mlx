@@ -51,3 +51,16 @@ def test_margin_in_voxels_rounds_up():
     assert margin_in_voxels(20.0, (3.0, 3.0, 3.0)) == (7, 7, 7)
     assert margin_in_voxels(20.0, (1.5, 0.7, 0.7)) == (14, 29, 29)
     assert margin_in_voxels(0.0, (3.0, 3.0, 3.0)) == (0, 0, 0)
+
+
+def test_label_roi_boxes_the_requested_classes():
+    from nnseg.envelope import label_roi
+    lab = np.zeros((20, 30, 40), np.uint8)
+    lab[5:9, 10:14, 12:18] = 3          # class 3 here
+    lab[15, 25, 35] = 7                 # class 7 elsewhere
+    roi = label_roi(lab, [3], margin_voxels=(1, 1, 1))
+    assert roi.lo == (4, 9, 11) and roi.hi == (10, 15, 19)   # box of class 3 only, +1
+    both = label_roi(lab, [3, 7], margin_voxels=0)
+    assert both.lo == (5, 10, 12) and both.hi == (16, 26, 36)  # spans both
+    absent = label_roi(lab, [99], margin_voxels=0)
+    assert absent.is_whole()            # missing class -> whole grid, never empty

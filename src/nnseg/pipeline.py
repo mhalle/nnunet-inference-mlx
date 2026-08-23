@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .envelope import AIR_HU, body_mask, envelope_of, margin_in_voxels
+from .envelope import AIR_HU, Envelope, body_mask, envelope_of, margin_in_voxels
 from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
@@ -17,6 +16,61 @@ from .network import TorchModel
 from .tasks import TaskCatalog, resolve_model_folder
 from .values import LabelSchema
 from .preprocess import to_model_frame
+
+
+def _run_cascade(spec, load, model_frame, crop_on_model_grid, predict_into, *, frame_box, device, say, T):
+    """Run a cascade: each stage but the last crops the next to the bounding box of its
+    ``crop_to_classes`` (dilated). Only the last stage's labels are the result; earlier stages
+    are discarded once their box is taken. Returns ``(array_zyx, geometry)`` in the input frame.
+
+    A stage that only reuses another task's output (``crop_from_task``) is not supported yet and
+    raises - none of the fetchable cascades need it.
+    """
+    import numpy as np
+    import torch
+    from .envelope import label_roi, margin_in_voxels
+    roi_mm = None
+    out_img = None
+    frame = None
+    for i, step in enumerate(spec.cascade):
+        last = i == len(spec.cascade) - 1
+        if step.weights_id is None:
+            raise NotImplementedError(f"cascade stage {i} of {spec.name!r} crops from a task "
+                                      f"({step.crop_from_task!r}); not supported yet")
+        t = time.perf_counter()
+        say(f"cascade stage {i + 1}/{len(spec.cascade)}: model {step.weights_id}"
+            + ("" if roi_mm is None else " (cropped to the previous stage)"))
+        model = load(step.weights_id)
+        x, frame = model_frame(model)
+        T[f"load:stage{i}"] = time.perf_counter() - t
+        # coarse stages: run inside the body; the target stage: run inside the ROI only
+        env = crop_on_model_grid(model, x, frame, use_body=not last, roi_mm=roi_mm)
+        ogrid = frame.resolve_grid(frame_box)
+        out = torch.zeros(ogrid.shape, dtype=torch.uint8, device=device)
+        t = time.perf_counter()
+        predict_into(model, x, frame, ogrid, env, lut=np.arange(model.K, dtype=np.int32), paint=False, out=out)
+        T[f"network:stage{i}"] = time.perf_counter() - t
+        if not last:
+            arr = out.cpu().numpy()
+            e = label_roi(arr, step.crop_to_classes, margin_voxels=margin_in_voxels(step.dilation_mm, ogrid.spacing))
+            if e.is_whole():
+                say(f"  crop classes {list(step.crop_to_classes)} absent/empty in the coarse output "
+                    f"-> next stage runs the whole volume")
+                roi_mm = None
+            else:
+                lo_mm = tuple(float(v) for v in ogrid.index_to_mm(e.lo))
+                hi_mm = tuple(float(v) for v in ogrid.index_to_mm([h - 1 for h in e.hi]))
+                roi_mm = ((lo_mm, hi_mm), step.dilation_mm)
+                say(f"  ROI from classes {list(step.crop_to_classes)}: {e.fraction * 100:.0f} % of the grid, "
+                    f"+{step.dilation_mm} mm for the next stage")
+            del arr
+        else:
+            from . import io as nio
+            out_img = nio.reorient(out, frame.output_geometry(ogrid), frame.original_orientation)
+        del model, out
+        if device in ("cuda", "mps"):
+            (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+    return out_img
 
 
 def _warm_restore_kernel(device: str) -> None:
@@ -41,7 +95,7 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
-            prefetch: bool = False, envelope_mm: float | None = 20.0, progress=None):
+            envelope_mm: float | None = 20.0, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
@@ -56,9 +110,6 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     ``envelope_mm`` restricts inference to the patient's bounding box (HU > -500, largest
     connected component, plus this margin in mm) - on a chest CT that is a third of the
     volume and ~3x fewer patches per model. ``None`` runs the full volume.
-
-    ``prefetch`` loads each part's model while the previous one predicts - off by default,
-    measured net negative on CUDA at batch > 1 (GIL contention with kernel launches).
 
     ``batch_size`` is patches per forward pass: an int, or ``"auto"`` - 1 on Apple silicon
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
@@ -82,7 +133,6 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
     spec = catalog.get(task)
-    parts = spec.parts
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
     if isinstance(image, (str, Path)):
@@ -99,83 +149,100 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     frame: Frame | None = None
     cached = {}                                   # model spacing -> (x, frame)
 
-    def load(wid, defer=False):
+    def load(wid):
         return TorchModel(resolve_model_folder(wid, model_root=model_root), folds=folds, device=device,
-                          dtype=dtype, accumulate=accumulate, batch_size=batch_size, defer_device=defer)
+                          dtype=dtype, accumulate=accumulate, batch_size=batch_size).to_device()
 
-    # Model prefetch is OFF by default, on measurement. The idea - read and build the next
-    # part's network while the current part predicts - hides ~0.9 s per warm load, but on an
-    # A10 at batch 4 it cost ~8 s of network time across five parts whether the helper moved
-    # weights to the GPU or not: unpickling a 700 MB checkpoint contends with the main
-    # thread's kernel launches (the GIL), and a batched forward has less slack to absorb it.
-    # Net negative there; at batch 1 roughly neutral. Left as an option for slow disks.
-    pool = ThreadPoolExecutor(max_workers=1) if prefetch and len(parts) > 1 else None
-    pending = pool.submit(load, parts[0][0], True) if pool else None
-    for i, (wid, remap, pname) in enumerate(parts):
-        t = time.perf_counter()
-        say(f"loading {pname} ({wid})")
-        model = (pending.result() if pending is not None else load(wid)).to_device()
-        if pool and i + 1 < len(parts):
-            pending = pool.submit(load, parts[i + 1][0], True)
-        T[f"load:{pname}"] = time.perf_counter() - t
-        t = time.perf_counter()
+    def model_frame(model):
         key = model.spacing_zyx
         if key not in cached:
             cached[key] = to_model_frame(data_zyx, geometry, model, convention=convention, device=device,
                                          order=resampling_order, original_orientation=orientation)
-        x, frame = cached[key]
-        env = None
-        if envelope_mm is not None:
-            if key + ("env",) not in cached:
-                # the body outline on the model grid, from the normalized intensities: HU -> z-score
-                # is affine, so the air threshold is just a different number in z-score units
-                props = model.intensity_properties(0)
-                z_thr = (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / max(props["std"], 1e-8)
-                mask = body_mask(x[0].numpy(), threshold=z_thr)
-                e = envelope_of(mask, margin_voxels=margin_in_voxels(envelope_mm, model.spacing_zyx))
-                cached[key + ("env",)] = e
-                say(f"envelope: {'whole volume' if e.is_whole() else f'{e.fraction * 100:.0f} % of the model grid'} "
-                    f"({e.lo} .. {e.hi} of {e.shape}, margin {envelope_mm} mm)")
-            env = cached[key + ("env",)]
+        return cached[key]
+
+    def crop_on_model_grid(model, x, frame, *, use_body, roi_mm):
+        """A voxel box on this model's grid: the body envelope (optional) intersected with a
+        physical ROI (optional, from a coarse cascade stage). None means run the whole grid."""
+        shape = tuple(int(s) for s in x.shape[1:])
+        lo = [0, 0, 0]
+        hi = list(shape)
+        if use_body and envelope_mm is not None:
+            props = model.intensity_properties(0)
+            z_thr = (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / max(props["std"], 1e-8)
+            e = envelope_of(body_mask(x[0].numpy(), threshold=z_thr),
+                            margin_voxels=margin_in_voxels(envelope_mm, model.spacing_zyx))
+            lo = [max(a, b) for a, b in zip(lo, e.lo)]
+            hi = [min(a, b) for a, b in zip(hi, e.hi)]
+        if roi_mm is not None:
+            (lo_mm, hi_mm), dil = roi_mm
+            src_sp = np.asarray(frame.source.spacing)
+            fr = frame.forward_rule
+            c0 = fr.apply(np.asarray(lo_mm) / src_sp)
+            c1 = fr.apply(np.asarray(hi_mm) / src_sp)
+            dv = margin_in_voxels(dil, model.spacing_zyx)
+            for ax in range(3):
+                a, b = sorted((c0[ax], c1[ax]))
+                lo[ax] = max(lo[ax], int(np.floor(a)) - dv[ax])
+                hi[ax] = min(hi[ax], int(np.ceil(b)) + 1 + dv[ax])
+        lo = [max(0, v) for v in lo]
+        hi = [min(n, v) for n, v in zip(shape, hi)]
+        if any(h <= l for l, h in zip(lo, hi)):               # empty -> fall back to whole grid
+            return Envelope((0, 0, 0), shape, shape)
+        return Envelope(tuple(lo), tuple(hi), shape)
+
+    def predict_into(model, x, frame, ogrid, env, *, lut, paint, out):
+        crop = x[(slice(None), *env.slices)] if not env.is_whole() else x
+        logits = model.predict_logits(crop).to(device)
+        mapping = frame.mapping(ogrid)
+        if not env.is_whole():
+            mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
+        to_labels(logits, ogrid, mapping, interp=interp, outside="background", lut=lut, paint=paint,
+                  out=out, backend="auto")
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elif device == "mps":
+            torch.mps.synchronize()
+        del logits
+        if device in ("cuda", "mps"):
+            (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+
+    if spec.shape == "cascade":
+        result = _run_cascade(spec, load, model_frame, crop_on_model_grid, predict_into,
+                              frame_box=grid, device=device, say=say, T=T)
+        out_img = nio.to_image(*result)
+        T["total"] = time.perf_counter() - t0
+        return out_img, schema, T
+
+    parts = spec.parts
+
+    # single or union: every part paints into one shared output (union) or is the whole output
+    # (single). Cascade returned earlier.
+    for i, (wid, remap, pname) in enumerate(parts):
+        t = time.perf_counter()
+        say(f"loading {pname} ({wid})")
+        model = load(wid)
+        T[f"load:{pname}"] = time.perf_counter() - t
+        t = time.perf_counter()
+        x, frame = model_frame(model)
+        env = crop_on_model_grid(model, x, frame, use_body=True, roi_mm=None)
+        if not env.is_whole():
+            say(f"envelope: {env.fraction * 100:.0f} % of the model grid ({env.lo} .. {env.hi})")
         T[f"preprocess:{pname}"] = time.perf_counter() - t
         if out_grid is None:
             out_grid = frame.resolve_grid(grid)
-            max_label = max(int(v) for v in spec.label_map) if spec.label_map else 255
-            labels = torch.zeros(out_grid.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16, device=device)
+            max_label = max((int(v) for v in spec.label_map), default=255)
+            labels = torch.zeros(out_grid.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16,
+                                 device=device)
         t = time.perf_counter()
         say(f"predicting {pname} ({i + 1}/{len(parts)})")
-        logits = model.predict_logits(x[(slice(None), *env.slices)] if env is not None and not env.is_whole() else x)
-        say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}")
-        say(f"{model.batch_choice['why']}")
-        T[f"network:{pname}"] = time.perf_counter() - t
-        t = time.perf_counter()
-        # free the network before the restore: on a memory-tight device the weights and the
-        # cached activations are dead weight while the logits need to be resident
         lut = _lut(model.K, remap)
+        predict_into(model, x, frame, out_grid, env, lut=lut, paint=len(parts) > 1, out=labels)
+        say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}; {model.batch_choice['why']}")
+        T[f"network:{pname}"] = time.perf_counter() - t
         del model
-        if device == "mps":
-            torch.mps.empty_cache()
-        elif device == "cuda":
-            torch.cuda.empty_cache()
-        logits = logits.to(device)
-        # the logits sit on the envelope's sub-grid: shift the output->model mapping by its
-        # offset, and let "outside" put background everywhere the body is not
-        mapping = frame.mapping(out_grid)
-        if env is not None and not env.is_whole():
-            mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
-        to_labels(logits, out_grid, mapping, interp=interp, outside="background",
-                  lut=lut, paint=len(parts) > 1, out=labels, backend="auto")
-        if device == "mps":
-            torch.mps.synchronize()
-        T[f"restore:{pname}"] = time.perf_counter() - t
-        del logits
-        if device == "mps":
-            torch.mps.empty_cache()
-        elif device == "cuda":
-            torch.cuda.empty_cache()
+        if device in ("cuda", "mps"):
+            (torch.cuda if device == "cuda" else torch.mps).empty_cache()
 
-    if pool:
-        pool.shutdown(wait=False)
     t = time.perf_counter()
     # back to the input's own orientation: a permute + flip where the labels already live,
     # not a 4 s single-threaded DICOMOrient over the host copy

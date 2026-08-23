@@ -71,8 +71,4 @@ def ensure_task_weights(task, root, *, catalog=None, progress=None) -> list[Path
     """Fetch every model a task needs (single, or all union parts). Idempotent."""
     from .tasks import TaskCatalog
     spec = (catalog or TaskCatalog("totalsegmentator")).get(task) if isinstance(task, str) else task
-    ids = []
-    if spec.single is not None:
-        ids.append(spec.single)
-    ids += [p.weights_id for p in spec.union]
-    return [fetch_one(i, root, progress=progress) for i in ids]
+    return [fetch_one(i, root, progress=progress) for i in spec.weights_ids]
