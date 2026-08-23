@@ -112,6 +112,39 @@ def device_budget_bytes(device: torch.device, *, host_headroom_gb: float = 3.0,
     return int(min(device_left, max(0.0, (host - host_headroom_gb * 1e9) * unified_fraction)))
 
 
+CUDA_AUTO_BATCH = 4
+
+
+def choose_batch(policy, *, device: torch.device, on_device: bool, held_bytes: int | None,
+                 budget_bytes: int | None, accumulator_bytes: int) -> tuple[int, str]:
+    """Patches per forward pass. An int is taken as given; ``"auto"`` decides from measurements.
+
+    Batch 1 is the measured optimum on Apple silicon (one patch saturates a bandwidth-bound
+    GPU). On CUDA, measured on an A10 in one container with alternated conditions: batch 2 is
+    12 % faster than 1 with no warmup cost, batch 4 is 18 % faster in steady state but its
+    first use of a patch shape pays ~7 s of cuDNN autotuning - still a net win for a whole-body
+    job, where five parts share one shape. Activations scale about linearly with batch, so
+    the rule is: CUDA, accumulator on the device, and ``CUDA_AUTO_BATCH`` x the measured
+    working set still fits beside the accumulator with margin.
+    """
+    if policy != "auto":
+        b = max(1, int(policy))
+        return b, f"batch {b} (requested)"
+    if device.type != "cuda":
+        return 1, "batch 1: not CUDA (1 is the measured optimum on Apple silicon)"
+    if not on_device:
+        return 1, "batch 1: accumulator is on the host, so the device-side batched loop does not apply"
+    if held_bytes is None or budget_bytes is None:
+        return 1, "batch 1: no memory measurement available"
+    need = CUDA_AUTO_BATCH * held_bytes + accumulator_bytes
+    if need + int(0.5e9) <= budget_bytes + held_bytes:      # budget was measured with b=1 already held
+        return CUDA_AUTO_BATCH, (f"batch {CUDA_AUTO_BATCH}: {CUDA_AUTO_BATCH}x the measured {held_bytes / 1e9:.2f} GB "
+                                 f"working set + {accumulator_bytes / 1e9:.2f} GB accumulator fits in "
+                                 f"{(budget_bytes + held_bytes) / 1e9:.2f} GB")
+    return 1, (f"batch 1: {CUDA_AUTO_BATCH}x the measured {held_bytes / 1e9:.2f} GB working set would not fit "
+               f"beside the {accumulator_bytes / 1e9:.2f} GB accumulator in {(budget_bytes + held_bytes) / 1e9:.2f} GB")
+
+
 def choose_accumulate(policy: str, *, device: torch.device, K: int, shape, bytes_per_element: int = 2,
                       activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB,
                       host_headroom_gb: float = 3.0, measured: bool = False,
@@ -181,7 +214,7 @@ class TorchModel:
 
     def __init__(self, folder, *, folds=(0,), device="auto", dtype: str = "fp16", channels_last: bool = True,
                  surgery: bool = True, accumulate: str = "auto", step_size: float = 0.5,
-                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size: int = 1,
+                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size="auto",
                  defer_device: bool = False):
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
         from nnunetv2.inference.sliding_window_prediction import compute_gaussian
@@ -194,12 +227,11 @@ class TorchModel:
             raise ValueError(f"accumulate must be one of {ACCUMULATE}; got {accumulate!r}")
         self.accumulate = accumulate
         self.activation_reserve_gb = float(activation_reserve_gb)
-        # Patches per forward pass. 1 is fastest on Apple silicon (one patch saturates a
-        # bandwidth-bound GPU; measured 35 % better than auto/8 on M2 and M1 Max). On CUDA
-        # with tensor cores and room to spare it is a lever - measured on an A10 in
-        # docs/backend-decision.md. Only the device-side accumulate batches; the host path
-        # keeps its per-patch pipeline.
-        self.batch_size = max(1, int(batch_size))
+        # Patches per forward pass: an int, or "auto" (decided per volume after the first patch
+        # from measured memory - see choose_batch). Only the device-side accumulate batches;
+        # the host path keeps its per-patch pipeline.
+        self.batch_size = batch_size
+        self.batch_choice = None
         self.accumulate_choice = None                       # set per volume in predict_logits
         p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
                             perform_everything_on_device=False, device=self.device, verbose=False, allow_tqdm=False)
@@ -316,10 +348,19 @@ class TorchModel:
             on_device, why = choose_accumulate(self.accumulate, device=self.device, K=K, shape=shape,
                                                activation_reserve_gb=self.activation_reserve_gb, measured=True)
         self.accumulate_choice = {"on_device": on_device, "why": why}
-        return self._accumulate(padded, slicers, first, on_device)
+        held = device_working_set_bytes(self.device)
+        budget = device_budget_bytes(self.device) if on_device else None
+        n = 1
+        for d in shape:
+            n *= int(d)
+        b, bwhy = choose_batch(self.batch_size, device=self.device, on_device=on_device, held_bytes=held,
+                               budget_bytes=budget, accumulator_bytes=(K + 1) * n * 2)
+        self.batch_choice = {"batch": b, "why": bwhy}
+        return self._accumulate(padded, slicers, first, on_device, batch=b)
 
     @torch.inference_mode()
-    def _accumulate(self, padded: torch.Tensor, slicers, first: torch.Tensor, on_device: bool) -> torch.Tensor:
+    def _accumulate(self, padded: torch.Tensor, slicers, first: torch.Tensor, on_device: bool,
+                    batch: int = 1) -> torch.Tensor:
         K, shape = self.K, padded.shape[1:]
         if on_device:
             acc = torch.zeros((K, *shape), dtype=torch.half, device=self.device)
@@ -328,7 +369,7 @@ class TorchModel:
             n_pred[slicers[0][1:]] += self.gaussian
             del first
             rest = slicers[1:]
-            B = self.batch_size
+            B = batch
             if B == 1:
                 for sl in rest:
                     pred = self._patch(padded, sl)

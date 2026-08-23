@@ -38,7 +38,7 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
-            folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size: int = 1,
+            folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
             prefetch: bool = False, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
@@ -54,8 +54,9 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     ``prefetch`` loads each part's model while the previous one predicts - off by default,
     measured net negative on CUDA at batch > 1 (GIL contention with kernel launches).
 
-    ``batch_size`` is patches per forward pass - 1 on Apple silicon (measured fastest), a
-    lever on CUDA cards with headroom; it only applies when the accumulator is on the device.
+    ``batch_size`` is patches per forward pass: an int, or ``"auto"`` - 1 on Apple silicon
+    (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
+    steady-state on an A10); it only applies when the accumulator is on the device.
 
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
@@ -126,6 +127,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
         say(f"predicting {pname} ({i + 1}/{len(parts)})")
         logits = model.predict_logits(x)
         say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}")
+        say(f"{model.batch_choice['why']}")
         T[f"network:{pname}"] = time.perf_counter() - t
         t = time.perf_counter()
         # free the network before the restore: on a memory-tight device the weights and the

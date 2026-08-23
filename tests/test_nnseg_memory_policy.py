@@ -121,3 +121,17 @@ def test_tight_host_declines_the_device_whatever_the_budget_says(monkeypatch):
 
 def test_accumulate_names():
     assert ACCUMULATE == ("auto", "device", "host")
+
+
+def test_choose_batch_policy():
+    from nnseg.network import CUDA_AUTO_BATCH, choose_batch
+    cuda = torch.device("cuda")
+    assert choose_batch(3, device=cuda, on_device=True, held_bytes=1, budget_bytes=1, accumulator_bytes=1)[0] == 3
+    assert choose_batch("auto", device=MPS, on_device=True, held_bytes=int(1e9), budget_bytes=int(20e9), accumulator_bytes=int(2e9))[0] == 1
+    assert choose_batch("auto", device=cuda, on_device=False, held_bytes=int(1e9), budget_bytes=int(20e9), accumulator_bytes=int(2e9))[0] == 1
+    # an A10 whole-body part: 1.5 GB working set, 2.9 GB accumulator, ~20 GB free -> 4
+    b, why = choose_batch("auto", device=cuda, on_device=True, held_bytes=int(1.5e9), budget_bytes=int(20e9), accumulator_bytes=int(2.9e9))
+    assert b == CUDA_AUTO_BATCH and "fits" in why
+    # a small card: 1.5 GB working set, 2.9 GB accumulator, 3 GB free -> stay at 1
+    b, why = choose_batch("auto", device=cuda, on_device=True, held_bytes=int(1.5e9), budget_bytes=int(3e9), accumulator_bytes=int(2.9e9))
+    assert b == 1 and "would not fit" in why
