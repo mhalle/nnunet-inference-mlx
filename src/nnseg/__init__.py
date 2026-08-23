@@ -9,6 +9,8 @@ layer** - ``io``, ``preprocess``, ``frame``, ``network``, ``pipeline``, ``cli`` 
 through SimpleITK, drives nnU-Net's networks, and composes tasks from the toolkit's catalog.
 """
 from . import backends, errors, io
+from .job import Job
+from .progress import CancelToken, Progress
 from .errors import (Cancelled, InputError, ModelNotFound, NnsegError, ResourceError,
                      UnsupportedModel)
 from .frame import Frame
@@ -30,7 +32,7 @@ from .tables import AxisTable, build_tables
 __version__ = "0.1.0"
 __all__ = [
     # the API most callers need
-    "segment", "Segmenter", "Segmentation", "ModelCache", "TaskCatalog", "TaskSpec", "io",
+    "segment", "Segmenter", "Segmentation", "Job", "Progress", "CancelToken", "ModelCache", "TaskCatalog", "TaskSpec", "io",
     # errors, catchable as a family or individually
     "NnsegError", "InputError", "ModelNotFound", "UnsupportedModel", "ResourceError",
     "Cancelled", "errors",

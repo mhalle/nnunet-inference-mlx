@@ -59,6 +59,27 @@ class Segmenter:
 
     __call__ = segment
 
+    def submit(self, image, task, *, on_progress=None, **overrides):
+        """Start a segmentation on a worker thread and return a :class:`~nnseg.job.Job`.
+
+        The caller's loop stays free: poll ``job.progress`` from a UI timer, ``job.cancel()`` on
+        a Cancel button, ``job.result()`` when done. Runs on one device at a time - a second job
+        reports stage ``"queued"`` until the first releases the device.
+        """
+        from .job import Job
+        unknown = set(overrides) - set(POLICY)
+        if unknown:
+            raise TypeError(f"unknown argument(s) {sorted(unknown)}; policy is {sorted(POLICY)}")
+        kw = {**self.policy, **overrides}
+
+        def run(reporter):
+            from .pipeline import segment
+            return segment(image, task, catalog=self.catalog, models=self.models,
+                           cancel=reporter.cancel, progress=reporter, **kw)
+
+        return Job(run, device=kw["device"], on_progress=on_progress,
+                   name=getattr(task, "name", str(task)))
+
     # -- introspection: what can this thing do, before it does it -----------
     def tasks(self) -> list[str]:
         """Every task name in the catalog."""

@@ -17,6 +17,7 @@ from .network import TorchModel, available_folds
 from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
 from .cache import ModelCache
 from .result import Segmentation
+from .progress import Reporter
 from .weights import as_store
 from .cache import ModelCache
 from .values import LabelSchema
@@ -64,7 +65,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
             envelope_mm: float | None = 20.0, configuration: str | None = None,
-            models=None, progress=None):
+            models=None, cancel=None, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
@@ -94,6 +95,10 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
     steady-state on an A10); it only applies when the accumulator is on the device.
 
+    ``cancel`` is a :class:`~nnseg.progress.CancelToken`; the run stops at the next patch
+    boundary. ``progress`` is called with a :class:`~nnseg.progress.Progress` snapshot (which
+    prints readably, so a ``lambda p: print(p)`` callback works).
+
     ``models`` is a :class:`~nnseg.cache.ModelCache`; pass one with ``capacity>=1`` (or use
     :class:`~nnseg.segmenter.Segmenter`) to keep models warm between calls instead of rebuilding
     them every time - the difference between a script and a server.
@@ -109,13 +114,15 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     Multi-model tasks composite at the label level in part order (later parts win).
     """
     from . import io as nio
+    from .job import device_lock
 
     from .resample import resolve_device
     device = str(resolve_device(device))                  # "auto" -> cuda / mps / cpu, once
-    say = progress or (lambda s: None)
+    report = Reporter.of(progress, cancel=cancel)
     _warm_restore_kernel(device)
     T: dict[str, float] = {}
     t0 = time.perf_counter()
+    lock = device_lock(device)                            # reentrant: a Job already holds it
     catalog = catalog or TaskCatalog("totalsegmentator")
     models = models if models is not None else ModelCache()   # no caching unless asked
     spec = _resolve_spec(task, catalog)
@@ -209,7 +216,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
 
     def predict_into(model, x, frame, ogrid, env, *, lut, paint, out):
         crop = x[(slice(None), *env.slices)] if not env.is_whole() else x
-        logits = model.predict_logits(crop).to(device)
+        logits = model.predict_logits(crop, report=report).to(device)
         mapping = frame.mapping(ogrid)
         if not env.is_whole():
             mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
@@ -225,28 +232,29 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
 
     def run_single_or_union(spc, tag):
         parts = spc.parts
+        report.n_parts = max(report.n_parts, len(parts))
         og = None
         out = None
         fr = None
         for i, (wid, remap, pname) in enumerate(parts):
             t = time.perf_counter()
-            say(f"loading {pname} ({wid})")
+            report.enter_part(i, f"{pname} ({wid})")
             model = load(wid)
             T[f"load:{tag}:{pname}"] = time.perf_counter() - t
             t = time.perf_counter()
             x, fr = model_frame(model)
             env = crop_on_model_grid(model, x, fr, use_body=True, roi_mm=None)
             if not env.is_whole():
-                say(f"envelope: {env.fraction * 100:.0f} % of the model grid ({env.lo} .. {env.hi})")
+                report.stage("preprocess", f"envelope {env.fraction * 100:.0f} % of the model grid")
             T[f"preprocess:{tag}:{pname}"] = time.perf_counter() - t
             if og is None:
                 og = fr.resolve_grid(grid)
                 max_label = max((int(v) for v in spc.label_map), default=255)
                 out = torch.zeros(og.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16, device=device)
             t = time.perf_counter()
-            say(f"predicting {pname} ({i + 1}/{len(parts)})")
+            report.stage("predict", pname)
             predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1, out=out)
-            say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}; {model.batch_choice['why']}")
+            report.stage("restore", f"{'device' if model.accumulate_choice['on_device'] else 'host'} accumulator")
             T[f"network:{tag}:{pname}"] = time.perf_counter() - t
             models.release(model)
         return out, fr, og
@@ -255,21 +263,22 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         roi_mm = None
         out = fr = og = None
         stages = spc.cascade
+        report.n_parts = max(report.n_parts, len(stages))
         for i, step in enumerate(stages):
             last = i == len(stages) - 1
             if step.crop_from_task is not None:
-                say(f"[{tag}] stage {i + 1}/{len(stages)}: crop from task {step.crop_from_task!r}")
+                report.stage("cascade", f"{tag} stage {i + 1}/{len(stages)}: crop from {step.crop_from_task!r}")
                 sub_labels, sub_fr, sub_og = run_task_canonical(catalog.get(step.crop_from_task), f"{tag}:{step.crop_from_task}")
                 e = label_roi(sub_labels.cpu().numpy(), step.crop_to_classes,
                               margin_voxels=margin_in_voxels(step.dilation_mm, sub_og.spacing))
                 roi_mm = None if e.is_whole() else ((tuple(float(v) for v in sub_og.index_to_mm(e.lo)),
                                                      tuple(float(v) for v in sub_og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
-                say(f"  ROI from {step.crop_from_task!r} classes {list(step.crop_to_classes)}: "
-                    + ("whole volume" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid"))
+                report.stage("cascade", f"ROI from {step.crop_from_task!r}: "
+                             + ("whole volume" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid"))
                 continue
             t = time.perf_counter()
-            say(f"[{tag}] stage {i + 1}/{len(stages)}: model {step.weights_id}"
-                + ("" if roi_mm is None else " (cropped to the previous stage)"))
+            report.enter_part(i, f"{tag} stage {i + 1}/{len(stages)}: model {step.weights_id}"
+                              + ("" if roi_mm is None else " (cropped)"))
             model = load(step.weights_id)
             x, fr = model_frame(model)
             T[f"load:{tag}:s{i}"] = time.perf_counter() - t
@@ -284,15 +293,16 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
                               margin_voxels=margin_in_voxels(step.dilation_mm, og.spacing))
                 roi_mm = None if e.is_whole() else ((tuple(float(v) for v in og.index_to_mm(e.lo)),
                                                      tuple(float(v) for v in og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
-                say(f"  ROI from classes {list(step.crop_to_classes)}: "
-                    + ("absent -> whole volume next" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid, +{step.dilation_mm} mm"))
+                report.stage("cascade", "ROI: " + ("absent -> whole volume next" if roi_mm is None
+                             else f"{e.fraction * 100:.0f} % of the grid, +{step.dilation_mm} mm"))
             models.release(model)
         return out, fr, og
 
     def run_task_canonical(spc, tag=""):
         return run_cascade(spc, tag or spc.name) if spc.shape == "cascade" else run_single_or_union(spc, tag or spc.name)
 
-    labels, frame, out_grid = run_task_canonical(spec)
+    with lock:
+        labels, frame, out_grid = run_task_canonical(spec)
     t = time.perf_counter()
     # back to the input's own orientation: a permute + flip where the labels already live,
     # not a single-threaded DICOMOrient over the host copy

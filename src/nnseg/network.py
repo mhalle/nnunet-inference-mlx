@@ -336,12 +336,16 @@ class TorchModel:
         self.net.to(self.dtype)
 
     @torch.inference_mode()
-    def predict_logits(self, x: torch.Tensor) -> torch.Tensor:
+    def predict_logits(self, x: torch.Tensor, *, report=None) -> torch.Tensor:
         """``(C, Z, Y, X)`` preprocessed float tensor -> ``(K, Z, Y, X)`` logits (fp16).
 
         The accumulator's placement follows ``self.accumulate`` and the device's free
         memory at this moment (see :func:`choose_accumulate`); the choice, and why, is
         recorded in ``self.accumulate_choice``.
+
+        ``report`` is an optional :class:`~nnseg.progress.Reporter`; it is ticked once per patch,
+        which is both the progress granularity and the only point a run can be cancelled. It is
+        passed in rather than held on the model, because models are shared through the cache.
         """
         from acvl_utils.cropping_and_padding.padding import pad_nd_image
 
@@ -353,7 +357,7 @@ class TorchModel:
         for i in range(len(self.fold_params)):
             self._load_fold(i)
             try:
-                acc = self._sliding_window(padded, slicers)
+                acc = self._sliding_window(padded, slicers, report=report)
             except (RuntimeError, torch.OutOfMemoryError) if hasattr(torch, "OutOfMemoryError") else RuntimeError as e:
                 if not self.accumulate_choice["on_device"] or "memory" not in str(e).lower():
                     raise
@@ -362,7 +366,7 @@ class TorchModel:
                     torch.mps.empty_cache()
                 elif self.device.type == "cuda":
                     torch.cuda.empty_cache()
-                acc = self._sliding_window(padded, slicers, force_host=True)
+                acc = self._sliding_window(padded, slicers, force_host=True, report=report)
             total = acc if total is None else total.add_(acc)
         if len(self.fold_params) > 1:
             total /= len(self.fold_params)
@@ -377,7 +381,8 @@ class TorchModel:
         pred *= self.gaussian
         return pred
 
-    def _sliding_window(self, padded: torch.Tensor, slicers, *, force_host: bool = False) -> torch.Tensor:
+    def _sliding_window(self, padded: torch.Tensor, slicers, *, force_host: bool = False,
+                        report=None) -> torch.Tensor:
         """Placement is decided after the *first* patch has run, from what the network actually
         holds on the device - no extra compute, and no guessing at an activation reserve that
         varies 2 GB between models."""
@@ -398,11 +403,11 @@ class TorchModel:
         b, bwhy = choose_batch(self.batch_size, device=self.device, on_device=on_device, held_bytes=held,
                                budget_bytes=budget, accumulator_bytes=(K + 1) * n * 2)
         self.batch_choice = {"batch": b, "why": bwhy}
-        return self._accumulate(padded, slicers, first, on_device, batch=b)
+        return self._accumulate(padded, slicers, first, on_device, batch=b, report=report)
 
     @torch.inference_mode()
     def _accumulate(self, padded: torch.Tensor, slicers, first: torch.Tensor, on_device: bool,
-                    batch: int = 1) -> torch.Tensor:
+                    batch: int = 1, report=None) -> torch.Tensor:
         K, shape = self.K, padded.shape[1:]
         if on_device:
             acc = torch.zeros((K, *shape), dtype=torch.half, device=self.device)
@@ -413,13 +418,17 @@ class TorchModel:
             rest = slicers[1:]
             B = batch
             if B == 1:
-                for sl in rest:
+                for i, sl in enumerate(rest):
+                    if report is not None:
+                        report.tick(i + 1, len(slicers))    # the cancellation point
                     pred = self._patch(padded, sl)
                     acc[sl] += pred
                     n_pred[sl[1:]] += self.gaussian
             else:
                 data = padded.to(self.device)
                 for i in range(0, len(rest), B):
+                    if report is not None:
+                        report.tick(min(i + B, len(rest)) + 1, len(slicers))
                     group = rest[i:i + B]
                     x = torch.stack([data[sl] for sl in group])          # (b, C, *patch)
                     preds = self.net(x)
@@ -454,11 +463,15 @@ class TorchModel:
         t.start()
         q.put((first.to("cpu"), slicers[0]))
         del first
-        for sl in slicers[1:]:
-            pred = self._patch(padded, sl)
-            q.put((pred.to("cpu"), sl))                                # the copy is cheap; the add overlaps the next forward
-        q.put(None)
-        t.join()
+        try:
+            for i, sl in enumerate(slicers[1:]):
+                if report is not None:
+                    report.tick(i + 1, len(slicers))                   # the cancellation point
+                pred = self._patch(padded, sl)
+                q.put((pred.to("cpu"), sl))                            # the copy is cheap; the add overlaps the next forward
+        finally:
+            q.put(None)                                                # never leave the worker parked on get()
+            t.join()
         if err:
             raise err[0]
         torch.div(acc, n_pred, out=acc)
