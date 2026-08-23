@@ -60,6 +60,27 @@ class TaskSpec:
     cascade: tuple[CascadeStep, ...] = ()
     label_map: Mapping[int, str] = field(default_factory=dict)
 
+    @classmethod
+    def from_model_folder(cls, folder, *, name: str | None = None) -> "TaskSpec":
+        """A single-model task read straight from a stock nnU-Net result folder.
+
+        Takes ``.../Dataset<id>_<name>/<trainer>__<plans>__<config>/`` (or the dataset folder,
+        resolved by :func:`resolve_model_folder`) and builds the spec from its ``dataset.json``:
+        labels become the label map, ``channel_names`` the modality. This is how a caller uses
+        nnseg with their own nnU-Net model, with no catalog entry anywhere.
+        """
+        f = resolve_model_folder(folder)
+        ds = json.loads((f / "dataset.json").read_text())
+        labels = ds.get("labels") or {}
+        if any(isinstance(v, (list, tuple)) for v in labels.values()):
+            raise NotImplementedError(
+                f"{f.name}: region-based labels (a label mapping to several values) are not "
+                "supported yet - nnseg takes the argmax of a softmax head")
+        chan = ds.get("channel_names") or ds.get("modality") or {"0": "unknown"}
+        return cls(name=name or f.parent.name, source="nnunet", modality=str(next(iter(chan.values()))),
+                   shape="single", single=str(f),
+                   label_map={int(v): str(k) for k, v in labels.items() if int(v) != 0})
+
     @property
     def parts(self) -> list[tuple[WeightsId, Mapping[int, int] | None, str]]:
         """``(weights id, local->global remap or None, part name)`` in paint order (single / union)."""
@@ -159,14 +180,46 @@ def weights_root(ecosystem: str = "totalsegmentator", explicit=None) -> Path:
     return default.expanduser()
 
 
-def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmentator", model_root=None) -> Path:
-    """``Dataset<id>_*`` under the weights root -> its ``trainer__plans__config`` folder."""
-    root = weights_root(ecosystem, model_root)
-    matches = sorted(root.glob(f"Dataset{weights_id}_*")) or sorted(root.glob(str(weights_id)))
+# Preference order when a dataset ships several configurations and the caller named none.
+# 3d_fullres is nnU-Net's default and the only one nnseg runs today: the cascade needs a
+# lowres prediction as an extra input channel, and 2d needs a slice-wise loop.
+CONFIG_PREFERENCE = ("3d_fullres", "3d_lowres", "2d")
+UNSUPPORTED_CONFIGS = {"3d_cascade_fullres": "needs the 3d_lowres prediction as an extra input channel"}
+
+
+def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmentator", model_root=None,
+                         configuration: str | None = None) -> Path:
+    """``Dataset<id>_*`` under the weights root -> its ``trainer__plans__config`` folder.
+
+    A model folder path passes through unchanged, so a caller can point nnseg straight at a
+    stock nnU-Net result directory. When a dataset ships several configurations (a trained
+    nnU-Net commonly has 2d / 3d_lowres / 3d_fullres / 3d_cascade_fullres), ``configuration``
+    picks one; otherwise :data:`CONFIG_PREFERENCE` decides, rather than whichever sorts first.
+    """
+    p = Path(str(weights_id)).expanduser()
+    if p.is_dir() and p.name.count("__") == 2:
+        return p
+    root = Path(p) if p.is_dir() else weights_root(ecosystem, model_root)
+    matches = ([root] if p.is_dir() else
+               sorted(root.glob(f"Dataset{weights_id}_*")) or sorted(root.glob(str(weights_id))))
     if not matches:
         raise FileNotFoundError(f"no Dataset{weights_id}_* under {root}")
-    configs = sorted(p for p in matches[0].iterdir()
-                     if p.is_dir() and not p.name.startswith(".") and p.name.count("__") == 2)
+    configs = sorted(c for c in matches[0].iterdir()
+                     if c.is_dir() and not c.name.startswith(".") and c.name.count("__") == 2)
     if not configs:
         raise FileNotFoundError(f"no trainer__plans__config folder in {matches[0]}")
-    return configs[0]
+    by_config = {c.name.rsplit("__", 1)[1]: c for c in configs}
+    if configuration is not None:
+        if configuration not in by_config:
+            raise FileNotFoundError(f"configuration {configuration!r} not in {matches[0].name}; "
+                                    f"have {sorted(by_config)}")
+        return by_config[configuration]
+    for name in CONFIG_PREFERENCE:
+        if name in by_config:
+            return by_config[name]
+    if len(configs) == 1:
+        return configs[0]
+    why = "; ".join(f"{k} ({UNSUPPORTED_CONFIGS[k]})" for k in sorted(by_config) if k in UNSUPPORTED_CONFIGS)
+    raise FileNotFoundError(
+        f"no runnable configuration in {matches[0].name}; have {sorted(by_config)}"
+        + (f" - unsupported: {why}" if why else "") + ". Pass configuration=... to choose.")

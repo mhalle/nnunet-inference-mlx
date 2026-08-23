@@ -29,6 +29,15 @@ def _warm_restore_kernel(device: str) -> None:
     threading.Thread(target=triton_gpu.warmup, daemon=True).start()
 
 
+def _resolve_spec(task, catalog) -> TaskSpec:
+    """A TaskSpec, a catalog name, or a path to a stock nnU-Net model folder."""
+    if isinstance(task, TaskSpec):
+        return task
+    if isinstance(task, Path) or (isinstance(task, str) and Path(task).expanduser().is_dir()):
+        return TaskSpec.from_model_folder(task)
+    return catalog.get(task)
+
+
 def _lut(K: int, remap: dict | None) -> np.ndarray:
     lut = np.arange(K, dtype=np.int64)
     if remap:
@@ -39,13 +48,21 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 
 
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
-            grid="input", interp="linear", outside: str = "background", convention: str = "corner",
+            grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
-            envelope_mm: float | None = 20.0, progress=None):
+            envelope_mm: float | None = 20.0, configuration: str | None = None, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
     directory - or a SimpleITK image the caller already holds.
+
+    ``task`` is a catalog name, a ``TaskSpec``, or a path to a stock nnU-Net result folder
+    (``.../Dataset<id>_<name>/<trainer>__<plans>__<config>/``, or the dataset folder - then
+    ``configuration`` picks among 2d / 3d_lowres / 3d_fullres, preferring 3d_fullres).
+
+    ``convention`` defaults to ``"auto"``: ``"center"`` (skimage half-pixel, plus crop-to-nonzero)
+    for nnU-Net-native models, ``"corner"`` (TotalSegmentator's ``change_spacing``, no crop) for
+    the TS catalog - each model's own training-time preprocessing.
 
     ``device`` defaults to ``"auto"``: CUDA, then MPS, then CPU.
 
@@ -80,15 +97,32 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
-    spec = task if isinstance(task, TaskSpec) else catalog.get(task)
+    spec = _resolve_spec(task, catalog)
+    # nnU-Net-native models were trained on their own preprocessing: skimage's half-pixel
+    # ("center") resample and crop-to-nonzero. TS bypasses both (corner-aligned change_spacing,
+    # no crop). Getting this backwards is a silent geometry error, so it follows the task's
+    # ecosystem unless the caller is explicit. See docs/resampler-parity-finding.md.
+    native = spec.source == "nnunet"
+    if convention == "auto":
+        convention = "center" if native else "corner"
+    crop_nonzero = native
+    # Orientation follows the model's own reader. TS canonicalizes to RAS; nnU-Net's default
+    # SimpleITKIO/NibabelIO do NOT - only the *WithReorient variants do - so a native model
+    # expects its acquisition orientation. Reorienting it anyway mirrors left/right.
+    reorient = True
+    if native and spec.single is not None:
+        reorient = nio.reader_reorients(resolve_model_folder(spec.single, ecosystem="nnunet",
+                                                             model_root=model_root,
+                                                             configuration=configuration))
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
     if isinstance(image, (str, Path)):
-        data_zyx, geometry, orientation = nio.read(image)
+        data_zyx, geometry, orientation = nio.read(image, reorient=reorient)
     else:                                        # a SimpleITK image the caller already holds
         import SimpleITK as sitk
         orientation = nio.orientation_of(image)
-        image = sitk.DICOMOrient(image, nio.CANONICAL)
+        if reorient:
+            image = sitk.DICOMOrient(image, nio.CANONICAL)
         data_zyx, geometry = sitk.GetArrayFromImage(image), nio.geometry_of(image)
     T["read+canonical"] = time.perf_counter() - t0
 
@@ -98,14 +132,17 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     cached = {}                                   # model spacing -> (x, frame)
 
     def load(wid):
-        return TorchModel(resolve_model_folder(wid, model_root=model_root), folds=folds, device=device,
-                          dtype=dtype, accumulate=accumulate, batch_size=batch_size).to_device()
+        folder = resolve_model_folder(wid, ecosystem="nnunet" if native else "totalsegmentator",
+                                      model_root=model_root, configuration=configuration)
+        return TorchModel(folder, folds=folds, device=device, dtype=dtype,
+                          accumulate=accumulate, batch_size=batch_size).to_device()
 
     def model_frame(model):
         key = model.spacing_zyx
         if key not in cached:
             cached[key] = to_model_frame(data_zyx, geometry, model, convention=convention, device=device,
-                                         order=resampling_order, original_orientation=orientation)
+                                         order=resampling_order, original_orientation=orientation,
+                                         crop_to_nonzero=crop_nonzero)
         return cached[key]
 
     def crop_on_model_grid(model, x, frame, *, use_body, roi_mm):
@@ -124,10 +161,12 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
             hi = [min(a, b) for a, b in zip(hi, e.hi)]
         if roi_mm is not None:
             (lo_mm, hi_mm), dil = roi_mm
-            src_sp = np.asarray(frame.source.spacing)
+            # mm -> index on the grid the resampler actually consumed (== source unless
+            # crop-to-nonzero moved its origin), then that grid's index -> model coordinate
+            rf = frame.resampled_from
             fr = frame.forward_rule
-            c0 = fr.apply(np.asarray(lo_mm) / src_sp)
-            c1 = fr.apply(np.asarray(hi_mm) / src_sp)
+            c0 = fr.apply(rf.mm_to_index(lo_mm))
+            c1 = fr.apply(rf.mm_to_index(hi_mm))
             dv = margin_in_voxels(dil, model.spacing_zyx)
             for ax in range(3):
                 a, b = sorted((c0[ax], c1[ax]))

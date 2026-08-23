@@ -37,6 +37,30 @@ def forward_resample(data_zyx: np.ndarray, spacing_zyx, new_spacing_zyx, *, conv
     return out, new_shape
 
 
+def nonzero_box(data_zyx: np.ndarray) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """nnU-Net's crop-to-nonzero box: ``(lo, hi)`` half-open, (Z, Y, X).
+
+    nnU-Net crops every case to the bounding box of its nonzero voxels *before* resampling
+    (``crop_to_nonzero``: ``data != 0``, holes filled, then the bbox). On CT this is usually
+    the whole image; on MRI, where the background outside the acquired volume is exactly 0,
+    it removes a real border. An all-zero image yields the whole grid rather than an empty
+    box - the same fail-safe direction as the body envelope.
+    """
+    mask = np.asarray(data_zyx) != 0
+    shape = tuple(int(s) for s in mask.shape)
+    if not mask.any():
+        return (0, 0, 0), shape
+    try:                                    # nnU-Net fills holes so interior zeros do not matter;
+        from scipy import ndimage           # for a bounding box it changes nothing, so it is optional
+        mask = ndimage.binary_fill_holes(mask)
+    except ImportError:
+        pass
+    idx = np.nonzero(mask)
+    lo = tuple(int(i.min()) for i in idx)
+    hi = tuple(int(i.max()) + 1 for i in idx)
+    return lo, hi
+
+
 def normalize(data: np.ndarray, schemes, props, *, use_mask_for_norm=None, seg=None) -> np.ndarray:
     """Normalize a single-channel image exactly as nnU-Net would, by delegating to nnU-Net's own
     normalization classes (named in ``plans``) - CTNormalization, ZScoreNormalization, etc.
@@ -66,22 +90,39 @@ def normalize(data: np.ndarray, schemes, props, *, use_mask_for_norm=None, seg=N
 
 
 def to_model_frame(data_zyx, geometry, model, *, convention: str = "corner", device="auto",
-                   order: int = DEFAULT_RESAMPLING_ORDER, original_orientation: str = "RAS") -> tuple[torch.Tensor, Frame]:
+                   order: int = DEFAULT_RESAMPLING_ORDER, original_orientation: str = "RAS",
+                   crop_to_nonzero: bool = False) -> tuple[torch.Tensor, Frame]:
     """Canonical (RAS) array + geometry -> ``(x (1, Z, Y, X) float32 CPU, Frame)`` for ``model``.
 
-    Resamples to the model spacing with the caller's convention (corner = TotalSegmentator's
-    ``change_spacing``), then applies nnU-Net's normalization (via nnU-Net's own classes -
-    CT, ZScore, ...). No crop-to-nonzero (TS-style). Arrays stay in (Z, Y, X) throughout -
-    SimpleITK hands them over that way, so there are no transposes.
+    Optionally crops to the nonzero box first (``crop_to_nonzero=True``, nnU-Net-native), then
+    resamples to the model spacing with the caller's convention (corner = TotalSegmentator's
+    ``change_spacing``, center = skimage / nnU-Net's own resampler), then applies nnU-Net's
+    normalization (via nnU-Net's own classes - CT, ZScore, ...). Arrays stay in (Z, Y, X)
+    throughout - SimpleITK hands them over that way, so there are no transposes.
+
+    The crop is recorded as ``Frame.model_source`` (a sub-grid with the crop offset as its
+    origin), so output grids keep referring to the full source and the un-crop is implicit in
+    the mapping - nothing has to be pasted back afterwards.
     """
     spacing_zyx = tuple(float(s) for s in geometry.spacing_zyx)
     source_shape_zyx = tuple(int(s) for s in data_zyx.shape)
-    res_zyx, _ = forward_resample(np.asarray(data_zyx, dtype=np.float32), spacing_zyx,
-                                  tuple(model.spacing_zyx), convention=convention, device=device, order=order)
+    source = Grid(source_shape_zyx, spacing_zyx, (0.0, 0.0, 0.0))
+
+    data_zyx = np.asarray(data_zyx, dtype=np.float32)
+    model_source = None
+    if crop_to_nonzero:
+        lo, hi = nonzero_box(data_zyx)
+        if (lo, hi) != ((0, 0, 0), source_shape_zyx):
+            data_zyx = data_zyx[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+            model_source = Grid(tuple(h - l for l, h in zip(lo, hi)), spacing_zyx,
+                                tuple(float(source.index_to_mm(lo)[a]) for a in range(3)))
+
+    res_zyx, _ = forward_resample(data_zyx, spacing_zyx, tuple(model.spacing_zyx),
+                                  convention=convention, device=device, order=order)
     x_zyx = normalize(res_zyx, model.normalization_schemes, model.intensity_properties(0),
                       use_mask_for_norm=model.use_mask_for_norm)
     del res_zyx
-    source = Grid(source_shape_zyx, spacing_zyx, (0.0, 0.0, 0.0))
     frame = Frame(source=source, model_shape=tuple(x_zyx.shape), model_spacing=tuple(model.spacing_zyx),
-                  convention=convention, canonical=geometry, original_orientation=original_orientation)
+                  convention=convention, canonical=geometry, original_orientation=original_orientation,
+                  model_source=model_source)
     return torch.from_numpy(np.ascontiguousarray(x_zyx))[None], frame

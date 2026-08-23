@@ -32,6 +32,7 @@ class Frame:
     convention: str
     canonical: object                      # nnseg.values.Geometry
     original_orientation: str = "RAS"
+    model_source: Grid | None = None
 
     def __post_init__(self):
         if self.convention not in CONVENTIONS:
@@ -39,15 +40,27 @@ class Frame:
         object.__setattr__(self, "model_shape", tuple(int(s) for s in self.model_shape))
 
     @property
+    def resampled_from(self) -> Grid:
+        """The grid actually handed to the forward resampler.
+
+        Equal to ``source`` unless the source was cropped first (nnU-Net's crop-to-nonzero,
+        which happens in source space *before* resampling); then it is the cropped sub-grid,
+        whose ``origin`` carries the crop offset. Output grids still refer to ``source``, so
+        ``mapping`` composes the offset in automatically and voxels outside the crop map
+        outside the model grid - where ``outside="background"`` handles them.
+        """
+        return self.model_source or self.source
+
+    @property
     def forward_rule(self) -> Mapping:
         """source index -> model-grid coordinate: the forward resampler's rule, inverted exactly."""
         if self.convention == "corner":
-            return Mapping.corner(self.source.shape, self.model_shape)
-        return Mapping.center(self.source.shape, self.model_shape)
+            return Mapping.corner(self.resampled_from.shape, self.model_shape)
+        return Mapping.center(self.resampled_from.shape, self.model_shape)
 
     def mapping(self, grid: Grid) -> Mapping:
         """Output-grid index -> model-grid coordinate, for any grid sharing the source axes."""
-        return Mapping.between(grid, self.source) >> self.forward_rule
+        return Mapping.between(grid, self.resampled_from) >> self.forward_rule
 
     def resolve_grid(self, grid) -> Grid:
         """``"input"`` -> the source grid; a number -> isotropic at that spacing (same field of

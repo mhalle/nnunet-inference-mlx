@@ -1,10 +1,15 @@
 """Image IO through SimpleITK - the same reader nnU-Net itself defaults to.
 
 TotalSegmentator is ``Nifti1Image`` all the way down; nnU-Net has a reader registry whose
-default is ``SimpleITKIO``, reorienting to RAS with ``sitk.DICOMOrient``. nnseg follows
+default is ``SimpleITKIO``. nnseg follows
 nnU-Net: SimpleITK reads NIfTI, NRRD, MetaImage, DICOM series and more, carries direction
 cosines (so oblique acquisitions survive the round trip), and hands back arrays already in
 (Z, Y, X) order - no transposes.
+
+Orientation is **not** uniform across the ecosystem: TotalSegmentator canonicalizes to RAS,
+while nnU-Net's default readers keep the stored axis order and only the opt-in ``*WithReorient``
+variants canonicalize. :func:`read` takes ``reorient`` and :func:`reader_reorients` reads the
+model's declared choice out of its plans.
 
 Geometry is the toolkit's :class:`Geometry` value (spacing/shape in Z, Y, X; origin and
 direction in SimpleITK's X, Y, Z), so the neutral core is shared rather than duplicated.
@@ -38,12 +43,17 @@ def orientation_of(image) -> str:
     return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(image.GetDirection())
 
 
-def read(path) -> tuple[np.ndarray, "Geometry", str]:
+def read(path, *, reorient: bool = True) -> tuple[np.ndarray, "Geometry", str]:
     """Read any SimpleITK-supported image (or a DICOM series directory).
 
-    Returns ``(array (Z, Y, X), canonical geometry, original orientation code)``: the array is
-    already reoriented to RAS, which is the frame nnU-Net's readers put every input in and the
-    frame the networks were trained in - feeding LPS mirrors left and right silently.
+    Returns ``(array (Z, Y, X), geometry, original orientation code)``.
+
+    With ``reorient=True`` (the default, and what TotalSegmentator does) the array comes back
+    in RAS; feeding a model LPS data mirrors left and right silently. But **nnU-Net's default
+    reader does not reorient**: ``SimpleITKIO`` hands the array over in its stored axis order,
+    and only the opt-in ``SimpleITKIOWithReorient`` / ``NibabelIOWithReorient`` canonicalize.
+    A model trained through the plain reader therefore expects its own acquisition orientation,
+    so pass ``reorient=False`` for those - see :func:`reader_reorients`.
     """
     sitk = _sitk()
     p = Path(path)
@@ -59,8 +69,31 @@ def read(path) -> tuple[np.ndarray, "Geometry", str]:
     if image.GetDimension() != 3:
         raise ValueError(f"expected a 3D image; {p} has {image.GetDimension()} dimensions")
     original = orientation_of(image)
-    image = sitk.DICOMOrient(image, CANONICAL)
+    if reorient:
+        image = sitk.DICOMOrient(image, CANONICAL)
     return sitk.GetArrayFromImage(image), geometry_of(image), original
+
+
+def reader_reorients(model_folder) -> bool:
+    """Does this nnU-Net model's declared reader reorient to RAS?
+
+    The plans name an ``image_reader_writer`` (``dataset.json``'s ``overwrite_image_reader_writer``
+    wins when present). Only the ``*WithReorient`` variants canonicalize; ``SimpleITKIO`` and
+    ``NibabelIO`` - the defaults, and what almost every trained model declares - do not. Getting
+    this wrong mirrors left and right, which shows up as paired structures scoring Dice 0 while
+    unpaired ones merely degrade.
+    """
+    import json
+    f = Path(model_folder)
+    name = None
+    ds = f / "dataset.json"
+    if ds.exists():
+        name = json.loads(ds.read_text()).get("overwrite_image_reader_writer")
+    if not name:
+        pl = f / "plans.json"
+        if pl.exists():
+            name = json.loads(pl.read_text()).get("image_reader_writer")
+    return bool(name) and "reorient" in str(name).lower()
 
 
 def to_image(array_zyx: np.ndarray, geometry: "Geometry"):

@@ -194,6 +194,28 @@ def choose_accumulate(policy: str, *, device: torch.device, K: int, shape, bytes
                   f"{reserve / 1e9:.1f} GB vs {budget / 1e9:.2f} GB free on {device} (unmeasured)")
 
 
+def available_folds(folder, folds) -> tuple:
+    """The requested folds, restricted to the ``fold_*`` directories that exist.
+
+    TotalSegmentator ships fold_0 only, so ``folds=(0,)`` is the right default - but a stock
+    nnU-Net result folder may hold any subset (the knee reference model ships only fold_1).
+    ``folds="all"`` takes whatever is on disk. Asking for folds that are all missing is an
+    error naming what is there, rather than nnU-Net's bare file-not-found.
+    """
+    root = Path(folder)
+    have = sorted(int(p.name.split("_")[1]) for p in root.glob("fold_*")
+                  if p.is_dir() and p.name.split("_")[-1].isdigit())
+    if not have:
+        raise FileNotFoundError(f"no fold_* directory in {root}")
+    if folds is None or (isinstance(folds, str) and folds == "all"):
+        return tuple(have)
+    want = [int(f) for f in ((folds,) if isinstance(folds, int) else folds)]
+    keep = [f for f in want if f in have]
+    if not keep:
+        raise FileNotFoundError(f"{root.name}: requested fold(s) {want} not present; have {have}")
+    return tuple(keep)
+
+
 class TorchModel:
     """One nnU-Net configuration folder (``{trainer}__{plans}__{config}``) on torch.
 
@@ -237,7 +259,8 @@ class TorchModel:
         ensure_trainer(self.folder)                       # shim custom trainers (e.g. SkeletonRecall)
         p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
                             perform_everything_on_device=False, device=self.device, verbose=False, allow_tqdm=False)
-        p.initialize_from_trained_model_folder(str(self.folder), use_folds=tuple(folds), checkpoint_name="checkpoint_final.pth")
+        p.initialize_from_trained_model_folder(str(self.folder), use_folds=available_folds(self.folder, folds),
+                                               checkpoint_name="checkpoint_final.pth")
         self.predictor = p
         self.plans = p.plans_manager.plans
         self.dataset_json = p.dataset_json
@@ -246,6 +269,14 @@ class TorchModel:
         self.patch = tuple(int(x) for x in p.configuration_manager.patch_size)
         self.spacing_zyx = tuple(float(x) for x in p.configuration_manager.spacing)
         self.transpose_forward = tuple(p.plans_manager.transpose_forward)
+        if tuple(self.transpose_forward) != (0, 1, 2):
+            # nnU-Net permutes the spatial axes before preprocessing, and configuration_manager
+            # .spacing is already expressed in that permuted frame - so ignoring it silently
+            # resamples to the wrong spacing per axis. Refuse rather than be quietly wrong.
+            raise NotImplementedError(
+                f"{self.folder.name}: plans set transpose_forward={self.transpose_forward}; nnseg "
+                "only supports the identity (0, 1, 2) today. The model spacing is expressed in the "
+                "transposed frame, so running it unpermuted would resample the wrong axes.")
         self.fold_params = list(p.list_of_parameters)
         # Everything up to here is CPU work (checkpoint read, architecture build, surgery) and
         # safe to do on a helper thread. The device move is deliberately separate: a helper
