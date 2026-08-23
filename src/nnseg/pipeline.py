@@ -15,8 +15,10 @@ from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel, available_folds
 from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
+from .cache import ModelCache
 from .result import Segmentation
-from .store import ModelStore
+from .weights import as_store
+from .cache import ModelCache
 from .values import LabelSchema
 from .preprocess import to_model_frame
 
@@ -45,6 +47,10 @@ def _resolve_spec(task, catalog) -> TaskSpec:
     return catalog.get(task)
 
 
+def _is_native(spec) -> bool:
+    return spec.source == "nnunet"
+
+
 def _lut(K: int, remap: dict | None) -> np.ndarray:
     lut = np.arange(K, dtype=np.int64)
     if remap:
@@ -54,7 +60,7 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
     return lut
 
 
-def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
+def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
             envelope_mm: float | None = 20.0, configuration: str | None = None,
@@ -88,7 +94,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
     steady-state on an A10); it only applies when the accumulator is on the device.
 
-    ``models`` is a :class:`~nnseg.store.ModelStore`; pass one with ``capacity>=1`` (or use
+    ``models`` is a :class:`~nnseg.cache.ModelCache`; pass one with ``capacity>=1`` (or use
     :class:`~nnseg.segmenter.Segmenter`) to keep models warm between calls instead of rebuilding
     them every time - the difference between a script and a server.
 
@@ -111,13 +117,14 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
-    models = models if models is not None else ModelStore()   # no caching unless asked
+    models = models if models is not None else ModelCache()   # no caching unless asked
     spec = _resolve_spec(task, catalog)
     # nnU-Net-native models were trained on their own preprocessing: skimage's half-pixel
     # ("center") resample and crop-to-nonzero. TS bypasses both (corner-aligned change_spacing,
     # no crop). Getting this backwards is a silent geometry error, so it follows the task's
     # ecosystem unless the caller is explicit. See docs/resampler-parity-finding.md.
-    native = spec.source == "nnunet"
+    native = _is_native(spec)
+    store = as_store(weights, ecosystem="nnunet" if native else "totalsegmentator")
     if convention == "auto":
         convention = "center" if native else "corner"
     crop_nonzero = native
@@ -126,13 +133,12 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     # expects its acquisition orientation. Reorienting it anyway mirrors left/right.
     reorient = True
     if native and spec.single is not None:
-        reorient = nio.reader_reorients(resolve_model_folder(spec.single, ecosystem="nnunet",
-                                                             model_root=model_root,
-                                                             configuration=configuration))
+        reorient = nio.reader_reorients(store.resolve(spec.single, configuration=configuration))
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
     prov = {"task": spec.name, "source": spec.source, "device": device, "dtype": dtype,
             "convention": convention, "reoriented_to_ras": reorient, "interp": interp,
             "envelope_mm": envelope_mm, "resampling_order": resampling_order, "models": [],
+            "weights_store": store.describe(),
             "nnseg": _version()}
 
     if isinstance(image, (str, Path)):
@@ -151,8 +157,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     cached = {}                                   # model spacing -> (x, frame)
 
     def load(wid):
-        folder = resolve_model_folder(wid, ecosystem="nnunet" if native else "totalsegmentator",
-                                      model_root=model_root, configuration=configuration)
+        folder = store.resolve(wid, configuration=configuration)
         m = models.get(folder, folds=folds, device=device, dtype=dtype,
                        accumulate=accumulate, batch_size=batch_size)
         prov["models"].append({"weights": str(wid), "folder": folder.name,

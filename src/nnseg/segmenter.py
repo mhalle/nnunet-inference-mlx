@@ -5,39 +5,43 @@ nothing retained. A Slicer module, an MCP tool or a REST endpoint wants the oppo
 device, weights root and dtype are properties of the *deployment*, fixed at startup, and
 reloading a checkpoint on every request is the difference between a service and a toy.
 
-:class:`Segmenter` holds that policy plus a :class:`~nnseg.store.ModelStore`, and exposes the
+:class:`Segmenter` holds that policy plus a :class:`~nnseg.cache.ModelCache`, and exposes the
 same operation as a method. Per-call arguments still win, so a caller can override anything for
 one request without building a second Segmenter.
 """
 from __future__ import annotations
 
-from .store import ModelStore
+from .cache import ModelCache
 from .tasks import TaskCatalog
+from .weights import as_store
 
 # Set once per deployment, and overridable per call.
-POLICY = ("device", "dtype", "model_root", "folds", "accumulate", "batch_size",
+POLICY = ("device", "dtype", "weights", "folds", "accumulate", "batch_size",
           "resampling_order", "envelope_mm", "convention", "interp", "grid", "configuration")
 
 
 class Segmenter:
     """Segment with a fixed execution policy and warm models.
 
-    >>> seg = Segmenter(device="cuda", model_root="/weights", cache_models=2)
+    >>> seg = Segmenter(device="cuda", weights="/weights", cache_models=2)
     >>> r = seg.segment("scan.nii.gz", "total_fast")
     >>> r.mask("liver").sum()
 
-    ``cache_models`` is how many models stay resident. Keep it small: warm weights compete for
-    the same device memory the sliding-window accumulator needs (see :mod:`nnseg.store`).
+    ``weights`` says where model files come from - a :class:`~nnseg.weights.WeightsStore`, a
+    directory, or ``None`` for the ecosystem default. ``cache_models`` is how many models stay
+    resident. Keep it small: warm weights compete for
+    the same device memory the sliding-window accumulator needs (see :mod:`nnseg.cache`).
     """
 
-    def __init__(self, *, device: str = "auto", dtype: str = "fp16", model_root=None,
+    def __init__(self, *, device: str = "auto", dtype: str = "fp16", weights=None,
                  catalog=None, folds=(0,), accumulate: str = "auto", batch_size="auto",
                  resampling_order: int = 3, envelope_mm: float | None = 20.0,
                  convention: str = "auto", interp: str = "linear", grid="input",
                  configuration: str | None = None, cache_models: int = 1):
         self.catalog = catalog if catalog is not None else TaskCatalog("totalsegmentator")
-        self.models = ModelStore(capacity=cache_models)
-        self.policy = dict(device=device, dtype=dtype, model_root=model_root, folds=folds,
+        self.models = ModelCache(capacity=cache_models)
+        self.weights = as_store(weights)
+        self.policy = dict(device=device, dtype=dtype, weights=self.weights, folds=folds,
                            accumulate=accumulate, batch_size=batch_size,
                            resampling_order=resampling_order, envelope_mm=envelope_mm,
                            convention=convention, interp=interp, grid=grid,
@@ -79,18 +83,20 @@ class Segmenter:
 
         Returns how many are resident afterwards. Only useful with ``cache_models >= 1``.
         """
-        from .pipeline import _resolve_spec
-        from .tasks import resolve_model_folder
+        from .pipeline import _is_native, _resolve_spec
         spec = _resolve_spec(task, self.catalog)
-        native = spec.source == "nnunet"
+        store = as_store(self.policy["weights"],
+                         ecosystem="nnunet" if _is_native(spec) else "totalsegmentator")
         for wid in spec.weights_ids:
-            folder = resolve_model_folder(wid, ecosystem="nnunet" if native else "totalsegmentator",
-                                          model_root=self.policy["model_root"],
-                                          configuration=self.policy["configuration"])
+            folder = store.resolve(wid, configuration=self.policy["configuration"])
             self.models.get(folder, folds=self.policy["folds"], device=self.policy["device"],
                             dtype=self.policy["dtype"], accumulate=self.policy["accumulate"],
                             batch_size=self.policy["batch_size"])
         return len(self.models)
+
+    def fetch(self, task) -> int:
+        """Download whatever this task needs, without running anything. Returns model count."""
+        return len(self.weights.ensure(task, catalog=self.catalog))
 
     def clear(self) -> None:
         """Drop every warm model and free the device memory."""
@@ -98,4 +104,4 @@ class Segmenter:
 
     def __repr__(self) -> str:
         return (f"Segmenter(device={self.policy['device']!r}, dtype={self.policy['dtype']!r}, "
-                f"{len(self.catalog)} tasks, {self.models!r})")
+                f"{len(self.catalog)} tasks, {self.weights!r}, {self.models!r})")

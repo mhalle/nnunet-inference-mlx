@@ -1,9 +1,9 @@
-"""Loading models, and optionally keeping them warm.
+"""Loading networks, and optionally keeping them warm.
 
 ``segment()`` on its own builds a :class:`~nnseg.network.TorchModel` per call and drops it -
 right for a one-shot script, wrong for a server, where every request would re-read the
 checkpoint, rebuild the architecture, redo the ShuffleUp surgery and re-upload the weights.
-:class:`ModelStore` is the seam: a bounded LRU keyed on the model folder *and* the policy that
+:class:`ModelCache` is the seam: a bounded LRU keyed on the model folder *and* the policy that
 was used to build it, so a cached model is only reused when it would be built identically.
 
 Capacity is deliberately small by default. A warm model holds its weights on the device, and a
@@ -17,8 +17,12 @@ from collections import OrderedDict
 from pathlib import Path
 
 
-class ModelStore:
+class ModelCache:
     """Builds :class:`TorchModel` instances, keeping up to ``capacity`` of them warm.
+
+    Distinct from :class:`~nnseg.weights.WeightsStore`: that one owns the *files* and is the
+    source of truth; this owns *loaded networks* on the device and is purely an optimization -
+    bounded, evictable, and safe to drop at any moment.
 
     ``capacity=0`` (the default) never caches, which is exactly ``segment()``'s historical
     behavior. Anything larger keeps the most recently used models loaded on the device.
@@ -81,5 +85,5 @@ class ModelStore:
         return len(self._warm)
 
     def __repr__(self) -> str:
-        return (f"ModelStore(capacity={self.capacity}, warm={len(self._warm)}, "
+        return (f"ModelCache(capacity={self.capacity}, warm={len(self._warm)}, "
                 f"hits={self.hits}, misses={self.misses})")

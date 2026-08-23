@@ -6,11 +6,11 @@ caching and policy logic, not the network, and these must stay in the fast suite
 import pytest
 
 from nnseg.segmenter import POLICY, Segmenter
-from nnseg.store import ModelStore
+from nnseg.cache import ModelCache
 
 
 class _FakeModel:
-    """Stands in for a TorchModel so the REAL ModelStore.get logic is what gets tested."""
+    """Stands in for a TorchModel so the REAL ModelCache.get logic is what gets tested."""
 
     built = 0
 
@@ -32,14 +32,14 @@ def _stub_model(monkeypatch):
 
 # -- the store --------------------------------------------------------------------------
 def test_capacity_zero_never_caches():
-    s = ModelStore()                       # the default: segment()'s historical behavior
+    s = ModelCache()                       # the default: segment()'s historical behavior
     a, b = s.get("/m", folds=(0,)), s.get("/m", folds=(0,))
     assert a is not b and len(s) == 0
     assert s.hits == 0 and s.misses == 2
 
 
 def test_a_warm_model_is_reused():
-    s = ModelStore(capacity=2)
+    s = ModelCache(capacity=2)
     a, b = s.get("/m", folds=(0,)), s.get("/m", folds=(0,))
     assert a is b and s.hits == 1 and s.misses == 1
     assert _FakeModel.built == 1           # built once, not twice
@@ -47,7 +47,7 @@ def test_a_warm_model_is_reused():
 
 def test_policy_is_part_of_the_key_so_a_different_policy_is_a_different_model():
     """Reusing a model built under another policy would silently ignore the new one."""
-    s = ModelStore(capacity=8)
+    s = ModelCache(capacity=8)
     base = dict(folds=(0,), device="cpu", dtype="fp16", accumulate="auto", batch_size="auto")
     s.get("/m", **base)
     for changed in ({"dtype": "fp32"}, {"device": "cuda"}, {"folds": (1,)},
@@ -57,13 +57,13 @@ def test_policy_is_part_of_the_key_so_a_different_policy_is_a_different_model():
 
 
 def test_a_different_folder_is_a_different_model():
-    s = ModelStore(capacity=4)
+    s = ModelCache(capacity=4)
     s.get("/a", folds=(0,)); s.get("/b", folds=(0,)); s.get("/a", folds=(0,))
     assert s.hits == 1 and len(s) == 2
 
 
 def test_lru_evicts_the_least_recently_used():
-    s = ModelStore(capacity=2)
+    s = ModelCache(capacity=2)
     s.get("/a", folds=(0,)); s.get("/b", folds=(0,))
     s.get("/a", folds=(0,))                # /a is now the most recent
     s.get("/c", folds=(0,))                # evicts /b, not /a
@@ -75,17 +75,17 @@ def test_lru_evicts_the_least_recently_used():
 
 
 def test_release_keeps_a_cached_model_and_drops_an_uncached_one():
-    warm = ModelStore(capacity=1)
+    warm = ModelCache(capacity=1)
     m = warm.get("/m", folds=(0,))
     warm.release(m)                        # cached: still there
     assert len(warm) == 1 and warm.get("/m", folds=(0,)) is m
-    cold = ModelStore()
+    cold = ModelCache()
     cold.release(cold.get("/m", folds=(0,)))   # uncached: no error, nothing retained
     assert len(cold) == 0
 
 
 def test_clear_drops_everything():
-    s = ModelStore(capacity=4)
+    s = ModelCache(capacity=4)
     s.get("/a", folds=(0,)); s.get("/b", folds=(0,))
     s.clear()
     assert len(s) == 0
@@ -159,3 +159,79 @@ def test_describe_works_for_a_union_task_and_lists_every_model():
     seg = Segmenter()
     d = seg.describe("total")
     assert d["shape"] == "label_union" and len(d["weights"]) == 5
+
+
+# -- the weights store -------------------------------------------------------------------
+def test_a_path_is_coerced_into_a_store(tmp_path):
+    from nnseg.weights import WeightsStore, as_store
+    s = as_store(tmp_path)
+    assert isinstance(s, WeightsStore) and s.root == tmp_path
+    assert as_store(s) is s                       # a store passes through unchanged
+
+
+def test_default_store_resolves_its_root_lazily_from_the_ecosystem(monkeypatch, tmp_path):
+    from nnseg.weights import WeightsStore
+    monkeypatch.setenv("TOTALSEG_WEIGHTS_PATH", str(tmp_path))
+    s = WeightsStore()
+    assert s.describe()["root"] == "(default)"    # nothing touched yet
+    assert s.root == tmp_path                     # resolved on demand
+
+
+def test_have_is_offline_and_resolve_finds_the_model(tmp_path):
+    from nnseg.weights import WeightsStore
+    d = tmp_path / "Dataset297_Total" / "nnUNetTrainer__nnUNetPlans__3d_fullres"
+    d.mkdir(parents=True)
+    s = WeightsStore(tmp_path, fetch=False)
+    assert s.have(297) and not s.have(999)
+    assert s.resolve(297) == d
+
+
+def test_fetch_disabled_raises_modelnotfound_instead_of_reaching_for_the_network(tmp_path):
+    from nnseg import errors
+    from nnseg.weights import WeightsStore
+    s = WeightsStore(tmp_path, fetch=False)
+    with pytest.raises(errors.ModelNotFound, match="fetching disabled"):
+        s.resolve(297)
+
+
+def test_a_model_folder_path_bypasses_the_store_layout(tmp_path):
+    """A caller with a model on disk should never have to arrange it into a store's layout."""
+    from nnseg.weights import WeightsStore
+    d = tmp_path / "anywhere" / "nnUNetTrainer__nnUNetPlans__3d_fullres"
+    d.mkdir(parents=True)
+    s = WeightsStore(tmp_path / "elsewhere", fetch=False)
+    assert s.resolve(d) == d
+
+
+def test_no_download_source_for_nnunet_says_so_clearly(tmp_path):
+    from nnseg import errors
+    from nnseg.weights import WeightsStore
+    s = WeightsStore(tmp_path, ecosystem="nnunet")
+    with pytest.raises(errors.ModelNotFound, match="no download source|has no download source"):
+        s.resolve(500)
+
+
+def test_a_subclass_can_fetch_from_somewhere_else(tmp_path):
+    """The override point: where weights come from is the store's business."""
+    from nnseg.weights import WeightsStore
+
+    class Pretend(WeightsStore):
+        def fetch(self, weights_id):
+            d = self.root / f"Dataset{weights_id}_Made" / "nnUNetTrainer__p__3d_fullres"
+            d.mkdir(parents=True)
+            return d
+
+    s = Pretend(tmp_path)
+    assert not s.have(42)
+    assert s.resolve(42).name == "nnUNetTrainer__p__3d_fullres"
+    assert s.have(42)                             # now cached locally
+
+
+def test_segmenter_holds_a_store_and_passes_it_through(monkeypatch, tmp_path):
+    from nnseg.weights import WeightsStore
+    seen = {}
+    monkeypatch.setattr("nnseg.pipeline.segment", lambda image, task, **kw: seen.update(kw))
+    seg = Segmenter(weights=tmp_path)
+    assert isinstance(seg.weights, WeightsStore)
+    seg.segment("i", "total_fast")
+    assert seen["weights"] is seg.weights
