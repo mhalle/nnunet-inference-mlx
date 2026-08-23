@@ -8,12 +8,16 @@ could be lifted out as its own package the day something outside wants it. The *
 layer** - ``io``, ``preprocess``, ``frame``, ``network``, ``pipeline``, ``cli`` - reads images
 through SimpleITK, drives nnU-Net's networks, and composes tasks from the toolkit's catalog.
 """
-from . import backends, io
+from . import backends, errors, io
+from .errors import (Cancelled, InputError, ModelNotFound, NnsegError, ResourceError,
+                     UnsupportedModel)
 from .frame import Frame
 from .grid import Grid
 from .mapping import Mapping
 from .network import TorchModel
 from .pipeline import segment
+from .result import Segmentation
+from .tasks import TaskCatalog, TaskSpec
 from .reference import margins
 from .resample import resample_data
 from .restore import available_backends, resample_argmax, resample_paint, to_labels
@@ -22,7 +26,15 @@ from .tables import AxisTable, build_tables
 
 __version__ = "0.1.0"
 __all__ = [
-    "Frame", "Grid", "Mapping", "TorchModel", "AxisTable", "ShuffleUp3d",
-    "available_backends", "backends", "build_tables", "io", "margins", "resample_argmax",
-    "resample_data", "resample_paint", "segment", "swap_transposed", "to_labels", "__version__",
+    # the API most callers need
+    "segment", "Segmentation", "TaskCatalog", "TaskSpec", "io",
+    # errors, catchable as a family or individually
+    "NnsegError", "InputError", "ModelNotFound", "UnsupportedModel", "ResourceError",
+    "Cancelled", "errors",
+    # geometry and models, for callers composing their own pipeline
+    "Frame", "Grid", "Mapping", "TorchModel",
+    # kernel layer
+    "AxisTable", "ShuffleUp3d", "available_backends", "backends", "build_tables", "margins",
+    "resample_argmax", "resample_data", "resample_paint", "swap_transposed", "to_labels",
+    "__version__",
 ]

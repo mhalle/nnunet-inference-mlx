@@ -24,7 +24,10 @@ SRC = _package_dir()
 
 KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuffleup",
           "backends", "backends.metal", "backends.torch_gather", "backends.triton_gpu"}
-PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope", "weights_fetch", "trainers"}
+PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope",
+            "weights_fetch", "trainers", "result"}
+# errors.py is deliberately dependency-free (stdlib only) so either layer may raise from it.
+SHARED = {"errors"}
 FORBIDDEN_FOR_KERNEL = {"nnunetv2", "SimpleITK", "nibabel", "scipy", "mlx", "totalsegmentator",
                         "nnunet_inference_mlx", "acvl_utils", "batchgenerators"}
 # nnseg must import on a machine with no mlx - that is the whole point of the torch path, and
@@ -59,8 +62,16 @@ class TestLayering(unittest.TestCase):
         found = {p.stem for p in SRC.glob("*.py") if p.stem not in ("__init__", "__main__")}
         found |= {f"backends.{p.stem}" for p in (SRC / "backends").glob("*.py") if p.stem != "__init__"}
         found |= {"backends"} if (SRC / "backends").is_dir() else set()
-        self.assertEqual(found, KERNEL | PIPELINE,
+        self.assertEqual(found, KERNEL | PIPELINE | SHARED,
                          "a module was added without deciding which layer it belongs to")
+
+    def test_shared_modules_import_nothing(self):
+        """errors.py is classified SHARED because either layer may raise from it - which only
+        holds while it stays dependency-free. Enforce that rather than trusting the comment."""
+        for name in sorted(SHARED):
+            for mod, line in _imports(_module_path(name), top_level_only=False):
+                self.assertTrue(mod.startswith("__future__"),
+                                f"{name}.py:{line} imports {mod!r}; SHARED modules must stay stdlib-only")
 
     def test_kernel_modules_do_not_import_the_pipeline_layer(self):
         for name in sorted(KERNEL):

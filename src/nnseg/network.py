@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .errors import ModelNotFound, UnsupportedModel
 from .shuffleup import swap_transposed
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -206,13 +207,13 @@ def available_folds(folder, folds) -> tuple:
     have = sorted(int(p.name.split("_")[1]) for p in root.glob("fold_*")
                   if p.is_dir() and p.name.split("_")[-1].isdigit())
     if not have:
-        raise FileNotFoundError(f"no fold_* directory in {root}")
+        raise ModelNotFound(f"no fold_* directory in {root}")
     if folds is None or (isinstance(folds, str) and folds == "all"):
         return tuple(have)
     want = [int(f) for f in ((folds,) if isinstance(folds, int) else folds)]
     keep = [f for f in want if f in have]
     if not keep:
-        raise FileNotFoundError(f"{root.name}: requested fold(s) {want} not present; have {have}")
+        raise ModelNotFound(f"{root.name}: requested fold(s) {want} not present; have {have}")
     return tuple(keep)
 
 
@@ -273,7 +274,7 @@ class TorchModel:
             # nnU-Net permutes the spatial axes before preprocessing, and configuration_manager
             # .spacing is already expressed in that permuted frame - so ignoring it silently
             # resamples to the wrong spacing per axis. Refuse rather than be quietly wrong.
-            raise NotImplementedError(
+            raise UnsupportedModel(
                 f"{self.folder.name}: plans set transpose_forward={self.transpose_forward}; nnseg "
                 "only supports the identity (0, 1, 2) today. The model spacing is expressed in the "
                 "transposed frame, so running it unpermuted would resample the wrong axes.")

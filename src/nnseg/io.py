@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .errors import InputError
+
 import numpy as np
 
 CANONICAL = "RAS"
@@ -61,13 +63,13 @@ def read(path, *, reorient: bool = True) -> tuple[np.ndarray, "Geometry", str]:
         reader = sitk.ImageSeriesReader()
         files = reader.GetGDCMSeriesFileNames(str(p))
         if not files:
-            raise FileNotFoundError(f"no DICOM series found in {p}")
+            raise InputError(f"no DICOM series found in {p}")
         reader.SetFileNames(files)
         image = reader.Execute()
     else:
         image = sitk.ReadImage(str(p))
     if image.GetDimension() != 3:
-        raise ValueError(f"expected a 3D image; {p} has {image.GetDimension()} dimensions")
+        raise InputError(f"expected a 3D image; {p} has {image.GetDimension()} dimensions")
     original = orientation_of(image)
     if reorient:
         image = sitk.DICOMOrient(image, CANONICAL)

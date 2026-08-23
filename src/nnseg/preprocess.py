@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from .grid import Grid
 
+from .errors import UnsupportedModel
 from .frame import Frame
 
 
@@ -75,10 +76,10 @@ def normalize(data: np.ndarray, schemes, props, *, use_mask_for_norm=None, seg=N
     from nnunetv2.preprocessing.normalization import default_normalization_schemes as N
     names = list(schemes)
     if len(names) != 1:
-        raise NotImplementedError(f"multi-channel normalization {names!r} not supported yet (single channel only)")
+        raise UnsupportedModel(f"multi-channel normalization {names!r} not supported yet (single channel only)")
     cls = getattr(N, names[0], None)
     if cls is None:
-        raise NotImplementedError(f"unknown normalization scheme {names[0]!r}")
+        raise UnsupportedModel(f"unknown normalization scheme {names[0]!r}")
     umn = bool(use_mask_for_norm[0]) if isinstance(use_mask_for_norm, (list, tuple)) else bool(use_mask_for_norm)
     # a fresh C-contiguous copy: run() mutates in place (must not touch the caller's array), and
     # mean/std on a non-contiguous view can round differently. np.array(copy=True) guarantees it.

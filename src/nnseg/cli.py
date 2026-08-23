@@ -26,18 +26,18 @@ def main(argv=None) -> int:
     s.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "segment":
-        from .io import write
         from .pipeline import segment
-        img, schema, T = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
-                                 grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
-                                 batch_size=args.batch_size if args.batch_size == "auto" else int(args.batch_size),
-                                 envelope_mm=args.envelope if args.envelope > 0 else None,
-                                 progress=None if args.quiet else (lambda m: print(f"  {m}", file=sys.stderr, flush=True)))
-        write(img, args.output)
+        r = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
+                    grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
+                    batch_size=args.batch_size if args.batch_size == "auto" else int(args.batch_size),
+                    envelope_mm=args.envelope if args.envelope > 0 else None,
+                    progress=None if args.quiet else (lambda m: print(f"  {m}", file=sys.stderr, flush=True)))
+        r.save(args.output)
         if not args.quiet:
-            for k, v in T.items():
+            for k, v in r.timings.items():
                 print(f"  {v:7.2f} s  {k}", file=sys.stderr)
-            print(f"wrote {args.output}: {tuple(reversed(img.GetSize()))}, {len(schema.names)} labels", file=sys.stderr)
+            print(f"wrote {args.output}: {tuple(r.grid.shape)}, "
+                  f"{len(r.present())}/{len(r.schema.names)} structures present", file=sys.stderr)
     return 0
 
 

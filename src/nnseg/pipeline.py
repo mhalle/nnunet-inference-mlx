@@ -13,10 +13,16 @@ from .envelope import (Envelope, body_mask, body_threshold, envelope_of, label_r
 from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
-from .network import TorchModel
+from .network import TorchModel, available_folds
 from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
+from .result import Segmentation
 from .values import LabelSchema
 from .preprocess import to_model_frame
+
+
+def _version() -> str:
+    from . import __version__                    # deferred: __init__ imports this module
+    return __version__
 
 
 def _warm_restore_kernel(device: str) -> None:
@@ -83,9 +89,11 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
 
-    Returns ``(labels_img, schema, timings)``: a SimpleITK image of the labels in the *input's*
-    orientation on the requested grid (``"input"`` = the input grid, a number = isotropic at
-    that spacing, a ``Grid`` = as given), the label schema, and per-stage seconds.
+    Returns a :class:`~nnseg.result.Segmentation`: ``.image`` is the labels as a SimpleITK image
+    in the *input's* orientation on the requested grid (``"input"`` = the input grid, a number =
+    isotropic at that spacing, a ``Grid`` = as given). It also carries ``.array``, ``.mask(name)``,
+    ``.present()``, ``.volumes_ml()``, ``.save(path)``, ``.timings`` and ``.provenance`` - what
+    models, folds, device and preprocessing policy actually ran.
     Multi-model tasks composite at the label level in part order (later parts win).
     """
     from . import io as nio
@@ -115,6 +123,10 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
                                                              model_root=model_root,
                                                              configuration=configuration))
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
+    prov = {"task": spec.name, "source": spec.source, "device": device, "dtype": dtype,
+            "convention": convention, "reoriented_to_ras": reorient, "interp": interp,
+            "envelope_mm": envelope_mm, "resampling_order": resampling_order, "models": [],
+            "nnseg": _version()}
 
     if isinstance(image, (str, Path)):
         data_zyx, geometry, orientation = nio.read(image, reorient=reorient)
@@ -134,8 +146,12 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     def load(wid):
         folder = resolve_model_folder(wid, ecosystem="nnunet" if native else "totalsegmentator",
                                       model_root=model_root, configuration=configuration)
-        return TorchModel(folder, folds=folds, device=device, dtype=dtype,
-                          accumulate=accumulate, batch_size=batch_size).to_device()
+        m = TorchModel(folder, folds=folds, device=device, dtype=dtype,
+                       accumulate=accumulate, batch_size=batch_size).to_device()
+        prov["models"].append({"weights": str(wid), "folder": folder.name,
+                               "folds": list(available_folds(folder, folds)), "K": m.K,
+                               "spacing": tuple(round(v, 4) for v in m.spacing_zyx)})
+        return m
 
     def model_frame(model):
         key = model.spacing_zyx
@@ -276,4 +292,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     out_img = nio.to_image(arr, geo)
     T["to input orientation"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
-    return out_img, schema, T
+    prov.update(input_orientation=orientation, output_grid=tuple(out_grid.shape),
+                cropped_to_nonzero=frame.model_source is not None)
+    return Segmentation(image=out_img, schema=schema, grid=out_grid, spec=spec,
+                        timings=T, provenance=prov)

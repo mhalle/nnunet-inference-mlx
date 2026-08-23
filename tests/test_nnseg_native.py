@@ -155,3 +155,76 @@ def test_available_folds_intersects_a_request(tmp_path):
     f = ds / "nnUNetTrainer__nnUNetPlans__3d_fullres"
     assert available_folds(f, (0, 1, 2)) == (0, 2)
     assert available_folds(f, "all") == (0, 2, 3)
+
+
+# -- the result object and the error hierarchy ---------------------------------------------
+def _segmentation(labels=None):
+    import SimpleITK as sitk
+    from nnseg.result import Segmentation
+    from nnseg.values import LabelSchema
+    a = np.zeros((4, 5, 6), np.uint8)
+    a[1:3, 1:4, 1:5] = 7          # femur
+    a[0, 0, 0] = 8                # tibia, one voxel
+    img = sitk.GetImageFromArray(labels if labels is not None else a)
+    img.SetSpacing((2.0, 2.0, 2.0))
+    return Segmentation(image=img, schema=LabelSchema(names={7: "femur", 8: "tibia", 9: "patella"}),
+                        grid=Grid((4, 5, 6), (2.0, 2.0, 2.0)), spec=TaskSpec(name="knee"),
+                        timings={"total": 1.5}, provenance={"device": "cpu"})
+
+
+def test_mask_by_name_and_by_value_agree():
+    r = _segmentation()
+    assert r.mask("femur").sum() == 2 * 3 * 4
+    assert np.array_equal(r.mask("femur"), r.mask(7))
+
+
+def test_unknown_structure_name_is_a_keyerror_that_names_the_options():
+    r = _segmentation()
+    with pytest.raises(KeyError, match="femur"):
+        r.mask("spleen")
+
+
+def test_present_reports_only_structures_actually_found():
+    r = _segmentation()
+    assert r.present() == {7: "femur", 8: "tibia"}      # patella declared but absent
+
+
+def test_volumes_ml_uses_the_grid_spacing():
+    r = _segmentation()
+    v = r.volumes_ml()
+    assert v["femur"] == pytest.approx(24 * 8 / 1000.0)   # 24 voxels x 8 mm^3
+    assert "patella" not in v
+
+
+def test_result_carries_provenance_and_timings():
+    r = _segmentation()
+    assert r.seconds == 1.5 and r.provenance["device"] == "cpu"
+    assert "knee" in repr(r) and "2/3 structures" in repr(r)
+
+
+def test_save_round_trips(tmp_path):
+    import SimpleITK as sitk
+    r = _segmentation()
+    p = r.save(tmp_path / "sub" / "out.nii.gz")          # creates the directory
+    assert p.exists()
+    assert np.array_equal(sitk.GetArrayFromImage(sitk.ReadImage(str(p))), r.array)
+
+
+def test_errors_are_catchable_as_a_family_and_as_the_builtin_they_replace():
+    from nnseg import errors
+    assert issubclass(errors.ModelNotFound, (errors.NnsegError, FileNotFoundError))
+    assert issubclass(errors.UnsupportedModel, (errors.NnsegError, NotImplementedError))
+    assert issubclass(errors.InputError, (errors.NnsegError, ValueError))
+
+
+def test_missing_model_raises_modelnotfound_not_a_bare_oserror(tmp_path):
+    from nnseg import errors
+    with pytest.raises(errors.ModelNotFound):
+        resolve_model_folder(999, model_root=tmp_path)
+
+
+def test_region_labels_raise_unsupportedmodel(tmp_path):
+    from nnseg import errors
+    ds = _model_tree(tmp_path, ["3d_fullres"], labels={"background": 0, "whole": [1, 2]})
+    with pytest.raises(errors.UnsupportedModel):
+        TaskSpec.from_model_folder(ds)

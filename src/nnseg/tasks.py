@@ -11,6 +11,8 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .errors import ModelNotFound, UnsupportedModel
 from typing import Mapping
 
 WeightsId = int | str
@@ -73,7 +75,7 @@ class TaskSpec:
         ds = json.loads((f / "dataset.json").read_text())
         labels = ds.get("labels") or {}
         if any(isinstance(v, (list, tuple)) for v in labels.values()):
-            raise NotImplementedError(
+            raise UnsupportedModel(
                 f"{f.name}: region-based labels (a label mapping to several values) are not "
                 "supported yet - nnseg takes the argmax of a softmax head")
         chan = ds.get("channel_names") or ds.get("modality") or {"0": "unknown"}
@@ -176,7 +178,7 @@ def weights_root(ecosystem: str = "totalsegmentator", explicit=None) -> Path:
         if v:
             return Path(v).expanduser()
     if default is None:
-        raise FileNotFoundError(f"no weights root for {ecosystem!r}; pass model_root or set {env_vars}")
+        raise ModelNotFound(f"no weights root for {ecosystem!r}; pass model_root or set {env_vars}")
     return default.expanduser()
 
 
@@ -203,15 +205,15 @@ def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmen
     matches = ([root] if p.is_dir() else
                sorted(root.glob(f"Dataset{weights_id}_*")) or sorted(root.glob(str(weights_id))))
     if not matches:
-        raise FileNotFoundError(f"no Dataset{weights_id}_* under {root}")
+        raise ModelNotFound(f"no Dataset{weights_id}_* under {root}")
     configs = sorted(c for c in matches[0].iterdir()
                      if c.is_dir() and not c.name.startswith(".") and c.name.count("__") == 2)
     if not configs:
-        raise FileNotFoundError(f"no trainer__plans__config folder in {matches[0]}")
+        raise ModelNotFound(f"no trainer__plans__config folder in {matches[0]}")
     by_config = {c.name.rsplit("__", 1)[1]: c for c in configs}
     if configuration is not None:
         if configuration not in by_config:
-            raise FileNotFoundError(f"configuration {configuration!r} not in {matches[0].name}; "
+            raise ModelNotFound(f"configuration {configuration!r} not in {matches[0].name}; "
                                     f"have {sorted(by_config)}")
         return by_config[configuration]
     for name in CONFIG_PREFERENCE:
@@ -220,6 +222,6 @@ def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmen
     if len(configs) == 1:
         return configs[0]
     why = "; ".join(f"{k} ({UNSUPPORTED_CONFIGS[k]})" for k in sorted(by_config) if k in UNSUPPORTED_CONFIGS)
-    raise FileNotFoundError(
+    raise ModelNotFound(
         f"no runnable configuration in {matches[0].name}; have {sorted(by_config)}"
         + (f" - unsupported: {why}" if why else "") + ". Pass configuration=... to choose.")
