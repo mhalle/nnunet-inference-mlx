@@ -1,0 +1,178 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "ts_version": "unknown",
+    "generator": "scripts/refresh_ts_weights.py",
+    "note": "id\u2192download URL extracted from libs.download_pretrained_weights; sha256 null (TS publishes none); gated=license-server only."
+  },
+  "weights": {
+    "8": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
+      "sha256": null
+    },
+    "113": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset113_ToothFairy3.zip",
+      "sha256": null
+    },
+    "115": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset115_mandible.zip",
+      "sha256": null
+    },
+    "117": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset117_lung_airways_arteries_veins_282subj.zip",
+      "sha256": null
+    },
+    "150": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset150_icb_v0.zip",
+      "sha256": null
+    },
+    "258": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset258_lung_vessels_248subj.zip",
+      "sha256": null
+    },
+    "260": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset260_hip_implant_71subj.zip",
+      "sha256": null
+    },
+    "291": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset291_TotalSegmentator_part1_organs_1559subj.zip",
+      "sha256": null
+    },
+    "292": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset292_TotalSegmentator_part2_vertebrae_1532subj.zip",
+      "sha256": null
+    },
+    "293": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset293_TotalSegmentator_part3_cardiac_1559subj.zip",
+      "sha256": null
+    },
+    "294": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset294_TotalSegmentator_part4_muscles_1559subj.zip",
+      "sha256": null
+    },
+    "295": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset295_TotalSegmentator_part5_ribs_1559subj.zip",
+      "sha256": null
+    },
+    "297": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset297_TotalSegmentator_total_3mm_1559subj.zip",
+      "sha256": null
+    },
+    "298": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset298_TotalSegmentator_total_6mm_1559subj.zip",
+      "sha256": null
+    },
+    "299": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset299_body_1559subj.zip",
+      "sha256": null
+    },
+    "300": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip",
+      "sha256": null
+    },
+    "315": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset315_thoraxCT.zip",
+      "sha256": null
+    },
+    "343": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset343_mediastinum_1786subj.zip",
+      "sha256": null
+    },
+    "351": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset351_oculomotor_muscles_18subj.zip",
+      "sha256": null
+    },
+    "527": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset527_breasts_1559subj.zip",
+      "sha256": null
+    },
+    "552": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset552_ventricle_parts_38subj.zip",
+      "sha256": null
+    },
+    "570": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset570_ct_liver_segments.zip",
+      "sha256": null
+    },
+    "576": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset576_mri_liver_segments_120subj.zip",
+      "sha256": null
+    },
+    "589": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset589_ct_mri_liver_lesions_750subj.zip",
+      "sha256": null
+    },
+    "591": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset591_ct_liver_lesions_842subj.zip",
+      "sha256": null
+    },
+    "597": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset597_mri_body_139subj.zip",
+      "sha256": null
+    },
+    "598": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset598_mri_body_6mm_139subj.zip",
+      "sha256": null
+    },
+    "615": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset615_MAXIMUS.zip",
+      "sha256": null
+    },
+    "756": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset756_mri_vertebrae_1076subj.zip",
+      "sha256": null
+    },
+    "775": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset775_head_glands_cavities_492subj.zip",
+      "sha256": null
+    },
+    "776": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset776_headneck_bones_vessels_492subj.zip",
+      "sha256": null
+    },
+    "777": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset777_head_muscles_492subj.zip",
+      "sha256": null
+    },
+    "778": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset778_headneck_muscles_part1_492subj.zip",
+      "sha256": null
+    },
+    "779": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset779_headneck_muscles_part2_492subj.zip",
+      "sha256": null
+    },
+    "789": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset789_kidney_cyst_501subj.zip",
+      "sha256": null
+    },
+    "850": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset850_TotalSegMRI_part1_organs_1088subj.zip",
+      "sha256": null
+    },
+    "851": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset851_TotalSegMRI_part2_muscles_1088subj.zip",
+      "sha256": null
+    },
+    "852": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset852_TotalSegMRI_total_3mm_1088subj.zip",
+      "sha256": null
+    },
+    "853": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset853_TotalSegMRI_total_6mm_1088subj.zip",
+      "sha256": null
+    },
+    "913": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset913_lung_nodules.zip",
+      "sha256": null
+    },
+    "920": {
+      "url": null,
+      "gated": true
+    },
+    "952": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset952_abdominal_muscles_167subj.zip",
+      "sha256": null
+    }
+  }
+}

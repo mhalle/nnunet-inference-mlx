@@ -24,7 +24,7 @@ SRC = _package_dir()
 
 KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuffleup",
           "backends", "backends.metal", "backends.torch_gather", "backends.triton_gpu"}
-PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope"}
+PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope", "weights_fetch"}
 FORBIDDEN_FOR_KERNEL = {"nnunetv2", "SimpleITK", "nibabel", "scipy", "mlx", "totalsegmentator",
                         "nnunet_inference_mlx", "acvl_utils", "batchgenerators"}
 # nnseg must import on a machine with no mlx - that is the whole point of the torch path, and
