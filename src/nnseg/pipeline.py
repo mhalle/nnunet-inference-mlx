@@ -39,7 +39,7 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size: int = 1,
-            prefetch: bool = True, progress=None):
+            prefetch: bool = False, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
@@ -51,7 +51,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
     a mild train/test mismatch that grows with the downsampling factor.
 
-    ``prefetch`` loads each part's model while the previous one predicts.
+    ``prefetch`` loads each part's model while the previous one predicts - off by default,
+    measured net negative on CUDA at batch > 1 (GIL contention with kernel launches).
 
     ``batch_size`` is patches per forward pass - 1 on Apple silicon (measured fastest), a
     lever on CUDA cards with headroom; it only applies when the accumulator is on the device.
@@ -91,21 +92,24 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     frame: Frame | None = None
     cached = {}                                   # model spacing -> (x, frame)
 
-    def load(wid):
+    def load(wid, defer=False):
         return TorchModel(resolve_model_folder(wid, model_root=model_root), folds=folds, device=device,
-                          dtype=dtype, accumulate=accumulate, batch_size=batch_size)
+                          dtype=dtype, accumulate=accumulate, batch_size=batch_size, defer_device=defer)
 
-    # Model loads are disk + CPU work that the GPU does not need: read the next part's
-    # checkpoint while the current part predicts. Measured on an A10, five cold loads were
-    # 11 % of a whole-body run with nothing else to do.
+    # Model prefetch is OFF by default, on measurement. The idea - read and build the next
+    # part's network while the current part predicts - hides ~0.9 s per warm load, but on an
+    # A10 at batch 4 it cost ~8 s of network time across five parts whether the helper moved
+    # weights to the GPU or not: unpickling a 700 MB checkpoint contends with the main
+    # thread's kernel launches (the GIL), and a batched forward has less slack to absorb it.
+    # Net negative there; at batch 1 roughly neutral. Left as an option for slow disks.
     pool = ThreadPoolExecutor(max_workers=1) if prefetch and len(parts) > 1 else None
-    pending = pool.submit(load, parts[0][0]) if pool else None
+    pending = pool.submit(load, parts[0][0], True) if pool else None
     for i, (wid, remap, pname) in enumerate(parts):
         t = time.perf_counter()
         say(f"loading {pname} ({wid})")
-        model = pending.result() if pending is not None else load(wid)
+        model = (pending.result() if pending is not None else load(wid)).to_device()
         if pool and i + 1 < len(parts):
-            pending = pool.submit(load, parts[i + 1][0])
+            pending = pool.submit(load, parts[i + 1][0], True)
         T[f"load:{pname}"] = time.perf_counter() - t
         t = time.perf_counter()
         key = model.spacing_zyx

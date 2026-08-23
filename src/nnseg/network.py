@@ -181,7 +181,8 @@ class TorchModel:
 
     def __init__(self, folder, *, folds=(0,), device="auto", dtype: str = "fp16", channels_last: bool = True,
                  surgery: bool = True, accumulate: str = "auto", step_size: float = 0.5,
-                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size: int = 1):
+                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size: int = 1,
+                 defer_device: bool = False):
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
         from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 
@@ -212,13 +213,30 @@ class TorchModel:
         self.spacing_zyx = tuple(float(x) for x in p.configuration_manager.spacing)
         self.transpose_forward = tuple(p.plans_manager.transpose_forward)
         self.fold_params = list(p.list_of_parameters)
-        self.net = p.network.to(self.device).eval()
+        # Everything up to here is CPU work (checkpoint read, architecture build, surgery) and
+        # safe to do on a helper thread. The device move is deliberately separate: a helper
+        # thread copying weights to the GPU contends with a running prediction - measured on
+        # an A10 at batch 4, prefetching whole models cost more network time than it saved.
+        self.net = p.network.eval()
         self.n_swapped = swap_transposed(self.net) if surgery else 0
         self.net.to(self.dtype)
-        if channels_last:
-            self.net.to(memory_format=torch.channels_last_3d)
-        self.gaussian = compute_gaussian(self.patch, sigma_scale=1. / 8, value_scaling_factor=10, device=self.device)
-        self._gaussian_cpu = self.gaussian.cpu()
+        self.channels_last = channels_last
+        self._gaussian_cpu = compute_gaussian(self.patch, sigma_scale=1. / 8, value_scaling_factor=10,
+                                              device=torch.device("cpu"))
+        self.gaussian = None
+        self._on_device = False
+        if not defer_device:
+            self.to_device()
+
+    def to_device(self) -> "TorchModel":
+        """Move the network to ``self.device``. Idempotent; call from the thread that predicts."""
+        if not self._on_device:
+            self.net.to(self.device)
+            if self.channels_last:
+                self.net.to(memory_format=torch.channels_last_3d)
+            self.gaussian = self._gaussian_cpu.to(self.device)
+            self._on_device = True
+        return self
 
     # -- normalization (nnU-Net plans) ------------------------------------------
     @property
@@ -257,6 +275,7 @@ class TorchModel:
         """
         from acvl_utils.cropping_and_padding.padding import pad_nd_image
 
+        self.to_device()
         x = x.to(self.dtype)
         padded, revert = pad_nd_image(x, self.patch, "constant", {"value": 0}, True, None)
         slicers = self.predictor._internal_get_sliding_window_slicers(padded.shape[1:])
