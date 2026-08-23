@@ -9,7 +9,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="nnseg", description="nnU-Net-family segmentation on torch with labelgrid restore")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("segment", help="segment one NIfTI")
-    s.add_argument("input")
+    s.add_argument("input", help="NIfTI / NRRD / MetaImage file, or a DICOM series directory")
     s.add_argument("--task", required=True, help="task name from the catalog, e.g. total_fast, total")
     s.add_argument("-o", "--output", required=True)
     s.add_argument("--spacing", type=float, default=None, help="isotropic output spacing in mm (default: the input grid)")
@@ -23,16 +23,16 @@ def main(argv=None) -> int:
     s.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "segment":
+        from .io import write
         from .pipeline import segment
-        import nibabel as nib
         img, schema, T = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
                                  grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
                                  progress=None if args.quiet else (lambda m: print(f"  {m}", file=sys.stderr, flush=True)))
-        nib.save(img, args.output)
+        write(img, args.output)
         if not args.quiet:
             for k, v in T.items():
                 print(f"  {v:7.2f} s  {k}", file=sys.stderr)
-            print(f"wrote {args.output}: {img.shape}, {len(schema.names)} labels", file=sys.stderr)
+            print(f"wrote {args.output}: {tuple(reversed(img.GetSize()))}, {len(schema.names)} labels", file=sys.stderr)
     return 0
 
 

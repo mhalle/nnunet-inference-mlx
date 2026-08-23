@@ -10,7 +10,7 @@ import labelgrid as lg
 
 from .frame import Frame
 from .network import TorchModel, resolve_model_folder
-from .preprocess import load_canonical, to_model_frame, undo_canonical
+from .preprocess import to_model_frame
 
 
 def _parts(spec):
@@ -33,7 +33,10 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "mps", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, progress=None):
-    """Segment a NIfTI path (or nibabel image) with a task from the toolkit's catalog.
+    """Segment an image with a task from the toolkit's catalog.
+
+    ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
+    directory - or a SimpleITK image the caller already holds.
 
     ``resampling_order`` is the spline order of the forward resample; 3 (cubic) matches what
     nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
@@ -42,14 +45,15 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
 
-    Returns ``(labels_img, schema, timings)``: a nibabel image of the labels in the *input's*
+    Returns ``(labels_img, schema, timings)``: a SimpleITK image of the labels in the *input's*
     orientation on the requested grid (``"input"`` = the input grid, a number = isotropic at
     that spacing, a ``labelgrid.Grid`` = as given), the label schema, and per-stage seconds.
     Multi-model tasks composite at the label level in part order (later parts win).
     """
     from nnunet_inference_mlx.catalog import TaskCatalog
     from nnunet_inference_mlx.values import LabelSchema
-    import nibabel as nib
+
+    from . import io as nio
 
     say = progress or (lambda s: None)
     T: dict[str, float] = {}
@@ -60,10 +64,12 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
     if isinstance(image, (str, Path)):
-        img_can, img_orig = load_canonical(image)
-    else:
-        img_orig = image
-        img_can = nib.as_closest_canonical(image)
+        data_zyx, geometry, orientation = nio.read(image)
+    else:                                        # a SimpleITK image the caller already holds
+        import SimpleITK as sitk
+        orientation = nio.orientation_of(image)
+        image = sitk.DICOMOrient(image, nio.CANONICAL)
+        data_zyx, geometry = sitk.GetArrayFromImage(image), nio.geometry_of(image)
     T["read+canonical"] = time.perf_counter() - t0
 
     labels = None
@@ -79,8 +85,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
         t = time.perf_counter()
         key = model.spacing_zyx
         if key not in cached:
-            cached[key] = to_model_frame(img_can, model, convention=convention, device=device,
-                                         order=resampling_order)
+            cached[key] = to_model_frame(data_zyx, geometry, model, convention=convention, device=device,
+                                         order=resampling_order, original_orientation=orientation)
         x, frame = cached[key]
         T[f"preprocess:{pname}"] = time.perf_counter() - t
         if out_grid is None:
@@ -114,9 +120,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
             torch.cuda.empty_cache()
 
     t = time.perf_counter()
-    arr_xyz = np.ascontiguousarray(labels.cpu().numpy().T)
-    out_can = nib.Nifti1Image(arr_xyz, frame.output_affine(out_grid))
-    out_img = undo_canonical(out_can, img_orig)
+    out_img = nio.restore_orientation(nio.to_image(labels.cpu().numpy(), frame.output_geometry(out_grid)),
+                                      frame.original_orientation)
     T["to input orientation"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
     return out_img, schema, T

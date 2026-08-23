@@ -6,9 +6,10 @@ The torch path of the toolkit. Reuses the framework-neutral core of
 ``preprocess`` (canonical frame, forward resample, normalization), ``frame`` (the geometry
 record that composes the output-grid mapping), ``pipeline`` (segment()).
 """
+from . import io
 from .frame import Frame
 from .network import TorchModel
 from .pipeline import segment
 
 __version__ = "0.1.0"
-__all__ = ["Frame", "TorchModel", "segment", "__version__"]
+__all__ = ["Frame", "TorchModel", "io", "segment", "__version__"]
