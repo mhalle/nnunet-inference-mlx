@@ -89,8 +89,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
 
-    Returns a :class:`~nnseg.result.Segmentation`: ``.image`` is the labels as a SimpleITK image
-    in the *input's* orientation on the requested grid (``"input"`` = the input grid, a number =
+    Returns a :class:`~nnseg.result.Segmentation`: ``.labels`` is the label volume as a SimpleITK
+    image in the *input's* orientation on the requested grid (``"input"`` = the input grid, a number =
     isotropic at that spacing, a ``Grid`` = as given). It also carries ``.array``, ``.mask(name)``,
     ``.present()``, ``.volumes_ml()``, ``.save(path)``, ``.timings`` and ``.provenance`` - what
     models, folds, device and preprocessing policy actually ran.
@@ -294,5 +294,5 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     T["total"] = time.perf_counter() - t0
     prov.update(input_orientation=orientation, output_grid=tuple(out_grid.shape),
                 cropped_to_nonzero=frame.model_source is not None)
-    return Segmentation(image=out_img, schema=schema, grid=out_grid, spec=spec,
+    return Segmentation(labels=out_img, schema=schema, grid=out_grid, spec=spec,
                         timings=T, provenance=prov)

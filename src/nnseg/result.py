@@ -17,13 +17,15 @@ import numpy as np
 class Segmentation:
     """The labels, what they mean, and how they were produced.
 
-    ``image`` is a SimpleITK image on the requested grid, in the *input's* orientation - the
-    thing you save. ``array`` is the same data as numpy (Z, Y, X). ``provenance`` records the
-    models, folds, device and preprocessing policy the run actually used; for a medical toolkit
-    that is not decoration, it is what makes a result reproducible and reviewable.
+    ``labels`` is the label volume as a SimpleITK image, on the requested grid and in the
+    *input's* orientation - the thing you save. It is deliberately not called ``image``: in this
+    domain that word means the intensity volume that went *in*, which is what ``segment()``'s
+    first parameter is. ``array`` is the same label data as numpy (Z, Y, X). ``provenance``
+    records the models, folds, device and preprocessing policy the run actually used; for a
+    medical toolkit that is not decoration - it is what makes a result reproducible.
     """
 
-    image: object                       # SimpleITK.Image
+    labels: object                      # SimpleITK.Image of the label volume
     schema: object                      # nnseg.values.LabelSchema
     grid: object                        # nnseg.grid.Grid - the grid the labels live on
     spec: object                        # nnseg.tasks.TaskSpec - what was asked for
@@ -35,7 +37,7 @@ class Segmentation:
     def array(self) -> np.ndarray:
         """The label volume as numpy (Z, Y, X). A fresh array each call - SimpleITK owns the buffer."""
         import SimpleITK as sitk
-        return sitk.GetArrayFromImage(self.image)
+        return sitk.GetArrayFromImage(self.labels)
 
     @property
     def names(self) -> dict[int, str]:
@@ -78,7 +80,7 @@ class Segmentation:
         import SimpleITK as sitk
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
-        sitk.WriteImage(self.image, str(p))
+        sitk.WriteImage(self.labels, str(p))
         return p
 
     @property

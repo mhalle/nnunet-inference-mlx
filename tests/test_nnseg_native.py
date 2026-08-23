@@ -167,7 +167,7 @@ def _segmentation(labels=None):
     a[0, 0, 0] = 8                # tibia, one voxel
     img = sitk.GetImageFromArray(labels if labels is not None else a)
     img.SetSpacing((2.0, 2.0, 2.0))
-    return Segmentation(image=img, schema=LabelSchema(names={7: "femur", 8: "tibia", 9: "patella"}),
+    return Segmentation(labels=img, schema=LabelSchema(names={7: "femur", 8: "tibia", 9: "patella"}),
                         grid=Grid((4, 5, 6), (2.0, 2.0, 2.0)), spec=TaskSpec(name="knee"),
                         timings={"total": 1.5}, provenance={"device": "cpu"})
 
