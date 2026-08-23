@@ -32,8 +32,12 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "mps", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
-            folds=(0,), accumulate: str = "auto", progress=None):
+            folds=(0,), accumulate: str = "auto", resampling_order: int = 3, progress=None):
     """Segment a NIfTI path (or nibabel image) with a task from the toolkit's catalog.
+
+    ``resampling_order`` is the spline order of the forward resample; 3 (cubic) matches what
+    nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
+    a mild train/test mismatch that grows with the downsampling factor.
 
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
@@ -75,7 +79,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
         t = time.perf_counter()
         key = model.spacing_zyx
         if key not in cached:
-            cached[key] = to_model_frame(img_can, model, convention=convention, device=device)
+            cached[key] = to_model_frame(img_can, model, convention=convention, device=device,
+                                         order=resampling_order)
         x, frame = cached[key]
         T[f"preprocess:{pname}"] = time.perf_counter() - t
         if out_grid is None:
