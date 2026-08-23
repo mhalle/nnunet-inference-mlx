@@ -67,8 +67,17 @@ def fetch_one(weights_id, root, *, progress=None) -> Path:
     return dest
 
 
-def ensure_task_weights(task, root, *, catalog=None, progress=None) -> list[Path]:
-    """Fetch every model a task needs (single, or all union parts). Idempotent."""
+def ensure_task_weights(task, root, *, catalog=None, progress=None, _seen=None) -> list[Path]:
+    """Fetch every model a task needs. Recurses through cascade ``crop_from_task`` stages, so a
+    task that crops from another task (teeth <- craniofacial_structures) pulls that chain too.
+    Idempotent."""
     from .tasks import TaskCatalog
-    spec = (catalog or TaskCatalog("totalsegmentator")).get(task) if isinstance(task, str) else task
-    return [fetch_one(i, root, progress=progress) for i in spec.weights_ids]
+    cat = catalog or TaskCatalog("totalsegmentator")
+    spec = cat.get(task) if isinstance(task, str) else task
+    seen = _seen if _seen is not None else set()
+    paths = [fetch_one(i, root, progress=progress) for i in spec.weights_ids]
+    for st in spec.cascade:
+        if st.crop_from_task and st.crop_from_task not in seen:
+            seen.add(st.crop_from_task)
+            paths += ensure_task_weights(st.crop_from_task, root, catalog=cat, progress=progress, _seen=seen)
+    return paths

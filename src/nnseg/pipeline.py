@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .envelope import AIR_HU, Envelope, body_mask, envelope_of, margin_in_voxels
+from .envelope import AIR_HU, Envelope, body_mask, envelope_of, label_roi, margin_in_voxels
 from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
@@ -16,61 +16,6 @@ from .network import TorchModel
 from .tasks import TaskCatalog, resolve_model_folder
 from .values import LabelSchema
 from .preprocess import to_model_frame
-
-
-def _run_cascade(spec, load, model_frame, crop_on_model_grid, predict_into, *, frame_box, device, say, T):
-    """Run a cascade: each stage but the last crops the next to the bounding box of its
-    ``crop_to_classes`` (dilated). Only the last stage's labels are the result; earlier stages
-    are discarded once their box is taken. Returns ``(array_zyx, geometry)`` in the input frame.
-
-    A stage that only reuses another task's output (``crop_from_task``) is not supported yet and
-    raises - none of the fetchable cascades need it.
-    """
-    import numpy as np
-    import torch
-    from .envelope import label_roi, margin_in_voxels
-    roi_mm = None
-    out_img = None
-    frame = None
-    for i, step in enumerate(spec.cascade):
-        last = i == len(spec.cascade) - 1
-        if step.weights_id is None:
-            raise NotImplementedError(f"cascade stage {i} of {spec.name!r} crops from a task "
-                                      f"({step.crop_from_task!r}); not supported yet")
-        t = time.perf_counter()
-        say(f"cascade stage {i + 1}/{len(spec.cascade)}: model {step.weights_id}"
-            + ("" if roi_mm is None else " (cropped to the previous stage)"))
-        model = load(step.weights_id)
-        x, frame = model_frame(model)
-        T[f"load:stage{i}"] = time.perf_counter() - t
-        # coarse stages: run inside the body; the target stage: run inside the ROI only
-        env = crop_on_model_grid(model, x, frame, use_body=not last, roi_mm=roi_mm)
-        ogrid = frame.resolve_grid(frame_box)
-        out = torch.zeros(ogrid.shape, dtype=torch.uint8, device=device)
-        t = time.perf_counter()
-        predict_into(model, x, frame, ogrid, env, lut=np.arange(model.K, dtype=np.int32), paint=False, out=out)
-        T[f"network:stage{i}"] = time.perf_counter() - t
-        if not last:
-            arr = out.cpu().numpy()
-            e = label_roi(arr, step.crop_to_classes, margin_voxels=margin_in_voxels(step.dilation_mm, ogrid.spacing))
-            if e.is_whole():
-                say(f"  crop classes {list(step.crop_to_classes)} absent/empty in the coarse output "
-                    f"-> next stage runs the whole volume")
-                roi_mm = None
-            else:
-                lo_mm = tuple(float(v) for v in ogrid.index_to_mm(e.lo))
-                hi_mm = tuple(float(v) for v in ogrid.index_to_mm([h - 1 for h in e.hi]))
-                roi_mm = ((lo_mm, hi_mm), step.dilation_mm)
-                say(f"  ROI from classes {list(step.crop_to_classes)}: {e.fraction * 100:.0f} % of the grid, "
-                    f"+{step.dilation_mm} mm for the next stage")
-            del arr
-        else:
-            from . import io as nio
-            out_img = nio.reorient(out, frame.output_geometry(ogrid), frame.original_orientation)
-        del model, out
-        if device in ("cuda", "mps"):
-            (torch.cuda if device == "cuda" else torch.mps).empty_cache()
-    return out_img
 
 
 def _warm_restore_kernel(device: str) -> None:
@@ -206,46 +151,83 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
         if device in ("cuda", "mps"):
             (torch.cuda if device == "cuda" else torch.mps).empty_cache()
 
-    if spec.shape == "cascade":
-        result = _run_cascade(spec, load, model_frame, crop_on_model_grid, predict_into,
-                              frame_box=grid, device=device, say=say, T=T)
-        out_img = nio.to_image(*result)
-        T["total"] = time.perf_counter() - t0
-        return out_img, schema, T
+    def run_single_or_union(spc, tag):
+        parts = spc.parts
+        og = None
+        out = None
+        fr = None
+        for i, (wid, remap, pname) in enumerate(parts):
+            t = time.perf_counter()
+            say(f"loading {pname} ({wid})")
+            model = load(wid)
+            T[f"load:{tag}:{pname}"] = time.perf_counter() - t
+            t = time.perf_counter()
+            x, fr = model_frame(model)
+            env = crop_on_model_grid(model, x, fr, use_body=True, roi_mm=None)
+            if not env.is_whole():
+                say(f"envelope: {env.fraction * 100:.0f} % of the model grid ({env.lo} .. {env.hi})")
+            T[f"preprocess:{tag}:{pname}"] = time.perf_counter() - t
+            if og is None:
+                og = fr.resolve_grid(grid)
+                max_label = max((int(v) for v in spc.label_map), default=255)
+                out = torch.zeros(og.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16, device=device)
+            t = time.perf_counter()
+            say(f"predicting {pname} ({i + 1}/{len(parts)})")
+            predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1, out=out)
+            say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}; {model.batch_choice['why']}")
+            T[f"network:{tag}:{pname}"] = time.perf_counter() - t
+            del model
+            if device in ("cuda", "mps"):
+                (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+        return out, fr, og
 
-    parts = spec.parts
+    def run_cascade(spc, tag):
+        roi_mm = None
+        out = fr = og = None
+        stages = spc.cascade
+        for i, step in enumerate(stages):
+            last = i == len(stages) - 1
+            if step.crop_from_task is not None:
+                say(f"[{tag}] stage {i + 1}/{len(stages)}: crop from task {step.crop_from_task!r}")
+                sub_labels, sub_fr, sub_og = run_task_canonical(catalog.get(step.crop_from_task), f"{tag}:{step.crop_from_task}")
+                e = label_roi(sub_labels.cpu().numpy(), step.crop_to_classes,
+                              margin_voxels=margin_in_voxels(step.dilation_mm, sub_og.spacing))
+                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in sub_og.index_to_mm(e.lo)),
+                                                     tuple(float(v) for v in sub_og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
+                say(f"  ROI from {step.crop_from_task!r} classes {list(step.crop_to_classes)}: "
+                    + ("whole volume" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid"))
+                continue
+            t = time.perf_counter()
+            say(f"[{tag}] stage {i + 1}/{len(stages)}: model {step.weights_id}"
+                + ("" if roi_mm is None else " (cropped to the previous stage)"))
+            model = load(step.weights_id)
+            x, fr = model_frame(model)
+            T[f"load:{tag}:s{i}"] = time.perf_counter() - t
+            env = crop_on_model_grid(model, x, fr, use_body=not last, roi_mm=roi_mm)
+            og = fr.resolve_grid(grid)
+            out = torch.zeros(og.shape, dtype=torch.uint8, device=device)
+            t = time.perf_counter()
+            predict_into(model, x, fr, og, env, lut=np.arange(model.K, dtype=np.int32), paint=False, out=out)
+            T[f"network:{tag}:s{i}"] = time.perf_counter() - t
+            if not last:
+                e = label_roi(out.cpu().numpy(), step.crop_to_classes,
+                              margin_voxels=margin_in_voxels(step.dilation_mm, og.spacing))
+                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in og.index_to_mm(e.lo)),
+                                                     tuple(float(v) for v in og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
+                say(f"  ROI from classes {list(step.crop_to_classes)}: "
+                    + ("absent -> whole volume next" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid, +{step.dilation_mm} mm"))
+            del model
+            if device in ("cuda", "mps"):
+                (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+        return out, fr, og
 
-    # single or union: every part paints into one shared output (union) or is the whole output
-    # (single). Cascade returned earlier.
-    for i, (wid, remap, pname) in enumerate(parts):
-        t = time.perf_counter()
-        say(f"loading {pname} ({wid})")
-        model = load(wid)
-        T[f"load:{pname}"] = time.perf_counter() - t
-        t = time.perf_counter()
-        x, frame = model_frame(model)
-        env = crop_on_model_grid(model, x, frame, use_body=True, roi_mm=None)
-        if not env.is_whole():
-            say(f"envelope: {env.fraction * 100:.0f} % of the model grid ({env.lo} .. {env.hi})")
-        T[f"preprocess:{pname}"] = time.perf_counter() - t
-        if out_grid is None:
-            out_grid = frame.resolve_grid(grid)
-            max_label = max((int(v) for v in spec.label_map), default=255)
-            labels = torch.zeros(out_grid.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16,
-                                 device=device)
-        t = time.perf_counter()
-        say(f"predicting {pname} ({i + 1}/{len(parts)})")
-        lut = _lut(model.K, remap)
-        predict_into(model, x, frame, out_grid, env, lut=lut, paint=len(parts) > 1, out=labels)
-        say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}; {model.batch_choice['why']}")
-        T[f"network:{pname}"] = time.perf_counter() - t
-        del model
-        if device in ("cuda", "mps"):
-            (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+    def run_task_canonical(spc, tag=""):
+        return run_cascade(spc, tag or spc.name) if spc.shape == "cascade" else run_single_or_union(spc, tag or spc.name)
 
+    labels, frame, out_grid = run_task_canonical(spec)
     t = time.perf_counter()
     # back to the input's own orientation: a permute + flip where the labels already live,
-    # not a 4 s single-threaded DICOMOrient over the host copy
+    # not a single-threaded DICOMOrient over the host copy
     arr, geo = nio.reorient(labels, frame.output_geometry(out_grid), frame.original_orientation)
     out_img = nio.to_image(arr, geo)
     T["to input orientation"] = time.perf_counter() - t

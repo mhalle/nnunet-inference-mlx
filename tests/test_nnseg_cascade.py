@@ -41,3 +41,15 @@ def test_segment_does_not_raise_on_spec_parts_for_a_cascade(tmp_path):
     with pytest.raises(Exception) as e:
         segment(str(p), "lung_vessels", device="cpu", model_root=str(tmp_path / "no_weights"))
     assert not isinstance(e.value, NotImplementedError), "segment hit spec.parts before the cascade branch"
+
+
+def test_teeth_provisioning_recurses_through_crop_from_task(tmp_path):
+    from nnseg.weights_fetch import ensure_task_weights
+    # pre-place every model in the teeth chain so no network is touched: 113 (teeth),
+    # 298 + 115 (craniofacial_structures)
+    for did in (113, 298, 115):
+        (tmp_path / f"Dataset{did}_x").mkdir()
+    got = ensure_task_weights("teeth", tmp_path)
+    names = {p.name for p in got}
+    assert any("Dataset113" in n for n in names)          # teeth's own model
+    assert any("Dataset298" in n for n in names) and any("Dataset115" in n for n in names)  # nested
