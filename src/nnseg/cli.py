@@ -6,7 +6,7 @@ import sys
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="nnseg", description="nnU-Net-family segmentation on torch with labelgrid restore")
+    ap = argparse.ArgumentParser(prog="nnseg", description="nnU-Net-family segmentation on torch: fused logit restore onto any grid")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("segment", help="segment one NIfTI")
     s.add_argument("input", help="NIfTI / NRRD / MetaImage file, or a DICOM series directory")

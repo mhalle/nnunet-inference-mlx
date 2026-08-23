@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from labelgrid import Grid, Mapping
+from .grid import Grid
+from .mapping import Mapping
 
 CONVENTIONS = ("corner", "center")
 

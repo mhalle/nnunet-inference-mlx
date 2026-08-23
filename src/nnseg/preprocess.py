@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from labelgrid import Grid
+from .grid import Grid
 
 from .frame import Frame
 
@@ -27,17 +27,14 @@ DEFAULT_RESAMPLING_ORDER = 3
 
 def forward_resample(data_zyx: np.ndarray, spacing_zyx, new_spacing_zyx, *, convention: str = "corner",
                      order: int = DEFAULT_RESAMPLING_ORDER, device="mps", out_dtype=np.int32):
-    """TotalSegmentator's ``change_spacing`` on the fork's GPU resampler: zoom = spacing /
-    new_spacing, new shape = round(shape * zoom), scipy.zoom corner rule, edge mode, no
-    anti-aliasing, then the dtype conversion TS applies (``astype`` = truncation)."""
-    from nnunetv2.preprocessing.resampling.resample_gpu import resample_data_or_seg_to_shape_gpu
-    zoom = np.asarray(spacing_zyx, dtype=np.float64) / np.asarray(new_spacing_zyx, dtype=np.float64)
-    new_shape = tuple(int(round(o * z)) for o, z in zip(data_zyx.shape, zoom))
-    arr = np.ascontiguousarray(data_zyx, dtype=np.float32)[None]        # no copy when already float32 C-order
-    out = resample_data_or_seg_to_shape_gpu(arr, new_shape, is_seg=False, device=device,
-                                            convention=convention, order=order, mode="nearest", anti_alias=False)
-    out = np.asarray(out)[0]
-    return out.astype(out_dtype) if out_dtype is not None else out, new_shape
+    """TotalSegmentator's ``change_spacing`` semantics on :mod:`nnseg.resample`: new shape =
+    round(shape * spacing / new_spacing), scipy.zoom corner rule, edge mode, no anti-aliasing,
+    then the dtype conversion TS applies (``astype`` = truncation, not rounding)."""
+    from .resample import resample_data, target_shape
+    new_shape = target_shape(data_zyx.shape, spacing_zyx, new_spacing_zyx)
+    out = resample_data(data_zyx, new_shape, convention=convention, order=order, mode="nearest",
+                        device=device, out_dtype=out_dtype)
+    return out, new_shape
 
 
 def normalize(data: np.ndarray, schemes, props: dict) -> np.ndarray:

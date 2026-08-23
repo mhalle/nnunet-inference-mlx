@@ -6,9 +6,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import labelgrid as lg
 
 from .frame import Frame
+from .restore import to_labels
 from .network import TorchModel, resolve_model_folder
 from .preprocess import to_model_frame
 
@@ -47,7 +47,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
 
     Returns ``(labels_img, schema, timings)``: a SimpleITK image of the labels in the *input's*
     orientation on the requested grid (``"input"`` = the input grid, a number = isotropic at
-    that spacing, a ``labelgrid.Grid`` = as given), the label schema, and per-stage seconds.
+    that spacing, a ``Grid`` = as given), the label schema, and per-stage seconds.
     Multi-model tasks composite at the label level in part order (later parts win).
     """
     from nnunet_inference_mlx.catalog import TaskCatalog
@@ -108,7 +108,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
         elif device == "cuda":
             torch.cuda.empty_cache()
         logits = logits.to(device)
-        lg.to_labels(logits, out_grid, frame.mapping(out_grid), interp=interp, outside=outside,
+        to_labels(logits, out_grid, frame.mapping(out_grid), interp=interp, outside=outside,
                      lut=lut, paint=len(parts) > 1, out=labels, backend="auto")
         if device == "mps":
             torch.mps.synchronize()

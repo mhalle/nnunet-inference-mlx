@@ -29,9 +29,11 @@ remote = ["httpx"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
 test = ["pytest"]
-# The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader, the nnU-Net fork at
-# resample-gpu-v1 (editable, path source below), labelgrid (path source), nibabel for TS-style IO.
-torch = ["torch>=2.7", "nnunetv2", "labelgrid", "nibabel", "scipy"]
+# The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader; nnunetv2 for the network
+# architecture, weights and sliding-window slicers (stock APIs only - the GPU resampler now
+# lives in nnseg.resample, so no fork is pinned); scipy builds the resampler's exact operators;
+# scikit-image is test-only reference. SimpleITK is already a core dependency and does the IO.
+torch = ["torch>=2.7", "nnunetv2", "scipy", "scikit-image"]
 
 [build-system]
 requires = ["hatchling"]
@@ -44,8 +46,9 @@ packages = ["src/nnunet_inference_mlx", "src/nnseg"]
 "src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
 
 [tool.uv.sources]
+# Local convenience, not a pin: nnseg uses only stock nnunetv2 APIs, so a released nnunetv2
+# works too. The checkout is here anyway for upstream work.
 nnunetv2 = { path = "../upstream/nnUNet", editable = true }
-labelgrid = { path = "../labelgrid", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

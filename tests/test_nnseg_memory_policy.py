@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-pytest.importorskip("labelgrid")
+pytest.importorskip("nnseg")
 from nnseg.network import ACCUMULATE, choose_accumulate, device_budget_bytes
 
 CPU = torch.device("cpu")

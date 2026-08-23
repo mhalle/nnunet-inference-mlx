@@ -4,8 +4,7 @@ A transposed conv whose kernel equals its stride maps every input voxel to one s
 block of output voxels with no overlap, so it is exactly a 1x1x1 Conv3d to
 out_ch * prod(stride) channels followed by depth-to-space. Same MACs, bit-exact in fp32
 (measured: max |diff| 0.0 on TS models), -11 % even in fp32 on MPS, and - the point -
-runs in fp16 / bf16 on MPS, which refuses ConvTranspose3d in half. Headed for nnseg's
-torch adapter as load-time network surgery.
+runs in fp16 / bf16 on MPS, which refuses ConvTranspose3d in half. Applied as load-time network surgery by :class:`nnseg.TorchModel`.
 """
 from __future__ import annotations
 

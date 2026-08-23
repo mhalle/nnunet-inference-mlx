@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-lg = pytest.importorskip("labelgrid")
+lg = pytest.importorskip("nnseg")
 sitk = pytest.importorskip("SimpleITK")
 from nnunet_inference_mlx.values import Geometry
 from nnseg import io as nio
