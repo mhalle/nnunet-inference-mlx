@@ -30,7 +30,7 @@ class Frame:
     model_shape: tuple[int, int, int]
     model_spacing: tuple[float, float, float]
     convention: str
-    canonical: object                      # nnunet_inference_mlx.values.Geometry
+    canonical: object                      # nnseg.values.Geometry
     original_orientation: str = "RAS"
 
     def __post_init__(self):
@@ -65,7 +65,7 @@ class Frame:
         world position is the canonical origin plus that offset rotated by the direction
         cosines, so an oblique acquisition keeps its orientation.
         """
-        from nnunet_inference_mlx.values import Geometry
+        from .values import Geometry
         d = np.asarray(self.canonical.direction_xyz, dtype=np.float64).reshape(3, 3)
         offset_xyz = np.asarray(grid.origin, dtype=np.float64)[::-1] - np.asarray(self.source.origin)[::-1]
         origin = np.asarray(self.canonical.origin_xyz, dtype=np.float64) + d @ offset_xyz

@@ -9,16 +9,10 @@ import torch
 
 from .frame import Frame
 from .restore import to_labels
-from .network import TorchModel, resolve_model_folder
+from .network import TorchModel
+from .tasks import TaskCatalog, resolve_model_folder
+from .values import LabelSchema
 from .preprocess import to_model_frame
-
-
-def _parts(spec):
-    if spec.single is not None:
-        return [(spec.single, None, spec.name)]
-    if spec.union:
-        return [(p.weights_id, dict(p.label_remap), p.name or str(p.weights_id)) for p in spec.union]
-    raise NotImplementedError(f"task {spec.name!r}: cascades are not implemented in nnseg yet")
 
 
 def _lut(K: int, remap: dict | None) -> np.ndarray:
@@ -50,9 +44,6 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     that spacing, a ``Grid`` = as given), the label schema, and per-stage seconds.
     Multi-model tasks composite at the label level in part order (later parts win).
     """
-    from nnunet_inference_mlx.catalog import TaskCatalog
-    from nnunet_inference_mlx.values import LabelSchema
-
     from . import io as nio
 
     say = progress or (lambda s: None)
@@ -60,7 +51,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
     spec = catalog.get(task)
-    parts = _parts(spec)
+    parts = spec.parts
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
     if isinstance(image, (str, Path)):

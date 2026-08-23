@@ -10,13 +10,26 @@ import ast
 import pathlib
 import unittest
 
-SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "nnseg"
+def _package_dir() -> pathlib.Path:
+    """Locate the package by import, not by repo layout - the tests also run against a copy
+    shipped into a container (cuda/), where there is no src/ directory."""
+    try:
+        import nnseg
+        return pathlib.Path(nnseg.__file__).resolve().parent
+    except Exception:
+        return pathlib.Path(__file__).resolve().parent.parent / "src" / "nnseg"
+
+
+SRC = _package_dir()
 
 KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuffleup",
           "backends", "backends.metal", "backends.torch_gather", "backends.triton_stub"}
-PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli"}
+PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values"}
 FORBIDDEN_FOR_KERNEL = {"nnunetv2", "SimpleITK", "nibabel", "scipy", "mlx", "totalsegmentator",
                         "nnunet_inference_mlx", "acvl_utils", "batchgenerators"}
+# nnseg must import on a machine with no mlx - that is the whole point of the torch path, and
+# depending on the MLX toolkit's value types once made it unimportable on Linux.
+FORBIDDEN_EVERYWHERE = {"mlx", "nnunet_inference_mlx"}
 # scipy is allowed at call time inside resample (the identity-probe operators) but must not be a
 # module-level import, so the kernel layer stays importable without it.
 SCIPY_OK_AT_CALL_TIME = {"resample"}
@@ -66,6 +79,12 @@ class TestLayering(unittest.TestCase):
                     self.assertIn(name, SCIPY_OK_AT_CALL_TIME if mod == "scipy" else set(),
                                   f"{name}.py:{line} imports {mod!r} at module level; the kernel "
                                   f"layer must stay torch + numpy so it can be extracted")
+
+    def test_no_module_depends_on_the_mlx_toolkit(self):
+        for path in sorted(SRC.rglob("*.py")):
+            for mod, line in _imports(path, top_level_only=False):
+                self.assertNotIn(mod, FORBIDDEN_EVERYWHERE,
+                                 f"{path.name}:{line} imports {mod!r}; nnseg must run where mlx does not")
 
     def test_scipy_is_only_a_call_time_dependency(self):
         """resample builds its operators with scipy, but importing nnseg must not need it."""

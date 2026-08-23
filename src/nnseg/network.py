@@ -344,11 +344,5 @@ class TorchModel:
         return acc
 
 
-def resolve_model_folder(weights_id, *, ecosystem: str = "totalsegmentator", model_root=None) -> Path:
-    """``Dataset{id}_*`` -> its configuration folder, through the toolkit's ecosystem table."""
-    from nnunet_inference_mlx.store import _ECOSYSTEMS, _resolve_model_root_dir
-    root = _resolve_model_root_dir(ecosystem, model_root)
-    if root is None:
-        raise FileNotFoundError(f"no model root for ecosystem {ecosystem!r}; pass model_root")
-    resolve = _ECOSYSTEMS[ecosystem][0]
-    return resolve(root, weights_id)
+# re-exported so callers keep importing it from here
+from .tasks import resolve_model_folder  # noqa: E402,F401

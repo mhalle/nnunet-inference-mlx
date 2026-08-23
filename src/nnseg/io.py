@@ -24,7 +24,7 @@ def _sitk():
 
 
 def geometry_of(image) -> "Geometry":
-    from nnunet_inference_mlx.values import Geometry
+    from .values import Geometry
     return Geometry(
         spacing_zyx=tuple(float(s) for s in reversed(image.GetSpacing())),
         shape_zyx=tuple(int(s) for s in reversed(image.GetSize())),
