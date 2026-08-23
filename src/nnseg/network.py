@@ -278,7 +278,11 @@ class TorchModel:
         return tuple(self.predictor.configuration_manager.normalization_schemes)
 
     def intensity_properties(self, channel: int = 0) -> dict:
-        return self.plans["foreground_intensity_properties_per_channel"][str(channel)]
+        return self.plans.get("foreground_intensity_properties_per_channel", {}).get(str(channel), {})
+
+    @property
+    def use_mask_for_norm(self):
+        return getattr(self.predictor.configuration_manager, "use_mask_for_norm", None)
 
     # -- sliding window ------------------------------------------------------------
     def _load_fold(self, i: int) -> None:
