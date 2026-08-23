@@ -17,6 +17,8 @@ from .mapping import Mapping
 from .network import TorchModel
 from .pipeline import segment
 from .result import Segmentation
+from .segmenter import Segmenter
+from .store import ModelStore
 from .tasks import TaskCatalog, TaskSpec
 from .reference import margins
 from .resample import resample_data
@@ -27,7 +29,7 @@ from .tables import AxisTable, build_tables
 __version__ = "0.1.0"
 __all__ = [
     # the API most callers need
-    "segment", "Segmentation", "TaskCatalog", "TaskSpec", "io",
+    "segment", "Segmenter", "Segmentation", "ModelStore", "TaskCatalog", "TaskSpec", "io",
     # errors, catchable as a family or individually
     "NnsegError", "InputError", "ModelNotFound", "UnsupportedModel", "ResourceError",
     "Cancelled", "errors",

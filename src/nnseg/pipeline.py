@@ -16,6 +16,7 @@ from .restore import to_labels
 from .network import TorchModel, available_folds
 from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
 from .result import Segmentation
+from .store import ModelStore
 from .values import LabelSchema
 from .preprocess import to_model_frame
 
@@ -56,7 +57,8 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
-            envelope_mm: float | None = 20.0, configuration: str | None = None, progress=None):
+            envelope_mm: float | None = 20.0, configuration: str | None = None,
+            models=None, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
@@ -86,6 +88,10 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
     steady-state on an A10); it only applies when the accumulator is on the device.
 
+    ``models`` is a :class:`~nnseg.store.ModelStore`; pass one with ``capacity>=1`` (or use
+    :class:`~nnseg.segmenter.Segmenter`) to keep models warm between calls instead of rebuilding
+    them every time - the difference between a script and a server.
+
     ``accumulate`` picks where the sliding-window accumulator lives: ``"auto"`` (from the
     device's free memory), ``"device"`` (fastest, needs headroom), ``"host"``.
 
@@ -105,6 +111,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
+    models = models if models is not None else ModelStore()   # no caching unless asked
     spec = _resolve_spec(task, catalog)
     # nnU-Net-native models were trained on their own preprocessing: skimage's half-pixel
     # ("center") resample and crop-to-nonzero. TS bypasses both (corner-aligned change_spacing,
@@ -146,8 +153,8 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     def load(wid):
         folder = resolve_model_folder(wid, ecosystem="nnunet" if native else "totalsegmentator",
                                       model_root=model_root, configuration=configuration)
-        m = TorchModel(folder, folds=folds, device=device, dtype=dtype,
-                       accumulate=accumulate, batch_size=batch_size).to_device()
+        m = models.get(folder, folds=folds, device=device, dtype=dtype,
+                       accumulate=accumulate, batch_size=batch_size)
         prov["models"].append({"weights": str(wid), "folder": folder.name,
                                "folds": list(available_folds(folder, folds)), "K": m.K,
                                "spacing": tuple(round(v, 4) for v in m.spacing_zyx)})
@@ -236,9 +243,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
             predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1, out=out)
             say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}; {model.batch_choice['why']}")
             T[f"network:{tag}:{pname}"] = time.perf_counter() - t
-            del model
-            if device in ("cuda", "mps"):
-                (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+            models.release(model)
         return out, fr, og
 
     def run_cascade(spc, tag):
@@ -276,9 +281,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
                                                      tuple(float(v) for v in og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
                 say(f"  ROI from classes {list(step.crop_to_classes)}: "
                     + ("absent -> whole volume next" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid, +{step.dilation_mm} mm"))
-            del model
-            if device in ("cuda", "mps"):
-                (torch.cuda if device == "cuda" else torch.mps).empty_cache()
+            models.release(model)
         return out, fr, og
 
     def run_task_canonical(spc, tag=""):
