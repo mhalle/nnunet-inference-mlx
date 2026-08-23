@@ -14,10 +14,35 @@ from .shuffleup import swap_transposed
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 ACCUMULATE = ("auto", "device", "host")
 
-# Empirical reserve for weights + one patch's activations, from E1/E2 on torch 2.13:
-# fp16 nnU-Net, 112x112x128 patch, K=118 -> 4.3 GB driver-allocated; 128^3, K=25 -> 2.5 GB.
-# Deliberately conservative; override per call when you know your model.
+# Fallback reserve for weights + one patch's activations when nothing has been measured yet,
+# from E1/E2 on torch 2.13: fp16 nnU-Net, 112x112x128 patch, K=118 -> 4.3 GB driver-allocated;
+# 128^3, K=25 -> 2.5 GB. One constant cannot fit both, which is why the real decision is made
+# from a measurement of the first patch (see TorchModel._sliding_window); this is only used
+# when a caller asks for a decision before any patch has run.
 DEFAULT_ACTIVATION_RESERVE_GB = 4.5
+
+
+def device_working_set_bytes(device: torch.device) -> int | None:
+    """What the framework currently holds on ``device`` (weights, activations, cache)."""
+    if device.type == "mps":
+        return int(torch.mps.driver_allocated_memory())
+    if device.type == "cuda":
+        return int(torch.cuda.memory_reserved(device))
+    return None
+
+
+def host_memory_health() -> int | None:
+    """macOS ``kern.memorystatus_level``: the percentage of memory the kernel considers free.
+    Lower than "available" suggests, because it accounts for what is already paged out."""
+    import platform
+    import subprocess
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip())
+    except Exception:
+        return None
 
 
 def host_available_bytes() -> int | None:
@@ -52,7 +77,8 @@ def host_available_bytes() -> int | None:
         return None
 
 
-def device_budget_bytes(device: torch.device, *, host_headroom_gb: float = 3.0) -> int | None:
+def device_budget_bytes(device: torch.device, *, host_headroom_gb: float = 3.0,
+                        unified_fraction: float = 0.5) -> int | None:
     """Allocatable bytes for a big buffer on ``device`` right now, or None if unknown.
 
     CUDA: the card's free memory - a discrete pool, so it is exactly the budget.
@@ -78,12 +104,18 @@ def device_budget_bytes(device: torch.device, *, host_headroom_gb: float = 3.0) 
     host = host_available_bytes()
     if host is None:
         return int(device_left)
-    return int(min(device_left, max(0.0, host - host_headroom_gb * 1e9)))
+    # Only a fraction of "available" is durably ours: on a machine with pages already swapped
+    # out, reclaiming inactive pages pushes other processes' memory to swap, and the swapping is
+    # the thing that hurts. Measured 2026-08-22: a snapshot showing 6.9 GB available let the
+    # policy take a 1.6 GB accumulator on device at K=118, after which the machine swapped at
+    # 4.9 GB/min. Taking the budget is what destroys the budget, on unified memory.
+    return int(min(device_left, max(0.0, (host - host_headroom_gb * 1e9) * unified_fraction)))
 
 
 def choose_accumulate(policy: str, *, device: torch.device, K: int, shape, bytes_per_element: int = 2,
                       activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB,
-                      host_headroom_gb: float = 3.0) -> tuple[bool, str]:
+                      host_headroom_gb: float = 3.0, measured: bool = False,
+                      safety_fraction: float = 0.25, min_host_health: int = 35) -> tuple[bool, str]:
     """Where the sliding-window accumulator lives. Returns ``(on_device, why)``.
 
     The accumulator is ``K`` channels plus a weight map at the *padded model grid*: on a
@@ -108,10 +140,25 @@ def choose_accumulate(policy: str, *, device: torch.device, K: int, shape, bytes
         return True, f"forced device ({need / 1e9:.2f} GB accumulator, {budget / 1e9:.2f} GB free)" if budget else "forced device"
     if budget is None:
         return False, "no device budget reported"
+    if device.type == "mps":
+        health = host_memory_health()
+        if health is not None and health < min_host_health:
+            return False, (f"host memory is already tight (kern.memorystatus_level {health}% < "
+                           f"{min_host_health}%): on unified memory a device accumulator would come "
+                           f"out of the same pool and push the machine into swap")
+    if measured:
+        # The network is already resident, so `budget` is what is genuinely left; reserve only a
+        # margin for per-patch transients the caching allocator has not yet settled.
+        held = device_working_set_bytes(device) or 0
+        margin = max(int(0.5e9), int(safety_fraction * held))
+        fits = need + margin <= budget
+        return fits, (f"{'fits' if fits else 'does not fit'}: accumulator {need / 1e9:.2f} GB + margin "
+                      f"{margin / 1e9:.2f} GB vs {budget / 1e9:.2f} GB free on {device} "
+                      f"(measured: network holds {held / 1e9:.2f} GB)")
     reserve = int(activation_reserve_gb * 1e9)
     fits = need + reserve <= budget
-    return fits, (f"{'fits' if fits else 'does not fit'}: accumulator {need / 1e9:.2f} GB + reserve "
-                  f"{reserve / 1e9:.1f} GB vs {budget / 1e9:.2f} GB free on {device}")
+    return fits, (f"{'fits' if fits else 'does not fit'}: accumulator {need / 1e9:.2f} GB + estimated reserve "
+                  f"{reserve / 1e9:.1f} GB vs {budget / 1e9:.2f} GB free on {device} (unmeasured)")
 
 
 class TorchModel:
@@ -206,40 +253,56 @@ class TorchModel:
         x = x.to(self.dtype)
         padded, revert = pad_nd_image(x, self.patch, "constant", {"value": 0}, True, None)
         slicers = self.predictor._internal_get_sliding_window_slicers(padded.shape[1:])
-        on_device, why = choose_accumulate(self.accumulate, device=self.device, K=self.K,
-                                           shape=padded.shape[1:],
-                                           activation_reserve_gb=self.activation_reserve_gb)
-        self.accumulate_choice = {"on_device": on_device, "why": why}
         total = None
         for i in range(len(self.fold_params)):
             self._load_fold(i)
             try:
-                acc = self._sliding_window(padded, slicers, on_device=on_device)
+                acc = self._sliding_window(padded, slicers)
             except (RuntimeError, torch.OutOfMemoryError) if hasattr(torch, "OutOfMemoryError") else RuntimeError as e:
-                if not on_device or "memory" not in str(e).lower():
+                if not self.accumulate_choice["on_device"] or "memory" not in str(e).lower():
                     raise
                 warnings.warn(f"on-device accumulation ran out of memory ({e}); falling back to host", stacklevel=2)
                 if self.device.type == "mps":
                     torch.mps.empty_cache()
                 elif self.device.type == "cuda":
                     torch.cuda.empty_cache()
-                on_device = False
-                self.accumulate_choice = {"on_device": False, "why": f"{why}; then OOM -> host"}
-                acc = self._sliding_window(padded, slicers, on_device=False)
+                acc = self._sliding_window(padded, slicers, force_host=True)
             total = acc if total is None else total.add_(acc)
         if len(self.fold_params) > 1:
             total /= len(self.fold_params)
         return total[(slice(None), *revert[1:])]
 
-    def _sliding_window(self, padded: torch.Tensor, slicers, *, on_device: bool) -> torch.Tensor:
+    def _patch(self, padded: torch.Tensor, sl):
+        pred = self.net(padded[sl][None].to(self.device))[0]
+        pred *= self.gaussian
+        return pred
+
+    def _sliding_window(self, padded: torch.Tensor, slicers, *, force_host: bool = False) -> torch.Tensor:
+        """Placement is decided after the *first* patch has run, from what the network actually
+        holds on the device - no extra compute, and no guessing at an activation reserve that
+        varies 2 GB between models."""
+        K, shape = self.K, padded.shape[1:]
+        with torch.inference_mode():
+            first = self._patch(padded, slicers[0])
+        if force_host:
+            on_device, why = False, "forced host after an out-of-memory fallback"
+        else:
+            on_device, why = choose_accumulate(self.accumulate, device=self.device, K=K, shape=shape,
+                                               activation_reserve_gb=self.activation_reserve_gb, measured=True)
+        self.accumulate_choice = {"on_device": on_device, "why": why}
+        return self._accumulate(padded, slicers, first, on_device)
+
+    @torch.inference_mode()
+    def _accumulate(self, padded: torch.Tensor, slicers, first: torch.Tensor, on_device: bool) -> torch.Tensor:
         K, shape = self.K, padded.shape[1:]
         if on_device:
             acc = torch.zeros((K, *shape), dtype=torch.half, device=self.device)
             n_pred = torch.zeros(shape, dtype=torch.half, device=self.device)
-            data = padded.to(self.device)
-            for sl in slicers:
-                pred = self.net(data[sl][None])[0]
-                pred *= self.gaussian
+            acc[slicers[0]] += first
+            n_pred[slicers[0][1:]] += self.gaussian
+            del first
+            for sl in slicers[1:]:
+                pred = self._patch(padded, sl)
                 acc[sl] += pred
                 n_pred[sl[1:]] += self.gaussian
             torch.div(acc, n_pred, out=acc)
@@ -266,9 +329,10 @@ class TorchModel:
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-        for sl in slicers:
-            pred = self.net(padded[sl][None].to(self.device))[0]
-            pred *= self.gaussian
+        q.put((first.to("cpu"), slicers[0]))
+        del first
+        for sl in slicers[1:]:
+            pred = self._patch(padded, sl)
             q.put((pred.to("cpu"), sl))                                # the copy is cheap; the add overlaps the next forward
         q.put(None)
         t.join()
