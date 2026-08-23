@@ -108,3 +108,31 @@ def test_resolve_grid_variants():
     with pytest.raises(ValueError):
         Frame(source=f.source, model_shape=(1, 1, 1), model_spacing=(1, 1, 1), convention="node",
               canonical=f.canonical)
+
+
+@pytest.mark.parametrize("target", ["RAS", "LPS", "SPL", "PIR", "ASL", "RIA"])
+def test_torch_reorient_matches_dicomorient_for_every_axis_aligned_orientation(target):
+    """reorient() must do exactly what DICOMOrient does - array, origin, spacing, direction -
+    for all 48 axis-aligned input orientations, on numpy and on torch."""
+    import itertools
+    import torch
+    rng = np.random.default_rng(7)
+    data = rng.integers(0, 200, size=(5, 7, 9)).astype(np.uint8)
+    n_checked = 0
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1.0, -1.0), repeat=3):
+            d = np.zeros((3, 3))
+            for col, (row, sgn) in enumerate(zip(perm, signs)):
+                d[row, col] = sgn
+            img = sitk.GetImageFromArray(data)
+            img.SetSpacing((0.8, 1.1, 2.0)); img.SetOrigin((3.0, -4.0, 12.5)); img.SetDirection(tuple(d.ravel()))
+            want = sitk.DICOMOrient(img, target)
+            geo = nio.geometry_of(img)
+            for arr_in in (data, torch.from_numpy(data)):
+                got, ggeo = nio.reorient(arr_in, geo, target)
+                np.testing.assert_array_equal(got, sitk.GetArrayFromImage(want))
+                np.testing.assert_allclose(ggeo.origin_xyz, want.GetOrigin(), atol=1e-9)
+                np.testing.assert_allclose(ggeo.spacing_zyx[::-1], want.GetSpacing(), atol=1e-12)
+                np.testing.assert_allclose(ggeo.direction_xyz, want.GetDirection(), atol=1e-12)
+                n_checked += 1
+    assert n_checked == 96

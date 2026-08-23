@@ -181,7 +181,7 @@ class TorchModel:
 
     def __init__(self, folder, *, folds=(0,), device="auto", dtype: str = "fp16", channels_last: bool = True,
                  surgery: bool = True, accumulate: str = "auto", step_size: float = 0.5,
-                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB):
+                 activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size: int = 1):
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
         from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 
@@ -193,6 +193,12 @@ class TorchModel:
             raise ValueError(f"accumulate must be one of {ACCUMULATE}; got {accumulate!r}")
         self.accumulate = accumulate
         self.activation_reserve_gb = float(activation_reserve_gb)
+        # Patches per forward pass. 1 is fastest on Apple silicon (one patch saturates a
+        # bandwidth-bound GPU; measured 35 % better than auto/8 on M2 and M1 Max). On CUDA
+        # with tensor cores and room to spare it is a lever - measured on an A10 in
+        # docs/backend-decision.md. Only the device-side accumulate batches; the host path
+        # keeps its per-patch pipeline.
+        self.batch_size = max(1, int(batch_size))
         self.accumulate_choice = None                       # set per volume in predict_logits
         p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
                             perform_everything_on_device=False, device=self.device, verbose=False, allow_tqdm=False)
@@ -302,10 +308,24 @@ class TorchModel:
             acc[slicers[0]] += first
             n_pred[slicers[0][1:]] += self.gaussian
             del first
-            for sl in slicers[1:]:
-                pred = self._patch(padded, sl)
-                acc[sl] += pred
-                n_pred[sl[1:]] += self.gaussian
+            rest = slicers[1:]
+            B = self.batch_size
+            if B == 1:
+                for sl in rest:
+                    pred = self._patch(padded, sl)
+                    acc[sl] += pred
+                    n_pred[sl[1:]] += self.gaussian
+            else:
+                data = padded.to(self.device)
+                for i in range(0, len(rest), B):
+                    group = rest[i:i + B]
+                    x = torch.stack([data[sl] for sl in group])          # (b, C, *patch)
+                    preds = self.net(x)
+                    preds *= self.gaussian                                # broadcasts over the batch
+                    for pred, sl in zip(preds, group):
+                        acc[sl] += pred
+                        n_pred[sl[1:]] += self.gaussian
+                    del x, preds
             torch.div(acc, n_pred, out=acc)
             return acc
         acc = torch.zeros((K, *shape), dtype=torch.half)
