@@ -23,7 +23,7 @@ def _package_dir() -> pathlib.Path:
 SRC = _package_dir()
 
 KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuffleup",
-          "backends", "backends.metal", "backends.torch_gather", "backends.triton_stub"}
+          "backends", "backends.metal", "backends.torch_gather", "backends.triton_gpu"}
 PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values"}
 FORBIDDEN_FOR_KERNEL = {"nnunetv2", "SimpleITK", "nibabel", "scipy", "mlx", "totalsegmentator",
                         "nnunet_inference_mlx", "acvl_utils", "batchgenerators"}

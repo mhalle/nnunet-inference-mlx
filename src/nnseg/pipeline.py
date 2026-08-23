@@ -1,6 +1,7 @@
 """segment(): the torch pipeline - task -> parts -> logits -> labels on the chosen grid."""
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +16,16 @@ from .values import LabelSchema
 from .preprocess import to_model_frame
 
 
+def _warm_restore_kernel(device: str) -> None:
+    """Compile the fused CUDA kernel while the network runs, instead of inside the first restore."""
+    if not str(device).startswith("cuda"):
+        return
+    from .backends import triton_gpu
+    if not triton_gpu.available():
+        return
+    threading.Thread(target=triton_gpu.warmup, daemon=True).start()
+
+
 def _lut(K: int, remap: dict | None) -> np.ndarray:
     lut = np.arange(K, dtype=np.int64)
     if remap:
@@ -24,13 +35,15 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
     return lut
 
 
-def segment(image, task: str, *, catalog=None, model_root=None, device: str = "mps", dtype: str = "fp16",
+def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
     directory - or a SimpleITK image the caller already holds.
+
+    ``device`` defaults to ``"auto"``: CUDA, then MPS, then CPU.
 
     ``resampling_order`` is the spline order of the forward resample; 3 (cubic) matches what
     nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
@@ -46,7 +59,10 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "m
     """
     from . import io as nio
 
+    from .resample import resolve_device
+    device = str(resolve_device(device))                  # "auto" -> cuda / mps / cpu, once
     say = progress or (lambda s: None)
+    _warm_restore_kernel(device)
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")

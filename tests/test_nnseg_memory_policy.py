@@ -66,11 +66,17 @@ def test_measured_mode_uses_what_the_network_actually_holds(monkeypatch):
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
 def test_mps_budget_honors_the_watermark_env(monkeypatch):
-    full = device_budget_bytes(MPS)
+    """The watermark caps the Metal side of the budget. The host figure is pinned high so that
+    side binds - otherwise on a busy machine both values are host-limited and drift between
+    calls, which says nothing about the watermark."""
+    import nnseg.network as N
+    monkeypatch.setattr(N, "host_available_bytes", lambda: int(400e9))
+    full = N.device_budget_bytes(MPS)
     monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.05")
-    capped = device_budget_bytes(MPS)
+    capped = N.device_budget_bytes(MPS)
     ceiling = torch.mps.recommended_max_memory()
-    assert capped <= 0.05 * ceiling and capped < full
+    assert capped <= 0.05 * ceiling
+    assert capped < full
 
 
 def test_host_available_is_reported_here():

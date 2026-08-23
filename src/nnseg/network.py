@@ -179,14 +179,15 @@ class TorchModel:
       and it keeps whole-body inference inside a modest GPU budget.
     """
 
-    def __init__(self, folder, *, folds=(0,), device="mps", dtype: str = "fp16", channels_last: bool = True,
+    def __init__(self, folder, *, folds=(0,), device="auto", dtype: str = "fp16", channels_last: bool = True,
                  surgery: bool = True, accumulate: str = "auto", step_size: float = 0.5,
                  activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB):
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
         from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 
+        from .resample import resolve_device
         self.folder = Path(folder)
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.dtype = DTYPES[dtype]
         if accumulate not in ACCUMULATE:
             raise ValueError(f"accumulate must be one of {ACCUMULATE}; got {accumulate!r}")

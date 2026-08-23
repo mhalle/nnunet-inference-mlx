@@ -15,7 +15,7 @@ def main(argv=None) -> int:
     s.add_argument("--spacing", type=float, default=None, help="isotropic output spacing in mm (default: the input grid)")
     s.add_argument("--interp", choices=("linear", "nearest"), default="linear",
                    help="logit interpolation for the restore: linear = sub-voxel boundaries; nearest = TotalSegmentator semantics")
-    s.add_argument("--device", default="mps")
+    s.add_argument("--device", default="auto", help="auto (default), cuda, mps or cpu")
     s.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     s.add_argument("--accumulate", choices=("auto", "device", "host"), default="auto",
                    help="sliding-window accumulator placement: auto (from free device memory), device (fastest, needs headroom), host")

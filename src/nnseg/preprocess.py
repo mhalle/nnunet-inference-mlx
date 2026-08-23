@@ -26,7 +26,7 @@ DEFAULT_RESAMPLING_ORDER = 3
 
 
 def forward_resample(data_zyx: np.ndarray, spacing_zyx, new_spacing_zyx, *, convention: str = "corner",
-                     order: int = DEFAULT_RESAMPLING_ORDER, device="mps", out_dtype=np.int32):
+                     order: int = DEFAULT_RESAMPLING_ORDER, device="auto", out_dtype=np.int32):
     """TotalSegmentator's ``change_spacing`` semantics on :mod:`nnseg.resample`: new shape =
     round(shape * spacing / new_spacing), scipy.zoom corner rule, edge mode, no anti-aliasing,
     then the dtype conversion TS applies (``astype`` = truncation, not rounding)."""
@@ -46,7 +46,7 @@ def normalize(data: np.ndarray, schemes, props: dict) -> np.ndarray:
     return (x - props["mean"]) / max(props["std"], 1e-8)
 
 
-def to_model_frame(data_zyx, geometry, model, *, convention: str = "corner", device="mps",
+def to_model_frame(data_zyx, geometry, model, *, convention: str = "corner", device="auto",
                    order: int = DEFAULT_RESAMPLING_ORDER, original_orientation: str = "RAS") -> tuple[torch.Tensor, Frame]:
     """Canonical (RAS) array + geometry -> ``(x (1, Z, Y, X) float32 CPU, Frame)`` for ``model``.
 

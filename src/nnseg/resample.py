@@ -35,9 +35,20 @@ CONVENTIONS = ("corner", "center")
 def best_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def resolve_device(spec="auto") -> torch.device:
+    """``"auto"`` picks the best available accelerator; anything else is taken literally.
+
+    The default must not name a vendor: nnseg exists to be portable, and a hard-coded "mps"
+    made it fail on the first CUDA machine it ever met.
+    """
+    if spec is None or spec == "auto":
+        return best_device()
+    return torch.device(spec)
 
 
 @functools.lru_cache(maxsize=128)

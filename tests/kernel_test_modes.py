@@ -11,7 +11,10 @@ from conftest import voronoi_logits
 
 
 def _backends_for(device):
-    return ["torch"] + (["metal"] if device.type == "mps" and metal.available() else [])
+    from nnseg.backends import triton_gpu
+    return (["torch"]
+            + (["metal"] if device.type == "mps" and metal.available() else [])
+            + (["triton"] if device.type == "cuda" and triton_gpu.available() else []))
 
 
 def _tie_free(mism, margin_list, tol=1e-4):
