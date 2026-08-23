@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .envelope import AIR_HU, Envelope, body_mask, envelope_of, label_roi, margin_in_voxels
+from .envelope import Envelope, body_mask, body_threshold, envelope_of, label_roi, margin_in_voxels
 from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
@@ -52,9 +52,11 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
     a mild train/test mismatch that grows with the downsampling factor.
 
-    ``envelope_mm`` restricts inference to the patient's bounding box (HU > -500, largest
+    ``envelope_mm`` restricts inference to the patient's bounding box (air removed, largest
     connected component, plus this margin in mm) - on a chest CT that is a third of the
-    volume and ~3x fewer patches per model. ``None`` runs the full volume.
+    volume and ~3x fewer patches per model. The air cut is the CT -500 HU threshold for CT
+    models and a data-driven (Otsu) split for per-image-normalized MRI. ``None`` runs the
+    full volume.
 
     ``batch_size`` is patches per forward pass: an int, or ``"auto"`` - 1 on Apple silicon
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
@@ -112,9 +114,10 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
         lo = [0, 0, 0]
         hi = list(shape)
         if use_body and envelope_mm is not None:
-            props = model.intensity_properties(0)
-            z_thr = (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / max(props["std"], 1e-8)
-            e = envelope_of(body_mask(x[0].numpy(), threshold=z_thr),
+            xnp = x[0].numpy()
+            thr = body_threshold(xnp, normalization_schemes=model.normalization_schemes,
+                                 intensity_properties=model.intensity_properties(0))
+            e = envelope_of(body_mask(xnp, threshold=thr),
                             margin_voxels=margin_in_voxels(envelope_mm, model.spacing_zyx))
             lo = [max(a, b) for a, b in zip(lo, e.lo)]
             hi = [min(a, b) for a, b in zip(hi, e.hi)]

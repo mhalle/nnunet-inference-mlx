@@ -64,3 +64,50 @@ def test_label_roi_boxes_the_requested_classes():
     assert both.lo == (5, 10, 12) and both.hi == (16, 26, 36)  # spans both
     absent = label_roi(lab, [99], margin_voxels=0)
     assert absent.is_whole()            # missing class -> whole grid, never empty
+
+
+def test_otsu_splits_a_bimodal_histogram_between_the_modes():
+    from nnseg.envelope import otsu_threshold
+    rng = np.random.default_rng(0)
+    lo = rng.normal(-2.0, 0.2, 40000)          # "air" mode
+    hi = rng.normal(+2.0, 0.3, 40000)          # "tissue" mode
+    t = otsu_threshold(np.concatenate([lo, hi]))
+    assert -2.0 < t < 2.0                                    # between the two modes
+    assert (lo < t).mean() > 0.99 and (hi > t).mean() > 0.99  # and it separates them cleanly
+
+
+def test_otsu_degenerate_inputs_fail_safe():
+    from nnseg.envelope import otsu_threshold
+    assert otsu_threshold(np.zeros(100)) == 0.0            # constant -> lo, no crash
+    assert otsu_threshold(np.array([], dtype=float)) == 0.0
+
+
+def test_body_threshold_ct_matches_the_hu_formula():
+    from nnseg.envelope import body_threshold, AIR_HU
+    props = {"percentile_00_5": -700.0, "mean": 100.0, "std": 250.0}
+    # CT: dataset-derived HU cut in normalized units, exactly the old inline formula
+    t = body_threshold(np.zeros((4, 4, 4)), normalization_schemes=("CTNormalization",),
+                       intensity_properties=props)
+    assert t == (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / props["std"]
+
+
+def test_body_threshold_mr_is_data_driven_and_crops_the_blob():
+    """A ZScore-normalized MR: background near -1, a centered blob near +2. The threshold must
+    come from the image (Otsu), and the resulting box must exclude the surrounding air."""
+    from nnseg.envelope import body_threshold, body_mask, envelope_of
+    x = np.full((24, 40, 40), -1.0)
+    x[6:18, 10:30, 12:28] = 2.0                # the "body"
+    t = body_threshold(x, normalization_schemes=("ZScoreNormalization",), intensity_properties={})
+    assert -1.0 < t < 2.0
+    env = envelope_of(body_mask(x, threshold=t), margin_voxels=(1, 1, 1))
+    assert not env.is_whole() and env.fraction < 0.5
+    assert env.lo[0] <= 6 and env.hi[0] >= 18   # the blob is fully inside the box
+
+
+def test_body_threshold_mr_ignores_stray_ct_properties():
+    """Even if a ZScore model happens to carry foreground props, MR must not use the HU path."""
+    from nnseg.envelope import body_threshold
+    x = np.concatenate([np.full(20000, -1.0), np.full(20000, 2.0)])
+    t = body_threshold(x, normalization_schemes=("ZScoreNormalization",),
+                       intensity_properties={"percentile_00_5": -700.0, "mean": 100.0, "std": 250.0})
+    assert -1.0 < t < 2.0                        # Otsu, not the (-700-100)/250 HU value

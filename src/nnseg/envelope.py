@@ -93,3 +93,53 @@ def label_roi(labels_zyx: np.ndarray, classes, *, margin_voxels) -> Envelope:
     """
     want = np.isin(labels_zyx, np.asarray(list(classes), dtype=labels_zyx.dtype))
     return envelope_of(want, margin_voxels=margin_voxels)
+
+
+def otsu_threshold(values: np.ndarray, *, bins: int = 256) -> float:
+    """Otsu's between-class-variance threshold over a flat array (256-bin histogram).
+
+    Separates a bimodal histogram - background/air vs tissue - at the value that maximizes
+    the variance between the two classes. This is the data-driven counterpart to the CT air
+    cut: it needs no fixed intensity, so it works on per-image-standardized inputs (ZScore
+    MRI) where a dataset-derived HU threshold has no meaning.
+    """
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    lo, hi = float(v.min()), float(v.max())
+    if hi <= lo:
+        return lo
+    hist, edges = np.histogram(v, bins=bins, range=(lo, hi))
+    p = hist.astype(np.float64)
+    total = p.sum()
+    if total == 0:
+        return lo
+    p /= total
+    mids = 0.5 * (edges[:-1] + edges[1:])
+    w0 = np.cumsum(p)                         # weight of the "below" class at each split
+    m0 = np.cumsum(p * mids)                  # its first moment
+    mt = m0[-1]                               # global mean
+    denom = w0 * (1.0 - w0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sigma_b2 = (mt * w0 - m0) ** 2 / denom
+    sigma_b2[~np.isfinite(sigma_b2)] = -1.0
+    return float(mids[int(np.argmax(sigma_b2))])
+
+
+def body_threshold(x_zyx: np.ndarray, *, normalization_schemes, intensity_properties) -> float:
+    """The value that separates the patient from surrounding air on a *normalized* model input.
+
+    CT normalization uses dataset statistics, so the air cut (``AIR_HU``, or the channel's
+    0.5th foreground percentile when that is higher) maps to a fixed value in normalized units -
+    coherent, and the validated CT behavior. Per-image normalizations (ZScore for MRI) standardize
+    each volume by its own mean/std, so a dataset-derived HU threshold is meaningless there; the
+    air/tissue split is taken from the image itself with Otsu. The largest connected component
+    above the threshold is still the body (see :func:`body_mask`), so a stray bright region does
+    not move the box.
+    """
+    schemes = [str(s) for s in (normalization_schemes or [])]
+    props = intensity_properties or {}
+    if any("CT" in s for s in schemes) and "percentile_00_5" in props:
+        return (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / max(props["std"], 1e-8)
+    return otsu_threshold(x_zyx)
