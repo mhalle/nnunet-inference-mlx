@@ -9,7 +9,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .envelope import AIR_HU, body_mask, envelope_of, margin_in_voxels
 from .frame import Frame
+from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel
 from .tasks import TaskCatalog, resolve_model_folder
@@ -39,7 +41,7 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
 def segment(image, task: str, *, catalog=None, model_root=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "corner",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
-            prefetch: bool = False, progress=None):
+            prefetch: bool = False, envelope_mm: float | None = 20.0, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
     ``image`` is a path to anything SimpleITK reads - NIfTI, NRRD, MetaImage, a DICOM series
@@ -50,6 +52,10 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     ``resampling_order`` is the spline order of the forward resample; 3 (cubic) matches what
     nnU-Net trained the models with - TotalSegmentator v2.18 defaults to 1 for speed, which is
     a mild train/test mismatch that grows with the downsampling factor.
+
+    ``envelope_mm`` restricts inference to the patient's bounding box (HU > -500, largest
+    connected component, plus this margin in mm) - on a chest CT that is a third of the
+    volume and ~3x fewer patches per model. ``None`` runs the full volume.
 
     ``prefetch`` loads each part's model while the previous one predicts - off by default,
     measured net negative on CUDA at batch > 1 (GIL contention with kernel launches).
@@ -118,6 +124,19 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
             cached[key] = to_model_frame(data_zyx, geometry, model, convention=convention, device=device,
                                          order=resampling_order, original_orientation=orientation)
         x, frame = cached[key]
+        env = None
+        if envelope_mm is not None:
+            if key + ("env",) not in cached:
+                # the body outline on the model grid, from the normalized intensities: HU -> z-score
+                # is affine, so the air threshold is just a different number in z-score units
+                props = model.intensity_properties(0)
+                z_thr = (max(AIR_HU, props["percentile_00_5"]) - props["mean"]) / max(props["std"], 1e-8)
+                mask = body_mask(x[0].numpy(), threshold=z_thr)
+                e = envelope_of(mask, margin_voxels=margin_in_voxels(envelope_mm, model.spacing_zyx))
+                cached[key + ("env",)] = e
+                say(f"envelope: {'whole volume' if e.is_whole() else f'{e.fraction * 100:.0f} % of the model grid'} "
+                    f"({e.lo} .. {e.hi} of {e.shape}, margin {envelope_mm} mm)")
+            env = cached[key + ("env",)]
         T[f"preprocess:{pname}"] = time.perf_counter() - t
         if out_grid is None:
             out_grid = frame.resolve_grid(grid)
@@ -125,7 +144,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
             labels = torch.zeros(out_grid.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16, device=device)
         t = time.perf_counter()
         say(f"predicting {pname} ({i + 1}/{len(parts)})")
-        logits = model.predict_logits(x)
+        logits = model.predict_logits(x[(slice(None), *env.slices)] if env is not None and not env.is_whole() else x)
         say(f"accumulator: {'device' if model.accumulate_choice['on_device'] else 'host'} - {model.accumulate_choice['why']}")
         say(f"{model.batch_choice['why']}")
         T[f"network:{pname}"] = time.perf_counter() - t
@@ -139,8 +158,13 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
         elif device == "cuda":
             torch.cuda.empty_cache()
         logits = logits.to(device)
-        to_labels(logits, out_grid, frame.mapping(out_grid), interp=interp, outside=outside,
-                     lut=lut, paint=len(parts) > 1, out=labels, backend="auto")
+        # the logits sit on the envelope's sub-grid: shift the output->model mapping by its
+        # offset, and let "outside" put background everywhere the body is not
+        mapping = frame.mapping(out_grid)
+        if env is not None and not env.is_whole():
+            mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
+        to_labels(logits, out_grid, mapping, interp=interp, outside="background",
+                  lut=lut, paint=len(parts) > 1, out=labels, backend="auto")
         if device == "mps":
             torch.mps.synchronize()
         T[f"restore:{pname}"] = time.perf_counter() - t

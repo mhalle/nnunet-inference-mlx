@@ -328,6 +328,10 @@ class TorchModel:
             total = acc if total is None else total.add_(acc)
         if len(self.fold_params) > 1:
             total /= len(self.fold_params)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
         return total[(slice(None), *revert[1:])]
 
     def _patch(self, padded: torch.Tensor, sl):

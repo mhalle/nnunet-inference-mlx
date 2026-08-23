@@ -20,6 +20,8 @@ def main(argv=None) -> int:
     s.add_argument("--accumulate", choices=("auto", "device", "host"), default="auto",
                    help="sliding-window accumulator placement: auto (from free device memory), device (fastest, needs headroom), host")
     s.add_argument("--batch-size", default="auto", help="patches per forward pass: auto (default), or an int")
+    s.add_argument("--envelope", type=float, default=20.0,
+                   help="restrict inference to the body's bounding box plus this margin in mm; 0 or negative = whole volume")
     s.add_argument("--model-root", default=None)
     s.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -29,6 +31,7 @@ def main(argv=None) -> int:
         img, schema, T = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
                                  grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
                                  batch_size=args.batch_size if args.batch_size == "auto" else int(args.batch_size),
+                                 envelope_mm=args.envelope if args.envelope > 0 else None,
                                  progress=None if args.quiet else (lambda m: print(f"  {m}", file=sys.stderr, flush=True)))
         write(img, args.output)
         if not args.quiet:
