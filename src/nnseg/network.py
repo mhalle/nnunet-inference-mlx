@@ -233,6 +233,8 @@ class TorchModel:
         self.batch_size = batch_size
         self.batch_choice = None
         self.accumulate_choice = None                       # set per volume in predict_logits
+        from .trainers import ensure_trainer
+        ensure_trainer(self.folder)                       # shim custom trainers (e.g. SkeletonRecall)
         p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
                             perform_everything_on_device=False, device=self.device, verbose=False, allow_tqdm=False)
         p.initialize_from_trained_model_folder(str(self.folder), use_folds=tuple(folds), checkpoint_name="checkpoint_final.pth")
