@@ -116,8 +116,10 @@ class TaskCatalog:
                 cascade=cascade,
                 label_map={int(k): str(v) for k, v in (d.get("label_map") or {}).items()})
 
-    def get(self, name: str) -> TaskSpec:
-        """By name, or by the source-qualified form the MLX toolkit also accepts (``ts:total``)."""
+    def get(self, name) -> TaskSpec:
+        """A task by name (or the source-qualified ``ts:total`` form); a TaskSpec passes through."""
+        if isinstance(name, TaskSpec):
+            return name
         if name in self._specs:
             return self._specs[name]
         if ":" in name:

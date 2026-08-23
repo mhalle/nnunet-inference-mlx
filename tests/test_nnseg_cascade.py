@@ -53,3 +53,12 @@ def test_teeth_provisioning_recurses_through_crop_from_task(tmp_path):
     names = {p.name for p in got}
     assert any("Dataset113" in n for n in names)          # teeth's own model
     assert any("Dataset298" in n for n in names) and any("Dataset115" in n for n in names)  # nested
+
+
+def test_catalog_get_and_segment_accept_a_taskspec():
+    """Passing a constructed TaskSpec (not a name) must not try to hash it - regression for the
+    mode-B oracle, which builds a synthetic single-model spec."""
+    from nnseg.tasks import TaskCatalog, TaskSpec
+    c = TaskCatalog("totalsegmentator")
+    spec = TaskSpec(name="lv_solo", shape="single", single=117, label_map={1: "a", 2: "b"})
+    assert c.get(spec) is spec            # passes through, no hashing

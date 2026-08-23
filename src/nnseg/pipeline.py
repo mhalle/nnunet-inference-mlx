@@ -13,7 +13,7 @@ from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel
-from .tasks import TaskCatalog, resolve_model_folder
+from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
 from .values import LabelSchema
 from .preprocess import to_model_frame
 
@@ -77,7 +77,7 @@ def segment(image, task: str, *, catalog=None, model_root=None, device: str = "a
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     catalog = catalog or TaskCatalog("totalsegmentator")
-    spec = catalog.get(task)
+    spec = task if isinstance(task, TaskSpec) else catalog.get(task)
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
 
     if isinstance(image, (str, Path)):
