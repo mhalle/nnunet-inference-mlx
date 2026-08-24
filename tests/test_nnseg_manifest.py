@@ -227,3 +227,59 @@ def test_a_corrupt_sidecar_is_not_fatal(tmp_path):
     d = tmp_path / "Dataset297_x"; d.mkdir()
     (d / wf.SIDECAR).write_text("{not json")
     assert wf.installed_version(d) is None
+
+
+# -- current means "what TotalSegmentator installs" -------------------------------------
+def test_pins_are_parsed_from_totalsegmentators_config(monkeypatch):
+    src = '''
+    291: {"foldername": "Dataset291_x", "version": "v2.0.0-weights"},
+    297: {
+        "foldername": "Dataset297_y",
+        "version": "v2.0.0-weights"
+    },
+    '''
+    monkeypatch.setattr(wf.urllib.request, "urlopen",
+                        lambda *a, **k: __import__("contextlib").nullcontext(
+                            type("R", (), {"read": lambda self: src.encode()})()))
+    assert wf.upstream_pins() == {"291": "v2.0.0-weights", "297": "v2.0.0-weights"}
+
+
+def test_unreachable_pins_fall_back_to_newest_rather_than_failing(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no network")
+    monkeypatch.setattr(wf.urllib.request, "urlopen", boom)
+    assert wf.upstream_pins() == {}          # advisory, never fatal
+
+
+def test_a_pin_beats_newest_when_choosing_current(fake_github, tmp_path, monkeypatch):
+    """297 is published as v2.0.0 and v2.5.0 here; TS pins the older one, so that is current."""
+    monkeypatch.setattr(wf, "upstream_pins", lambda repo=None, progress=None: {"297": "v2.0.0"})
+    m = tmp_path / "w.json"
+    m.write_text(json.dumps({"weights": {}}))
+    wf.refresh_manifest(path=m)
+    e = json.loads(m.read_text())["weights"]["297"]
+    assert e["current"] == "v2.0.0"                  # not v2.5.0, the newest asset
+    assert set(e["versions"]) == {"v2.0.0", "v2.5.0"}
+
+
+def test_without_a_pin_current_falls_back_to_newest(fake_github, tmp_path, monkeypatch):
+    monkeypatch.setattr(wf, "upstream_pins", lambda repo=None, progress=None: {})
+    m = tmp_path / "w.json"
+    m.write_text(json.dumps({"weights": {}}))
+    wf.refresh_manifest(path=m)
+    assert json.loads(m.read_text())["weights"]["297"]["current"] == "v2.5.0"
+
+
+def test_our_manifest_agrees_with_totalsegmentator_today():
+    """A drift guard: if a refresh ever repoints something away from TS's pin, this fails.
+    Uses the local TotalSegmentator clone, and skips where there isn't one."""
+    import re
+    from pathlib import Path
+    cfg = Path(__file__).resolve().parents[2] / "upstream/TotalSegmentator/totalsegmentator/map_tasks_config.py"
+    if not cfg.exists():
+        pytest.skip("no local TotalSegmentator clone")
+    pins = {str(int(m.group(1))): m.group(2) for m in wf.PIN_RE.finditer(cfg.read_text())}
+    ours = wf._manifest()
+    differ = {k: (ours[k]["current"], pins[k]) for k in set(pins) & set(ours)
+              if ours[k]["current"] != pins[k]}
+    assert not differ, f"manifest diverges from TotalSegmentator's pins: {differ}"

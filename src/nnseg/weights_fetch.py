@@ -271,6 +271,34 @@ def discover_release_assets(repo: str = TS_REPO, *, token: str | None = None,
     return found
 
 
+PINS_URL = "https://raw.githubusercontent.com/{repo}/master/totalsegmentator/map_tasks_config.py"
+PIN_RE = re.compile(r'(\d+):\s*\{[^}]*?"version":\s*"([^"]+)"', re.S)
+
+
+def upstream_pins(repo: str = TS_REPO, *, progress=None) -> dict[str, str]:
+    """Which release TotalSegmentator itself installs for each dataset.
+
+    TS records this in ``map_tasks_config.py`` and it is the right meaning for ``current``:
+    the version whose behavior their documentation and published numbers describe. It is not
+    always the newest asset - Dataset297 is published as v2.0.0 and v2.0.4 while TS installs
+    v2.0.0 - so "newest wins" would silently diverge from the ecosystem nnseg exists to match.
+
+    Read over HTTP rather than by importing totalsegmentator, so nnseg keeps no dependency on
+    it. Best effort: an unreachable file yields ``{}`` and the caller falls back to newest.
+    """
+    say = progress or (lambda s: None)
+    try:
+        req = urllib.request.Request(PINS_URL.format(repo=repo), headers={"User-Agent": "nnseg"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            src = r.read().decode("utf-8", "replace")
+    except Exception as e:                            # noqa: BLE001 - advisory, never fatal
+        say(f"  ! could not read {repo}'s version pins ({type(e).__name__}); falling back to newest")
+        return {}
+    pins = {str(int(m.group(1))): m.group(2) for m in PIN_RE.finditer(src)}
+    say(f"read {len(pins)} version pins from {repo}")
+    return pins
+
+
 def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = None,
                      add_missing: bool = True, update_existing: bool = False,
                      write: bool = True, progress=None) -> dict:
@@ -284,6 +312,10 @@ def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = 
     say = progress or (lambda s: None)
     current = _manifest(path)
     upstream = discover_release_assets(repo, token=token, progress=progress)
+    pins = upstream_pins(repo, progress=progress)
+    for wid, up in upstream.items():                  # prefer TS's own pin over "newest asset"
+        if pins.get(wid) in up["versions"]:
+            up["current"] = pins[wid]
 
     merged = {w: {"current": e["current"], "versions": dict(e["versions"])} for w, e in current.items()}
     added, new_versions, repointed, migrated = {}, {}, {}, {}
@@ -318,7 +350,8 @@ def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = 
     behind = {w: (merged[w]["current"], upstream[w]["current"])
               for w in upstream if w in merged and merged[w]["current"] != upstream[w]["current"]}
     say(f"manifest: {len(current)} -> {len(merged)} datasets; {len(added)} added, "
-        f"{len(new_versions)} gained versions, {len(behind)} not on upstream's newest"
+        f"{len(new_versions)} gained versions, {len(behind)} differ from "
+        f"{'TotalSegmentator' if pins else 'upstream newest'}"
         f"{' (repointed)' if update_existing else ' (left alone)'}")
     if write and merged != current:
         Path(path).write_text(json.dumps(
