@@ -135,3 +135,33 @@ def test_choose_batch_policy():
     # a small card: 1.5 GB working set, 2.9 GB accumulator, 3 GB free -> stay at 1
     b, why = choose_batch("auto", device=cuda, on_device=True, held_bytes=int(1.5e9), budget_bytes=int(3e9), accumulator_bytes=int(2.9e9))
     assert b == 1 and "would not fit" in why
+
+
+def test_a_budget_query_for_an_absent_backend_returns_none_rather_than_raising(monkeypatch):
+    """CI is Linux with no MPS. A budget query must answer "unknown", not raise - naming a
+    device the host does not have is a legitimate question with a legitimate answer."""
+    from nnseg.network import choose_accumulate, device_budget_bytes
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert device_budget_bytes(torch.device("mps")) is None
+    on, why = choose_accumulate("device", device=torch.device("mps"), K=118, shape=CHEST_3MM)
+    assert on is True and "forced device" in why            # forced still works without a budget
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert device_budget_bytes(torch.device("cuda")) is None
+
+
+def test_host_available_works_on_linux_without_psutil(monkeypatch):
+    """The CUDA path runs on Linux, where there is no vm_stat - /proc/meminfo is the fallback."""
+    import builtins
+    import nnseg.network as N
+    real_import = builtins.__import__
+
+    def no_psutil(name, *a, **k):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_psutil)
+    got = N.host_available_bytes()
+    import platform
+    if platform.system() == "Linux":
+        assert got is not None and got > 0

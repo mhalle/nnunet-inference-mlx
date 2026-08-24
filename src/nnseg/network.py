@@ -49,13 +49,21 @@ def host_memory_health() -> int | None:
 def host_available_bytes() -> int | None:
     """Memory the OS could hand out now without swapping, or None if unknown.
 
-    Uses psutil when present; otherwise, on macOS, free + inactive + speculative pages
-    from ``vm_stat`` (what the kernel will reclaim without paging out).
+    psutil when present; else ``/proc/meminfo`` MemAvailable on Linux (the kernel's own estimate,
+    and where the CUDA path runs); else, on macOS, free + inactive + speculative pages from
+    ``vm_stat`` - what the kernel will reclaim without paging out.
     """
     try:
         import psutil
         return int(psutil.virtual_memory().available)
     except Exception:
+        pass
+    try:                                    # Linux, where the CUDA path actually runs
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
         pass
     import platform
     import subprocess
@@ -93,10 +101,14 @@ def device_budget_bytes(device: torch.device, *, host_headroom_gb: float = 3.0,
     host can spare, keeping ``host_headroom_gb`` for everything else.
     """
     import os
+    # "or None if unknown" includes "this backend is not present on this machine": a budget
+    # query must not raise just because a caller named a device the host does not have.
     if device.type == "cuda":
+        if not torch.cuda.is_available():
+            return None
         free, _total = torch.cuda.mem_get_info(device)
         return int(free)
-    if device.type != "mps":
+    if device.type != "mps" or not torch.backends.mps.is_available():
         return None
     rec = float(torch.mps.recommended_max_memory())
     ratio = os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
