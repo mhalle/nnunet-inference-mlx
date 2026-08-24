@@ -97,6 +97,17 @@ class TestLayering(unittest.TestCase):
                 self.assertNotIn(mod, FORBIDDEN_EVERYWHERE,
                                  f"{path.name}:{line} imports {mod!r}; nnseg must run where mlx does not")
 
+    def test_the_nnseg_tests_do_not_depend_on_the_mlx_toolkit_either(self):
+        """The rules above cover src/nnseg. The tests need the same property or CI cannot run
+        them on Linux - test_nnseg_frame once imported nnunet_inference_mlx.values.Geometry and
+        broke the build."""
+        here = pathlib.Path(__file__).resolve().parent
+        for path in sorted(list(here.glob("test_nnseg_*.py")) + list(here.glob("kernel_test_*.py"))):
+            for mod, line in _imports(path, top_level_only=False):
+                self.assertNotIn(mod, FORBIDDEN_EVERYWHERE,
+                                 f"{path.name}:{line} imports {mod!r}; the nnseg tests must run "
+                                 f"where mlx does not")
+
     def test_scipy_is_only_a_call_time_dependency(self):
         """resample builds its operators with scipy, but importing nnseg must not need it."""
         for mod, line in _imports(_module_path("resample"), top_level_only=True):

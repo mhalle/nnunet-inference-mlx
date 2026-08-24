@@ -4,7 +4,7 @@ import pytest
 
 lg = pytest.importorskip("nnseg")
 sitk = pytest.importorskip("SimpleITK")
-from nnunet_inference_mlx.values import Geometry
+from nnseg.values import Geometry
 from nnseg import io as nio
 from nnseg.frame import Frame
 

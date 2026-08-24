@@ -21,6 +21,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # uv.lock is not the dependency source here (see below), so key the cache on the
+          # workflow itself - it invalidates exactly when the installed set changes.
+          cache-dependency-glob: .github/workflows/tests.yml
       - name: Install dependencies
         # Not `uv sync`: that installs the package, whose core dependency is mlx. Install what
         # nnseg itself needs and put src on the path - the same recipe cuda/_common.py uses.
@@ -33,4 +36,7 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: src
-        run: uv run pytest tests/test_nnseg_*.py tests/kernel_test_*.py -m "not slow" -q
+        # --no-project is load-bearing: plain `uv run` re-syncs the project first, and
+        # [tool.uv.sources] points nnunetv2 at ../upstream/nnUNet, a sibling checkout that
+        # exists in the dev workspace but not in a CI clone.
+        run: uv run --no-project pytest tests/test_nnseg_*.py tests/kernel_test_*.py -m "not slow" -q
