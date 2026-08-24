@@ -73,11 +73,11 @@ def main(argv=None) -> int:
                 kw["repo"] = args.repo
             r = wfm.refresh_manifest(**kw)
             for wid, e in sorted(r["added"].items(), key=lambda kv: int(kv[0])):
-                print(f"  + {wid:5s} new dataset, current {e['current']}")
+                print(f"  + {wid:5s} new dataset, default {e['default']}")
             for wid, tags in sorted(r["new_versions"].items(), key=lambda kv: int(kv[0])):
                 print(f"  v {wid:5s} versions recorded: {', '.join(tags)}")
             for wid, (ours, theirs) in sorted(r["behind_upstream"].items(), key=lambda kv: int(kv[0])):
-                print(f"  ~ {wid:5s} current {ours}, upstream newest {theirs}"
+                print(f"  ~ {wid:5s} default {ours}, TotalSegmentator pins {theirs}"
                       + ("" if args.update_existing else "   [not repointed]"))
     return 0
 

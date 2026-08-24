@@ -85,32 +85,41 @@ def _manifest(path=None) -> dict:
 def _normalize(entries: dict) -> dict:
     """Accept both manifest shapes and return the current one.
 
-    An entry is ``{"current": tag, "versions": {tag: {...}}}``: what upstream published is a
+    An entry is ``{"default": tag, "versions": {tag: {...}}}``: what upstream published is a
     *fact* that refresh may rewrite freely, while which one to install is a *decision* that only
     a human changes. Keeping them parallel means switching versions is a one-token edit and no
-    version is a special case. Legacy flat entries (``{"url": ...}``) are lifted into that shape
-    on read, so an old manifest still works.
+    version is a special case.
+
+    ``default``, not ``current``: in a file listing several versions "current" reads as "the
+    newest", which is wrong here - Dataset297's default is v2.0.0 while v2.0.4 exists, because
+    v2.0.0 is what TotalSegmentator installs. It is the version you get without asking for one.
+
+    Legacy shapes - a flat ``{"url": ...}`` entry, or the earlier ``current`` key - are lifted
+    into this shape on read, so an old manifest still works.
     """
     out: dict = {}
     for raw, e in entries.items():
         wid = dataset_key(raw)
-        if not (isinstance(e, dict) and "versions" in e):
+        if isinstance(e, dict) and "versions" in e:
+            if "current" in e and "default" not in e:      # the key was named `current` before
+                e = {"default": e["current"], "versions": e["versions"]}
+        else:
             e = e if isinstance(e, dict) else {"url": e}
             tag = e.get("tag") or "unversioned"
-            e = {"current": tag, "versions": {tag: e}}
+            e = {"default": tag, "versions": {tag: e}}
         if wid in out:                                # 8 and 008 are the same dataset
             merged = dict(out[wid]["versions"]); merged.update(e["versions"])
-            keep = out[wid]["current"] if out[wid]["current"] != "unversioned" else e["current"]
-            out[wid] = {"current": keep if keep in merged else next(iter(merged)), "versions": merged}
+            keep = out[wid]["default"] if out[wid]["default"] != "unversioned" else e["default"]
+            out[wid] = {"default": keep if keep in merged else next(iter(merged)), "versions": merged}
         else:
             out[wid] = e
     return out
 
 
 def selected(entry: dict, tag: str | None = None) -> dict:
-    """The version of an entry that would be installed - ``tag`` if given, else ``current``."""
+    """The version of an entry that would be installed - ``tag`` if given, else the default."""
     versions = entry["versions"]
-    want = tag or entry.get("current")
+    want = tag or entry.get("default")
     if want not in versions:
         raise KeyError(f"version {want!r} not in manifest; have {sorted(versions)}")
     return versions[want]
@@ -152,7 +161,7 @@ def fetch_one(weights_id, root, *, tag: str | None = None, progress=None) -> Pat
     entry = _manifest().get(dataset_key(weights_id))
     if entry is None:
         raise _no_entry(weights_id)
-    chosen_tag = tag or entry.get("current")
+    chosen_tag = tag or entry.get("default")
     chosen = selected(entry, tag)
     if not chosen.get("url"):                        # a placeholder, e.g. a license-gated dataset
         raise _no_entry(weights_id)
@@ -264,7 +273,7 @@ def discover_release_assets(repo: str = TS_REPO, *, token: str | None = None,
             digest = a.get("digest") or ""            # "sha256:..." on newer GitHub API responses
             if digest.startswith("sha256:"):
                 entry["sha256"] = digest.split(":", 1)[1]
-            slot = found.setdefault(dataset_key(wid), {"current": tag, "versions": {}})
+            slot = found.setdefault(dataset_key(wid), {"default": tag, "versions": {}})
             slot["versions"].setdefault(tag, entry)
     n_ver = sum(len(v["versions"]) for v in found.values())
     say(f"found {len(found)} datasets ({n_ver} published versions) across {len(releases)} releases")
@@ -315,15 +324,15 @@ def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = 
     pins = upstream_pins(repo, progress=progress)
     for wid, up in upstream.items():                  # prefer TS's own pin over "newest asset"
         if pins.get(wid) in up["versions"]:
-            up["current"] = pins[wid]
+            up["default"] = pins[wid]
 
-    merged = {w: {"current": e["current"], "versions": dict(e["versions"])} for w, e in current.items()}
+    merged = {w: {"default": e["default"], "versions": dict(e["versions"])} for w, e in current.items()}
     added, new_versions, repointed, migrated = {}, {}, {}, {}
     for wid, up in upstream.items():
         if wid not in merged:
             if add_missing:
                 added[wid] = up
-                merged[wid] = {"current": up["current"], "versions": dict(up["versions"])}
+                merged[wid] = {"default": up["default"], "versions": dict(up["versions"])}
             continue
         slot = merged[wid]
         fresh = {t: v for t, v in up["versions"].items() if t not in slot["versions"]}
@@ -333,22 +342,22 @@ def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = 
         # A legacy flat entry carries no tag. Name it by matching its URL against what upstream
         # published - NOT by adopting upstream's newest, which would silently repoint it (297 is
         # published as both v2.0.0 and v2.0.4, and TotalSegmentator itself pins v2.0.0).
-        if slot.get("current") == "unversioned":
+        if slot.get("default") == "unversioned":
             was = (slot["versions"].get("unversioned") or {}).get("url")
             match = next((t for t, v in slot["versions"].items()
                           if t != "unversioned" and v.get("url") == was), None)
             if match:
                 slot["versions"].pop("unversioned")
-                slot["current"] = match
+                slot["default"] = match
                 migrated[wid] = match
             else:
                 say(f"  ! Dataset{wid}: current URL matches no published asset; leaving as-is")
-        elif update_existing and slot["current"] != up["current"]:
-            slot["current"] = up["current"]              # a decision, never made silently
-            repointed[wid] = up["current"]
+        elif update_existing and slot["default"] != up["default"]:
+            slot["default"] = up["default"]              # a decision, never made silently
+            repointed[wid] = up["default"]
 
-    behind = {w: (merged[w]["current"], upstream[w]["current"])
-              for w in upstream if w in merged and merged[w]["current"] != upstream[w]["current"]}
+    behind = {w: (merged[w]["default"], upstream[w]["default"])
+              for w in upstream if w in merged and merged[w]["default"] != upstream[w]["default"]}
     say(f"manifest: {len(current)} -> {len(merged)} datasets; {len(added)} added, "
         f"{len(new_versions)} gained versions, {len(behind)} differ from "
         f"{'TotalSegmentator' if pins else 'upstream newest'}"
