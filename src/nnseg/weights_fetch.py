@@ -28,6 +28,42 @@ def _sort_key(item):
     return (0, int(k), "") if str(k).isdigit() else (1, 0, str(k))
 
 
+# Written into each unpacked model folder by fetch_one. A sidecar rather than one index at the
+# weights root: only the fetch that created the folder writes it, so concurrent fetches into a
+# shared volume cannot race, and the record travels with the folder if it is copied elsewhere.
+SIDECAR = ".nnseg-version.json"
+
+
+def installed_version(folder) -> dict | None:
+    """What :func:`fetch_one` recorded when it installed this model folder, if anything.
+
+    ``None`` means nnseg did not install it - TotalSegmentator may have, or it was copied in by
+    hand. That is reported as unknown rather than guessed at from the manifest: guessing would
+    be wrong in exactly the case versioning exists for, where an older version is on disk and
+    the manifest has since moved on.
+    """
+    f = Path(folder)
+    for cand in (f / SIDECAR, f.parent / SIDECAR):    # accept a model folder or its dataset dir
+        if cand.exists():
+            try:
+                return json.loads(cand.read_text())
+            except (json.JSONDecodeError, OSError):
+                return None
+    return None
+
+
+def _write_sidecar(dest: Path, weights_id, tag: str, entry: dict, sha256: str | None) -> None:
+    import datetime
+    rec = {"id": dataset_key(weights_id), "tag": tag, "sha256": sha256 or entry.get("sha256"),
+           "url": entry.get("url"), "name": entry.get("name"),
+           "installed": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "by": "nnseg"}
+    try:
+        (dest / SIDECAR).write_text(json.dumps(rec, indent=2) + "\n")
+    except OSError:                                   # a read-only weights root must not fail a fetch
+        pass
+
+
 def dataset_key(weights_id) -> str:
     """Canonical manifest key for a dataset id: unpadded decimal.
 
@@ -116,6 +152,7 @@ def fetch_one(weights_id, root, *, tag: str | None = None, progress=None) -> Pat
     entry = _manifest().get(dataset_key(weights_id))
     if entry is None:
         raise _no_entry(weights_id)
+    chosen_tag = tag or entry.get("current")
     chosen = selected(entry, tag)
     if not chosen.get("url"):                        # a placeholder, e.g. a license-gated dataset
         raise _no_entry(weights_id)
@@ -136,9 +173,12 @@ def fetch_one(weights_id, root, *, tag: str | None = None, progress=None) -> Pat
         say(f"unpacking Dataset{weights_id}")
         with zipfile.ZipFile(archive) as z:
             z.extractall(tmp)
-        unpacked = next(p for p in tmp.iterdir() if p.is_dir() and p.name.startswith(f"Dataset{weights_id}"))
+        prefix = f"Dataset{int(str(weights_id)):03d}" if str(weights_id).isdigit() else f"Dataset{weights_id}"
+        unpacked = next(p for p in tmp.iterdir() if p.is_dir()
+                        and (p.name.startswith(f"Dataset{weights_id}") or p.name.startswith(prefix)))
+        _write_sidecar(unpacked, weights_id, chosen_tag, chosen, h.hexdigest())
         dest = root / unpacked.name
-        os.replace(unpacked, dest)
+        os.replace(unpacked, dest)                    # sidecar is inside, so the move stays atomic
     return dest
 
 

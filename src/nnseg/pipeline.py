@@ -167,7 +167,12 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         folder = store.resolve(wid, configuration=configuration)
         m = models.get(folder, folds=folds, device=device, dtype=dtype,
                        accumulate=accumulate, batch_size=batch_size)
+        # the folder name does NOT identify the weights version - Dataset297 ships as both
+        # v2.0.0 and v2.0.4 and both unpack to the same name - so read what fetch_one recorded
+        from .weights_fetch import installed_version
+        rec = installed_version(folder) or {}
         prov["models"].append({"weights": str(wid), "folder": folder.name,
+                               "version": rec.get("tag", "unknown"), "sha256": rec.get("sha256"),
                                "folds": list(available_folds(folder, folds)), "K": m.K,
                                "spacing": tuple(round(v, 4) for v in m.spacing_zyx)})
         return m

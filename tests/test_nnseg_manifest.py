@@ -163,3 +163,67 @@ def test_a_placeholder_without_a_url_is_not_downloaded(tmp_path, monkeypatch):
         "920": {"current": "unversioned", "versions": {"unversioned": {"url": None, "gated": True}}}})
     with pytest.raises(ModelNotFound, match="licensed backend"):
         wf.fetch_one(920, tmp_path)
+
+
+# -- recording what is installed ------------------------------------------------------------
+def _fake_release_zip(tmp_path, folder_name="Dataset297_TotalSegmentator_total_3mm_1559subj"):
+    import zipfile
+    z = tmp_path / "asset.zip"
+    with zipfile.ZipFile(z, "w") as f:
+        f.writestr(f"{folder_name}/plans.json", "{}")
+        f.writestr(f"{folder_name}/fold_0/checkpoint_final.pth", "weights")
+    return z
+
+
+def _serve(monkeypatch, zip_path):
+    """Point urlopen at a local file so fetch_one runs end to end without a network."""
+    import contextlib
+    data = zip_path.read_bytes()
+
+    class R:
+        def read(self, n=-1):
+            nonlocal data
+            out, data = (data, b"") if n in (-1, None) or n >= len(data) else (data[:n], data[n:])
+            return out
+
+    monkeypatch.setattr(wf.urllib.request, "urlopen", lambda *a, **k: contextlib.nullcontext(R()))
+
+
+def test_fetch_writes_a_sidecar_naming_the_version(tmp_path, monkeypatch):
+    import hashlib
+    z = _fake_release_zip(tmp_path)
+    sha = hashlib.sha256(z.read_bytes()).hexdigest()
+    monkeypatch.setattr(wf, "_manifest", lambda path=None: {"297": {
+        "current": "v2.0.0-weights",
+        "versions": {"v2.0.0-weights": {"url": "https://x/a.zip", "name": "a.zip", "sha256": sha}}}})
+    _serve(monkeypatch, z)
+    root = tmp_path / "weights"
+    dest = wf.fetch_one(297, root)
+    rec = wf.installed_version(dest)
+    assert rec["tag"] == "v2.0.0-weights" and rec["id"] == "297" and rec["sha256"] == sha
+    assert rec["by"] == "nnseg" and "installed" in rec
+
+
+def test_a_named_version_is_what_gets_recorded(tmp_path, monkeypatch):
+    z = _fake_release_zip(tmp_path)
+    monkeypatch.setattr(wf, "_manifest", lambda path=None: {"297": {
+        "current": "v2.0.0-weights",
+        "versions": {"v2.0.0-weights": {"url": "https://x/a.zip"},
+                     "v2.0.4-weights": {"url": "https://x/b.zip"}}}})
+    _serve(monkeypatch, z)
+    dest = wf.fetch_one(297, tmp_path / "w", tag="v2.0.4-weights")
+    assert wf.installed_version(dest)["tag"] == "v2.0.4-weights"
+
+
+def test_weights_we_did_not_install_report_unknown_rather_than_guessing(tmp_path):
+    """TotalSegmentator or a human may have put them there; guessing from the manifest would be
+    wrong in exactly the case versioning exists for."""
+    d = tmp_path / "Dataset297_TotalSegmentator_total_3mm_1559subj"
+    d.mkdir()
+    assert wf.installed_version(d) is None
+
+
+def test_a_corrupt_sidecar_is_not_fatal(tmp_path):
+    d = tmp_path / "Dataset297_x"; d.mkdir()
+    (d / wf.SIDECAR).write_text("{not json")
+    assert wf.installed_version(d) is None
