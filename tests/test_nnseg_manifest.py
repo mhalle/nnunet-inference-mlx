@@ -32,43 +32,48 @@ def fake_github(monkeypatch):
 def test_discovery_parses_dataset_assets_and_ignores_others(fake_github):
     found = wf.discover_release_assets()
     assert set(found) == {"291", "297", "305"}          # the .txt is skipped
-    assert found["305"]["sha256"] == "bbb"
-    assert "sha256" not in found["291"]                 # absent digest is simply omitted
+    assert wf.selected(found["305"])["sha256"] == "bbb"
+    assert "sha256" not in wf.selected(found["291"])    # absent digest is simply omitted
 
 
-def test_the_newest_release_wins_when_a_dataset_appears_twice(fake_github):
+def test_discovery_records_every_version_and_defaults_current_to_newest(fake_github):
     found = wf.discover_release_assets()
-    assert found["297"]["tag"] == "v2.5.0"              # 2025 beats 2023
-    assert found["297"]["name"] == "Dataset297_total_3mm_v204.zip"
+    assert set(found["297"]["versions"]) == {"v2.0.0", "v2.5.0"}   # both kept, not just one
+    assert found["297"]["current"] == "v2.5.0"                     # 2025 beats 2023
 
 
-def test_refresh_adds_missing_but_leaves_existing_alone(fake_github, tmp_path, monkeypatch):
-    """Repointing a dataset at a newer release changes which weights download, and therefore the
-    segmentations. That must not happen silently."""
+def test_refresh_adds_missing_datasets(fake_github, tmp_path):
     m = tmp_path / "w.json"
-    m.write_text(json.dumps({"weights": {"297": {"url": "https://x/v2.0.0/Dataset297_total_3mm.zip"}}}))
-    monkeypatch.setattr(wf, "_manifest", lambda: json.loads(m.read_text())["weights"])
+    m.write_text(json.dumps({"weights": {}}))
     r = wf.refresh_manifest(path=m)
     saved = json.loads(m.read_text())["weights"]
-    assert set(r["added"]) == {"291", "305"}
-    assert set(r["newer_upstream"]) == {"297"}
-    assert saved["297"]["url"].endswith("v2.0.0/Dataset297_total_3mm.zip")   # untouched
-    assert "291" in saved and "305" in saved
+    assert set(r["added"]) == {"291", "297", "305"} and set(saved) == {"291", "297", "305"}
 
 
-def test_update_existing_opts_in_to_repointing(fake_github, tmp_path, monkeypatch):
+def test_new_versions_are_recorded_without_changing_current(fake_github, tmp_path):
+    """Facts (what upstream published) update freely; the decision (which to install) does not."""
     m = tmp_path / "w.json"
-    m.write_text(json.dumps({"weights": {"297": {"url": "https://x/v2.0.0/Dataset297_total_3mm.zip"}}}))
-    monkeypatch.setattr(wf, "_manifest", lambda: json.loads(m.read_text())["weights"])
+    m.write_text(json.dumps({"weights": {"297": {
+        "current": "v2.0.0", "versions": {"v2.0.0": {"url": "https://x/v2.0.0/Dataset297_total_3mm.zip"}}}}}))
+    r = wf.refresh_manifest(path=m)
+    saved = json.loads(m.read_text())["weights"]["297"]
+    assert saved["current"] == "v2.0.0"                  # untouched
+    assert set(saved["versions"]) == {"v2.0.0", "v2.5.0"}
+    assert r["new_versions"]["297"] == ["v2.5.0"] and r["behind_upstream"]["297"] == ("v2.0.0", "v2.5.0")
+
+
+def test_update_existing_opts_in_to_repointing(fake_github, tmp_path):
+    m = tmp_path / "w.json"
+    m.write_text(json.dumps({"weights": {"297": {
+        "current": "v2.0.0", "versions": {"v2.0.0": {"url": "https://x/v2.0.0/Dataset297_total_3mm.zip"}}}}}))
     wf.refresh_manifest(path=m, update_existing=True)
-    assert json.loads(m.read_text())["weights"]["297"]["tag"] == "v2.5.0"
+    assert json.loads(m.read_text())["weights"]["297"]["current"] == "v2.5.0"
 
 
-def test_dry_run_writes_nothing(fake_github, tmp_path, monkeypatch):
+def test_dry_run_writes_nothing(fake_github, tmp_path):
     m = tmp_path / "w.json"
     before = json.dumps({"weights": {}})
     m.write_text(before)
-    monkeypatch.setattr(wf, "_manifest", lambda: {})
     r = wf.refresh_manifest(path=m, write=False)
     assert r["added"] and m.read_text() == before
 
@@ -101,3 +106,60 @@ def test_license_gated_ids_match_totalsegmentators_own_list():
     assert wf.LICENSE_GATED["301"] == "heartchambers_highres"
     assert wf.LICENSE_GATED["857"] == "thigh_shoulder_muscles"
     assert all(k.isdigit() for k in wf.LICENSE_GATED)
+
+
+# -- the parallel current/versions schema -------------------------------------------------
+def test_legacy_flat_entries_are_lifted_into_the_versioned_shape():
+    e = wf._normalize({"297": {"url": "https://x/a.zip", "sha256": "aa"}})["297"]
+    assert e["current"] == "unversioned"
+    assert e["versions"]["unversioned"]["url"] == "https://x/a.zip"
+
+
+def test_selected_returns_current_or_a_named_version():
+    e = {"current": "v1", "versions": {"v1": {"url": "one"}, "v2": {"url": "two"}}}
+    assert wf.selected(e)["url"] == "one"
+    assert wf.selected(e, "v2")["url"] == "two"
+    with pytest.raises(KeyError, match="v9"):
+        wf.selected(e, "v9")
+
+
+def test_dataset_key_canonicalizes_zero_padding():
+    assert wf.dataset_key("008") == wf.dataset_key(8) == wf.dataset_key("8") == "8"
+    assert wf.dataset_key("body_mr") == "body_mr"       # non-numeric ids pass through
+
+
+def test_padded_and_unpadded_entries_merge_into_one_dataset():
+    """Dataset008 and Dataset8 are the same model; two keys would be two entries for one thing."""
+    n = wf._normalize({"8": {"url": "https://x/Dataset008.zip"},
+                       "008": {"current": "v2.4", "versions": {"v2.4": {"url": "https://x/Dataset008.zip"}}}})
+    assert list(n) == ["8"] and n["8"]["current"] == "v2.4"
+
+
+def test_a_zero_padded_folder_on_disk_resolves(tmp_path):
+    from nnseg.tasks import resolve_model_folder
+    d = tmp_path / "Dataset008_HepaticVessel" / "nnUNetTrainer__nnUNetPlans__3d_fullres"
+    d.mkdir(parents=True)
+    assert resolve_model_folder(8, model_root=tmp_path) == d       # globbing Dataset8_* would miss
+    assert wf.is_present(8, tmp_path)
+
+
+def test_migration_matches_by_url_and_never_silently_repoints(fake_github, tmp_path, monkeypatch):
+    """A legacy entry must keep the weights it already pointed at. 297 is published as both
+    v2.0.0 and v2.0.4 and TotalSegmentator pins the older one - adopting 'newest' would change
+    which weights download, and therefore the segmentations."""
+    m = tmp_path / "w.json"
+    m.write_text(json.dumps({"weights": {"297": {"url": "https://x/v2.0.0/Dataset297_total_3mm.zip"}}}))
+    r = wf.refresh_manifest(path=m)
+    saved = json.loads(m.read_text())["weights"]["297"]
+    assert saved["current"] == "v2.0.0"                 # named, not repointed
+    assert set(saved["versions"]) == {"v2.0.0", "v2.5.0"}   # the newer one is recorded, not chosen
+    assert r["migrated"] == {"297": "v2.0.0"}
+
+
+def test_a_placeholder_without_a_url_is_not_downloaded(tmp_path, monkeypatch):
+    """A license-gated entry has no URL; fetch must explain, not try to download None."""
+    from nnseg.errors import ModelNotFound
+    monkeypatch.setattr(wf, "_manifest", lambda path=None: {
+        "920": {"current": "unversioned", "versions": {"unversioned": {"url": None, "gated": True}}}})
+    with pytest.raises(ModelNotFound, match="licensed backend"):
+        wf.fetch_one(920, tmp_path)

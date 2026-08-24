@@ -189,6 +189,19 @@ CONFIG_PREFERENCE = ("3d_fullres", "3d_lowres", "2d")
 UNSUPPORTED_CONFIGS = {"3d_cascade_fullres": "needs the 3d_lowres prediction as an extra input channel"}
 
 
+def _dataset_dirs(root: Path, weights_id) -> list[Path]:
+    """``Dataset<id>_*`` directories, tolerating zero-padded ids (Dataset008 vs Dataset8)."""
+    pats = [f"Dataset{weights_id}_*"]
+    t = str(weights_id).strip()
+    if t.isdigit():
+        pats += [f"Dataset{int(t)}_*", f"Dataset{int(t):03d}_*"]
+    seen: dict[str, Path] = {}
+    for pat in pats:
+        for d in sorted(root.glob(pat)):
+            seen.setdefault(d.name, d)
+    return list(seen.values()) or sorted(root.glob(str(weights_id)))
+
+
 def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmentator", model_root=None,
                          configuration: str | None = None) -> Path:
     """``Dataset<id>_*`` under the weights root -> its ``trainer__plans__config`` folder.
@@ -202,8 +215,7 @@ def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmen
     if p.is_dir() and p.name.count("__") == 2:
         return p
     root = Path(p) if p.is_dir() else weights_root(ecosystem, model_root)
-    matches = ([root] if p.is_dir() else
-               sorted(root.glob(f"Dataset{weights_id}_*")) or sorted(root.glob(str(weights_id))))
+    matches = ([root] if p.is_dir() else _dataset_dirs(root, weights_id))
     if not matches:
         raise ModelNotFound(f"no Dataset{weights_id}_* under {root}")
     configs = sorted(c for c in matches[0].iterdir()

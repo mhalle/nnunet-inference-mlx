@@ -1,7 +1,7 @@
 """Weight provisioning: manifest coverage and the skip-if-present contract (no network)."""
 import pytest
 
-from nnseg.weights_fetch import _manifest, ensure_task_weights, fetch_one, is_present
+from nnseg.weights_fetch import dataset_key, selected, _manifest, ensure_task_weights, fetch_one, is_present
 from nnseg.tasks import TaskCatalog
 
 
@@ -15,7 +15,9 @@ def test_manifest_covers_the_core_tasks():
         ids = ([spec.single] if spec.single is not None else []) + [p.weights_id for p in spec.union]
         # cascade crop-from parts count too
         for i in ids:
-            assert str(i) in m and m[str(i)].get("url"), f"{name}: weights id {i} not fetchable from the manifest"
+            k = dataset_key(i)
+            assert k in m, f"{name}: weights id {i} not in the manifest"
+            assert selected(m[k]).get("url"), f"{name}: weights id {i} has no URL to fetch"
 
 
 def test_every_url_present_points_at_the_official_source():

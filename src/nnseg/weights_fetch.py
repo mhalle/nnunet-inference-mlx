@@ -22,13 +22,67 @@ from pathlib import Path
 MANIFEST = Path(__file__).parent / "data" / "ts_weights.json"
 
 
-def _manifest() -> dict:
-    raw = json.loads(MANIFEST.read_text())
-    return raw.get("weights") or raw
+def _sort_key(item):
+    """Numeric ids sort numerically; any non-numeric id sorts after them, alphabetically."""
+    k = item[0]
+    return (0, int(k), "") if str(k).isdigit() else (1, 0, str(k))
+
+
+def dataset_key(weights_id) -> str:
+    """Canonical manifest key for a dataset id: unpadded decimal.
+
+    TotalSegmentator publishes both ``Dataset008_HepaticVessel`` and ``Dataset297_...``, so the
+    same dataset can be written 8 or 008. Without canonicalizing, those become two entries for
+    one model.
+    """
+    t = str(weights_id).strip()
+    return str(int(t)) if t.isdigit() else t
+
+
+def _manifest(path=None) -> dict:
+    raw = json.loads(Path(path or MANIFEST).read_text())
+    # `raw.get("weights") or raw` would fall through to the wrapper for an EMPTY manifest,
+    # leaking the key "weights" in as a dataset id. Test for the key, not its truthiness.
+    return _normalize(raw["weights"] if "weights" in raw else raw)
+
+
+def _normalize(entries: dict) -> dict:
+    """Accept both manifest shapes and return the current one.
+
+    An entry is ``{"current": tag, "versions": {tag: {...}}}``: what upstream published is a
+    *fact* that refresh may rewrite freely, while which one to install is a *decision* that only
+    a human changes. Keeping them parallel means switching versions is a one-token edit and no
+    version is a special case. Legacy flat entries (``{"url": ...}``) are lifted into that shape
+    on read, so an old manifest still works.
+    """
+    out: dict = {}
+    for raw, e in entries.items():
+        wid = dataset_key(raw)
+        if not (isinstance(e, dict) and "versions" in e):
+            e = e if isinstance(e, dict) else {"url": e}
+            tag = e.get("tag") or "unversioned"
+            e = {"current": tag, "versions": {tag: e}}
+        if wid in out:                                # 8 and 008 are the same dataset
+            merged = dict(out[wid]["versions"]); merged.update(e["versions"])
+            keep = out[wid]["current"] if out[wid]["current"] != "unversioned" else e["current"]
+            out[wid] = {"current": keep if keep in merged else next(iter(merged)), "versions": merged}
+        else:
+            out[wid] = e
+    return out
+
+
+def selected(entry: dict, tag: str | None = None) -> dict:
+    """The version of an entry that would be installed - ``tag`` if given, else ``current``."""
+    versions = entry["versions"]
+    want = tag or entry.get("current")
+    if want not in versions:
+        raise KeyError(f"version {want!r} not in manifest; have {sorted(versions)}")
+    return versions[want]
 
 
 def is_present(weights_id, root) -> bool:
-    return bool(sorted(Path(root).glob(f"Dataset{weights_id}_*")))
+    from .tasks import _dataset_dirs
+    return bool(_dataset_dirs(Path(root), weights_id))
 
 
 def _no_entry(weights_id) -> "ModelNotFound":
@@ -45,21 +99,27 @@ def _no_entry(weights_id) -> "ModelNotFound":
         f"published weights, or place the model folder under the weights root yourself")
 
 
-def fetch_one(weights_id, root, *, progress=None) -> Path:
+def fetch_one(weights_id, root, *, tag: str | None = None, progress=None) -> Path:
     """Download and unpack one dataset into ``root`` if it is not already there.
+
+    ``tag`` installs a specific published version instead of the manifest's ``current`` one.
 
     Returns the ``Dataset{id}_*`` directory. Verifies sha256 when the manifest gives one.
     Unpacks to a temp dir and moves into place, so an interrupted download never leaves a
     half-populated model folder that ``is_present`` would accept.
     """
     root = Path(root)
-    existing = sorted(root.glob(f"Dataset{weights_id}_*"))
+    from .tasks import _dataset_dirs
+    existing = _dataset_dirs(root, weights_id)
     if existing:
         return existing[0]
-    entry = _manifest().get(str(weights_id))
+    entry = _manifest().get(dataset_key(weights_id))
     if entry is None:
         raise _no_entry(weights_id)
-    url, expected = entry["url"], entry.get("sha256")
+    chosen = selected(entry, tag)
+    if not chosen.get("url"):                        # a placeholder, e.g. a license-gated dataset
+        raise _no_entry(weights_id)
+    url, expected = chosen["url"], chosen.get("sha256")
     say = progress or (lambda m: None)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as tmp:
@@ -153,18 +213,21 @@ def discover_release_assets(repo: str = TS_REPO, *, token: str | None = None,
     releases = _api(f"https://api.github.com/repos/{repo}/releases", token)
     releases.sort(key=lambda r: r.get("published_at") or "", reverse=True)
     found: dict[str, dict] = {}
-    for rel in releases:
+    for rel in releases:                              # newest first, so current defaults to newest
+        tag = rel.get("tag_name", "")
         for a in rel.get("assets") or ():
             m = ASSET_RE.match(a.get("name", ""))
-            if not m or m.group(1) in found:          # newest release wins
+            if not m:
                 continue
-            entry = {"url": a["browser_download_url"], "name": a["name"],
-                     "tag": rel.get("tag_name", ""), "size": a.get("size")}
+            wid = m.group(1)
+            entry = {"url": a["browser_download_url"], "name": a["name"], "size": a.get("size")}
             digest = a.get("digest") or ""            # "sha256:..." on newer GitHub API responses
             if digest.startswith("sha256:"):
                 entry["sha256"] = digest.split(":", 1)[1]
-            found[m.group(1)] = entry
-    say(f"found {len(found)} dataset assets across {len(releases)} releases")
+            slot = found.setdefault(dataset_key(wid), {"current": tag, "versions": {}})
+            slot["versions"].setdefault(tag, entry)
+    n_ver = sum(len(v["versions"]) for v in found.values())
+    say(f"found {len(found)} datasets ({n_ver} published versions) across {len(releases)} releases")
     return found
 
 
@@ -179,28 +242,51 @@ def refresh_manifest(path=MANIFEST, *, repo: str = TS_REPO, token: str | None = 
     reports what changed either way, so ``write=False`` is a dry run.
     """
     say = progress or (lambda s: None)
-    current = _manifest()
+    current = _manifest(path)
     upstream = discover_release_assets(repo, token=token, progress=progress)
 
-    def url_of(entry):
-        return entry.get("url") if isinstance(entry, dict) else entry
+    merged = {w: {"current": e["current"], "versions": dict(e["versions"])} for w, e in current.items()}
+    added, new_versions, repointed, migrated = {}, {}, {}, {}
+    for wid, up in upstream.items():
+        if wid not in merged:
+            if add_missing:
+                added[wid] = up
+                merged[wid] = {"current": up["current"], "versions": dict(up["versions"])}
+            continue
+        slot = merged[wid]
+        fresh = {t: v for t, v in up["versions"].items() if t not in slot["versions"]}
+        if fresh:
+            new_versions[wid] = sorted(fresh)
+            slot["versions"].update(fresh)            # facts: always kept up to date
+        # A legacy flat entry carries no tag. Name it by matching its URL against what upstream
+        # published - NOT by adopting upstream's newest, which would silently repoint it (297 is
+        # published as both v2.0.0 and v2.0.4, and TotalSegmentator itself pins v2.0.0).
+        if slot.get("current") == "unversioned":
+            was = (slot["versions"].get("unversioned") or {}).get("url")
+            match = next((t for t, v in slot["versions"].items()
+                          if t != "unversioned" and v.get("url") == was), None)
+            if match:
+                slot["versions"].pop("unversioned")
+                slot["current"] = match
+                migrated[wid] = match
+            else:
+                say(f"  ! Dataset{wid}: current URL matches no published asset; leaving as-is")
+        elif update_existing and slot["current"] != up["current"]:
+            slot["current"] = up["current"]              # a decision, never made silently
+            repointed[wid] = up["current"]
 
-    added = {w: e for w, e in upstream.items() if w not in current}
-    newer = {w: e for w, e in upstream.items()
-             if w in current and url_of(current[w]) != e["url"]}
-    merged = dict(current)
-    if add_missing:
-        merged.update(added)
-    if update_existing:
-        merged.update(newer)
-    say(f"manifest: {len(current)} -> {len(merged)} entries; {len(added)} missing upstream entries"
-        f"{' added' if add_missing else ' NOT added'}, {len(newer)} point at a newer release"
-        f"{' (applied)' if update_existing else ' (left alone)'}")
+    behind = {w: (merged[w]["current"], upstream[w]["current"])
+              for w in upstream if w in merged and merged[w]["current"] != upstream[w]["current"]}
+    say(f"manifest: {len(current)} -> {len(merged)} datasets; {len(added)} added, "
+        f"{len(new_versions)} gained versions, {len(behind)} not on upstream's newest"
+        f"{' (repointed)' if update_existing else ' (left alone)'}")
     if write and merged != current:
-        Path(path).write_text(
-            json.dumps({"weights": dict(sorted(merged.items(), key=lambda kv: int(kv[0])))}, indent=2) + "\n")
+        Path(path).write_text(json.dumps(
+            {"weights": dict(sorted(merged.items(), key=_sort_key))}, indent=2) + "\n")
         say(f"wrote {path}")
-    return {"added": added, "newer_upstream": newer, "total": len(merged), "path": str(path)}
+    return {"added": added, "new_versions": new_versions, "behind_upstream": behind,
+            "migrated": migrated,
+            "total": len(merged), "path": str(path)}
 
 
 def coverage(catalog=None) -> dict:
@@ -215,7 +301,7 @@ def coverage(catalog=None) -> dict:
     have = _manifest()
     ok, licensed, missing = [], {}, {}
     for name in cat.names():
-        absent = [str(w) for w in cat.get(name).weights_ids if str(w) not in have]
+        absent = [dataset_key(w) for w in cat.get(name).weights_ids if dataset_key(w) not in have]
         if not absent:
             ok.append(name)
         elif all(w in LICENSE_GATED for w in absent):

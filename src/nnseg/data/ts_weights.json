@@ -1,228 +1,530 @@
 {
   "weights": {
     "8": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
-      "sha256": null
-    },
-    "008": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
-      "name": "Dataset008_HepaticVessel.zip",
-      "tag": "v2.4.0-weights",
-      "size": 230191278
+      "current": "v2.4.0-weights",
+      "versions": {
+        "unversioned": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
+          "sha256": null
+        },
+        "v2.4.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
+          "name": "Dataset008_HepaticVessel.zip",
+          "tag": "v2.4.0-weights",
+          "size": 230191278
+        }
+      }
     },
     "113": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset113_ToothFairy3.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset113_ToothFairy3.zip",
+          "name": "Dataset113_ToothFairy3.zip",
+          "size": 232066830,
+          "sha256": "cf28693eec49b7a8448e2ebf0a372da41855a099a26d52d1cffe15a3c7e4b740"
+        }
+      }
     },
     "115": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset115_mandible.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset115_mandible.zip",
+          "name": "Dataset115_mandible.zip",
+          "size": 230321497
+        }
+      }
     },
     "117": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset117_lung_airways_arteries_veins_282subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset117_lung_airways_arteries_veins_282subj.zip",
+          "name": "Dataset117_lung_airways_arteries_veins_282subj.zip",
+          "size": 229853539,
+          "sha256": "bdd71e8cf8c38351cf82ead0f854b93b92ea39406633f5a9e85cc72a902fa56e"
+        }
+      }
     },
     "150": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset150_icb_v0.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset150_icb_v0.zip",
+          "name": "Dataset150_icb_v0.zip",
+          "size": 325569459
+        }
+      }
     },
     "258": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset258_lung_vessels_248subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset258_lung_vessels_248subj.zip",
+          "name": "Dataset258_lung_vessels_248subj.zip",
+          "size": 230593821
+        }
+      }
     },
     "260": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset260_hip_implant_71subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset260_hip_implant_71subj.zip",
+          "name": "Dataset260_hip_implant_71subj.zip",
+          "size": 232729513
+        }
+      }
     },
     "291": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset291_TotalSegmentator_part1_organs_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset291_TotalSegmentator_part1_organs_1559subj.zip",
+          "name": "Dataset291_TotalSegmentator_part1_organs_1559subj.zip",
+          "size": 233742255
+        }
+      }
     },
     "292": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset292_TotalSegmentator_part2_vertebrae_1532subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset292_TotalSegmentator_part2_vertebrae_1532subj.zip",
+          "name": "Dataset292_TotalSegmentator_part2_vertebrae_1532subj.zip",
+          "size": 234050721
+        }
+      }
     },
     "293": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset293_TotalSegmentator_part3_cardiac_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset293_TotalSegmentator_part3_cardiac_1559subj.zip",
+          "name": "Dataset293_TotalSegmentator_part3_cardiac_1559subj.zip",
+          "size": 234190318
+        }
+      }
     },
     "294": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset294_TotalSegmentator_part4_muscles_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset294_TotalSegmentator_part4_muscles_1559subj.zip",
+          "name": "Dataset294_TotalSegmentator_part4_muscles_1559subj.zip",
+          "size": 233625081
+        }
+      }
     },
     "295": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset295_TotalSegmentator_part5_ribs_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset295_TotalSegmentator_part5_ribs_1559subj.zip",
+          "name": "Dataset295_TotalSegmentator_part5_ribs_1559subj.zip",
+          "size": 234016576
+        }
+      }
     },
     "297": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset297_TotalSegmentator_total_3mm_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.4-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.4-weights/Dataset297_TotalSegmentator_total_3mm_1559subj_v204.zip",
+          "name": "Dataset297_TotalSegmentator_total_3mm_1559subj_v204.zip",
+          "size": 126882706
+        },
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset297_TotalSegmentator_total_3mm_1559subj.zip",
+          "name": "Dataset297_TotalSegmentator_total_3mm_1559subj.zip",
+          "size": 135386075
+        }
+      }
     },
     "298": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset298_TotalSegmentator_total_6mm_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset298_TotalSegmentator_total_6mm_1559subj.zip",
+          "name": "Dataset298_TotalSegmentator_total_6mm_1559subj.zip",
+          "size": 134827240
+        }
+      }
     },
     "299": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset299_body_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset299_body_1559subj.zip",
+          "name": "Dataset299_body_1559subj.zip",
+          "size": 233211222
+        }
+      }
     },
     "300": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip",
+          "name": "Dataset300_body_6mm_1559subj.zip",
+          "size": 124286256
+        }
+      }
     },
     "302": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset302_vertebrae_body_1559subj.zip",
-      "name": "Dataset302_vertebrae_body_1559subj.zip",
-      "tag": "v2.0.0-weights",
-      "size": 233459212
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset302_vertebrae_body_1559subj.zip",
+          "name": "Dataset302_vertebrae_body_1559subj.zip",
+          "tag": "v2.0.0-weights",
+          "size": 233459212
+        }
+      }
     },
     "305": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset305_vertebrae_discs_1559subj.zip",
-      "name": "Dataset305_vertebrae_discs_1559subj.zip",
-      "tag": "v2.5.0-weights",
-      "size": 233569643,
-      "sha256": "b0c936e317a9be1eccaf52bf7043ff28af6c40a3e200cbc6cbc1fbdc0c234920"
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset305_vertebrae_discs_1559subj.zip",
+          "name": "Dataset305_vertebrae_discs_1559subj.zip",
+          "tag": "v2.5.0-weights",
+          "size": 233569643,
+          "sha256": "b0c936e317a9be1eccaf52bf7043ff28af6c40a3e200cbc6cbc1fbdc0c234920"
+        }
+      }
     },
     "315": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset315_thoraxCT.zip",
-      "sha256": null
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset315_thoraxCT.zip",
+          "name": "Dataset315_thoraxCT.zip",
+          "size": 233744954
+        }
+      }
     },
     "343": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset343_mediastinum_1786subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset343_mediastinum_1786subj.zip",
+          "name": "Dataset343_mediastinum_1786subj.zip",
+          "size": 233215432,
+          "sha256": "561c64fc20b5fde4f1776c0a369910156266e7653afc038574dd8ddc4f12fd9a"
+        }
+      }
     },
     "351": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset351_oculomotor_muscles_18subj.zip",
-      "sha256": null
+      "current": "v2.4.0-weights",
+      "versions": {
+        "v2.4.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset351_oculomotor_muscles_18subj.zip",
+          "name": "Dataset351_oculomotor_muscles_18subj.zip",
+          "size": 230606852
+        }
+      }
     },
     "503": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset503_cardiac_motion.zip",
-      "name": "Dataset503_cardiac_motion.zip",
-      "tag": "v2.0.0-weights",
-      "size": 233338905
+      "current": "v2.0.0-weights",
+      "versions": {
+        "v2.0.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset503_cardiac_motion.zip",
+          "name": "Dataset503_cardiac_motion.zip",
+          "tag": "v2.0.0-weights",
+          "size": 233338905
+        }
+      }
     },
     "527": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset527_breasts_1559subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset527_breasts_1559subj.zip",
+          "name": "Dataset527_breasts_1559subj.zip",
+          "size": 233756114
+        }
+      }
     },
     "552": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset552_ventricle_parts_38subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset552_ventricle_parts_38subj.zip",
+          "name": "Dataset552_ventricle_parts_38subj.zip",
+          "size": 232836551
+        }
+      }
     },
     "570": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset570_ct_liver_segments.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset570_ct_liver_segments.zip",
+          "name": "Dataset570_ct_liver_segments.zip",
+          "size": 230049561
+        }
+      }
     },
     "576": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset576_mri_liver_segments_120subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset576_mri_liver_segments_120subj.zip",
+          "name": "Dataset576_mri_liver_segments_120subj.zip",
+          "size": 229689699
+        }
+      }
     },
     "589": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset589_ct_mri_liver_lesions_750subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset589_ct_mri_liver_lesions_750subj.zip",
+          "name": "Dataset589_ct_mri_liver_lesions_750subj.zip",
+          "size": 231339706,
+          "sha256": "67807f2da94acbebf55d714ed84c6d0c7c06d937ead6bcb4d1039e48c1664f66"
+        }
+      }
     },
     "591": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset591_ct_liver_lesions_842subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset591_ct_liver_lesions_842subj.zip",
+          "name": "Dataset591_ct_liver_lesions_842subj.zip",
+          "size": 230940114,
+          "sha256": "b3bdd53de65dc64a46264edfdeb491b18e8f95973a691eeccfa530d1da1678a0"
+        }
+      }
     },
     "597": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset597_mri_body_139subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset597_mri_body_139subj.zip",
+          "name": "Dataset597_mri_body_139subj.zip",
+          "size": 229810326
+        }
+      }
     },
     "598": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset598_mri_body_6mm_139subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset598_mri_body_6mm_139subj.zip",
+          "name": "Dataset598_mri_body_6mm_139subj.zip",
+          "size": 42741891
+        }
+      }
     },
     "615": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset615_MAXIMUS.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset615_MAXIMUS.zip",
+          "name": "Dataset615_MAXIMUS.zip",
+          "size": 1168954978,
+          "sha256": "da6550f9ad0af3559e3d34ff47f5fa04fd0d75e2d56d5168c0e4fc25614b122b"
+        }
+      }
     },
     "730": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
-      "name": "Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
-      "tag": "v2.2.0-weights",
-      "size": 230623313
+      "current": "v2.2.0-weights",
+      "versions": {
+        "v2.2.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
+          "name": "Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
+          "tag": "v2.2.0-weights",
+          "size": 230623313
+        }
+      }
     },
     "731": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
-      "name": "Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
-      "tag": "v2.2.0-weights",
-      "size": 230748066
+      "current": "v2.2.0-weights",
+      "versions": {
+        "v2.2.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
+          "name": "Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
+          "tag": "v2.2.0-weights",
+          "size": 230748066
+        }
+      }
     },
     "732": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
-      "name": "Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
-      "tag": "v2.2.0-weights",
-      "size": 125131057
+      "current": "v2.2.0-weights",
+      "versions": {
+        "v2.2.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
+          "name": "Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
+          "tag": "v2.2.0-weights",
+          "size": 125131057
+        }
+      }
     },
     "733": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
-      "name": "Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
-      "tag": "v2.2.0-weights",
-      "size": 43479207
+      "current": "v2.2.0-weights",
+      "versions": {
+        "v2.2.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
+          "name": "Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
+          "tag": "v2.2.0-weights",
+          "size": 43479207
+        }
+      }
     },
     "756": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset756_mri_vertebrae_1076subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset756_mri_vertebrae_1076subj.zip",
+          "name": "Dataset756_mri_vertebrae_1076subj.zip",
+          "size": 230791939
+        }
+      }
     },
     "775": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset775_head_glands_cavities_492subj.zip",
-      "sha256": null
+      "current": "v2.3.0-weights",
+      "versions": {
+        "v2.3.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset775_head_glands_cavities_492subj.zip",
+          "name": "Dataset775_head_glands_cavities_492subj.zip",
+          "size": 231091065
+        }
+      }
     },
     "776": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset776_headneck_bones_vessels_492subj.zip",
-      "sha256": null
+      "current": "v2.3.0-weights",
+      "versions": {
+        "v2.3.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset776_headneck_bones_vessels_492subj.zip",
+          "name": "Dataset776_headneck_bones_vessels_492subj.zip",
+          "size": 230805136
+        }
+      }
     },
     "777": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset777_head_muscles_492subj.zip",
-      "sha256": null
+      "current": "v2.3.0-weights",
+      "versions": {
+        "v2.3.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset777_head_muscles_492subj.zip",
+          "name": "Dataset777_head_muscles_492subj.zip",
+          "size": 230370685
+        }
+      }
     },
     "778": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset778_headneck_muscles_part1_492subj.zip",
-      "sha256": null
+      "current": "v2.3.0-weights",
+      "versions": {
+        "v2.3.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset778_headneck_muscles_part1_492subj.zip",
+          "name": "Dataset778_headneck_muscles_part1_492subj.zip",
+          "size": 230197164
+        }
+      }
     },
     "779": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset779_headneck_muscles_part2_492subj.zip",
-      "sha256": null
+      "current": "v2.3.0-weights",
+      "versions": {
+        "v2.3.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.3.0-weights/Dataset779_headneck_muscles_part2_492subj.zip",
+          "name": "Dataset779_headneck_muscles_part2_492subj.zip",
+          "size": 230397368
+        }
+      }
     },
     "789": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset789_kidney_cyst_501subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset789_kidney_cyst_501subj.zip",
+          "name": "Dataset789_kidney_cyst_501subj.zip",
+          "size": 230592397
+        }
+      }
     },
     "803": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
-      "name": "Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
-      "tag": "v2.5.0-weights",
-      "size": 233669247,
-      "sha256": "de7b07b2bdd2298945e4f147da0117d5f97d9801125da75b365db423d8bb98dd"
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
+          "name": "Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
+          "tag": "v2.5.0-weights",
+          "size": 233669247,
+          "sha256": "de7b07b2bdd2298945e4f147da0117d5f97d9801125da75b365db423d8bb98dd"
+        }
+      }
     },
     "850": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset850_TotalSegMRI_part1_organs_1088subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset850_TotalSegMRI_part1_organs_1088subj.zip",
+          "name": "Dataset850_TotalSegMRI_part1_organs_1088subj.zip",
+          "size": 231681650
+        }
+      }
     },
     "851": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset851_TotalSegMRI_part2_muscles_1088subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset851_TotalSegMRI_part2_muscles_1088subj.zip",
+          "name": "Dataset851_TotalSegMRI_part2_muscles_1088subj.zip",
+          "size": 232156399
+        }
+      }
     },
     "852": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset852_TotalSegMRI_total_3mm_1088subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset852_TotalSegMRI_total_3mm_1088subj.zip",
+          "name": "Dataset852_TotalSegMRI_total_3mm_1088subj.zip",
+          "size": 126399352
+        }
+      }
     },
     "853": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset853_TotalSegMRI_total_6mm_1088subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset853_TotalSegMRI_total_6mm_1088subj.zip",
+          "name": "Dataset853_TotalSegMRI_total_6mm_1088subj.zip",
+          "size": 44657261
+        }
+      }
     },
     "913": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset913_lung_nodules.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset913_lung_nodules.zip",
+          "name": "Dataset913_lung_nodules.zip",
+          "size": 765102050
+        }
+      }
     },
     "920": {
-      "url": null,
-      "gated": true
+      "current": "unversioned",
+      "versions": {
+        "unversioned": {
+          "url": null,
+          "gated": true
+        }
+      }
     },
     "952": {
-      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset952_abdominal_muscles_167subj.zip",
-      "sha256": null
+      "current": "v2.5.0-weights",
+      "versions": {
+        "v2.5.0-weights": {
+          "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset952_abdominal_muscles_167subj.zip",
+          "name": "Dataset952_abdominal_muscles_167subj.zip",
+          "size": 124276110,
+          "sha256": "7442ec9a0ed29e8263cd6e889eecad8e03680f4d9c3e005aebbfe677dee1faff"
+        }
+      }
     }
   }
 }
