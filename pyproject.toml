@@ -28,7 +28,7 @@ nnseg = "nnseg.cli:main"
 remote = ["httpx"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
-test = ["pytest"]
+test = ["pytest", "pydicom"]
 # The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader; nnunetv2 for the network
 # architecture, weights and sliding-window slicers (stock APIs only - the GPU resampler now
 # lives in nnseg.resample, so no fork is pinned); scipy builds the resampler's exact operators;

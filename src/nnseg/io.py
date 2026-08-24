@@ -45,6 +45,74 @@ def orientation_of(image) -> str:
     return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(image.GetDirection())
 
 
+def _series_tags(path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(IPP, IOP, PixelSpacing) of one slice, from the geometric tags."""
+    sitk = _sitk()
+    r = sitk.ImageFileReader()
+    r.SetFileName(str(path))
+    r.ReadImageInformation()
+
+    def tag(key, n):
+        if not r.HasMetaDataKey(key):
+            raise InputError(f"DICOM slice {path} lacks tag {key}; cannot establish geometry")
+        v = np.array([float(x) for x in r.GetMetaData(key).split("\\")], dtype=np.float64)
+        if v.size != n:
+            raise InputError(f"DICOM tag {key} in {path} has {v.size} values, expected {n}")
+        return v
+
+    return tag("0020|0032", 3), tag("0020|0037", 6), tag("0028|0030", 2)
+
+
+def _series_geometry(files) -> tuple[tuple, tuple, tuple]:
+    """Origin/direction/spacing of a sorted slice stack, from IOP + IPP only.
+
+    The reader cannot be trusted for this: ITK's GDCM layer takes the slice axis's
+    *sign* from SpacingBetweenSlices (0018,0088) - a vendor acquisition convention
+    that Philips writes negative on head-to-foot scans - while origin and stacking
+    follow the spatially sorted file list. On such a series the two disagree and the
+    assembled volume claims a physical span the scan never occupies; canonicalization
+    then hands the network a head-down body (found 2026-08-24 on CPTAC-CCRCC: 28 of
+    111 structures lost, including a kidney). The IPP sequence *is* the geometry, so
+    it is constructed here from the tags and (0018,0088) is never consulted.
+
+    Raises :class:`InputError` when the positions do not describe one uniform
+    orthogonal grid - a tilted gantry (slice positions not advancing along the image
+    normal), inconsistent orientations, duplicate slices, or gaps.
+    """
+    if len(files) < 2:
+        raise InputError("DICOM series has fewer than 2 slices; not a 3D volume")
+    ipps, iops, spacings = zip(*(_series_tags(f) for f in files))
+    ipps = np.stack(ipps)
+    if (np.abs(np.stack(iops) - iops[0]).max() > 1e-4
+            or np.abs(np.stack(spacings) - spacings[0]).max() > 1e-4):
+        raise InputError("DICOM series mixes image orientations or pixel spacings; "
+                         "not a single uniform volume")
+    row, col = iops[0][:3], iops[0][3:]
+    span = ipps[-1] - ipps[0]
+    n_hat = span / np.linalg.norm(span)
+    if abs(float(np.dot(n_hat, np.cross(row, col)))) < 0.999:
+        raise InputError("non-orthogonal acquisition (gantry tilt or shear): slice "
+                         "positions do not advance along the image normal")
+    s = (ipps - ipps[0]) @ n_hat                       # position along the normal, mm
+    resid = np.linalg.norm((ipps - ipps[0]) - s[:, None] * n_hat[None, :], axis=1)
+    if resid.max() > 0.05:
+        raise InputError("slice positions drift off the image normal "
+                         f"(max {resid.max():.3f} mm): tilted or sheared acquisition")
+    steps = np.diff(s)
+    if steps.min() <= 0:
+        raise InputError("duplicate or non-monotonic slice positions in the series")
+    dz = float(steps.mean())
+    if np.abs(steps - dz).max() > max(0.01, 1e-3 * dz):
+        raise InputError("non-uniform slice spacing "
+                         f"(steps {steps.min():.3f}-{steps.max():.3f} mm): "
+                         "missing or duplicate slices")
+    direction = np.stack([row, col, n_hat], axis=1)    # columns = x, y, z axes
+    ps = spacings[0]                                    # (row spacing, column spacing)
+    return (tuple(float(v) for v in ipps[0]),
+            tuple(float(v) for v in direction.ravel()),
+            (float(ps[1]), float(ps[0]), dz))
+
+
 def read(path, *, reorient: bool = True) -> tuple[np.ndarray, "Geometry", str]:
     """Read any SimpleITK-supported image (or a DICOM series directory).
 
@@ -66,6 +134,12 @@ def read(path, *, reorient: bool = True) -> tuple[np.ndarray, "Geometry", str]:
             raise InputError(f"no DICOM series found in {p}")
         reader.SetFileNames(files)
         image = reader.Execute()
+        # The reader decodes and stacks; the geometry comes from the tags. See
+        # _series_geometry for why its own claim cannot be trusted.
+        origin, direction, spacing = _series_geometry(files)
+        image.SetOrigin(origin)
+        image.SetDirection(direction)
+        image.SetSpacing(spacing)
     else:
         image = sitk.ReadImage(str(p))
     if image.GetDimension() != 3:

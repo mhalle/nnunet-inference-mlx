@@ -1,0 +1,133 @@
+"""DICOM series geometry comes from IOP + IPP, never from SpacingBetweenSlices.
+
+Regression for the 2026-08-24 finding: on Philips head-to-foot series (0018,0088)
+is negative and ITK's GDCM layer takes the slice axis's sign from it, while origin
+and stacking follow the spatially sorted list - the assembled volume then claims a
+physical span the scan never occupies and the network sees a head-down body
+(CPTAC-CCRCC a05fb365: 28 of 111 structures lost, including a kidney). nnseg now
+constructs series geometry from the geometric tags; these fixtures encode the
+failure and the grid contract without shipping patient data.
+"""
+import numpy as np
+import pytest
+
+pydicom = pytest.importorskip("pydicom")
+
+from nnseg import io
+from nnseg.errors import InputError
+
+
+CT_SOP = "1.2.840.10008.5.1.4.1.1.2"
+
+
+def write_series(dirpath, ipps, *, sbs=None, iop=(1, 0, 0, 0, 1, 0), pixel_spacing=(0.7, 0.5)):
+    """Minimal CT slices: 4x4 int16, geometry per arguments, InstanceNumber
+    descending with file index (the Philips pattern that exposed the bug)."""
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+
+    series_uid, study_uid, frame_uid = generate_uid(), generate_uid(), generate_uid()
+    for i, ipp in enumerate(ipps):
+        sop = generate_uid()
+        meta = FileMetaDataset()
+        meta.MediaStorageSOPClassUID = CT_SOP
+        meta.MediaStorageSOPInstanceUID = sop
+        meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        ds = FileDataset(None, {}, file_meta=meta, preamble=b"\0" * 128)
+        ds.SOPClassUID = CT_SOP
+        ds.SOPInstanceUID = sop
+        ds.Modality = "CT"
+        ds.SeriesInstanceUID = series_uid
+        ds.StudyInstanceUID = study_uid
+        ds.FrameOfReferenceUID = frame_uid
+        ds.PatientID = "fixture"
+        ds.PatientName = "fixture"
+        ds.InstanceNumber = len(ipps) - i
+        ds.ImagePositionPatient = [float(v) for v in ipp]
+        ds.ImageOrientationPatient = [float(v) for v in iop]
+        ds.PixelSpacing = [float(v) for v in pixel_spacing]
+        ds.SliceThickness = 2.0
+        if sbs is not None:
+            ds.SpacingBetweenSlices = float(sbs)
+        ds.Rows = ds.Columns = 4
+        ds.BitsAllocated = ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 1
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelData = np.full((4, 4), i, dtype=np.int16).tobytes()
+        ds.save_as(dirpath / f"slice_{i:03d}.dcm", enforce_file_format=True)
+    return dirpath
+
+
+def ascending(n=4, z0=31.0, dz=1.0):
+    return [(-266.0, -138.0, z0 + i * dz) for i in range(n)]
+
+
+def geometry(tmp_path, **kw):
+    write_series(tmp_path, kw.pop("ipps"), **kw)
+    _, geo, _ = io.read(tmp_path, reorient=False)
+    return geo
+
+
+def test_negative_sbs_gets_ipp_geometry(tmp_path):
+    """THE regression: Philips negative (0018,0088) must not flip the slice axis."""
+    geo = geometry(tmp_path, ipps=ascending(), sbs=-1.0)
+    d = np.array(geo.direction_xyz).reshape(3, 3)
+    assert np.allclose(d, np.eye(3)), d                      # +z, from the IPPs
+    assert geo.origin_xyz == (-266.0, -138.0, 31.0)          # first sorted slice
+    assert np.allclose(geo.spacing_zyx, (1.0, 0.7, 0.5))     # (dz, row, col)
+
+
+def test_positive_sbs_same_answer(tmp_path):
+    geo = geometry(tmp_path, ipps=ascending(), sbs=1.0)
+    assert np.allclose(np.array(geo.direction_xyz).reshape(3, 3), np.eye(3))
+    assert geo.origin_xyz == (-266.0, -138.0, 31.0)
+
+
+def test_absent_sbs_same_answer(tmp_path):
+    geo = geometry(tmp_path, ipps=ascending())
+    assert np.allclose(np.array(geo.direction_xyz).reshape(3, 3), np.eye(3))
+
+
+def test_descending_storage_reads_identically(tmp_path):
+    """File creation order must not matter - GDCM sorts spatially either way."""
+    geo = geometry(tmp_path, ipps=list(reversed(ascending())), sbs=-1.0)
+    assert np.allclose(np.array(geo.direction_xyz).reshape(3, 3), np.eye(3))
+    assert geo.origin_xyz == (-266.0, -138.0, 31.0)
+
+
+def test_gantry_tilt_rejected(tmp_path):
+    ipps = [(-266.0 + 0.4 * i, -138.0, 31.0 + i) for i in range(4)]   # x drifts with z
+    write_series(tmp_path, ipps)
+    with pytest.raises(InputError, match="tilt|normal"):
+        io.read(tmp_path, reorient=False)
+
+
+def test_gap_rejected(tmp_path):
+    ipps = [(-266.0, -138.0, z) for z in (31.0, 32.0, 33.0, 35.0)]    # missing slice
+    write_series(tmp_path, ipps)
+    with pytest.raises(InputError, match="spacing|missing"):
+        io.read(tmp_path, reorient=False)
+
+
+def test_duplicate_position_rejected(tmp_path):
+    ipps = [(-266.0, -138.0, z) for z in (31.0, 32.0, 32.0, 33.0)]
+    write_series(tmp_path, ipps)
+    with pytest.raises(InputError, match="[Dd]uplicate|monotonic"):
+        io.read(tmp_path, reorient=False)
+
+
+def test_single_slice_rejected(tmp_path):
+    write_series(tmp_path, ascending(n=1))
+    with pytest.raises(InputError, match="fewer than 2|3D"):
+        io.read(tmp_path, reorient=False)
+
+
+def test_reorient_lands_in_ras(tmp_path):
+    """End to end through the canonical path: RAS out, regardless of the SBS sign."""
+    write_series(tmp_path, ascending(), sbs=-1.0)
+    _, geo, original = io.read(tmp_path, reorient=True)
+    img = io.to_image(np.zeros(geo.shape_zyx, dtype=np.uint8), geo)
+    assert io.orientation_of(img) == io.CANONICAL
+    assert original == "LPS"                                 # the stored frame
