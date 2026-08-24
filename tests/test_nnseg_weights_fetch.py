@@ -34,7 +34,9 @@ def test_present_and_skip(tmp_path):
 
 
 def test_unknown_id_is_a_clear_error(tmp_path):
-    with pytest.raises(KeyError):
+    """ModelNotFound, not a KeyError leaking out of the manifest dict - and it says what to do."""
+    from nnseg.errors import ModelNotFound
+    with pytest.raises(ModelNotFound, match="weights refresh"):
         fetch_one(999999, tmp_path)
 
 
