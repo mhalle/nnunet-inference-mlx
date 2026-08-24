@@ -1,0 +1,68 @@
+# Keep data/ts_weights.json in step with what TotalSegmentator publishes.
+#
+# The manifest is how any machine without weights on disk provisions them, so a gap means a task
+# simply cannot run there - and it rots silently, which is how it drifted 16 tasks behind before
+# anyone noticed. Weekly is generous: TotalSegmentator has published 7 releases in total.
+#
+# NOTE: GitHub runs `schedule` only from the repository's DEFAULT branch. Until this lands on
+# main it will only run via workflow_dispatch.
+name: weights manifest
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"          # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv && uv pip install pytest
+
+      - name: Refresh the manifest and check for divergence
+        id: refresh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 60 -> 1000 API requests/hour
+          PYTHONPATH: src
+        run: |
+          uv run python - <<'PY'
+          import os, sys
+          from nnseg import weights_fetch as wf
+          r = wf.refresh_manifest(progress=lambda m: print(m, flush=True))
+          c = wf.coverage()
+          print(f"\ncoverage: {len(c['covered'])}/{c['n_tasks']} provisionable, "
+                f"{len(c['license_required'])} license-gated, {len(c['missing'])} missing")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"- added: {sorted(r['added']) or 'none'}\n")
+              f.write(f"- new versions recorded: {len(r['new_versions'])}\n")
+              f.write(f"- provisionable: {len(c['covered'])}/{c['n_tasks']}\n")
+          # The signal that needs a human is not a new release - it is TotalSegmentator
+          # REPOINTING a dataset, which silently changes which weights we install.
+          if r["behind_upstream"]:
+              print("\nERROR: default no longer matches TotalSegmentator's pin:", file=sys.stderr)
+              for wid, (ours, theirs) in sorted(r["behind_upstream"].items()):
+                  print(f"  Dataset{wid}: ours={ours} TotalSegmentator={theirs}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Open a pull request if anything changed
+        # A PR, never a direct push: a newly published dataset usually needs a ts_tasks.json
+        # entry too, and that is a judgment call.
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/weights-manifest
+          title: "chore: refresh the weights manifest"
+          commit-message: "chore: refresh the weights manifest from TotalSegmentator releases"
+          body: |
+            Automated `nnseg weights refresh`. Only records what upstream published -
+            `default` is never repointed by this job.
+
+            Check whether any newly added dataset also needs a `ts_tasks.json` task entry.
+          add-paths: src/nnseg/data/ts_weights.json

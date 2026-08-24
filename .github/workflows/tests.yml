@@ -1,0 +1,36 @@
+# nnseg's test suite.
+#
+# Scope is deliberately `test_nnseg_*` + `kernel_test_*`: the rest of this repo is the MLX
+# toolkit, whose core dependency (mlx) has no Linux wheels. That split is not a workaround -
+# nnseg running where mlx does not is the point of the torch path, and tests/test_nnseg_layering
+# enforces it. So this job also proves that property on every push.
+name: tests
+
+on:
+  push:
+    branches: [main, feature/nnseg]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  nnseg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        # Not `uv sync`: that installs the package, whose core dependency is mlx. Install what
+        # nnseg itself needs and put src on the path - the same recipe cuda/_common.py uses.
+        # The CPU torch index avoids pulling ~2.5 GB of CUDA wheels for a CPU-only runner.
+        run: |
+          uv venv
+          uv pip install --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            torch nnunetv2 scipy scikit-image 'SimpleITK>=2.3' pytest
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: uv run pytest tests/test_nnseg_*.py tests/kernel_test_*.py -m "not slow" -q
