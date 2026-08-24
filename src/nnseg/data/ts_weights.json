@@ -1,14 +1,14 @@
 {
-  "_meta": {
-    "schema_version": 1,
-    "ts_version": "unknown",
-    "generator": "scripts/refresh_ts_weights.py",
-    "note": "id\u2192download URL extracted from libs.download_pretrained_weights; sha256 null (TS publishes none); gated=license-server only."
-  },
   "weights": {
     "8": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
       "sha256": null
+    },
+    "008": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset008_HepaticVessel.zip",
+      "name": "Dataset008_HepaticVessel.zip",
+      "tag": "v2.4.0-weights",
+      "size": 230191278
     },
     "113": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset113_ToothFairy3.zip",
@@ -70,6 +70,19 @@
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip",
       "sha256": null
     },
+    "302": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset302_vertebrae_body_1559subj.zip",
+      "name": "Dataset302_vertebrae_body_1559subj.zip",
+      "tag": "v2.0.0-weights",
+      "size": 233459212
+    },
+    "305": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset305_vertebrae_discs_1559subj.zip",
+      "name": "Dataset305_vertebrae_discs_1559subj.zip",
+      "tag": "v2.5.0-weights",
+      "size": 233569643,
+      "sha256": "b0c936e317a9be1eccaf52bf7043ff28af6c40a3e200cbc6cbc1fbdc0c234920"
+    },
     "315": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset315_thoraxCT.zip",
       "sha256": null
@@ -81,6 +94,12 @@
     "351": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.4.0-weights/Dataset351_oculomotor_muscles_18subj.zip",
       "sha256": null
+    },
+    "503": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset503_cardiac_motion.zip",
+      "name": "Dataset503_cardiac_motion.zip",
+      "tag": "v2.0.0-weights",
+      "size": 233338905
     },
     "527": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset527_breasts_1559subj.zip",
@@ -118,6 +137,30 @@
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset615_MAXIMUS.zip",
       "sha256": null
     },
+    "730": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
+      "name": "Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip",
+      "tag": "v2.2.0-weights",
+      "size": 230623313
+    },
+    "731": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
+      "name": "Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip",
+      "tag": "v2.2.0-weights",
+      "size": 230748066
+    },
+    "732": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
+      "name": "Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip",
+      "tag": "v2.2.0-weights",
+      "size": 125131057
+    },
+    "733": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
+      "name": "Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip",
+      "tag": "v2.2.0-weights",
+      "size": 43479207
+    },
     "756": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset756_mri_vertebrae_1076subj.zip",
       "sha256": null
@@ -145,6 +188,13 @@
     "789": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset789_kidney_cyst_501subj.zip",
       "sha256": null
+    },
+    "803": {
+      "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
+      "name": "Dataset803_TotalSegmentator_vertebrae_inner_1559subj.zip",
+      "tag": "v2.5.0-weights",
+      "size": 233669247,
+      "sha256": "de7b07b2bdd2298945e4f147da0117d5f97d9801125da75b365db423d8bb98dd"
     },
     "850": {
       "url": "https://github.com/wasserth/TotalSegmentator/releases/download/v2.5.0-weights/Dataset850_TotalSegMRI_part1_organs_1088subj.zip",

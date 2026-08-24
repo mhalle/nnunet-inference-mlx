@@ -24,6 +24,19 @@ def main(argv=None) -> int:
                    help="restrict inference to the body's bounding box plus this margin in mm; 0 or negative = whole volume")
     s.add_argument("--model-root", default=None)
     s.add_argument("--quiet", action="store_true")
+
+    w = sub.add_parser("weights", help="provision and maintain model weights")
+    wsub = w.add_subparsers(dest="wcmd", required=True)
+    wf = wsub.add_parser("fetch", help="download everything a task needs")
+    wf.add_argument("task")
+    wf.add_argument("--root", default=None, help="weights root (default: the ecosystem's location)")
+    wsub.add_parser("coverage", help="which catalog tasks the manifest can provision")
+    wr = wsub.add_parser("refresh", help="merge newly published weights into the manifest")
+    wr.add_argument("--repo", default=None, help="GitHub repo to read releases from")
+    wr.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
+    wr.add_argument("--update-existing", action="store_true",
+                    help="also repoint datasets at newer releases (changes which weights download)")
+
     args = ap.parse_args(argv)
     if args.cmd == "segment":
         from .pipeline import segment
@@ -38,6 +51,32 @@ def main(argv=None) -> int:
                 print(f"  {v:7.2f} s  {k}", file=sys.stderr)
             print(f"wrote {args.output}: {tuple(r.grid.shape)}, "
                   f"{len(r.present())}/{len(r.schema.names)} structures present", file=sys.stderr)
+    if args.cmd == "weights":
+        from . import weights_fetch as wfm
+        say = lambda m: print(m, file=sys.stderr, flush=True)
+        if args.wcmd == "fetch":
+            from .tasks import weights_root
+            root = args.root or weights_root("totalsegmentator")
+            paths = wfm.ensure_task_weights(args.task, root, progress=lambda m: say(f"  {m}"))
+            print(f"{len(paths)} model(s) under {root}")
+        elif args.wcmd == "coverage":
+            c = wfm.coverage()
+            print(f"{len(c['covered'])}/{c['n_tasks']} tasks provisionable from {c['n_weights']} manifest entries")
+            for name, ids in sorted(c["license_required"].items()):
+                print(f"  LICENSE  {name:32s} {','.join(ids)}  (TotalSegmentator licensed backend)")
+            for name, ids in sorted(c["missing"].items()):
+                print(f"  MISSING  {name:32s} {','.join(ids)}")
+            return 1 if c["missing"] else 0
+        elif args.wcmd == "refresh":
+            kw = {"write": not args.dry_run, "update_existing": args.update_existing, "progress": say}
+            if args.repo:
+                kw["repo"] = args.repo
+            r = wfm.refresh_manifest(**kw)
+            for wid, e in sorted(r["added"].items(), key=lambda kv: int(kv[0])):
+                print(f"  + {wid:5s} {e['name']}  ({e['tag']})")
+            for wid, e in sorted(r["newer_upstream"].items(), key=lambda kv: int(kv[0])):
+                print(f"  ~ {wid:5s} {e['name']}  ({e['tag']})"
+                      + ("" if args.update_existing else "   [not applied]"))
     return 0
 
 
