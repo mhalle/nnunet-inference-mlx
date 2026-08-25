@@ -1474,7 +1474,15 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     raise HTTPException(404, "not materialized; authenticated access can "
                                              "compute it")
                 initiated = False
-                if jid is None:                # authed, nothing running: initiate
+                if jid is None:                # authed, nothing running
+                    # Labels follow the same rule as every derived artifact
+                    # (user decision 2026-08-25, closing review F8): the
+                    # Prefer header expresses the intent to compute, its
+                    # duration the patience. A plain GET is a read.
+                    if _prefer_wait_raw(request, wait_max) is None:
+                        raise HTTPException(404, "not materialized; send Prefer: wait to "
+                                                 "compute it from this URL (wait=0 fires "
+                                                 "the job and returns 202 immediately)")
                     if not _source_enabled(srcobj):
                         raise HTTPException(404, "not materialized, and this server cannot "
                                                  f"fetch {prefix} data (missing dependency)")

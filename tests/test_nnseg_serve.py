@@ -1994,10 +1994,15 @@ def test_preference_applied_only_with_prefer(tmp_path, monkeypatch):
     client = TestClient(create_app(ex))
     u = "1be27d1c-9410-47ff-9c9f-a44b26a4bd55"
     url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
-    r = client.get(url)                        # no Prefer: default wait applies
-    assert r.status_code == 200
-    assert "preference-applied" not in {k.lower() for k in r.headers}
-    ex.cache.delete(next(iter(d.name for d in (tmp_path / "rc").iterdir())))
+    # F8 (user decision): a plain GET is a READ even when authorized - the
+    # Prefer header is the intent to compute, exactly as on every artifact
+    r = client.get(url)
+    assert r.status_code == 404 and "Prefer" in r.json()["detail"]
+    assert len(seg.calls) == 0
     r = client.get(url, headers={"Prefer": "wait=30"})
     assert r.status_code == 200
     assert r.headers.get("Preference-Applied") == "wait=30"
+    r = client.get(url)                        # cached read, no Prefer sent
+    assert r.status_code == 200
+    assert "preference-applied" not in {k.lower() for k in r.headers}
+    assert len(seg.calls) == 1
