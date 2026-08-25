@@ -1078,6 +1078,12 @@ def inverse_resample_paint(
     np.ndarray
         Integer label volume at acquisition spacing, shape ``out_shape_zyx``.
     """
+    if len(regions_class_order) != int(logits_target.shape[0]):
+        raise ValueError(
+            f"logits have {int(logits_target.shape[0])} channels but "
+            f"regions_class_order has {len(regions_class_order)} labels - one label "
+            "per region channel, in paint-priority order")
+
     if peak_working_memory_mb is None:
         peak_working_memory_mb = _auto_memory_budget_mb()
 
