@@ -34,3 +34,26 @@ def test_purgeable_policy():
     assert not _purgeable({"state": "running", "started": now - 10 ** 6}, now, ttl)
     # garbage records are purgeable
     assert _purgeable(None, now, ttl)
+
+
+def test_emit_is_terminal_wins():
+    """A worker progress emit racing an API cancel must not resurrect a
+    terminal record to running - the lost-cancel wedge."""
+    from nnseg import modal_app
+
+    class FakeDict(dict):
+        pass
+
+    orig = modal_app.jobs_dict
+    modal_app.jobs_dict = fake = FakeDict()
+    try:
+        modal_app._emit("j1", {"state": "running", "started": 1.0})
+        modal_app._emit("j1", {"state": "cancelled", "finished": 2.0})
+        modal_app._emit("j1", {"state": "running", "progress": {"stage": "x"}})
+        assert fake["j1"]["state"] == "cancelled"          # cancel survives
+        modal_app._emit("j1", {"progress": {"stage": "y"}})
+        assert fake["j1"]["state"] == "cancelled"          # stateless merge too
+        modal_app._emit("j1", {"state": "done", "finished": 3.0})
+        assert fake["j1"]["state"] == "done"               # terminal->terminal ok
+    finally:
+        modal_app.jobs_dict = orig

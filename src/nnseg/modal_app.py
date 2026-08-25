@@ -235,6 +235,12 @@ def _bound_jobs_store(current_jid: str) -> None:
                         del jobs_dict[k]
                     except Exception:
                         pass
+            elif k.startswith("cancel:"):
+                if now - float(jobs_dict.get(k) or 0) > 900:
+                    try:
+                        del jobs_dict[k]
+                    except Exception:
+                        pass
         if purged:
             print(f"[purge] {len(purged)} finished jobs past {JOBS_TTL_H:g}h TTL", flush=True)
         jobs_vol.commit()
@@ -242,8 +248,20 @@ def _bound_jobs_store(current_jid: str) -> None:
         print(f"[purge] failed: {e}", flush=True)
 
 
+_TERMINAL = ("done", "failed", "cancelled")
+
+
 def _emit(jid: str, update: dict) -> None:
+    """Merge an update into the job's Dict record, terminal-wins: once a
+    record is terminal, only idempotent terminal re-writes land - a worker
+    progress emit racing an API cancel can no longer resurrect the record to
+    'running' (which wedged it forever: the purge never touches active
+    states, so the inflight marker and 202 probes lived eternally). The
+    read-modify-write is still not atomic - this closes the lost-CANCEL
+    class, which is the one with an unbounded blast radius."""
     meta = jobs_dict.get(jid) or {}
+    if meta.get("state") in _TERMINAL and update.get("state") not in _TERMINAL:
+        return
     meta.update(update)
     jobs_dict[jid] = meta
 
@@ -363,10 +381,13 @@ class Worker:
             now = time.time()
             if now - last["t"] >= 0.25 or p.stage in ("restore", "finalize"):
                 last["t"] = now
+                if jobs_dict.contains(f"cancel:{jid}") if hasattr(jobs_dict, "contains")                         else jobs_dict.get(f"cancel:{jid}") is not None:
+                    token.cancel()         # cooperative: honored at the next check
                 _emit(jid, {"progress": asdict(p)})
 
         token = CancelToken()
-        _emit(jid, {"state": "running", "started": time.time()})
+        started = time.time()
+        _emit(jid, {"state": "running", "started": started})
         prefetch_stop = threading.Event()
         _prefetch_next(jid, prefetch_stop, self.series_cache,
                        self.read_ahead, self._vol_lock)   # CPU downloader + pre-reader
@@ -448,7 +469,7 @@ class Worker:
                     meta["cache_key"], jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
-                     "computed": meta.get("started")})
+                     "computed": started})
                 cache_vol.commit()
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
             if pair is not None:
@@ -543,8 +564,7 @@ class ModalExecutor:
         if key:
             jobs_dict[f"inflight:{key}"] = jid
         call = Worker().run_job.spawn(jid, source_tokens=source_tokens)
-        meta["call_id"] = call.object_id
-        jobs_dict[jid] = meta
+        _emit(jid, {"call_id": call.object_id})   # merge, never clobber worker emits
         return meta
 
     def cache_get(self, key):
@@ -587,13 +607,19 @@ class ModalExecutor:
     def statuses(self):
         out = []
         try:
-            for jid in jobs_dict.keys():
-                s = self.status_of(jid)
-                if s:
-                    out.append({k: s.get(k) for k in
-                                ("id", "task", "state", "created", "started", "finished")})
+            keys = list(jobs_dict.keys())
         except Exception:                    # keys() availability varies by client version
-            pass
+            return out
+        for jid in keys:
+            if ":" in str(jid):              # inflight:/artifacts:/cancel: markers
+                continue
+            try:
+                s = self.status_of(jid)
+            except Exception:                # one bad row must not truncate the listing
+                continue
+            if s:
+                out.append({k: s.get(k) for k in
+                            ("id", "task", "state", "created", "started", "finished")})
         return out
 
     def cancel(self, jid):
@@ -608,6 +634,7 @@ class ModalExecutor:
                     modal.FunctionCall.from_id(call_id).cancel()
                 except Exception:
                     pass
+            jobs_dict[f"cancel:{jid}"] = time.time()
             _emit(jid, {"state": "cancelled", "finished": time.time()})
             return "cancelled", False
         import shutil
