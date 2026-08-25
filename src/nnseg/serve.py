@@ -117,11 +117,18 @@ class SeriesCache:
         self._lock = threading.Lock()          # eviction bookkeeping only
 
     def _entry(self, series: str) -> Path:
-        # keys become directory names; no source id_pattern, however sloppy,
-        # may reach outside the cache root
-        if "/" in series or "\x00" in series or series in (".", ".."):
-            raise InputError(f"invalid cache key {series!r}")
-        return self.root / series
+        # Keys become directory names. Filesystem-safe keys keep their readable
+        # verbatim name (a cache you can ls); anything else - separators, dot
+        # names, absurd lengths - maps to a deterministic hash, so identifiers
+        # with slashes (DOIs, org/name ids) are safe by construction rather
+        # than forbidden.
+        safe = ("/" not in series and "\\" not in series and "\x00" not in series
+                and series not in (".", "..") and 0 < len(series) <= 200)
+        if safe:
+            return self.root / series
+        import hashlib
+        d = self.root / ("h_" + hashlib.sha256(series.encode()).hexdigest()[:32])
+        return d
 
     def has(self, series: str) -> bool:
         return (self._entry(series) / self.MARKER).exists()
@@ -160,7 +167,7 @@ class SeriesCache:
                 continue
             try:
                 dest = Path(self.fetch(series, entry))
-                self._commit(entry)
+                self._commit(entry, key=series)
                 return dest
             except BaseException:
                 shutil.rmtree(entry, ignore_errors=True)
@@ -178,14 +185,16 @@ class SeriesCache:
             return False
         try:
             self.fetch(series, entry)
-            self._commit(entry)
+            self._commit(entry, key=series)
             return True
         except Exception:
             shutil.rmtree(entry, ignore_errors=True)
             return False
 
-    def _commit(self, entry: Path) -> None:
+    def _commit(self, entry: Path, key: str | None = None) -> None:
         size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+        if key is not None and entry.name != key:
+            (entry / ".key").write_text(key)   # readable name for hashed entries
         (entry / self.MARKER).write_text(str(size))
         self._evict(keep={entry.name})
 
@@ -286,7 +295,8 @@ class ResultCache:
                     and not str(ident[0]).startswith("sha256:")
                     and not meta.get("options")):
                 prefix, one = str(ident[0]).split(":", 1)
-                entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
+                if "/" not in one:             # multi-segment ids are not path-addressable
+                    entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]

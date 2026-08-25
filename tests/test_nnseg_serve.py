@@ -1054,28 +1054,38 @@ def test_segmentations_listing_shape(tmp_path, monkeypatch):
     assert e["path"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
 
 
-def test_identifiers_cannot_traverse_the_cache(tmp_path):
-    """Defense in depth: even if a source's pattern admitted a slash, the
-    series cache refuses path-bearing keys, and the registry refuses such
-    patterns outright."""
-    import pytest as _pytest
-
-    from nnseg.errors import InputError as _IE
+def test_slashed_identifiers_hash_into_the_cache(tmp_path):
+    """Identifiers that cannot be directory names (slashes, dot names) map to
+    deterministic hashed entries inside the root - safe by construction, and
+    sources with DOI-style ids need no special casing."""
     from nnseg.serve import SeriesCache
     from nnseg.sources import registry
 
-    sc = SeriesCache(tmp_path / "sc", lambda i, d: d)
-    for bad in ("a/../../etc", "x/y", "..", "."):
-        with _pytest.raises(_IE):
-            sc.get_or_fetch(bad)
+    fetched = []
 
-    class Sloppy:
-        prefix = "sloppy"
-        id_pattern = r"[a-z/]+"
+    def fetch(key, entry):
+        d = entry / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "f").write_bytes(b"x")
+        fetched.append(key)
+        return d
+
+    root = tmp_path / "sc"
+    sc = SeriesCache(root, fetch)
+    for weird in ("doi:10.1234/abc.def", "a/../../etc", "..", "."):
+        got = sc.get_or_fetch(weird)
+        assert got.resolve().is_relative_to(root.resolve())   # never escapes
+        assert sc.has(weird)
+        assert sc._entry(weird).name.startswith("h_")
+        assert (sc._entry(weird) / ".key").read_text() == weird
+    assert sc.get_or_fetch("doi:10.1234/abc.def") and len(fetched) == 4  # cached
+
+    class Doi:
+        prefix = "doi"
+        id_pattern = r"10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+"
         description = ""
 
         def enabled(self):
             return True
 
-    with _pytest.raises(ValueError):
-        registry([Sloppy()])
+    assert "doi" in registry([Doi()])          # slashed patterns are fine now

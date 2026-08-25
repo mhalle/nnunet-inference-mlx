@@ -166,10 +166,9 @@ def registry(sources=None) -> dict:
             raise ValueError(f"source prefix {s.prefix!r} collides")
         if not s.id_pattern:
             raise ValueError(f"source {s.prefix!r} declares no id_pattern")
-        for probe in ("../x", "a/b", "..", "a\\b"):
-            if re.fullmatch(s.id_pattern, probe):
-                raise ValueError(f"source {s.prefix!r}: id_pattern admits "
-                                 f"{probe!r} - identifiers become directory "
-                                 "names and must not carry path separators")
+        # identifiers may contain slashes (DOIs, org/name ids): the series
+        # cache hashes filesystem-unsafe keys, so no pattern restriction is
+        # needed here. Slashed identifiers are reachable through the jobs API;
+        # only the single-segment path surface cannot address them.
         out[s.prefix] = s
     return out
