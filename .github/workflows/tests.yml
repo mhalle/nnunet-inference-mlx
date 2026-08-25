@@ -28,11 +28,15 @@ jobs:
         # Not `uv sync`: that installs the package, whose core dependency is mlx. Install what
         # nnseg itself needs and put src on the path - the same recipe cuda/_common.py uses.
         # The CPU torch index avoids pulling ~2.5 GB of CUDA wheels for a CPU-only runner.
+        # The second line is the serve/REST tier (fastapi..matplotlib) plus modal + pydicom:
+        # without them the serve suite importorskips to nothing and CI proves less than it
+        # appears to (found when unguarded fastapi imports failed the 2026-08-25 push).
         run: |
           uv venv
           uv pip install --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cpu \
-            torch nnunetv2 scipy scikit-image 'SimpleITK>=2.3' pytest
+            torch nnunetv2 scipy scikit-image 'SimpleITK>=2.3' pytest \
+            fastapi httpx python-multipart matplotlib modal pydicom
       - name: Run tests
         env:
           PYTHONPATH: src

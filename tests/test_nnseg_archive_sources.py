@@ -143,6 +143,7 @@ def test_token_header_reaches_fetch_and_never_leaks(tmp_path):
     fallback covers restricted prefetches by design."""
     import json as _json
 
+    pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
     from nnseg.serve import LocalExecutor, create_app
@@ -201,6 +202,7 @@ def test_slashed_identifiers_get_the_full_path_surface(tmp_path, monkeypatch):
 
     import numpy as np
     import SimpleITK as sitk
+    pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
     from nnseg.serve import LocalExecutor, create_app
