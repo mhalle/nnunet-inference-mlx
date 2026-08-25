@@ -55,6 +55,8 @@ WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
 MAX_CONTAINERS = int(os.environ.get("NNSEG_MAX_CONTAINERS", "1"))
 SHM_CACHE_GB = float(os.environ.get("NNSEG_SHM_CACHE_GB", "8"))
 JOBS_TTL_H = float(os.environ.get("NNSEG_JOBS_TTL_H", "72"))
+ARTIFACTS = set(filter(None, os.environ.get("NNSEG_ARTIFACTS",
+                                            "preview,statistics").split(",")))
 RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
@@ -73,7 +75,7 @@ def _pkg_dir() -> Path:
 # env at deploy time - a deploy-shell variable does not otherwise exist in the
 # container (found the hard way: a TTL override that never took effect).
 _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP",
-                  "NNSEG_WARM_TASK")
+                  "NNSEG_WARM_TASK", "NNSEG_ARTIFACTS")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -376,20 +378,32 @@ class Worker:
                 s.save(jdir / RESULT_NAME)
                 jobs_vol.commit()
             preview, stats = None, None
-            try:                           # best-effort: a preview never fails a job -
-                                           # rendered before the finally deletes the input
-                from nnseg.preview import render_preview
-                preview = render_preview(input_path, jdir / RESULT_NAME,
-                                         Path("/dev/shm") / f"preview_{jid}.png",
-                                         title=meta["task"])
+            try:                           # best-effort: artifacts never fail a job -
+                                           # one shared load, done before the finally
+                                           # deletes the input, timed for visibility.
+                                           # NNSEG_ARTIFACTS selects them (measured
+                                           # ~3 s preview + ~7 s statistics per big
+                                           # computed case; a throughput deployment
+                                           # can set it empty)
+                if ARTIFACTS:
+                    from nnseg.preview import load_oriented_pair, render_preview
+                    from nnseg.statistics import compute_statistics
+                    t_l = time.time()
+                    pair = load_oriented_pair(input_path, jdir / RESULT_NAME)
+                    t_p = time.time()
+                    if "preview" in ARTIFACTS:
+                        preview = render_preview(input_path, jdir / RESULT_NAME,
+                                                 Path("/dev/shm") / f"preview_{jid}.png",
+                                                 title=meta["task"], pair=pair)
+                    t_s = time.time()
+                    if "statistics" in ARTIFACTS:
+                        stats = compute_statistics(input_path, jdir / RESULT_NAME,
+                                                   Path("/dev/shm") / f"stats_{jid}.json",
+                                                   pair=pair)
+                    print(f"[artifacts] load {t_p - t_l:.1f}s preview {t_s - t_p:.1f}s "
+                          f"statistics {time.time() - t_s:.1f}s", flush=True)
             except Exception:
-                preview = None
-            try:                           # ditto statistics
-                from nnseg.statistics import compute_statistics
-                stats = compute_statistics(input_path, jdir / RESULT_NAME,
-                                           Path("/dev/shm") / f"stats_{jid}.json")
-            except Exception:
-                stats = None
+                pass
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},

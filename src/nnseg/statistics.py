@@ -19,24 +19,19 @@ from pathlib import Path
 __all__ = ["compute_statistics", "statistics_tsv"]
 
 
-def compute_statistics(image, labels_path, out_json) -> Path | None:
+def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | None:
     """Write per-structure first-order statistics as JSON; returns the path,
-    or None if they could not be computed."""
+    or None if they could not be computed. ``pair`` shares one load with the
+    preview (see preview.load_oriented_pair)."""
     try:
         import numpy as np
         import SimpleITK as sitk
 
-        from .io import read_image
+        from .preview import load_oriented_pair
 
-        seg = sitk.ReadImage(str(labels_path))
-        img = image if isinstance(image, sitk.Image) else read_image(image)
-        img_r, seg_r = (sitk.DICOMOrient(v, "RAS") for v in (img, seg))
-        if (img_r.GetSize() != seg_r.GetSize()
-                or not np.allclose(img_r.GetSpacing(), seg_r.GetSpacing(), atol=1e-4)):
-            img_r = sitk.Resample(img_r, seg_r, sitk.Transform(),
-                                  sitk.sitkLinear, -1024.0, img_r.GetPixelID())
-        gray = sitk.GetArrayFromImage(img_r).astype(np.float64)
-        lab = sitk.GetArrayFromImage(seg_r).astype(np.int64)
+        seg, img_r, seg_r = pair or load_oriented_pair(image, labels_path)
+        gray = sitk.GetArrayFromImage(img_r)       # native dtype; cast subsets only
+        lab = sitk.GetArrayFromImage(seg_r)
         if gray.shape != lab.shape:
             return None
 
@@ -54,24 +49,24 @@ def compute_statistics(image, labels_path, out_json) -> Path | None:
         sp = seg_r.GetSpacing()
         voxel_ml = float(sp[0] * sp[1] * sp[2]) / 1000.0
 
-        flat = lab.ravel()
-        K = int(flat.max()) + 1
-        counts = np.bincount(flat, minlength=K)
+        # only labeled voxels matter: on a torso CT that is ~10-20 % of the
+        # volume, and sorting 40M beats sorting 400M by an order of magnitude
+        # (the full-volume argsort was measured costing ~20 s per job)
+        fz, fy, fx = np.nonzero(lab)
+        labs = lab[fz, fy, fx].astype(np.int32)
+        vals_fg = gray[fz, fy, fx].astype(np.float32)
+        K = int(labs.max()) + 1 if labs.size else 1
+        counts = np.bincount(labs, minlength=K)
 
-        # one sort, then every per-label distribution is a contiguous slice
-        order = np.argsort(flat, kind="stable")
-        vals = gray.ravel()[order]
-        starts = np.searchsorted(flat[order], np.arange(K))
-        ends = np.concatenate([starts[1:], [flat.size]])
+        order = np.argsort(labs, kind="stable")
+        vals = vals_fg[order]
+        starts = np.searchsorted(labs[order], np.arange(K))
+        ends = np.concatenate([starts[1:], [labs.size]])
 
-        # vectorized centroids: mean index per axis, then to physical RAS mm
-        zz, yy, xx = np.indices(lab.shape, sparse=True)
-        sums = {ax: np.bincount(flat, weights=w.ravel() if w.size == flat.size
-                                else np.broadcast_to(w, lab.shape).ravel(),
-                                minlength=K)
-                for ax, w in (("z", np.broadcast_to(zz, lab.shape)),
-                              ("y", np.broadcast_to(yy, lab.shape)),
-                              ("x", np.broadcast_to(xx, lab.shape)))}
+        # centroids from the foreground indices alone
+        sums = {"z": np.bincount(labs, weights=fz, minlength=K),
+                "y": np.bincount(labs, weights=fy, minlength=K),
+                "x": np.bincount(labs, weights=fx, minlength=K)}
 
         structures = []
         for v in sorted(names):

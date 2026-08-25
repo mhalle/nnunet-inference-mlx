@@ -409,7 +409,8 @@ class LocalExecutor:
     def __init__(self, segmenter, *, workdir, max_pending: int = 16,
                  keep_finished: int = 50, segment_fn=None, fetch_idc_fn=None,
                  cache_dir=None, keep_cached: int = 500,
-                 input_cache_bytes: int = 8 << 30, read_fn=None, sources=None):
+                 input_cache_bytes: int = 8 << 30, read_fn=None, sources=None,
+                 artifacts=("preview", "statistics")):
         self.segmenter = segmenter
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -421,6 +422,7 @@ class LocalExecutor:
         self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_source,
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
+        self.artifacts = set(artifacts or ())
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -661,18 +663,24 @@ class LocalExecutor:
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
                 preview, stats = None, None
-                try:                       # best-effort: a preview never fails a job
-                    from .preview import render_preview
-                    preview = render_preview(inp, rec.labels_path,
-                                             rec.dir / "preview.png", title=rec.task)
+                try:                       # best-effort: artifacts never fail a job;
+                                           # one shared load feeds both; the artifacts
+                                           # set is deployment policy (throughput
+                                           # deployments may run with none)
+                    if self.artifacts:
+                        from .preview import load_oriented_pair, render_preview
+                        from .statistics import compute_statistics
+                        pair = load_oriented_pair(inp, rec.labels_path)
+                        if "preview" in self.artifacts:
+                            preview = render_preview(inp, rec.labels_path,
+                                                     rec.dir / "preview.png",
+                                                     title=rec.task, pair=pair)
+                        if "statistics" in self.artifacts:
+                            stats = compute_statistics(inp, rec.labels_path,
+                                                       rec.dir / "statistics.json",
+                                                       pair=pair)
                 except Exception:
-                    preview = None
-                try:                       # ditto statistics
-                    from .statistics import compute_statistics
-                    stats = compute_statistics(inp, rec.labels_path,
-                                               rec.dir / "statistics.json")
-                except Exception:
-                    stats = None
+                    pass
                 # cache BEFORE flipping state: anything that observes "done"
                 # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:

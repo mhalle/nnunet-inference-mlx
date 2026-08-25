@@ -16,11 +16,32 @@ its absence just means no preview.
 """
 from pathlib import Path
 
-__all__ = ["render_preview"]
+__all__ = ["render_preview", "load_oriented_pair"]
+
+
+def load_oriented_pair(image, labels_path):
+    """The shared load for completion artifacts: both volumes through the same
+    reader and the same RAS operator, grayscale resampled onto the labels'
+    grid for variants - done ONCE, then handed to preview and statistics
+    (each was re-reading the gzip-compressed labelmap on its own, measured as
+    part of a ~24 s per-job regression on 400M-voxel torsos)."""
+    import numpy as np
+    import SimpleITK as sitk
+
+    from .io import read_image
+
+    seg = sitk.ReadImage(str(labels_path))
+    img = image if isinstance(image, sitk.Image) else read_image(image)
+    img_r, seg_r = (sitk.DICOMOrient(v, "RAS") for v in (img, seg))
+    if (img_r.GetSize() != seg_r.GetSize()
+            or not np.allclose(img_r.GetSpacing(), seg_r.GetSpacing(), atol=1e-4)):
+        img_r = sitk.Resample(img_r, seg_r, sitk.Transform(),
+                              sitk.sitkLinear, -1024.0, img_r.GetPixelID())
+    return seg, img_r, seg_r
 
 
 def render_preview(image, labels_path, out_png, *, title: str | None = None,
-                   dpi: int = 110) -> Path | None:
+                   dpi: int = 110, pair=None) -> Path | None:
     """Write a three-plane overlay PNG; returns the path, or None if the
     preview could not be made (missing matplotlib, unreadable inputs, ...).
 
@@ -37,25 +58,21 @@ def render_preview(image, labels_path, out_png, *, title: str | None = None,
 
         from .io import read_image
 
-        seg = sitk.ReadImage(str(labels_path))
-        img = image if isinstance(image, sitk.Image) else read_image(image)
-        img_r, seg_r = (sitk.DICOMOrient(v, "RAS") for v in (img, seg))
-        if (img_r.GetSize() != seg_r.GetSize()
-                or not np.allclose(img_r.GetSpacing(), seg_r.GetSpacing(), atol=1e-4)):
-            # grid-variant labels (e.g. 1mm output): resample the GRAYSCALE
-            # onto the labels' grid for display - the labels stay untouched
-            img_r = sitk.Resample(img_r, seg_r, sitk.Transform(),
-                                  sitk.sitkLinear, -1024.0, img_r.GetPixelID())
-        gray = sitk.GetArrayFromImage(img_r).astype(np.float32)
-        lab = sitk.GetArrayFromImage(seg_r).astype(np.int32)
+        seg, img_r, seg_r = pair or load_oriented_pair(image, labels_path)
+        gray = sitk.GetArrayFromImage(img_r)       # native dtype: window per-slice
+        lab = sitk.GetArrayFromImage(seg_r)
         if gray.shape != lab.shape:
             return None
 
-        if gray.min() < -200:                      # CT: soft-tissue window
-            gray = np.clip((gray + 160.0) / 400.0, 0, 1)
+        if float(gray.min()) < -200:               # CT: soft-tissue window
+            def window(sl):
+                return np.clip((sl.astype(np.float32) + 160.0) / 400.0, 0, 1)
         else:                                      # MR / PET: robust stretch
             lo, hi = np.percentile(gray, (1, 99.5))
-            gray = np.clip((gray - lo) / max(hi - lo, 1e-6), 0, 1)
+            span = max(float(hi - lo), 1e-6)
+
+            def window(sl):
+                return np.clip((sl.astype(np.float32) - lo) / span, 0, 1)
 
         colors = {}
         for k in seg.GetMetaDataKeys():
@@ -83,7 +100,7 @@ def render_preview(image, labels_path, out_png, *, title: str | None = None,
         for ax, (z, y, x, name, aspect) in zip(axes, planes):
             sl = gray[z] if z is not None else gray[:, y, :] if y is not None else gray[:, :, x]
             ls = lab[z] if z is not None else lab[:, y, :] if y is not None else lab[:, :, x]
-            ax.imshow(sl, cmap="gray", origin="lower", vmin=0, vmax=1, aspect=aspect)
+            ax.imshow(window(sl), cmap="gray", origin="lower", vmin=0, vmax=1, aspect=aspect)
             ax.imshow(rgba[np.clip(ls, 0, rgba.shape[0] - 1)], origin="lower", aspect=aspect)
             ax.set_title(name, fontsize=8, color="white")
             ax.axis("off")
