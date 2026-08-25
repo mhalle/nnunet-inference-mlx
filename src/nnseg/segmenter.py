@@ -11,7 +11,10 @@ one request without building a second Segmenter.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from .cache import ModelCache
+from .errors import NnsegError
 from .tasks import TaskCatalog
 from .weights import as_store
 
@@ -86,13 +89,47 @@ class Segmenter:
         return self.catalog.names()
 
     def describe(self, task) -> dict:
-        """What a task is and what it needs, without running or downloading anything."""
+        """What a task is and what it needs, without running or downloading anything.
+
+        Beyond the spec itself: the policy knobs a caller can override per job
+        (``folds_default``, ``configuration``), what is actually installed under this
+        store's root - with the version/sha the install sidecar recorded, never a
+        guess from the manifest - and ``channel_names`` when an installed model's
+        ``dataset.json`` is there to read. All best-effort: an unconfigured weights
+        root reports ``installed: false`` rather than raising.
+        """
         from .pipeline import _resolve_spec
         spec = _resolve_spec(task, self.catalog)
-        return {"name": spec.name, "source": spec.source, "modality": spec.modality,
-                "shape": spec.shape, "n_structures": len(spec.label_map),
-                "structures": [spec.label_map[k] for k in sorted(spec.label_map)],
-                "weights": [str(w) for w in spec.weights_ids]}
+        d = {"name": spec.name, "source": spec.source, "modality": spec.modality,
+             "shape": spec.shape, "n_structures": len(spec.label_map),
+             "structures": [spec.label_map[k] for k in sorted(spec.label_map)],
+             "weights": [str(w) for w in spec.weights_ids],
+             "folds_default": list(self.policy["folds"]),
+             "configuration": self.policy["configuration"]}
+        installed, channels = [], None
+        for wid in spec.weights_ids:
+            entry = {"id": str(wid), "installed": False}
+            try:
+                if self.weights.have(wid):
+                    folder = self.weights.resolve(wid, configuration=self.policy["configuration"])
+                    entry["installed"] = True
+                    from .weights_fetch import installed_version
+                    side = installed_version(folder)
+                    if side:
+                        entry["version"] = side.get("tag")
+                        entry["sha256"] = side.get("sha256")
+                    if channels is None:
+                        import json
+                        ds = Path(folder) / "dataset.json"
+                        if ds.exists():
+                            j = json.loads(ds.read_text())
+                            channels = j.get("channel_names") or j.get("modality")
+            except NnsegError:
+                pass                      # no root configured / unresolvable: stays not-installed
+            installed.append(entry)
+        d["weights_installed"] = installed
+        d["channel_names"] = channels
+        return d
 
     def structures(self, task) -> list[str]:
         """The structure names a task produces, in label order."""

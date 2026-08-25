@@ -26,9 +26,13 @@ nnseg = "nnseg.cli:main"
 [project.optional-dependencies]
 # Remote weight download (store.download / download_archive).
 remote = ["httpx"]
+# The REST job server (nnseg serve).
+serve = ["fastapi", "uvicorn", "python-multipart"]
+# Server-side fetch of IDC series by UUID (source kind "idc").
+idc = ["obstore"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
-test = ["pytest", "pydicom"]
+test = ["pytest", "pydicom", "fastapi", "httpx", "python-multipart"]
 # The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader; nnunetv2 for the network
 # architecture, weights and sliding-window slicers (stock APIs only - the GPU resampler now
 # lives in nnseg.resample, so no fork is pinned); scipy builds the resampler's exact operators;

@@ -37,10 +37,84 @@ def main(argv=None) -> int:
     wr.add_argument("--update-existing", action="store_true",
                     help="also repoint datasets at newer releases (changes which weights download)")
 
+    sv = sub.add_parser("serve", help="run the REST job server (needs the serve extra)")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8790)
+    sv.add_argument("--device", default="auto")
+    sv.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    sv.add_argument("--cache-models", type=int, default=5,
+                    help="models kept warm across jobs (5 covers a total union)")
+    sv.add_argument("--model-root", default=None)
+    sv.add_argument("--max-pending", type=int, default=16, help="queue bound; past it POST returns 429")
+    sv.add_argument("--keep-finished", type=int, default=50, help="finished jobs (and files) retained")
+    sv.add_argument("--workdir", default=None, help="job storage (default: a temp directory)")
+
+    rc = sub.add_parser("remote", help="talk to an nnseg server (needs the remote extra)")
+    rc.add_argument("--server", default=None,
+                    help="server URL, e.g. http://gpu-box:8790 (or set NNSEG_SERVER)")
+    rc.add_argument("--token", default=None, help="bearer token, if the server wants one")
+    rsub = rc.add_subparsers(dest="rcmd", required=True)
+    rs = rsub.add_parser("submit", help="upload, wait with progress, download the labels")
+    rs.add_argument("input", help="a local image file, or idc:<crdc_series_uuid> to segment straight from the Imaging Data Commons")
+    rs.add_argument("--task", required=True)
+    rs.add_argument("-o", "--output", default=None, help="where to save the labels (default: <input>_<task>.nii.gz)")
+    rs.add_argument("--no-wait", action="store_true", help="print the job id and return")
+    rst = rsub.add_parser("status", help="one job's status, as JSON")
+    rst.add_argument("job_id")
+    rf = rsub.add_parser("fetch", help="download a finished job's labels")
+    rf.add_argument("job_id")
+    rf.add_argument("-o", "--output", required=True)
+    rx = rsub.add_parser("cancel", help="cancel an active job / delete a finished one")
+    rx.add_argument("job_id")
+    rsub.add_parser("tasks", help="what the server can segment")
+
     args = ap.parse_args(argv)
+    if args.cmd == "serve":
+        from .serve import main_serve
+        return main_serve(args)
+    if args.cmd == "remote":
+        import json
+        import os
+        from .client import RemoteClient
+        server = args.server or os.environ.get("NNSEG_SERVER")
+        if not server:
+            print("no server: pass --server or set NNSEG_SERVER", file=sys.stderr)
+            return 2
+        c = RemoteClient(server, token=args.token)
+        if args.rcmd == "tasks":
+            for t in c.tasks():
+                print(t)
+        elif args.rcmd == "status":
+            print(json.dumps(c.status(args.job_id), indent=2))
+        elif args.rcmd == "fetch":
+            print(c.fetch(args.job_id, args.output))
+        elif args.rcmd == "cancel":
+            print(json.dumps(c.cancel(args.job_id)))
+        elif args.rcmd == "submit":
+            if args.no_wait:
+                print(c.submit(args.input, args.task))
+                return 0
+            stem = args.input[4:16] if args.input.startswith("idc:") else args.input.rsplit(".nii", 1)[0].rstrip("/")
+            out = args.output or f"{stem}_{args.task}.nii.gz"
+            last = {}
+            def show(s, _last=last):
+                p = s.get("progress") or {}
+                line = (f"  {s['state']:9s} " + (f"[queue {s['queue_position']}] " if s.get("queue_position") is not None else "")
+                        + f"{p.get('stage', '')} {p.get('detail', '')} "
+                        + (f"{p.get('fraction', 0) * 100:3.0f}%" if p else ""))
+                if line != _last.get("line"):
+                    print(line, file=sys.stderr, flush=True)
+                    _last["line"] = line
+            final = c.run(args.input, args.task, out, on_status=show)
+            if final["state"] == "done":
+                print(out)
+            else:
+                print(f"job ended {final['state']}", file=sys.stderr)
+                return 1
+        return 0
     if args.cmd == "segment":
         from .pipeline import segment
-        r = segment(args.input, args.task, model_root=args.model_root, device=args.device, dtype=args.dtype,
+        r = segment(args.input, args.task, weights=args.model_root, device=args.device, dtype=args.dtype,
                     grid=args.spacing if args.spacing else "input", interp=args.interp, accumulate=args.accumulate,
                     batch_size=args.batch_size if args.batch_size == "auto" else int(args.batch_size),
                     envelope_mm=args.envelope if args.envelope > 0 else None,
