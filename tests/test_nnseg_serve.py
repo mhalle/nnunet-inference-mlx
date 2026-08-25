@@ -1191,3 +1191,31 @@ def test_catalog_remaps_match_installed_weights():
             checked += 1
     if checked == 0:
         pytest.skip("no TS weights installed locally")
+
+
+def test_prepare_endpoint_installs_via_job(tmp_path):
+    """POST /v1/tasks/{task}/prepare queues a weights install through the same
+    queue; the job's result is the task's description."""
+    prepared = []
+
+    seg = FakeSegmenter()
+    seg.prepare = lambda t: (prepared.append(t) or {"name": t, "materialized": True})
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    client = TestClient(create_app(ex))
+    r = client.post("/v1/tasks/total_fast/prepare")
+    assert r.status_code == 202 and r.json()["kind"] == "prepare"
+    s = wait_state(client, r.json()["id"], ("done",))
+    assert prepared == ["total_fast"]
+    assert s["result"]["materialized"] is True
+    assert client.post("/v1/tasks/nope/prepare").status_code == 404
+
+
+def test_prepare_requires_auth_when_token_set(tmp_path):
+    seg = FakeSegmenter()
+    seg.prepare = lambda t: {"name": t}
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    client = TestClient(create_app(ex, token="s3cret"))
+    assert client.post("/v1/tasks/total_fast/prepare").status_code == 401
+    r = client.post("/v1/tasks/total_fast/prepare",
+                    headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 202

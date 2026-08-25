@@ -297,9 +297,6 @@ class Worker:
 
         from nnseg.errors import Cancelled
         from nnseg.progress import CancelToken, Reporter
-        from nnseg.serve import _fetch_idc_series
-        from nnseg.weights_fetch import ensure_task_weights
-
         meta = jobs_dict.get(jid)
         if meta is None or meta.get("state") == "cancelled":
             return
@@ -318,11 +315,20 @@ class Worker:
         _prefetch_next(jid, prefetch_stop, self.series_cache,
                        self.read_ahead, self._vol_lock)   # CPU downloader + pre-reader
         try:
+            if meta.get("kind") == "prepare":
+                rep = Reporter.of(on_progress, cancel=token)
+                rep.stage("weights", meta["task"])
+                result = self.seg.prepare(meta["task"])
+                weights_vol.commit()
+                self._ensured.add(meta["task"])
+                _emit(jid, {"state": "done", "finished": time.time(), "result": result})
+                return
             if meta["task"] not in self._ensured:
                 # a Volume.commit scans the whole multi-GB weights tree - measured as
                 # a suspect in the 41.8 s warm gap - so ensure+commit once per
-                # container, not once per job
-                ensure_task_weights(meta["task"], WEIGHTS_ROOT, progress=None)
+                # container, not once per job. seg.prepare is catalog-aware:
+                # ts, moose, and native tasks all install through it.
+                self.seg.prepare(meta["task"])
                 weights_vol.commit()
                 self._ensured.add(meta["task"])
             src = (meta.get("source") or [{"kind": "upload"}])[0]
@@ -399,6 +405,13 @@ class ModalExecutor:
     def sources(self):
         from nnseg.sources import registry
         return registry(None)
+
+    def submit_prepare(self, jid, jdir, task):
+        meta = {"id": jid, "task": task, "options": {}, "kind": "prepare",
+                "state": "queued", "created": time.time(), "source": []}
+        jobs_dict[jid] = meta
+        Worker().run_job.spawn(jid)
+        return meta
 
     def cache_list(self):
         from nnseg.serve import ResultCache

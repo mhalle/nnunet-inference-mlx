@@ -41,14 +41,28 @@ class Segmenter:
                  resampling_order: int = 3, envelope_mm: float | None = 20.0,
                  convention: str = "auto", interp: str = "linear", grid="input",
                  configuration: str | None = None, cache_models: int = 1):
-        self.catalog = catalog if catalog is not None else TaskCatalog("totalsegmentator")
         self.models = ModelCache(capacity=cache_models)
         self.weights = as_store(weights)
+        if catalog is None:
+            from .ecosystems import EcosystemCatalog
+            catalog = EcosystemCatalog(root=self.weights.root)
+        self.catalog = catalog
         self.policy = dict(device=device, dtype=dtype, weights=self.weights, folds=folds,
                            accumulate=accumulate, batch_size=batch_size,
                            resampling_order=resampling_order, envelope_mm=envelope_mm,
                            convention=convention, interp=interp, grid=grid,
                            configuration=configuration)
+
+    def prepare(self, task, *, progress=None) -> dict:
+        """Install the task's weights now (idempotent) and return describe().
+
+        The deliberate form of what first use does implicitly - a server or a
+        UI calls this to warm a task before the data arrives."""
+        if hasattr(self.catalog, "prepare"):
+            self.catalog.prepare(task, progress=progress)
+        else:
+            self.weights.ensure(task, catalog=self.catalog)
+        return self.describe(task)
 
     # -- the operation ------------------------------------------------------
     def segment(self, image, task, **overrides):
@@ -99,6 +113,18 @@ class Segmenter:
         root reports ``installed: false`` rather than raising.
         """
         from .pipeline import _resolve_spec
+        info = None
+        if isinstance(task, str) and hasattr(self.catalog, "info"):
+            try:
+                info = self.catalog.info(task)
+            except LookupError:
+                info = None
+            if info is not None and not info.get("materialized", True):
+                # weights not installed yet: report what is knowable without
+                # downloading anything, and how to materialize the rest
+                return {**info, "folds_default": list(self.policy["folds"]),
+                        "hint": "structures are read from the checkpoint once "
+                                "installed; prepare() or first use installs it"}
         spec = _resolve_spec(task, self.catalog)
         d = {"name": spec.name, "source": spec.source, "modality": spec.modality,
              "shape": spec.shape, "n_structures": len(spec.label_map),

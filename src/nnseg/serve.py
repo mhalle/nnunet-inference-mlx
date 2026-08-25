@@ -358,6 +358,7 @@ class JobRecord:
     options: dict
     dir: Path
     input_path: Path
+    kind: str = "segment"                         # or "prepare": install weights only
     state: str = "queued"
     created: float = field(default_factory=time.time)
     started: float | None = None
@@ -372,6 +373,10 @@ class JobRecord:
     cache_key: str | None = None
     cancel_token: CancelToken = field(default_factory=CancelToken)
     subscribers: list = field(default_factory=list)   # (event_loop, asyncio.Queue)
+
+
+class _PrepareDone(Exception):
+    """Control-flow escape: a prepare job finished; skip the segment path."""
 
 
 class LocalExecutor:
@@ -461,6 +466,19 @@ class LocalExecutor:
         self._emit(rec)
         if busy:
             self._prefetch_next()          # overlap this fetch with the running job
+        return rec
+
+    def submit_prepare(self, jid: str, jdir: Path, task: str) -> JobRecord:
+        """Queue a weights-install job: same queue, no input, no cache."""
+        rec = JobRecord(id=jid, task=task, options={}, dir=jdir, input_path=None,
+                        kind="prepare", source=[])
+        with self._cv:
+            if len(self._pending) >= self.max_pending:
+                raise QueueFull(f"queue is full ({self.max_pending} pending)")
+            self._jobs[jid] = rec
+            self._pending.append(jid)
+            self._cv.notify()
+        self._emit(rec)
         return rec
 
     # -- cache face (shared by the path surface and the public tier) ---------
@@ -577,6 +595,12 @@ class LocalExecutor:
             try:
                 reporter = Reporter.of(progress=lambda p, r=rec: self._on_progress(r, p),
                                        cancel=rec.cancel_token)
+                if rec.kind == "prepare":
+                    reporter.stage("weights", rec.task)
+                    rec.result = self.segmenter.prepare(rec.task)
+                    reporter.check()
+                    rec.state = "done"
+                    raise _PrepareDone
                 src = rec.source[0] if rec.source else {"kind": "upload"}
                 kind = src.get("kind", "upload")
                 if kind != "upload":
@@ -621,6 +645,8 @@ class LocalExecutor:
                                     "options": rec.options, "computed": rec.started,
                                     "job": rec.id})
                 rec.state = "done"
+            except _PrepareDone:
+                pass
             except Cancelled:
                 rec.state = "cancelled"
             except Exception as e:             # noqa: BLE001 - reported to the client
@@ -834,7 +860,37 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
     @app.get("/v1/tasks")
     def tasks():
-        return {"tasks": seg.tasks()}
+        out = {"tasks": seg.tasks()}
+        cat = getattr(seg, "catalog", None)
+        if hasattr(cat, "info"):
+            detail = {}
+            for t in out["tasks"]:
+                try:
+                    i = dict(cat.info(t))
+                    i.pop("structures", None)   # describe() carries the full list
+                    detail[t] = i
+                except Exception:
+                    pass
+            out["detail"] = detail
+        return out
+
+    @app.post("/v1/tasks/{task}/prepare", status_code=202)
+    def prepare_task(request: Request, task: str):
+        """Install a task's weights now (authorized): the deliberate form of
+        what first use does implicitly. Returns a job to watch; its result is
+        the task's full description once materialized."""
+        require_auth(request)
+        if task not in seg.tasks():
+            raise HTTPException(404, f"unknown task {task!r}")
+        if not executor.accepting:
+            raise HTTPException(429, "queue is full, retry later",
+                                headers={"Retry-After": "30"})
+        jid, jdir = executor.new_job_dir()
+        try:
+            executor.submit_prepare(jid, jdir, task)
+        except QueueFull as e:
+            raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
+        return {"id": jid, "kind": "prepare", "task": task}
 
     @app.get("/v1/sources")
     def list_sources():

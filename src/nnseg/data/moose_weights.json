@@ -1,0 +1,110 @@
+{
+ "source": "moosez/models.py",
+ "tasks": {
+  "clin_ct_body": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_body_27112023.zip",
+   "folder": "Dataset001_body",
+   "tag": "27112023"
+  },
+  "clin_ct_lungs": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_lungs_24062023.zip",
+   "folder": "Dataset333_HMS3dlungs",
+   "tag": "24062023"
+  },
+  "clin_ct_organs": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_organs_ras_07052025.zip",
+   "folder": "Dataset123_Organs",
+   "tag": "07052025"
+  },
+  "clin_ct_ribs": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_ribs_ras_08052025.zip",
+   "folder": "Dataset444_Ribs",
+   "tag": "08052025"
+  },
+  "clin_ct_muscles": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_muscles_ras_21052025.zip",
+   "folder": "Dataset555_Muscles",
+   "tag": "21052025"
+  },
+  "clin_ct_peripheral_bones": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_peripheral_bones_ras_07052025.zip",
+   "folder": "Dataset666_Peripheral-Bones",
+   "tag": "07052025"
+  },
+  "clin_ct_vertebrae": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_vertebrae_ras_21052025.zip",
+   "folder": "Dataset111_Vertebrae",
+   "tag": "21052025"
+  },
+  "clin_ct_cardiac": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_cardiac_ras_21052025.zip",
+   "folder": "Dataset888_Cardiac",
+   "tag": "21052025"
+  },
+  "clin_ct_digestive": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_digestive_06102024.zip",
+   "folder": "Dataset999_Digestive",
+   "tag": "06102024"
+  },
+  "clin_ct_body_composition": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_body_composition_05092024.zip",
+   "folder": "Dataset778_Body_composition",
+   "tag": "05092024"
+  },
+  "clin_ct_fast_organs": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_organs_6_02092024.zip",
+   "folder": "Dataset145_Fast_organs",
+   "tag": "02092024"
+  },
+  "clin_ct_fast_vertebrae": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_vertebrae3_10092024.zip",
+   "folder": "Dataset112_FastVertebrae",
+   "tag": "10092024"
+  },
+  "clin_ct_fast_cardiac": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_cardiac3_10092024.zip",
+   "folder": "Dataset890_FastCardiac",
+   "tag": "10092024"
+  },
+  "clin_ct_all_bones_v1": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_all_bones_25102023.zip",
+   "folder": "Dataset600_Original_bones",
+   "tag": "25102023"
+  },
+  "clin_pt_fdg_brain_v1": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_fdg_pt_brain_v1_17112023.zip",
+   "folder": "Dataset100_Brain_v1",
+   "tag": "17112023"
+  },
+  "clin_ct_fat_old": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/clin_ct_fat_31082023.zip",
+   "folder": "Dataset777_Fat",
+   "tag": "31082023"
+  },
+  "clin_ct_dental": {
+   "url": "https://model.s.mdforge.com/Dataset112_DentalSegmentator_v100_moose.zip",
+   "folder": "Dataset112_DentalSegmentator_v100",
+   "tag": "v100"
+  },
+  "clin_ct_face": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.7/clin_ct_face_ear_12052026.zip",
+   "folder": "Dataset006_face_ear_v2",
+   "tag": "12052026"
+  },
+  "clin_pt_fdg_face": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.5/clin_pt_face_12012026.zip",
+   "folder": "Dataset183_PETface",
+   "tag": "12012026"
+  },
+  "preclin_mr_all": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/preclin_mr_all_05122023.zip",
+   "folder": "Dataset234_minimoose",
+   "tag": "05122023"
+  },
+  "preclin_ct_legs": {
+   "url": "https://github.com/ENHANCE-PET/MOOSE/releases/download/moosez-v.3.1.3/preclin_ct_legs_05122023.zip",
+   "folder": "Dataset256_Preclin_leg_muscles",
+   "tag": "05122023"
+  }
+ }
+}
