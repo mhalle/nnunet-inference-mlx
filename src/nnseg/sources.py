@@ -276,11 +276,19 @@ def _safe_opener():
     import urllib.request
     from urllib.parse import urlparse
 
+    def _origin_change(old_url: str, new_url: str) -> bool:
+        a, b = urlparse(old_url), urlparse(new_url)
+        if a.netloc != b.netloc:
+            return True
+        # an https->http downgrade on the SAME host still exposes the token in
+        # cleartext; strip it (an http->https upgrade is safe and kept, which
+        # is exactly what httpx does)
+        return a.scheme == "https" and b.scheme == "http"
+
     class _StripCrossHostAuth(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             new = super().redirect_request(req, fp, code, msg, headers, newurl)
-            if new is not None and urlparse(newurl).netloc != urlparse(
-                    req.full_url).netloc:
+            if new is not None and _origin_change(req.full_url, newurl):
                 for k in [h for h in new.headers if h.lower() == "authorization"]:
                     del new.headers[k]
             return new

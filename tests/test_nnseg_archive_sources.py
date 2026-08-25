@@ -350,3 +350,35 @@ def test_zenodo_access_fails_closed(monkeypatch):
     z = ZenodoSource()                                 # allow_restricted=False
     with pytest.raises(InputError, match="undeclared access|restricted|only fetches"):
         z.resolve("1234567/x.nii.gz")
+
+
+def test_redirect_strips_auth_on_scheme_downgrade():
+    """Round-4 sign-off: the token is dropped on an https->http downgrade
+    even on the same host (cleartext exposure), while an http->https upgrade
+    keeps it - matching httpx."""
+    import nnseg.sources as srcmod
+    opener = srcmod._safe_opener()
+    (h,) = [x for x in opener.handlers
+            if type(x).__name__ == "_StripCrossHostAuth"]
+    import urllib.request
+
+    def mk(url):
+        r = urllib.request.Request(url, headers={"Authorization": "Bearer T"})
+        return r
+
+    # https -> http, same host: stripped
+    new = h.redirect_request(mk("https://h/a"), None, 302, "", {},
+                             "http://h/b")
+    assert not any(k.lower() == "authorization" for k in new.headers)
+    # http -> https, same host: kept (safe upgrade)
+    new = h.redirect_request(mk("http://h/a"), None, 302, "", {},
+                             "https://h/b")
+    assert any(k.lower() == "authorization" for k in new.headers)
+    # https -> https, same host: kept
+    new = h.redirect_request(mk("https://h/a"), None, 302, "", {},
+                             "https://h/b")
+    assert any(k.lower() == "authorization" for k in new.headers)
+    # cross host: stripped
+    new = h.redirect_request(mk("https://h/a"), None, 302, "", {},
+                             "https://evil/b")
+    assert not any(k.lower() == "authorization" for k in new.headers)
