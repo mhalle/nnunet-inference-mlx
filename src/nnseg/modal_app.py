@@ -53,6 +53,7 @@ GPU_SNAPSHOT = os.environ.get("NNSEG_GPU_SNAPSHOT", "0") not in ("0", "false", "
 SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) or GPU_SNAPSHOT
 WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
 MAX_CONTAINERS = int(os.environ.get("NNSEG_MAX_CONTAINERS", "1"))
+SHM_CACHE_GB = float(os.environ.get("NNSEG_SHM_CACHE_GB", "8"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 
@@ -80,37 +81,15 @@ jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
-def _prefetch_base(series: str) -> Path:
-    return Path("/dev/shm") / f"prefetch_{series}"
-
-
-def _prefetched_or_none(series: str, rep) -> Path | None:
-    """If a prefetch for this series exists or is in flight, wait for its
-    ``.done`` marker (cancellable) and hand back the directory. A directory
-    without the marker is a writer mid-flight - never read it. On timeout the
-    caller fetches into its own separate directory, so the two writers can
-    never collide."""
-    base = _prefetch_base(series)
-    if not base.exists():
-        return None
-    deadline = time.time() + 180
-    while not (base / ".done").exists():
-        if not base.exists() or time.time() > deadline:
-            return None                    # writer failed (dir removed) or hung
-        rep.check()
-        time.sleep(0.2)
-    return base / "series"
-
-
-def _prefetch_next(current_jid: str, stop) -> None:
+def _prefetch_next(current_jid: str, stop, cache) -> None:
     """Best-effort CPU downloader, parallel to this GPU job: watch the shared
-    jobs Dict for the oldest OTHER queued idc job and fetch its series into
-    /dev/shm. Scans every 2 s for the length of the run - a single scan at job
-    start misses jobs whose submit lands moments later (the warm-chain case).
-    With max_containers=1 the same container serves the next input, so the
-    prefetch is always warm-handed. One-ahead only, marker-committed
-    (``.done``), removed after use; failures leave nothing behind."""
-    import shutil
+    jobs Dict for the oldest OTHER queued idc job and stage its series into the
+    /dev/shm series cache. Scans every 2 s for the length of the run - a single
+    scan at job start misses jobs whose submit lands moments later (the
+    warm-chain case). With max_containers=1 the same container serves the next
+    input, so the staging is always warm-handed. One-ahead only; the cache owns
+    claims (atomic mkdir), commits (``.done`` marker) and LRU eviction, and a
+    failed staging leaves nothing behind."""
     import threading
 
     def scan_once():
@@ -127,29 +106,19 @@ def _prefetch_next(current_jid: str, stop) -> None:
         return min(cands)[1] if cands else None
 
     def work():
-        base = None
         try:
-            from nnseg.serve import _fetch_idc_series
             while not stop.is_set():
                 series = scan_once()
-                if series is None:
+                if series is None or cache.has(series) or cache.staging(series):
                     stop.wait(2.0)
                     continue
-                base = _prefetch_base(series)
-                try:
-                    base.mkdir(parents=True)   # atomic claim: one writer per series
-                except FileExistsError:
-                    return                     # done, or another thread is on it
                 t_f = time.time()
-                _fetch_idc_series(series, base)
-                (base / ".done").touch()
-                print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
-                      f"(parallel to {current_jid})", flush=True)
-                return                         # one-ahead only
+                if cache.prefetch(series):
+                    print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
+                          f"(parallel to {current_jid})", flush=True)
+                    return                     # one-ahead only
         except Exception as e:
             print(f"[prefetch] failed: {e}", flush=True)
-            if base is not None:
-                shutil.rmtree(str(base), ignore_errors=True)
 
     threading.Thread(target=work, name="nnseg-prefetch", daemon=True).start()
 
@@ -198,6 +167,9 @@ class Worker:
         """Post-restore, GPU attached: everything CUDA-adjacent lives here (unless
         the GPU snapshot already carries it)."""
         _pkg_dir()
+        from nnseg.serve import SeriesCache, _fetch_idc_series
+        self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), _fetch_idc_series,
+                                        budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
         if not hasattr(self, "seg"):
             self._gpu_setup()
 
@@ -223,10 +195,9 @@ class Worker:
                 _emit(jid, {"progress": asdict(p)})
 
         token = CancelToken()
-        series = None
         _emit(jid, {"state": "running", "started": time.time()})
         prefetch_stop = threading.Event()
-        _prefetch_next(jid, prefetch_stop)   # CPU downloader, parallel to this GPU job
+        _prefetch_next(jid, prefetch_stop, self.series_cache)   # CPU downloader
         try:
             if meta["task"] not in self._ensured:
                 # a Volume.commit scans the whole multi-GB weights tree - measured as
@@ -239,15 +210,16 @@ class Worker:
             if src.get("kind") == "idc":
                 rep = Reporter.of(on_progress, cancel=token)
                 series = src["crdc_series_uuid"]
-                input_path = _prefetched_or_none(series, rep)
-                if input_path is not None:
-                    rep.stage("fetch", "prefetched")
-                    print(f"[fetch] {series[:13]} prefetched", flush=True)
+                if self.series_cache.has(series):
+                    how = "cached"
+                elif self.series_cache.staging(series):
+                    how = "prefetched"
                 else:
-                    rep.stage("fetch", series[:13])
-                    t_f = time.time()
-                    input_path = _fetch_idc_series(series, Path("/dev/shm"))
-                    print(f"[fetch] {series[:13]} inline {time.time() - t_f:.1f}s", flush=True)
+                    how = "inline"
+                rep.stage("fetch", series[:13] if how == "inline" else how)
+                t_f = time.time()
+                input_path = self.series_cache.get_or_fetch(series, check=rep.check)
+                print(f"[fetch] {series[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
             else:
                 jobs_vol.reload()
@@ -276,10 +248,6 @@ class Worker:
                         "error": f"{type(e).__name__}: {e}"})
         finally:
             prefetch_stop.set()            # end the scan loop with the run
-            if series is not None:         # bound tmpfs: drop this job's staged input
-                import shutil
-                shutil.rmtree(str(_prefetch_base(series)), ignore_errors=True)
-                shutil.rmtree(f"/dev/shm/{series}", ignore_errors=True)
             if meta.get("cache_key"):
                 try:
                     del jobs_dict[f"inflight:{meta['cache_key']}"]

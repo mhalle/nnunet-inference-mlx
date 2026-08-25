@@ -781,3 +781,92 @@ def test_prefetch_failure_falls_back_to_inline_fetch(tmp_path, monkeypatch):
     sb = wait_state(client, b, ("done",))
     assert sb["state"] == "done"
     assert len(calls) == 3                 # A, failed prefetch, B's inline retry
+
+
+# -- SeriesCache: the evicting LRU input cache -------------------------------
+
+def _cache(tmp_path, fetched, payload=b"x" * 100, delay=0.0, fail_on=()):
+    from nnseg.serve import SeriesCache
+
+    def fetch(series, entry):
+        if delay:
+            time.sleep(delay)
+        if series in fail_on:
+            raise RuntimeError("bucket hiccup")
+        d = entry / "series"
+        d.mkdir()
+        (d / "slice.dcm").write_bytes(payload)
+        fetched.append(series)
+        return d
+
+    return SeriesCache(tmp_path / "sc", fetch, budget_bytes=250)
+
+
+def test_series_cache_reuses_across_calls(tmp_path):
+    fetched = []
+    sc = _cache(tmp_path, fetched)
+    p1 = sc.get_or_fetch("u1")
+    p2 = sc.get_or_fetch("u1")
+    assert p1 == p2 and fetched == ["u1"]
+    assert sc.has("u1")
+
+
+def test_series_cache_reader_waits_out_writer(tmp_path):
+    fetched = []
+    sc = _cache(tmp_path, fetched, delay=0.3)
+    t = threading.Thread(target=lambda: sc.prefetch("u1"))
+    t.start()
+    time.sleep(0.05)                       # writer holds the claim now
+    assert sc.staging("u1")
+    p = sc.get_or_fetch("u1")              # blocks on the marker, no second fetch
+    t.join()
+    assert p.name == "series" and fetched == ["u1"]
+
+
+def test_series_cache_failed_writer_leaves_nothing(tmp_path):
+    fetched = []
+    sc = _cache(tmp_path, fetched, fail_on={"u1"})
+    assert sc.prefetch("u1") is False
+    assert not sc.has("u1") and not sc.staging("u1")
+
+
+def test_series_cache_lru_eviction_on_budget(tmp_path):
+    fetched = []
+    sc = _cache(tmp_path, fetched)         # budget 250, entries are 100 bytes + marker
+    sc.get_or_fetch("u1")
+    time.sleep(0.02)
+    sc.get_or_fetch("u2")
+    time.sleep(0.02)
+    sc.get_or_fetch("u1")                  # touch: u1 is now newer than u2
+    time.sleep(0.02)
+    sc.get_or_fetch("u3")                  # 3 x 100 > 250: evict LRU = u2
+    assert sc.has("u1") and sc.has("u3") and not sc.has("u2")
+    sc.get_or_fetch("u2")                  # refetch after eviction
+    assert fetched == ["u1", "u2", "u3", "u2"]
+
+
+def test_same_series_two_tasks_fetches_once(tmp_path, monkeypatch):
+    """The user's multi-task-per-image case: total_fast then total on one
+    series downloads it exactly once."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    fetched = []
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "slice.dcm").write_bytes(b"dcm")
+        fetched.append(series)
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    uu = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    src = json.dumps([{"kind": "idc", "crdc_series_uuid": uu}])
+    ja = client.post("/v1/jobs", data={"task": "total_fast", "source": src}).json()["id"]
+    jb = client.post("/v1/jobs", data={"task": "total", "source": src}).json()["id"]
+    wait_state(client, ja, ("done",))
+    wait_state(client, jb, ("done",))
+    assert fetched == [uu]                 # one download for both tasks
+    assert seg.calls[0][1] == "total_fast" and seg.calls[1][1] == "total"

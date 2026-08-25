@@ -49,7 +49,9 @@ LANs. The authenticated deployment is the Modal one, where the platform supplies
 both the queue (spawn + autoscaler) and the auth (proxy tokens).
 """
 import json
+import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -91,6 +93,115 @@ def weights_versions_of(segmenter, task) -> list:
         return out or ["unknown"]
     except Exception:
         return ["unknown"]
+
+
+class SeriesCache:
+    """Series-keyed staging for fetched inputs: one directory per series under
+    ``root``, claimed by atomic mkdir, committed by a ``.done`` marker holding
+    the entry's byte count, evicted least-recently-used past ``budget_bytes``.
+    One writer per series ever; readers wait on the marker. A directory without
+    the marker is a writer mid-flight and is never read; a claim whose writer
+    died (directory removed) ends the wait immediately; a claim stuck past
+    ``claim_timeout`` is torn down and re-fetched. This is what lets several
+    tasks on the same image download the series once."""
+
+    MARKER = ".done"
+
+    def __init__(self, root, fetch_fn, *, budget_bytes: int = 8 << 30,
+                 claim_timeout: float = 180.0):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.fetch = fetch_fn                  # fetch_fn(series, entry_dir) -> content dir
+        self.budget = int(budget_bytes)
+        self.claim_timeout = float(claim_timeout)
+        self._lock = threading.Lock()          # eviction bookkeeping only
+
+    def _entry(self, series: str) -> Path:
+        return self.root / series
+
+    def has(self, series: str) -> bool:
+        return (self._entry(series) / self.MARKER).exists()
+
+    def staging(self, series: str) -> bool:
+        e = self._entry(series)
+        return e.exists() and not (e / self.MARKER).exists()
+
+    def get_or_fetch(self, series: str, *, check=None) -> Path:
+        """Return the series content directory, fetching if needed (blocking).
+        ``check`` is called while waiting on another writer; raise from it to
+        cancel the wait."""
+        while True:
+            entry = self._entry(series)
+            marker = entry / self.MARKER
+            if marker.exists():
+                os.utime(marker)               # LRU touch
+                return entry / "series"
+            try:
+                entry.mkdir(parents=True)      # atomic claim: one writer per series
+            except FileExistsError:
+                deadline = time.time() + self.claim_timeout
+                while not marker.exists():
+                    if not entry.exists():
+                        break                  # writer failed and cleaned up; reclaim
+                    if time.time() > deadline:
+                        shutil.rmtree(entry, ignore_errors=True)   # hung writer
+                        break
+                    if check is not None:
+                        check()
+                    time.sleep(0.2)
+                continue
+            try:
+                dest = Path(self.fetch(series, entry))
+                self._commit(entry)
+                return dest
+            except BaseException:
+                shutil.rmtree(entry, ignore_errors=True)
+                raise
+
+    def prefetch(self, series: str) -> bool:
+        """Claim + fetch + commit without blocking on other writers. False if
+        already present, claimed elsewhere, or the fetch failed."""
+        entry = self._entry(series)
+        if entry.exists():
+            return False
+        try:
+            entry.mkdir(parents=True)
+        except FileExistsError:
+            return False
+        try:
+            self.fetch(series, entry)
+            self._commit(entry)
+            return True
+        except Exception:
+            shutil.rmtree(entry, ignore_errors=True)
+            return False
+
+    def _commit(self, entry: Path) -> None:
+        size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+        (entry / self.MARKER).write_text(str(size))
+        self._evict(keep={entry.name})
+
+    def _evict(self, keep) -> None:
+        with self._lock:
+            entries, kept_bytes = [], 0
+            for e in self.root.iterdir():
+                m = e / self.MARKER
+                if not m.exists():
+                    continue                   # a writer mid-flight: never touch
+                try:
+                    mtime, size = m.stat().st_mtime, int(m.read_text() or 0)
+                except (OSError, ValueError):
+                    continue
+                if e.name in keep:
+                    kept_bytes += size
+                else:
+                    entries.append((mtime, size, e))
+            total = kept_bytes + sum(sz for _, sz, _ in entries)
+            for _, size, e in sorted(entries, key=lambda t: t[0]):
+                if total <= self.budget:
+                    break
+                shutil.rmtree(e, ignore_errors=True)
+                total -= size
 
 
 class ResultCache:
@@ -173,9 +284,6 @@ class JobRecord:
     cache_key: str | None = None
     cancel_token: CancelToken = field(default_factory=CancelToken)
     subscribers: list = field(default_factory=list)   # (event_loop, asyncio.Queue)
-    fetch_claimed: bool = False                   # exactly one fetcher per record
-    fetch_done: threading.Event | None = None
-    fetch_ok: bool = False
 
 
 class LocalExecutor:
@@ -190,7 +298,8 @@ class LocalExecutor:
 
     def __init__(self, segmenter, *, workdir, max_pending: int = 16,
                  keep_finished: int = 50, segment_fn=None, fetch_idc_fn=None,
-                 cache_dir=None, keep_cached: int = 500):
+                 cache_dir=None, keep_cached: int = 500,
+                 input_cache_bytes: int = 8 << 30):
         self.segmenter = segmenter
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +307,8 @@ class LocalExecutor:
         self.keep_finished = int(keep_finished)
         self._segment = segment_fn or segmenter.segment
         self._fetch_idc = fetch_idc_fn or _fetch_idc_series
+        self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_idc,
+                                        budget_bytes=input_cache_bytes)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -366,21 +477,15 @@ class LocalExecutor:
                                        cancel=rec.cancel_token)
                 src = rec.source[0] if rec.source else {"kind": "upload"}
                 if src.get("kind") == "idc":
-                    with self._cv:
-                        theirs = rec.fetch_claimed
-                        if not theirs:
-                            rec.fetch_claimed = True
-                    dest = rec.dir / "series"
-                    if theirs:
+                    series = src["crdc_series_uuid"]
+                    if self.series_cache.has(series):
+                        reporter.stage("fetch", "cached")
+                    elif self.series_cache.staging(series):
                         reporter.stage("fetch", "prefetched")
-                        while not rec.fetch_done.wait(0.2):
-                            reporter.check()   # cancellable while the prefetch runs
-                    if rec.fetch_ok:
-                        rec.input_path = dest
                     else:
-                        reporter.stage("fetch", str(src.get("crdc_series_uuid", ""))[:13])
-                        rec.input_path = Path(self._fetch_idc(src["crdc_series_uuid"], rec.dir))
-                        rec.fetch_ok = True
+                        reporter.stage("fetch", series[:13])
+                    rec.input_path = self.series_cache.get_or_fetch(
+                        series, check=reporter.check)
                     reporter.check()
                 seg = self._segment(rec.input_path, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
@@ -412,36 +517,25 @@ class LocalExecutor:
                 self._evict()
 
     def _prefetch_next(self) -> None:
-        """Best-effort: download the HEAD queued idc job's series on a background
-        thread while the GPU runs the current one. The fetch releases the GIL
-        (Rust + file IO), so it costs the GPU loop nothing. Claim-once protocol:
-        whoever flips ``fetch_claimed`` under the cv owns the record's single
-        fetch; the dispatcher waits on ``fetch_done`` instead of racing a second
-        writer into the same directory. On failure the partial directory is
-        removed and the dispatcher falls back to an inline fetch. This is the
-        pre-loading half of the IO-prefetch pipeline - it hides the fetch;
-        hiding the read is the follow-on."""
+        """Best-effort: download the HEAD queued idc job's series into the
+        series cache on a background thread while the GPU runs the current one.
+        The fetch releases the GIL (Rust + file IO), so it costs the GPU loop
+        nothing. The cache's atomic directory claim guarantees one writer per
+        series; the dispatcher waits out an in-flight staging instead of racing
+        it, and a failed staging leaves nothing behind, so the dispatcher falls
+        back to its own fetch. This is the pre-loading half of the IO-prefetch
+        pipeline - it hides the fetch; hiding the read is the follow-on."""
         with self._cv:
             nxt = self._jobs.get(self._pending[0]) if self._pending else None
-            if (nxt is None or nxt.state != "queued" or nxt.fetch_claimed
+            if (nxt is None or nxt.state != "queued"
                     or not nxt.source or nxt.source[0].get("kind") != "idc"
                     or not nxt.source[0].get("crdc_series_uuid")):
                 return
-            nxt.fetch_claimed = True
-            nxt.fetch_done = threading.Event()
         series = nxt.source[0]["crdc_series_uuid"]
-
-        def fetch(rec=nxt):
-            import shutil
-            try:
-                self._fetch_idc(series, rec.dir)
-                rec.fetch_ok = True
-            except Exception:
-                shutil.rmtree(rec.dir / "series", ignore_errors=True)
-            finally:
-                rec.fetch_done.set()
-
-        threading.Thread(target=fetch, name="nnseg-prefetch", daemon=True).start()
+        if self.series_cache.has(series) or self.series_cache.staging(series):
+            return
+        threading.Thread(target=lambda: self.series_cache.prefetch(series),
+                         name="nnseg-prefetch", daemon=True).start()
 
     def _on_progress(self, rec: JobRecord, p) -> None:
         rec.progress = asdict(p)
