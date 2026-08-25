@@ -20,3 +20,17 @@ def test_worker_uses_series_cache():
     src = inspect.getsource(modal_app)
     assert "SeriesCache" in src
     assert "series_cache.get_or_fetch" in src
+
+
+def test_purgeable_policy():
+    from nnseg.modal_app import _purgeable
+    now = 1000000.0
+    ttl = 3600.0
+    assert _purgeable({"state": "done", "finished": now - 7200}, now, ttl)
+    assert _purgeable({"state": "failed", "finished": now - 7200}, now, ttl)
+    assert not _purgeable({"state": "done", "finished": now - 60}, now, ttl)
+    # active records are never purged by age
+    assert not _purgeable({"state": "queued", "created": now - 10 ** 6}, now, ttl)
+    assert not _purgeable({"state": "running", "started": now - 10 ** 6}, now, ttl)
+    # garbage records are purgeable
+    assert _purgeable(None, now, ttl)

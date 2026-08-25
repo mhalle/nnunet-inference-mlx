@@ -65,7 +65,7 @@ from .progress import CancelToken, Reporter
 ACTIVE = ("queued", "running")
 TERMINAL = ("done", "failed", "cancelled")
 RESULT_NAME = "labels.seg.nrrd"          # the information-preserving default artifact
-CRDC_RE = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+from .sources import CRDC_RE, IDC_BUCKETS, registry as _source_registry  # noqa: E402
 
 
 def result_key(identity, task, options, weights_versions, version=None) -> str:
@@ -259,6 +259,34 @@ class ResultCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self.keep = int(keep)
 
+    def list(self, limit: int = 500) -> list:
+        """Completed segmentations, newest first: the readable meta of every
+        cached entry plus size and, when the entry is path-addressable (single
+        source identity, default options), its path-surface URL."""
+        out = []
+        for d in self.root.iterdir():
+            labels, meta_p = d / RESULT_NAME, d / "meta.json"
+            if not (d.is_dir() and labels.exists()):
+                continue
+            try:
+                meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
+                st = labels.stat()
+            except (OSError, json.JSONDecodeError):
+                continue
+            entry = {"key": d.name, "task": meta.get("task"),
+                     "identity": meta.get("identity"),
+                     "options": meta.get("options"),
+                     "computed": meta.get("computed"), "bytes": st.st_size}
+            ident = meta.get("identity") or []
+            if (len(ident) == 1 and ":" in str(ident[0])
+                    and not str(ident[0]).startswith("sha256:")
+                    and not meta.get("options")):
+                prefix, one = str(ident[0]).split(":", 1)
+                entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
+            out.append(entry)
+        out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
+        return out[:limit]
+
     def get(self, key: str):
         d = self.root / key
         labels = d / RESULT_NAME
@@ -276,9 +304,11 @@ class ResultCache:
         import shutil
         d = self.root / key
         d.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(labels_path, d / RESULT_NAME)
+        # labels lands LAST: get() and list() gate on its existence, so writing
+        # the sidecars first makes an entry appear atomically complete
         (d / "result.json").write_text(json.dumps(result))
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
+        shutil.copy2(labels_path, d / RESULT_NAME)
         self.evict()
 
     def delete(self, key: str) -> bool:
@@ -343,7 +373,7 @@ class LocalExecutor:
     def __init__(self, segmenter, *, workdir, max_pending: int = 16,
                  keep_finished: int = 50, segment_fn=None, fetch_idc_fn=None,
                  cache_dir=None, keep_cached: int = 500,
-                 input_cache_bytes: int = 8 << 30, read_fn=None):
+                 input_cache_bytes: int = 8 << 30, read_fn=None, sources=None):
         self.segmenter = segmenter
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -351,7 +381,8 @@ class LocalExecutor:
         self.keep_finished = int(keep_finished)
         self._segment = segment_fn or segmenter.segment
         self._fetch_idc = fetch_idc_fn or _fetch_idc_series
-        self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_idc,
+        self.sources = _source_registry(sources)
+        self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_source,
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
@@ -363,6 +394,15 @@ class LocalExecutor:
         self._stop = False
         self._thread = threading.Thread(target=self._dispatch, name="nnseg-serve", daemon=True)
         self._thread.start()
+
+    def _fetch_source(self, key: str, entry):
+        """Series-cache fetch dispatcher: keys are ``<prefix>:<identifier>``.
+        The idc prefix routes through ``self._fetch_idc`` so the historical
+        ``fetch_idc_fn`` injection seam keeps working."""
+        prefix, ident = key.split(":", 1)
+        if prefix == "idc":
+            return self._fetch_idc(ident, entry)
+        return self.sources[prefix].fetch(ident, entry)
 
     # -- intake --------------------------------------------------------------
     def new_job_dir(self) -> tuple[str, Path]:
@@ -421,6 +461,9 @@ class LocalExecutor:
 
     def cache_delete(self, key: str) -> bool:
         return self.cache.delete(key) if self.cache is not None else False
+
+    def cache_list(self) -> list:
+        return self.cache.list() if self.cache is not None else []
 
     # -- introspection -------------------------------------------------------
     def get(self, jid: str) -> JobRecord | None:
@@ -521,18 +564,20 @@ class LocalExecutor:
                 reporter = Reporter.of(progress=lambda p, r=rec: self._on_progress(r, p),
                                        cancel=rec.cancel_token)
                 src = rec.source[0] if rec.source else {"kind": "upload"}
-                if src.get("kind") == "idc":
-                    series = src["crdc_series_uuid"]
-                    if self.series_cache.has(series):
+                kind = src.get("kind", "upload")
+                if kind != "upload":
+                    ident = src.get("id") or src.get("crdc_series_uuid")
+                    key = f"{kind}:{ident}"
+                    if self.series_cache.has(key):
                         reporter.stage("fetch", "cached")
-                    elif self.series_cache.staging(series):
+                    elif self.series_cache.staging(key):
                         reporter.stage("fetch", "prefetched")
                     else:
-                        reporter.stage("fetch", series[:13])
+                        reporter.stage("fetch", ident[:13])
                     rec.input_path = self.series_cache.get_or_fetch(
-                        series, check=reporter.check)
+                        key, check=reporter.check)
                     reporter.check()
-                    preread = self.read_ahead.pop(series)
+                    preread = self.read_ahead.pop(key)
                     if preread is not None:
                         reporter.stage("read", "preread")
                         inp = preread
@@ -554,12 +599,14 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
-                rec.state = "done"
+                # cache BEFORE flipping state: anything that observes "done"
+                # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:
                     self.cache.put(rec.cache_key, rec.labels_path, rec.result,
                                    {"identity": list(rec.input_identity), "task": rec.task,
                                     "options": rec.options, "computed": rec.started,
                                     "job": rec.id})
+                rec.state = "done"
             except Cancelled:
                 rec.state = "cancelled"
             except Exception as e:             # noqa: BLE001 - reported to the client
@@ -588,14 +635,16 @@ class LocalExecutor:
             if nxt is None or nxt.state != "queued":
                 return
         src = nxt.source[0] if nxt.source else {"kind": "upload"}
-        if src.get("kind") == "idc" and src.get("crdc_series_uuid"):
-            series = src["crdc_series_uuid"]
-            if self.series_cache.staging(series) or self.read_ahead.has(series):
+        kind = src.get("kind", "upload")
+        ident = src.get("id") or src.get("crdc_series_uuid")
+        if kind != "upload" and ident:
+            key = f"{kind}:{ident}"
+            if self.series_cache.staging(key) or self.read_ahead.has(key):
                 return                         # another writer, or already read
 
             def work():
-                if self.series_cache.has(series) or self.series_cache.prefetch(series):
-                    self.read_ahead.fill(series, self.series_cache.path(series))
+                if self.series_cache.has(key) or self.series_cache.prefetch(key):
+                    self.read_ahead.fill(key, self.series_cache.path(key))
         else:                                  # upload: bytes are local, hide the read
             key, path = nxt.id, nxt.input_path
             if self.read_ahead.has(key):
@@ -666,14 +715,15 @@ class LocalExecutor:
         return d
 
 
+# The IDC fetch itself lives in nnseg.sources.IDCSource; these two shims keep
+# the historical seams - tests monkeypatch _idc_enabled, and _fetch_idc_series
+# is the injectable default for LocalExecutor(fetch_idc_fn=...).
+# (kept text below for context)
 # The three public IDC buckets, probed in order (idc-open-data holds 99.5 % of
 # series). If IDC ever adds a bucket, series in it will fail loudly below; the
 # upgrade path is resolving per series via idc-index (`series_aws_url`), which we
 # deliberately keep OUT of the server tier to stay dependency-light - see the
 # 2026-08-24 three-bucket finding in the medseg design doc before re-deriving this.
-IDC_BUCKETS = ("idc-open-data", "idc-open-data-two", "idc-open-data-cr")
-
-
 def _idc_enabled() -> bool:
     try:
         import obstore  # noqa: F401
@@ -683,37 +733,9 @@ def _idc_enabled() -> bool:
 
 
 def _fetch_idc_series(series: str, jobdir: Path) -> Path:
-    """Fetch one IDC series into the job directory, anonymously, 32 threads.
-
-    IDC spreads series across three public buckets (found the hard way 2026-08-24),
-    so the prefix is probed in order rather than assumed. No client-supplied URLs -
-    the series UUID is the whole reference, which is what keeps this SSRF-free.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    from obstore.store import S3Store
-    keys, store = [], None
-    for bucket in IDC_BUCKETS:
-        store = S3Store.from_url(f"s3://{bucket}", config={"aws_skip_signature": "true"})
-        keys = [(o.get("path") if isinstance(o, dict) else str(o))
-                for b in store.list(prefix=f"{series}/") for o in b]
-        if keys:
-            break
-    if not keys:
-        raise InputError(f"no objects under {series!r}/ in any probed IDC bucket "
-                         f"({', '.join(IDC_BUCKETS)}); if the series exists, IDC may "
-                         "have added a bucket this server does not know")
-    dest = jobdir / "series"
-    dest.mkdir(exist_ok=True)
-
-    def one(k):
-        with open(dest / k.rsplit("/", 1)[-1], "wb") as f:
-            f.write(bytes(store.get(k).bytes()))
-
-    with ThreadPoolExecutor(32) as ex:
-        list(ex.map(one, keys))
-    return dest
-
+    """Fetch one IDC series (see nnseg.sources.IDCSource for the mechanics)."""
+    from .sources import IDCSource
+    return IDCSource().fetch(series, jobdir)
 
 def _version() -> str:
     try:
@@ -769,6 +791,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
     seg = executor.segmenter
+    sources = getattr(executor, "sources", None) or _source_registry(None)
+
+    def _source_enabled(srcobj) -> bool:
+        # _idc_enabled stays the patchable seam for the idc source
+        return _idc_enabled() if srcobj.prefix == "idc" else srcobj.enabled()
+
     app = FastAPI(title="nnseg", version=_version())
 
     def authed(request) -> bool:
@@ -787,11 +815,22 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         return {"name": "nnseg", "version": _version(),
                 "device": str(policy.get("device", "?")),
                 "n_tasks": len(seg.tasks()), "accepting": executor.accepting,
-                "sources": ["upload"] + (["idc"] if _idc_enabled() else [])}
+                "sources": ["upload"] + [k for k, v in sources.items()
+                                         if _source_enabled(v)]}
 
     @app.get("/v1/tasks")
     def tasks():
         return {"tasks": seg.tasks()}
+
+    @app.get("/v1/sources")
+    def list_sources():
+        return {"sources": [dict(v.describe(), enabled=_source_enabled(v))
+                            for v in sources.values()]}
+
+    @app.get("/v1/segmentations")
+    def list_segmentations():
+        lister = getattr(executor, "cache_list", None)
+        return {"segmentations": lister() if lister else []}
 
     @app.get("/v1/tasks/{task}")
     def describe(task: str):
@@ -822,11 +861,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if kind == "url":
             raise HTTPException(422, "source kind 'url' is reserved for the "
                                      "authenticated tier")
-        if kind not in ("upload", "idc"):
-            raise HTTPException(422, f"unknown source kind {kind!r}")
-        if kind == "idc" and not _idc_enabled():
-            raise HTTPException(422, "source kind 'idc' is not enabled on this server "
-                                     "(install the idc extra)")
+        if kind != "upload" and kind not in sources:
+            raise HTTPException(422, f"unknown source kind {kind!r}; this server "
+                                     f"offers upload, {', '.join(sources)}")
+        if kind != "upload" and not _source_enabled(sources[kind]):
+            raise HTTPException(422, f"source kind {kind!r} is not enabled on this "
+                                     "server (missing dependency)")
         names = seg.tasks()
         if task not in names:              # catalog names only at the wire boundary
             raise HTTPException(404, f"unknown task {task!r}; this server offers "
@@ -861,37 +901,40 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             identity = (f"sha256:{h.hexdigest()}",)
         else:
             if file is not None:
-                raise HTTPException(422, "unexpected file upload with an 'idc' source")
-            # Explicit identifier fields, no format sniffing: the two IDC
-            # identifiers MEAN different things. crdc_series_uuid is the storage
-            # identity - version-pinned, immutable, cache-key-grade. A DICOM
-            # SeriesInstanceUID names the series in DICOM space and can resolve to
-            # different crdc uuids across IDC data releases; accepting it is a
-            # resolution step, which is /v1/resolve's job when it lands.
-            if "series_instance_uid" in src[0]:
-                raise HTTPException(422, "series_instance_uid (+ optional idc_version, "
-                                         "default latest) is not supported yet; "
-                                         "resolution arrives with /v1/resolve - "
-                                         "today pass crdc_series_uuid")
-            if "series" in src[0]:
-                raise HTTPException(422, "ambiguous field 'series': be explicit - "
-                                         "crdc_series_uuid (IDC storage id, "
-                                         "8-4-4-4-12 hex), or series_instance_uid "
-                                         "(+ optional idc_version) once /v1/resolve "
-                                         "lands")
-            if "idc_version" in src[0]:
-                raise HTTPException(422, "idc_version goes with series_instance_uid; "
-                                         "a crdc_series_uuid is already pinned to one "
-                                         "IDC data release")
-            series = str(src[0].get("crdc_series_uuid") or "").strip().lower()
-            if not series:
-                raise HTTPException(422, "an 'idc' source needs crdc_series_uuid")
-            if not re.fullmatch(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", series):
-                raise HTTPException(422, f"{series!r} is not a crdc_series_uuid "
-                                         "(expected 8-4-4-4-12 hex; a dotted value "
-                                         "would be a DICOM SeriesInstanceUID, which "
-                                         "needs /v1/resolve)")
-            input_path, identity = None, (f"idc:{series}",)
+                raise HTTPException(422, f"unexpected file upload with a {kind!r} source")
+            if kind == "idc":
+                # Explicit identifier fields, no format sniffing: the two IDC
+                # identifiers MEAN different things. crdc_series_uuid is the storage
+                # identity - version-pinned, immutable, cache-key-grade. A DICOM
+                # SeriesInstanceUID names the series in DICOM space and can resolve to
+                # different crdc uuids across IDC data releases; accepting it is a
+                # resolution step, which is /v1/resolve's job when it lands.
+                if "series_instance_uid" in src[0]:
+                    raise HTTPException(422, "series_instance_uid (+ optional idc_version, "
+                                             "default latest) is not supported yet; "
+                                             "resolution arrives with /v1/resolve - "
+                                             "today pass crdc_series_uuid")
+                if "series" in src[0]:
+                    raise HTTPException(422, "ambiguous field 'series': be explicit - "
+                                             "crdc_series_uuid (IDC storage id, "
+                                             "8-4-4-4-12 hex), or series_instance_uid "
+                                             "(+ optional idc_version) once /v1/resolve "
+                                             "lands")
+                if "idc_version" in src[0]:
+                    raise HTTPException(422, "idc_version goes with series_instance_uid; "
+                                             "a crdc_series_uuid is already pinned to one "
+                                             "IDC data release")
+            ident = str(src[0].get("id") or src[0].get("crdc_series_uuid") or "").strip()
+            ident = ident.lower() if kind == "idc" else ident
+            if not ident:
+                need = "crdc_series_uuid" if kind == "idc" else "id"
+                raise HTTPException(422, f"a {kind!r} source needs {need}")
+            if not re.fullmatch(sources[kind].id_pattern, ident):
+                hint = (" (expected 8-4-4-4-12 hex; a dotted value would be a DICOM "
+                        "SeriesInstanceUID, which needs /v1/resolve)") if kind == "idc" else ""
+                raise HTTPException(422, f"{ident!r} is not a valid {kind} identifier" + hint)
+            src[0]["id"] = ident
+            input_path, identity = None, (sources[kind].identity(ident),)
         try:
             executor.submit(jid, jdir, input_path, task, opts,
                             source=src, identity=identity, no_cache=no_cache)
@@ -1001,124 +1044,148 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     # would run the full handler - a `curl -I` on a miss would start a GPU job.
     # HEAD is the compute-free probe, and the one place status codes distinguish
     # in-flight: 200 materialized / 202 computing (authorized view) / 404 absent.
-    @app.head("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    def idc_probe(request: Request, uuid: str, task: str):
-        from fastapi import Response
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid) or task not in seg.tasks():
-            raise HTTPException(404, "unknown resource")
-        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
-        hit = executor.cache_get(key)
-        if hit is not None:
-            return Response(status_code=200, headers=_resource_headers(key))
-        jid = executor.find_inflight(key)
-        if jid is not None:
-            # anonymous callers see this too (user decision): watching a flight
-            # for public data is harmless and tells them to check back
-            snap = executor.status_of(jid) or {}
-            return Response(status_code=202,
-                            headers=_progress_headers(snap.get("progress")))
-        raise HTTPException(404, "not materialized")
+    def _mount_source(prefix: str, srcobj) -> None:
+        """The path surface for one data source: probe / blocking GET / evict /
+        meta, all parameterized by the source's prefix, identifier pattern, and
+        identity. Adding a repository is defining a DataSource - these routes
+        come for free."""
+        pat = srcobj.id_pattern
+        base = f"/v1/{prefix}/{{ident}}/{{task}}"
 
-    @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    async def idc_resource(request: Request, uuid: str, task: str):
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid):
-            raise HTTPException(422, f"{uuid!r} is not a crdc_series_uuid")
-        if task not in seg.tasks():
-            raise HTTPException(404, f"unknown task {task!r}")
-        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
-        hit = executor.cache_get(key)
-        if hit is not None:
-            return FileResponse(hit[0], media_type="application/octet-stream",
-                                filename=f"{task}_{uuid[:8]}.seg.nrrd",
-                                headers=_resource_headers(key))
-        jid = executor.find_inflight(key)      # single flight: ride an existing run
-        is_authed = authed(request)
-        if not is_authed and jid is None:
-            raise HTTPException(404, "not materialized; authenticated access can "
-                                     "compute it")
-        initiated = False
-        if jid is None:                        # authed, nothing running: initiate
-            if not _idc_enabled():
-                raise HTTPException(404, "not materialized, and this server cannot "
-                                         "fetch IDC series (idc extra not installed)")
-            initiated = True
-            jid, jdir = executor.new_job_dir()
-            try:
-                executor.submit(jid, jdir, None, task, {},
-                                source=[{"kind": "idc", "crdc_series_uuid": uuid}],
-                                identity=(f"idc:{uuid}",))
-            except QueueFull as e:
-                raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
-        wait = _prefer_wait(request, wait_default, wait_max)
-        deadline = time.time() + wait
-        snap = executor.status_of(jid) or {}
-        while snap.get("state") not in TERMINAL and time.time() < deadline:
-            await asyncio.sleep(0.5)
-            snap = executor.status_of(jid) or {}
-        if snap.get("state") == "done":
+        def norm(ident: str) -> str:
+            ident = ident.strip()
+            return ident.lower() if prefix == "idc" else ident
+
+        def keyed(ident: str, task: str):
+            if not re.fullmatch(pat, ident) or task not in seg.tasks():
+                return None
+            return result_key((srcobj.identity(ident),), task, {},
+                              weights_versions_of(seg, task))
+
+        @app.head(base + "/labels.seg.nrrd")
+        def probe(request: Request, ident: str, task: str):
+            from fastapi import Response
+            key = keyed(norm(ident), task)
+            if key is None:
+                raise HTTPException(404, "unknown resource")
             hit = executor.cache_get(key)
-            headers = _resource_headers(key)
-            headers["Preference-Applied"] = f"wait={int(wait)}"
-            src_path = hit[0] if hit else executor.result_file(jid)[1]
-            return FileResponse(src_path, media_type="application/octet-stream",
-                                filename=f"{task}_{uuid[:8]}.seg.nrrd", headers=headers)
-        if snap.get("state") == "failed":
-            if not is_authed:                  # for anonymous the resource just is not there
-                raise HTTPException(404, "not materialized")
-            raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
-        if not is_authed:                      # watcher's view: no job vocabulary
-            p = snap.get("progress") or {}
-            return JSONResponse({"state": "materializing",
-                                 "progress": {"stage": p.get("stage"),
-                                              "fraction": p.get("fraction")}},
+            if hit is not None:
+                return Response(status_code=200, headers=_resource_headers(key))
+            jid = executor.find_inflight(key)
+            if jid is not None:
+                # anonymous callers see this too (user decision): watching a flight
+                # for public data is harmless and tells them to check back
+                snap = executor.status_of(jid) or {}
+                return Response(status_code=202,
+                                headers=_progress_headers(snap.get("progress")))
+            raise HTTPException(404, "not materialized")
+
+        @app.get(base + "/labels.seg.nrrd")
+        async def resource(request: Request, ident: str, task: str):
+            ident = norm(ident)
+            if not re.fullmatch(pat, ident):
+                raise HTTPException(422, f"{ident!r} is not a valid {prefix} identifier")
+            if task not in seg.tasks():
+                raise HTTPException(404, f"unknown task {task!r}")
+            key = result_key((srcobj.identity(ident),), task, {},
+                             weights_versions_of(seg, task))
+            hit = executor.cache_get(key)
+            if hit is not None:
+                return FileResponse(hit[0], media_type="application/octet-stream",
+                                    filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                    headers=_resource_headers(key))
+            jid = executor.find_inflight(key)  # single flight: ride an existing run
+            is_authed = authed(request)
+            if not is_authed and jid is None:
+                raise HTTPException(404, "not materialized; authenticated access can "
+                                         "compute it")
+            initiated = False
+            if jid is None:                    # authed, nothing running: initiate
+                if not _source_enabled(srcobj):
+                    raise HTTPException(404, "not materialized, and this server cannot "
+                                             f"fetch {prefix} data (missing dependency)")
+                initiated = True
+                jid, jdir = executor.new_job_dir()
+                srcdict = {"kind": prefix, "id": ident}
+                if prefix == "idc":
+                    srcdict["crdc_series_uuid"] = ident
+                try:
+                    executor.submit(jid, jdir, None, task, {},
+                                    source=[srcdict],
+                                    identity=(srcobj.identity(ident),))
+                except QueueFull as e:
+                    raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
+            wait = _prefer_wait(request, wait_default, wait_max)
+            deadline = time.time() + wait
+            snap = executor.status_of(jid) or {}
+            while snap.get("state") not in TERMINAL and time.time() < deadline:
+                await asyncio.sleep(0.5)
+                snap = executor.status_of(jid) or {}
+            if snap.get("state") == "done":
+                hit = executor.cache_get(key)
+                headers = _resource_headers(key)
+                headers["Preference-Applied"] = f"wait={int(wait)}"
+                src_path = hit[0] if hit else executor.result_file(jid)[1]
+                return FileResponse(src_path, media_type="application/octet-stream",
+                                    filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                    headers=headers)
+            if snap.get("state") == "failed":
+                if not is_authed:              # for anonymous the resource just is not there
+                    raise HTTPException(404, "not materialized")
+                raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
+            if not is_authed:                  # watcher's view: no job vocabulary
+                p = snap.get("progress") or {}
+                return JSONResponse({"state": "materializing",
+                                     "progress": {"stage": p.get("stage"),
+                                                  "fraction": p.get("fraction")}},
+                                    status_code=202,
+                                    headers=_progress_headers(snap.get("progress")))
+            return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
+                                 "initiated": initiated,   # did THIS request start it?
+                                 "progress": snap.get("progress")},
                                 status_code=202,
                                 headers=_progress_headers(snap.get("progress")))
-        return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
-                             "initiated": initiated,       # did THIS request start it?
-                             "progress": snap.get("progress")},
-                            status_code=202,
-                            headers=_progress_headers(snap.get("progress")))
 
-    @app.delete("/v1/idc/{uuid}/{task}")
-    @app.delete("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    def idc_delete(request: Request, uuid: str, task: str):
-        """Evict the cached entry (authorized only). Also cancels any in-flight
-        single-flight compute for the same key - otherwise the entry would
-        repopulate moments after being cleared. DELETE + GET = recompute with
-        whatever is installed now; the jobs API's no_cache is the per-job form."""
-        require_auth(request)
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid) or task not in seg.tasks():
-            raise HTTPException(404, "unknown resource")
-        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
-        jid = executor.find_inflight(key)
-        if jid is not None:
-            executor.cancel(jid)
-        deleted = executor.cache_delete(key)
-        if not deleted and jid is None:
-            raise HTTPException(404, "not materialized")
-        out = {"deleted": deleted}
-        if jid is not None:
-            out["cancelled_job"] = jid
-        return out
+        @app.delete(base)
+        @app.delete(base + "/labels.seg.nrrd")
+        def evict(request: Request, ident: str, task: str):
+            """Evict the cached entry (authorized only). Also cancels any in-flight
+            single-flight compute for the same key - otherwise the entry would
+            repopulate moments after being cleared. DELETE + GET = recompute with
+            whatever is installed now; the jobs API's no_cache is the per-job form."""
+            require_auth(request)
+            key = keyed(norm(ident), task)
+            if key is None:
+                raise HTTPException(404, "unknown resource")
+            jid = executor.find_inflight(key)
+            if jid is not None:
+                executor.cancel(jid)
+            deleted = executor.cache_delete(key)
+            if not deleted and jid is None:
+                raise HTTPException(404, "not materialized")
+            out = {"deleted": deleted}
+            if jid is not None:
+                out["cancelled_job"] = jid
+            return out
 
-    @app.get("/v1/idc/{uuid}/{task}/meta.json")
-    def idc_meta(uuid: str, task: str):
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid) or task not in seg.tasks():
-            raise HTTPException(404, "unknown resource")
-        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
-        hit = executor.cache_get(key)
-        if hit is None:
-            raise HTTPException(404, "not materialized")
-        return JSONResponse(hit[1], headers=_resource_headers(key))
+        @app.get(base + "/meta.json")
+        def meta(ident: str, task: str):
+            key = keyed(norm(ident), task)
+            if key is None:
+                raise HTTPException(404, "unknown resource")
+            hit = executor.cache_get(key)
+            if hit is None:
+                raise HTTPException(404, "not materialized")
+            return JSONResponse(hit[1], headers=_resource_headers(key))
+
+    for _prefix, _srcobj in sources.items():
+        _mount_source(_prefix, _srcobj)
 
     return app
 
 
-def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
+def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
+                      list_fn=None):
     """The anonymous read-only twin: cache hits and nothing else.
 
     Contains no compute path at all - it cannot spend a GPU cent by
@@ -1127,6 +1194,11 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
     ``inflight(key)`` reports an authorized computation in progress, in which
     case the caller gets 202 + Retry-After (and may long-poll it with
     Prefer: wait): watching a flight is read-only; only starting one needs auth.
+
+    ``key_fn(identity, task)`` maps a source identity string ("idc:<uuid>") to
+    the result-cache key; routes are mounted per registered source, so the
+    twin's surface follows the main app's. ``list_fn`` (optional) backs
+    /v1/segmentations - omit it to keep the twin listing-free.
     """
     import asyncio
 
@@ -1144,70 +1216,86 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
     def tasks():
         return {"tasks": tasks_fn()}
 
-    def _key_or_404(uuid: str, task: str):
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid) or task not in tasks_fn():
-            raise HTTPException(404, "unknown resource")
-        return uuid, key_fn(uuid, task)
+    srcmap = _source_registry(sources)
 
-    def _serve(hit, uuid, task, key):
-        return FileResponse(hit[0], media_type="application/octet-stream",
-                            filename=f"{task}_{uuid[:8]}.seg.nrrd",
-                            headers={"Cache-Control": "public, max-age=3600",
-                                     "ETag": f'"{key[:32]}"'})
+    if list_fn is not None:
+        @app.get("/v1/segmentations")
+        def list_segmentations():
+            return {"segmentations": list_fn()}
 
-    @app.head("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    def probe(uuid: str, task: str):
-        uuid, key = _key_or_404(uuid, task)
-        if cache_get(key) is not None:
-            return Response(status_code=200)
-        state = inflight(key) if inflight is not None else None
-        if state:
-            return Response(status_code=202,
-                            headers=_progress_headers(state.get("progress")))
-        raise HTTPException(404, "not materialized")
+    def _mount(prefix: str, srcobj) -> None:
+        pat = srcobj.id_pattern
+        base = f"/v1/{prefix}/{{ident}}/{{task}}"
 
-    @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    async def resource(request: Request, uuid: str, task: str):
-        uuid, key = _key_or_404(uuid, task)
-        hit = cache_get(key)
-        if hit is not None:
-            return _serve(hit, uuid, task, key)
-        state = inflight(key) if inflight is not None else None
-        if not state:
-            raise HTTPException(404, "not materialized; authenticated access can "
-                                     "compute it")
-        deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
-        while time.time() < deadline:          # watch only - nothing here computes
-            await asyncio.sleep(0.7)
+        def norm(ident: str) -> str:
+            ident = ident.strip()
+            return ident.lower() if prefix == "idc" else ident
+
+        def _key_or_404(ident, task):
+            ident = norm(ident)
+            if not re.fullmatch(pat, ident) or task not in tasks_fn():
+                raise HTTPException(404, "unknown resource")
+            return ident, key_fn(srcobj.identity(ident), task)
+
+        def _serve(hit, ident, task, key):
+            return FileResponse(hit[0], media_type="application/octet-stream",
+                                filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                headers={"Cache-Control": "public, max-age=3600",
+                                         "ETag": f'"{key[:32]}"'})
+
+        @app.head(base + "/labels.seg.nrrd")
+        def probe(ident: str, task: str):
+            ident, key = _key_or_404(ident, task)
+            if cache_get(key) is not None:
+                return Response(status_code=200)
+            state = inflight(key) if inflight is not None else None
+            if state:
+                return Response(status_code=202,
+                                headers=_progress_headers(state.get("progress")))
+            raise HTTPException(404, "not materialized")
+
+        @app.get(base + "/labels.seg.nrrd")
+        async def resource(request: Request, ident: str, task: str):
+            ident, key = _key_or_404(ident, task)
             hit = cache_get(key)
             if hit is not None:
-                return _serve(hit, uuid, task, key)
-            state = inflight(key)
+                return _serve(hit, ident, task, key)
+            state = inflight(key) if inflight is not None else None
             if not state:
-                break
-        hit = cache_get(key)
-        if hit is not None:
-            return _serve(hit, uuid, task, key)
-        if state:
-            p = state.get("progress") or {}
-            return JSONResponse({"state": "materializing",
-                                 "progress": {"stage": p.get("stage"),
-                                              "fraction": p.get("fraction")}},
-                                status_code=202,
-                                headers=_progress_headers(state.get("progress")))
-        raise HTTPException(404, "not materialized; authenticated access can "
-                                 "compute it")
+                raise HTTPException(404, "not materialized; authenticated access can "
+                                         "compute it")
+            deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
+            while time.time() < deadline:      # watch only - nothing here computes
+                await asyncio.sleep(0.7)
+                hit = cache_get(key)
+                if hit is not None:
+                    return _serve(hit, ident, task, key)
+                state = inflight(key)
+                if not state:
+                    break
+            hit = cache_get(key)
+            if hit is not None:
+                return _serve(hit, ident, task, key)
+            if state:
+                p = state.get("progress") or {}
+                return JSONResponse({"state": "materializing",
+                                     "progress": {"stage": p.get("stage"),
+                                                  "fraction": p.get("fraction")}},
+                                    status_code=202,
+                                    headers=_progress_headers(state.get("progress")))
+            raise HTTPException(404, "not materialized; authenticated access can "
+                                     "compute it")
 
-    @app.get("/v1/idc/{uuid}/{task}/meta.json")
-    def meta(uuid: str, task: str):
-        uuid = uuid.strip().lower()
-        if not re.fullmatch(CRDC_RE, uuid) or task not in tasks_fn():
-            raise HTTPException(404, "unknown resource")
-        hit = cache_get(key_fn(uuid, task))
-        if hit is None:
-            raise HTTPException(404, "not materialized")
-        return JSONResponse(hit[1])
+        @app.get(base + "/meta.json")
+        def meta(ident: str, task: str):
+            _, key = _key_or_404(ident, task)
+            hit = cache_get(key)
+            if hit is None:
+                raise HTTPException(404, "not materialized")
+            return JSONResponse(hit[1])
+
+    for _prefix, _srcobj in srcmap.items():
+        _mount(_prefix, _srcobj)
 
     return app
 

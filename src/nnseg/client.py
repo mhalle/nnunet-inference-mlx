@@ -52,11 +52,19 @@ class RemoteClient:
         return self._json("GET", f"/v1/tasks/{task}")
 
     def submit(self, image, task: str, **options) -> str:
-        """``image`` is a local file to upload, or ``"idc:<crdc_series_uuid>"`` to have
-        the server fetch the series from the public IDC buckets itself."""
+        """``image`` is a local file to upload, or ``"<source>:<identifier>"``
+        (e.g. ``"idc:<crdc_series_uuid>"``) to have the server fetch the input
+        from one of its registered data sources. A path that exists locally
+        always wins over the shorthand reading."""
         data = {"task": task, "options": json.dumps(options)}
-        if str(image).startswith("idc:"):
-            data["source"] = json.dumps([{"kind": "idc", "crdc_series_uuid": str(image)[4:]}])
+        img = str(image)
+        prefix = img.split(":", 1)[0] if ":" in img else ""
+        if prefix.isidentifier() and prefix.islower() and not Path(img).exists():
+            ident = img.split(":", 1)[1]
+            src = {"kind": prefix, "id": ident}
+            if prefix == "idc":
+                src["crdc_series_uuid"] = ident
+            data["source"] = json.dumps([src])
             r = self._json("POST", "/v1/jobs", data=data)
         else:
             p = Path(image)

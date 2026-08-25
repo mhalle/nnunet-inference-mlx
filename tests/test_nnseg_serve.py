@@ -533,9 +533,9 @@ def test_public_app_is_read_only_by_construction(tmp_path):
     from nnseg.serve import ResultCache, create_public_app, result_key
     cache = ResultCache(tmp_path / "c")
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
+    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
     src = tmp_path / "labels.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
-    cache.put(key_fn(u, "total_fast"), src, {"volumes_ml": {"spleen": 1.0}}, {})
+    cache.put(key_fn(f"idc:{u}", "total_fast"), src, {"volumes_ml": {"spleen": 1.0}}, {})
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
     client = TestClient(app)
     assert client.get("/v1/health").json()["mode"] == "public-cache"
@@ -665,20 +665,20 @@ def test_public_app_shows_inflight_and_waits(tmp_path):
     from nnseg.serve import ResultCache, create_public_app, result_key
     cache = ResultCache(tmp_path / "c")
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
+    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
     flights = {}
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
                             inflight=lambda k: flights.get(k))
     client = TestClient(app)
     url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
     assert client.get(url).status_code == 404
-    flights[key_fn(u, "total_fast")] = {"progress": {"stage": "predict", "fraction": 0.4}}
+    flights[key_fn(f"idc:{u}", "total_fast")] = {"progress": {"stage": "predict", "fraction": 0.4}}
     r = client.get(url, headers={"Prefer": "wait=0"})
     assert r.status_code == 202
     assert r.json()["progress"]["stage"] == "predict"
     assert client.head(url).status_code == 202
     src = tmp_path / "l.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
-    cache.put(key_fn(u, "total_fast"), src, {}, {})
+    cache.put(key_fn(f"idc:{u}", "total_fast"), src, {}, {})
     assert client.get(url).status_code == 200              # materialized mid-watch
 
 
@@ -687,8 +687,8 @@ def test_202s_carry_progress_headers(tmp_path):
     body) and header-only clients see stage and fraction."""
     from nnseg.serve import ResultCache, create_public_app, result_key
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
-    flights = {key_fn(u, "total_fast"):
+    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
+    flights = {key_fn(f"idc:{u}", "total_fast"):
                {"progress": {"stage": "predict", "fraction": 0.42}}}
     cache = ResultCache(tmp_path / "c")
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
@@ -960,3 +960,95 @@ def test_prefetch_prereads_next_upload(tmp_path, monkeypatch):
     wait_state(client, b, ("done",))
     assert seg.calls[1][0].startswith("PREREAD:")     # B got the object
     assert seg.calls[0][0].endswith("a.nii.gz")       # A read inline
+
+
+# -- pluggable data sources ---------------------------------------------------
+
+class ToySource:
+    """A programmatic source: numbered specimens from a fake repository."""
+    prefix = "toy"
+    id_pattern = r"sp[0-9]{3}"
+    description = "test specimens"
+
+    def __init__(self):
+        self.fetched = []
+
+    def enabled(self):
+        return True
+
+    def identity(self, ident):
+        return f"toy:{ident}"
+
+    def describe(self):
+        return {"prefix": self.prefix, "id_pattern": self.id_pattern,
+                "enabled": True, "description": self.description}
+
+    def fetch(self, ident, dest_dir):
+        d = dest_dir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "img.nii.gz").write_bytes(b"\x1f\x8b" + ident.encode())
+        self.fetched.append(ident)
+        return d
+
+
+def test_custom_source_end_to_end(tmp_path):
+    """A new repository = one class: submit by kind, path surface, caching,
+    prefetch keys - all come from the registry."""
+    from nnseg.sources import IDCSource
+    toy = ToySource()
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       sources=[IDCSource(), toy])
+    client = TestClient(create_app(ex))
+
+    srcs = client.get("/v1/sources").json()["sources"]
+    assert [x["prefix"] for x in srcs] == ["idc", "toy"]
+
+    r = client.post("/v1/jobs", data={"task": "total_fast",
+                                      "source": json.dumps([{"kind": "toy", "id": "sp042"}])})
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+    assert s["input_identity"] == ["toy:sp042"]
+    assert toy.fetched == ["sp042"]
+
+    # the path surface exists for the new prefix, serving the cached result
+    r2 = client.get("/v1/toy/sp042/total_fast/labels.seg.nrrd")
+    assert r2.status_code == 200
+    assert client.get("/v1/toy/zzz/total_fast/labels.seg.nrrd").status_code == 422
+    assert client.head("/v1/toy/sp999/total_fast/labels.seg.nrrd").status_code == 404
+
+    # completed-segmentations listing shows it with its path
+    segs = client.get("/v1/segmentations").json()["segmentations"]
+    assert any(e["identity"] == ["toy:sp042"]
+               and e["path"] == "/v1/toy/sp042/total_fast/labels.seg.nrrd"
+               for e in segs)
+
+
+def test_segmentations_listing_shape(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    jid = _idc_submit(client, u)
+    wait_state(client, jid, ("done",))
+    t0 = time.time()                       # the cache put lands just after "done"
+    while True:
+        segs = client.get("/v1/segmentations").json()["segmentations"]
+        if segs or time.time() - t0 > 2:
+            break
+        time.sleep(0.01)
+    assert len(segs) == 1
+    e = segs[0]
+    assert e["task"] == "total_fast" and e["identity"] == [f"idc:{u}"]
+    assert e["bytes"] > 0 and e["computed"]
+    assert e["path"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"

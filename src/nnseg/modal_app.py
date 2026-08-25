@@ -54,6 +54,8 @@ SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) o
 WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
 MAX_CONTAINERS = int(os.environ.get("NNSEG_MAX_CONTAINERS", "1"))
 SHM_CACHE_GB = float(os.environ.get("NNSEG_SHM_CACHE_GB", "8"))
+JOBS_TTL_H = float(os.environ.get("NNSEG_JOBS_TTL_H", "72"))
+RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 
@@ -67,11 +69,18 @@ def _pkg_dir() -> Path:
     return Path(nnseg.__file__).parent
 
 
+# Knobs read at RUNTIME inside the container must be forwarded into the image
+# env at deploy time - a deploy-shell variable does not otherwise exist in the
+# container (found the hard way: a TTL override that never took effect).
+_RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP",
+                  "NNSEG_WARM_TASK")
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("torch>=2.7", "numpy>=1.24", "triton", "nnunetv2>=2.5",
                     "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart")
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -101,8 +110,10 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
             if m.get("state") != "queued":
                 continue
             src = (m.get("source") or [{"kind": "upload"}])[0]
-            if src.get("kind") == "idc" and src.get("crdc_series_uuid"):
-                cands.append((m.get("created", 0), "idc", src["crdc_series_uuid"], m["id"]))
+            kind = src.get("kind", "upload")
+            ident = src.get("id") or src.get("crdc_series_uuid")
+            if kind != "upload" and ident:
+                cands.append((m.get("created", 0), kind, f"{kind}:{ident}", m["id"]))
             else:
                 cands.append((m.get("created", 0), "upload", None, m["id"]))
         return min(cands)[1:] if cands else None
@@ -116,7 +127,7 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
                     stop.wait(2.0)
                     continue
                 kind, series, njid = nxt
-                if kind == "idc":
+                if kind != "upload":
                     if cache.staging(series) or read_ahead.has(series):
                         stop.wait(2.0)
                         continue
@@ -166,6 +177,61 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
     threading.Thread(target=work, name="nnseg-prefetch", daemon=True).start()
 
 
+def _purgeable(meta: dict, now: float, ttl_s: float) -> bool:
+    """A job record may be purged when it is terminal and its ``finished``
+    stamp is older than the TTL. Queued/running records are never purged by
+    age - a stale active record is a symptom to surface, not tidy away."""
+    if not isinstance(meta, dict):
+        return True
+    if meta.get("state") not in ("done", "failed", "cancelled"):
+        return False
+    return (now - float(meta.get("finished") or meta.get("created") or now)) > ttl_s
+
+
+def _bound_jobs_store(current_jid: str) -> None:
+    """The retention policy for the jobs store, run after every job: delete the
+    finished job's own input upload (the bulk of the bytes - nothing reads an
+    input after the job is terminal), purge terminal records + their
+    directories past NNSEG_JOBS_TTL_H, and drop inflight markers whose job is
+    gone. Keeps the jobs Dict listable and the jobs Volume bounded by traffic
+    x TTL at ~result-size per job instead of ~input-size."""
+    import shutil
+    now, ttl_s = time.time(), JOBS_TTL_H * 3600.0
+    try:
+        jdir = Path(JOBS_ROOT) / current_jid
+        for f in jdir.glob("input_*"):
+            f.unlink(missing_ok=True)
+        purged = []
+        for k in list(jobs_dict.keys()):
+            k = str(k)
+            if k.startswith("inflight:"):
+                continue
+            m = jobs_dict.get(k)
+            if k != current_jid and _purgeable(m, now, ttl_s):
+                purged.append(k)
+        for k in purged:
+            shutil.rmtree(Path(JOBS_ROOT) / k, ignore_errors=True)
+            try:
+                del jobs_dict[k]
+            except Exception:
+                pass
+        for k in list(jobs_dict.keys()):
+            k = str(k)
+            if k.startswith("inflight:"):
+                jid = jobs_dict.get(k)         # markers hold the job id
+                tgt = jobs_dict.get(jid) if isinstance(jid, str) else None
+                if tgt is None or _purgeable(tgt, now, 0.0):
+                    try:
+                        del jobs_dict[k]
+                    except Exception:
+                        pass
+        if purged:
+            print(f"[purge] {len(purged)} finished jobs past {JOBS_TTL_H:g}h TTL", flush=True)
+        jobs_vol.commit()
+    except Exception as e:
+        print(f"[purge] failed: {e}", flush=True)
+
+
 def _emit(jid: str, update: dict) -> None:
     meta = jobs_dict.get(jid) or {}
     meta.update(update)
@@ -210,8 +276,15 @@ class Worker:
         """Post-restore, GPU attached: everything CUDA-adjacent lives here (unless
         the GPU snapshot already carries it)."""
         _pkg_dir()
-        from nnseg.serve import ReadAhead, SeriesCache, _fetch_idc_series
-        self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), _fetch_idc_series,
+        from nnseg.serve import ReadAhead, SeriesCache
+        from nnseg.sources import registry
+        self._sources = registry(None)
+
+        def fetch_source(key, entry):
+            prefix, ident = key.split(":", 1)
+            return self._sources[prefix].fetch(ident, entry)
+
+        self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
                                         budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
         self.read_ahead = ReadAhead()
         self._vol_lock = threading.Lock()    # scan-thread reload vs save+commit
@@ -253,24 +326,26 @@ class Worker:
                 weights_vol.commit()
                 self._ensured.add(meta["task"])
             src = (meta.get("source") or [{"kind": "upload"}])[0]
-            if src.get("kind") == "idc":
+            kind = src.get("kind", "upload")
+            if kind != "upload":
                 rep = Reporter.of(on_progress, cancel=token)
-                series = src["crdc_series_uuid"]
-                if self.series_cache.has(series):
+                ident = src.get("id") or src.get("crdc_series_uuid")
+                key = f"{kind}:{ident}"
+                if self.series_cache.has(key):
                     how = "cached"
-                elif self.series_cache.staging(series):
+                elif self.series_cache.staging(key):
                     how = "prefetched"
                 else:
                     how = "inline"
-                rep.stage("fetch", series[:13] if how == "inline" else how)
+                rep.stage("fetch", ident[:13] if how == "inline" else how)
                 t_f = time.time()
-                input_path = self.series_cache.get_or_fetch(series, check=rep.check)
-                print(f"[fetch] {series[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
+                input_path = self.series_cache.get_or_fetch(key, check=rep.check)
+                print(f"[fetch] {ident[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
-                preread = self.read_ahead.pop(series)
+                preread = self.read_ahead.pop(key)
                 if preread is not None:
                     rep.stage("read", "preread")
-                    print(f"[read] {series[:13]} preread", flush=True)
+                    print(f"[read] {ident[:13]} preread", flush=True)
                     input_path = preread
             else:
                 preread = self.read_ahead.pop(jid)
@@ -294,7 +369,7 @@ class Worker:
                                      for k, v in s.volumes_ml().items()},
                       "provenance": s.provenance}
             if meta.get("cache_key"):
-                ResultCache(CACHE_ROOT, keep=10 ** 6).put(
+                ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
                     meta["cache_key"], jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
@@ -308,6 +383,8 @@ class Worker:
                         "error": f"{type(e).__name__}: {e}"})
         finally:
             prefetch_stop.set()            # end the scan loop with the run
+            with self._vol_lock:
+                _bound_jobs_store(jid)
             if meta.get("cache_key"):
                 try:
                     del jobs_dict[f"inflight:{meta['cache_key']}"]
@@ -317,6 +394,19 @@ class Worker:
 
 class ModalExecutor:
     """The :func:`nnseg.serve.create_app` executor protocol over Modal primitives."""
+
+    @property
+    def sources(self):
+        from nnseg.sources import registry
+        return registry(None)
+
+    def cache_list(self):
+        from nnseg.serve import ResultCache
+        try:
+            cache_vol.reload()
+        except Exception:
+            pass
+        return ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).list()
 
     supports_push = False                    # SSE uses the server's poll branch
     accepting = True                         # Modal's backlog is the queue
@@ -364,7 +454,7 @@ class ModalExecutor:
             cache_vol.reload()
         except Exception:
             pass
-        return ResultCache(CACHE_ROOT, keep=10 ** 6).get(key)
+        return ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).get(key)
 
     def find_inflight(self, key):
         jid = jobs_dict.get(f"inflight:{key}")
@@ -379,7 +469,7 @@ class ModalExecutor:
             cache_vol.reload()
         except Exception:
             pass
-        deleted = ResultCache(CACHE_ROOT, keep=10 ** 6).delete(key)
+        deleted = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).delete(key)
         if deleted:
             cache_vol.commit()
         return deleted
@@ -479,10 +569,10 @@ if PUBLIC:
         from nnseg.serve import (ResultCache, create_public_app, result_key,
                                  weights_versions_of)
         seg = Segmenter(device="cpu", weights=WEIGHTS_ROOT)
-        cache = ResultCache(CACHE_ROOT, keep=10 ** 6)
+        cache = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP)
 
-        def key_fn(uuid, task):
-            return result_key((f"idc:{uuid}",), task, {},
+        def key_fn(identity, task):
+            return result_key((identity,), task, {},
                               weights_versions_of(seg, task))
 
         def get(key):
@@ -501,4 +591,12 @@ if PUBLIC:
                 return None
             return {"progress": meta.get("progress")}
 
-        return create_public_app(key_fn, get, seg.tasks, inflight=inflight)
+        def list_fn():
+            try:
+                cache_vol.reload()
+            except Exception:
+                pass
+            return ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).list()
+
+        return create_public_app(key_fn, get, seg.tasks, inflight=inflight,
+                                 list_fn=list_fn)
