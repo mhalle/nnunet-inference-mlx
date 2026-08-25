@@ -280,8 +280,10 @@ class Worker:
         from nnseg.sources import registry
         self._sources = registry(None)
 
-        def fetch_source(key, entry):
+        def fetch_source(key, entry, credentials=None):
             prefix, ident = key.split(":", 1)
+            if credentials is not None:
+                return self._sources[prefix].fetch(ident, entry, credentials=credentials)
             return self._sources[prefix].fetch(ident, entry)
 
         self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
@@ -292,7 +294,7 @@ class Worker:
             self._gpu_setup()
 
     @modal.method()
-    def run_job(self, jid: str) -> None:
+    def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
         from dataclasses import asdict
 
         from nnseg.errors import Cancelled
@@ -345,7 +347,9 @@ class Worker:
                     how = "inline"
                 rep.stage("fetch", ident[:13] if how == "inline" else how)
                 t_f = time.time()
-                input_path = self.series_cache.get_or_fetch(key, check=rep.check)
+                input_path = self.series_cache.get_or_fetch(
+                    key, check=rep.check,
+                    credentials=(source_tokens or {}).get(kind))
                 print(f"[fetch] {ident[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
                 preread = self.read_ahead.pop(key)
@@ -432,7 +436,7 @@ class ModalExecutor:
         return jid, d
 
     def submit(self, jid, jdir, input_path, task, options, *, source=None,
-               identity=(), no_cache: bool = False):
+               identity=(), no_cache: bool = False, source_tokens=None):
         from nnseg.serve import result_key, weights_versions_of
         jobs_vol.commit()                    # make any upload visible to the worker
         key = None
@@ -456,7 +460,7 @@ class ModalExecutor:
         jobs_dict[jid] = meta
         if key:
             jobs_dict[f"inflight:{key}"] = jid
-        call = Worker().run_job.spawn(jid)
+        call = Worker().run_job.spawn(jid, source_tokens=source_tokens)
         meta["call_id"] = call.object_id
         jobs_dict[jid] = meta
         return meta

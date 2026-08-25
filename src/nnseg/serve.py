@@ -141,7 +141,7 @@ class SeriesCache:
         e = self._entry(series)
         return e.exists() and not (e / self.MARKER).exists()
 
-    def get_or_fetch(self, series: str, *, check=None) -> Path:
+    def get_or_fetch(self, series: str, *, check=None, credentials=None) -> Path:
         """Return the series content directory, fetching if needed (blocking).
         ``check`` is called while waiting on another writer; raise from it to
         cancel the wait."""
@@ -166,7 +166,8 @@ class SeriesCache:
                     time.sleep(0.2)
                 continue
             try:
-                dest = Path(self.fetch(series, entry))
+                dest = Path(self.fetch(series, entry, credentials=credentials)
+                            if credentials is not None else self.fetch(series, entry))
                 self._commit(entry, key=series)
                 return dest
             except BaseException:
@@ -373,6 +374,7 @@ class JobRecord:
     cache_key: str | None = None
     cancel_token: CancelToken = field(default_factory=CancelToken)
     subscribers: list = field(default_factory=list)   # (event_loop, asyncio.Queue)
+    source_tokens: dict | None = None             # credentials in transit: never serialized
 
 
 class _PrepareDone(Exception):
@@ -414,13 +416,16 @@ class LocalExecutor:
         self._thread = threading.Thread(target=self._dispatch, name="nnseg-serve", daemon=True)
         self._thread.start()
 
-    def _fetch_source(self, key: str, entry):
+    def _fetch_source(self, key: str, entry, credentials=None):
         """Series-cache fetch dispatcher: keys are ``<prefix>:<identifier>``.
         The idc prefix routes through ``self._fetch_idc`` so the historical
-        ``fetch_idc_fn`` injection seam keeps working."""
+        ``fetch_idc_fn`` injection seam keeps working. ``credentials`` is a
+        per-request secret, forwarded and never stored."""
         prefix, ident = key.split(":", 1)
         if prefix == "idc":
             return self._fetch_idc(ident, entry)
+        if credentials is not None:
+            return self.sources[prefix].fetch(ident, entry, credentials=credentials)
         return self.sources[prefix].fetch(ident, entry)
 
     # -- intake --------------------------------------------------------------
@@ -436,9 +441,11 @@ class LocalExecutor:
             return len(self._pending) < self.max_pending
 
     def submit(self, jid: str, jdir: Path, input_path, task: str, options: dict,
-               *, source=None, identity: tuple = (), no_cache: bool = False) -> JobRecord:
+               *, source=None, identity: tuple = (), no_cache: bool = False,
+               source_tokens: dict | None = None) -> JobRecord:
         rec = JobRecord(id=jid, task=task, options=options, dir=jdir, input_path=input_path,
-                        source=list(source or [{"kind": "upload"}]), input_identity=tuple(identity))
+                        source=list(source or [{"kind": "upload"}]), input_identity=tuple(identity),
+                        source_tokens=source_tokens or None)
         if self.cache is not None and identity:
             rec.cache_key = result_key(identity, task, options,
                                        weights_versions_of(self.segmenter, task))
@@ -613,7 +620,8 @@ class LocalExecutor:
                     else:
                         reporter.stage("fetch", ident[:13])
                     rec.input_path = self.series_cache.get_or_fetch(
-                        key, check=reporter.check)
+                        key, check=reporter.check,
+                        credentials=(rec.source_tokens or {}).get(kind))
                     reporter.check()
                     preread = self.read_ahead.pop(key)
                     if preread is not None:
@@ -842,6 +850,21 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # _idc_enabled stays the patchable seam for the idc source
         return _idc_enabled() if srcobj.prefix == "idc" else srcobj.enabled()
 
+    def source_tokens_of(request) -> dict | None:
+        """Per-source credentials from the NNSeg-Source-Token header
+        (``prefix=token[,prefix=token]``). Headers, never query strings -
+        query strings cache-bust and land in logs. The parsed dict lives only
+        on the in-memory job record; the status whitelist cannot leak it."""
+        raw = request.headers.get("nnseg-source-token")
+        if not raw:
+            return None
+        out = {}
+        for part in raw.split(","):
+            prefix, _, tok = part.strip().partition("=")
+            if prefix and tok:
+                out[prefix] = tok
+        return out or None
+
     def canon_task(t: str):
         """Canonical task name for any accepted form (short, eco:name,
         eco:name@version) - None when unknown/ambiguous. All forms converge to
@@ -1027,7 +1050,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             input_path, identity = None, (sources[kind].identity(ident),)
         try:
             executor.submit(jid, jdir, input_path, task, opts,
-                            source=src, identity=identity, no_cache=no_cache)
+                            source=src, identity=identity, no_cache=no_cache,
+                            source_tokens=source_tokens_of(request))
         except QueueFull as e:
             import shutil
             shutil.rmtree(jdir, ignore_errors=True)
@@ -1205,7 +1229,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 try:
                     executor.submit(jid, jdir, None, task, {},
                                     source=[srcdict],
-                                    identity=(srcobj.identity(ident),))
+                                    identity=(srcobj.identity(ident),),
+                                    source_tokens=source_tokens_of(request))
                 except QueueFull as e:
                     raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
             wait = _prefer_wait(request, wait_default, wait_max)
