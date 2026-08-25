@@ -110,8 +110,8 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
             if str(k).startswith("inflight:") or k == current_jid:
                 continue
             m = jobs_dict.get(k) or {}
-            if m.get("state") != "queued":
-                continue
+            if m.get("state") != "queued" or m.get("kind") == "prepare":
+                continue                       # prepare has no input to stage
             src = (m.get("source") or [{"kind": "upload"}])[0]
             kind = src.get("kind", "upload")
             ident = src.get("id") or src.get("crdc_series_uuid")

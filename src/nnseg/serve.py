@@ -178,7 +178,10 @@ class SeriesCache:
             entry = self._entry(series)
             marker = entry / self.MARKER
             if marker.exists():
-                os.utime(marker)               # LRU touch
+                try:
+                    os.utime(marker)           # LRU touch
+                except OSError:                # evicted between check and touch
+                    continue                   # reclaim on the next pass
                 return entry / "series"
             try:
                 entry.mkdir(parents=True)      # atomic claim: one writer per series
@@ -423,10 +426,20 @@ class ResultCache:
 
     def evict(self) -> None:
         import shutil
-        dirs = [d for d in self.root.iterdir() if d.is_dir()]
+
+        def _mtime(d):                         # entries can vanish between
+            try:                               # iterdir and stat (concurrent
+                return d.stat().st_mtime       # delete/evict); a raise here
+            except OSError:                    # would fail the putting job
+                return 0.0
+
+        try:
+            dirs = [d for d in self.root.iterdir() if d.is_dir()]
+        except OSError:
+            return
         if len(dirs) <= self.keep:
             return
-        for d in sorted(dirs, key=lambda x: x.stat().st_mtime)[: len(dirs) - self.keep]:
+        for d in sorted(dirs, key=_mtime)[: len(dirs) - self.keep]:
             shutil.rmtree(d, ignore_errors=True)
 
 
@@ -852,8 +865,8 @@ class LocalExecutor:
         pipeline - it hides the fetch; hiding the read is the follow-on."""
         with self._cv:
             nxt = self._jobs.get(self._pending[0]) if self._pending else None
-            if nxt is None or nxt.state != "queued":
-                return
+            if nxt is None or nxt.state != "queued" or nxt.kind == "prepare":
+                return                         # prepare has no input to stage
         src = nxt.source[0] if nxt.source else {"kind": "upload"}
         kind = src.get("kind", "upload")
         ident = src.get("id") or src.get("crdc_series_uuid")
@@ -910,11 +923,14 @@ class LocalExecutor:
         return [self.status(r, brief=True) for r in self.jobs()]
 
     def result_file(self, jid: str):
-        """(state, labels path or None); (None, None) for an unknown job."""
+        """(state, labels path or None); (None, None) for an unknown job. The
+        path is None when the bytes are gone (job dir purged under a kept
+        record) - callers must not assume done implies readable."""
         rec = self.get(jid)
         if rec is None:
             return None, None
-        return rec.state, rec.labels_path
+        p = rec.labels_path
+        return rec.state, (p if p is not None and Path(p).exists() else None)
 
     # -- serialization -------------------------------------------------------
     def status(self, rec: JobRecord, *, brief: bool = False) -> dict:
@@ -1129,6 +1145,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         try:
             executor.submit_prepare(jid, jdir, task)
         except QueueFull as e:
+            import shutil
+            shutil.rmtree(jdir, ignore_errors=True)
             raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
         return {"id": jid, "kind": "prepare", "task": task}
 
@@ -1339,18 +1357,26 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         state, path = executor.result_file(jid)
         if state is None:
             raise HTTPException(404, f"no job {jid!r}")
-        if state != "done" or path is None:
+        if state != "done":
             raise HTTPException(409, f"job is {state}, not done")
+        if path is None:                       # done, but the bytes were purged
+            raise HTTPException(410, "result no longer on the server; recompute it")
         task_name = (executor.status_of(jid) or {}).get("task", "labels")
+        stem = _task_stem(task_name)           # canonical eco:name is not filename-safe
         if format in ("nii.gz", "nii"):        # the LOSSY conversion, by request only
+            import shutil
             import tempfile
 
             import SimpleITK as sitk
-            out = Path(tempfile.mkdtemp(prefix="nnseg-conv-")) / f"{task_name}_{jid}.nii.gz"
+            from starlette.background import BackgroundTask
+            tmpd = tempfile.mkdtemp(prefix="nnseg-conv-")
+            out = Path(tmpd) / f"{stem}_{jid}.nii.gz"
             sitk.WriteImage(sitk.ReadImage(str(path)), str(out), True)
-            return FileResponse(out, media_type="application/gzip", filename=out.name)
+            return FileResponse(out, media_type="application/gzip", filename=out.name,
+                                background=BackgroundTask(shutil.rmtree, tmpd,
+                                                          ignore_errors=True))
         return FileResponse(path, media_type="application/octet-stream",
-                            filename=f"{task_name}_{jid}.seg.nrrd")
+                            filename=f"{stem}_{jid}.seg.nrrd")
 
     @app.delete("/v1/jobs/{jid}")
     def cancel(request: Request, jid: str):
@@ -1463,6 +1489,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                         identity=(srcobj.identity(ident),),
                                         source_tokens=source_tokens_of(request))
                     except QueueFull as e:
+                        import shutil
+                        shutil.rmtree(jdir, ignore_errors=True)
                         raise HTTPException(429, str(e),
                                             headers={"Retry-After": "30"}) from e
                 wait = _prefer_wait(request, wait_default, wait_max)
@@ -1474,8 +1502,11 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if snap.get("state") == "done":
                     hit = executor.cache_get(key)
                     headers = _resource_headers(key)
-                    headers["Preference-Applied"] = f"wait={int(wait)}"
+                    if _prefer_wait_raw(request, wait_max) is not None:
+                        headers["Preference-Applied"] = f"wait={int(wait)}"
                     src_path = hit[0] if hit else executor.result_file(jid)[1]
+                    if src_path is None:       # evicted between done and read
+                        raise HTTPException(404, "not materialized")
                     return FileResponse(src_path, media_type="application/octet-stream",
                                         filename=fname, headers=headers)
                 if snap.get("state") == "failed":
@@ -1609,6 +1640,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                     identity=(srcobj.identity(ident),),
                                     source_tokens=source_tokens_of(request))
                 except QueueFull as e:
+                    import shutil
+                    shutil.rmtree(jdir, ignore_errors=True)
                     raise HTTPException(429, str(e),
                                         headers={"Retry-After": "30"}) from e
             snap = executor.status_of(jid) or {}
@@ -1620,8 +1653,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             hit = executor.cache_get(key)
             if hit is None:                    # initiated; patience exhausted (or 0)
                 raise HTTPException(202, detail="materializing",
-                                    headers={"Retry-After": "5",
-                                             **_progress_headers(snap.get("progress"))})
+                                    headers=_progress_headers(snap.get("progress"),
+                                                              {"Retry-After": "5"}))
             return hit
 
         async def _await_artifact(request, key, hit, filename: str, what: str):
@@ -1646,6 +1679,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if state_fn(key) == "pending":
                     raise HTTPException(202, headers={"Retry-After": "2"},
                                         detail=f"{what} still materializing")
+            if path.exists():                  # placed between our probe and the
+                return path                    # pending flag clearing
             raise HTTPException(404, f"no {what} for this result")
 
         def _register_statistics(tok: str, gopts: dict):

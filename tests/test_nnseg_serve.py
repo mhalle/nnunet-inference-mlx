@@ -1926,3 +1926,75 @@ def test_events_refetches_after_subscribe(tmp_path, monkeypatch):
     t.join(8)
     assert not t.is_alive(), "events stream hung on a stale pre-subscribe snapshot"
     assert b'"done"' in out["body"]
+
+
+def test_result_purged_bytes_is_410(tmp_path):
+    """Review C9: a done job whose labels file was purged answers 410, not a
+    500 from streaming a missing file."""
+    seg, ex, client = make(tmp_path)
+    jid = submit(client)
+    wait_state(client, jid)
+    assert client.get(f"/v1/jobs/{jid}/result").status_code == 200
+    _, p = ex.result_file(jid)
+    import pathlib
+    pathlib.Path(p).unlink()
+    r = client.get(f"/v1/jobs/{jid}/result")
+    assert r.status_code == 410
+
+
+def test_result_filename_is_stem_sanitized(tmp_path):
+    """Review C9: canonical eco:name task names must not leak a ':' into the
+    download filename."""
+    seg, ex, client = make(tmp_path)
+    jid = submit(client)
+    wait_state(client, jid)
+    cd = client.get(f"/v1/jobs/{jid}/result").headers.get("content-disposition", "")
+    assert ":" not in cd and "/" not in cd.split("filename=")[-1]
+
+
+def test_queuefull_cleans_job_dir(tmp_path):
+    """Review C9: a submit refused with QueueFull must not leave the freshly
+    created job directory behind."""
+    gate = threading.Event()                   # never set: first job blocks
+    seg, ex, client = make(tmp_path, gate=gate, max_pending=1)
+    try:
+        submit(client)                         # running (blocked on the gate)
+        submit(client)                         # fills the pending bound
+        before = {d.name for d in tmp_path.iterdir() if d.is_dir()}
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                        data={"task": "total_fast"})
+        assert r.status_code == 429
+        r2 = client.post("/v1/tasks/total_fast/prepare")
+        assert r2.status_code == 429
+        after = {d.name for d in tmp_path.iterdir() if d.is_dir()}
+        assert after == before, f"leaked job dirs: {sorted(after - before)}"
+    finally:
+        gate.set()
+        ex.close()
+
+
+def test_preference_applied_only_with_prefer(tmp_path, monkeypatch):
+    """Review C9: Preference-Applied is an echo of an applied preference
+    (RFC 7240) - it must not appear when the client sent no Prefer header."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "1be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    r = client.get(url)                        # no Prefer: default wait applies
+    assert r.status_code == 200
+    assert "preference-applied" not in {k.lower() for k in r.headers}
+    ex.cache.delete(next(iter(d.name for d in (tmp_path / "rc").iterdir())))
+    r = client.get(url, headers={"Prefer": "wait=30"})
+    assert r.status_code == 200
+    assert r.headers.get("Preference-Applied") == "wait=30"
