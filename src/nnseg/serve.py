@@ -1101,7 +1101,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                             for v in sources.values()]}
 
     @app.get("/v1/segmentations")
-    def list_segmentations():
+    def list_segmentations(request: Request):
+        """Authorized only (review finding): the listing enumerates every
+        cached result including sha256 identities of authenticated users'
+        uploads - not part of the anonymous tier. The public twin's listing
+        stays an explicit operator opt-in (list_fn)."""
+        require_auth(request)
         lister = getattr(executor, "cache_list", None)
         return {"segmentations": lister() if lister else []}
 

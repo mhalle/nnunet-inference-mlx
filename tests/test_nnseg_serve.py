@@ -1792,3 +1792,13 @@ def test_pinned_entries_survive_eviction_and_live_writers_survive_timeouts(tmp_p
     _time.sleep(0.3)
     assert sc3.get_or_fetch("dead").exists()  # reclaimed and fetched
     assert "dead" in fetched
+
+
+def test_segmentations_listing_requires_auth_when_token_set(tmp_path):
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc")
+    client = TestClient(create_app(ex, token="s3cret"))
+    assert client.get("/v1/segmentations").status_code == 401
+    r = client.get("/v1/segmentations",
+                   headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
