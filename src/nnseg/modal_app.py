@@ -14,8 +14,11 @@ tell the difference:
   (``scaledown_window`` keeps it alive between a session's runs); weights
   self-provision into the shared ``nnseg-weights`` Volume on first use;
 - where the LocalExecutor supplies a bounded FIFO, here **Modal is the queue**:
-  spawn enqueues, the autoscaler drains up to the plan's GPU cap, and there is no
-  bound to enforce (``accepting`` is always true);
+  spawn enqueues and the autoscaler drains up to ``NNSEG_MAX_CONTAINERS``
+  (default 1: parallel requests queue and run serially on one warm worker - the
+  economical posture, and every job after the first is warm; raise it at deploy
+  time for cohort fan-out, up to the plan's GPU cap). ``accepting`` is always
+  true - the backlog has no bound to enforce;
 - progress writes are rate-limited (~4/s) because each Dict write is an RPC; the
   server's SSE endpoint reads them through its poll branch (``supports_push=False``);
 - cancel is `FunctionCall.cancel()` - the container stops, billing stops;
@@ -48,6 +51,7 @@ SCALEDOWN = int(os.environ.get("NNSEG_SCALEDOWN", "600"))
 GPU_SNAPSHOT = os.environ.get("NNSEG_GPU_SNAPSHOT", "0") not in ("0", "false", "no", "")
 SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) or GPU_SNAPSHOT
 WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
+MAX_CONTAINERS = int(os.environ.get("NNSEG_MAX_CONTAINERS", "1"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 
@@ -85,6 +89,7 @@ _cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAP
 
 
 @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
+         max_containers=MAX_CONTAINERS,
          volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
          enable_memory_snapshot=SNAPSHOT, **_cls_extra)
 class Worker:
