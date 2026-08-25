@@ -624,3 +624,59 @@ def test_head_probe_never_computes_and_distinguishes_states(tmp_path, monkeypatc
     wait_state(client, jid, ("done",))
     assert client.head(url).status_code == 200          # probe sees materialized
     assert len(seg.calls) == 1
+
+
+def test_anonymous_watches_authorized_flight(tmp_path, monkeypatch):
+    """User decision 2026-08-24: an anonymous request for a resource an
+    authorized job is materializing gets 202 (check back) - and may long-poll
+    to the file - but can never initiate."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate, steps=2)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex, token="s3cret"))
+    auth = {"Authorization": "Bearer s3cret"}
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+
+    assert client.get(url).status_code == 404              # nothing in flight: 404
+    r = client.get(url, headers={**auth, "Prefer": "wait=0"})
+    assert r.status_code == 202                            # authorized initiates
+    anon = client.get(url, headers={"Prefer": "wait=0"})
+    assert anon.status_code == 202                         # anonymous watches
+    assert anon.json()["state"] == "materializing"
+    assert "job" not in anon.json()                        # no job vocabulary leaked
+    assert client.head(url).status_code == 202             # probe agrees
+    assert len(seg.calls) == 1                             # one compute entered; watching added none
+    gate.set()
+    blocked = client.get(url, headers={"Prefer": "wait=10"})
+    assert blocked.status_code == 200                      # anonymous long-poll to bytes
+    assert len(seg.calls) == 1                             # one compute total
+
+
+def test_public_app_shows_inflight_and_waits(tmp_path):
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    cache = ResultCache(tmp_path / "c")
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
+    flights = {}
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
+                            inflight=lambda k: flights.get(k))
+    client = TestClient(app)
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert client.get(url).status_code == 404
+    flights[key_fn(u, "total_fast")] = {"progress": {"stage": "predict", "fraction": 0.4}}
+    r = client.get(url, headers={"Prefer": "wait=0"})
+    assert r.status_code == 202
+    assert r.json()["progress"]["stage"] == "predict"
+    assert client.head(url).status_code == 202
+    src = tmp_path / "l.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
+    cache.put(key_fn(u, "total_fast"), src, {}, {})
+    assert client.get(url).status_code == 200              # materialized mid-watch

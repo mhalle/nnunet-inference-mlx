@@ -782,12 +782,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         hit = executor.cache_get(key)
         if hit is not None:
             return Response(status_code=200, headers=_resource_headers(key))
-        if authed(request):
-            jid = executor.find_inflight(key)
-            if jid is not None:
-                return Response(status_code=202,
-                                headers={"Retry-After": "10",
-                                         "Cache-Control": "no-store"})
+        if executor.find_inflight(key) is not None:
+            # anonymous callers see this too (user decision): watching a flight
+            # for public data is harmless and tells them to check back
+            return Response(status_code=202,
+                            headers={"Retry-After": "10",
+                                     "Cache-Control": "no-store"})
         raise HTTPException(404, "not materialized")
 
     @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
@@ -803,15 +803,17 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             return FileResponse(hit[0], media_type="application/octet-stream",
                                 filename=f"{task}_{uuid[:8]}.seg.nrrd",
                                 headers=_resource_headers(key))
-        if not authed(request):
+        jid = executor.find_inflight(key)      # single flight: ride an existing run
+        is_authed = authed(request)
+        if not is_authed and jid is None:
             raise HTTPException(404, "not materialized; authenticated access can "
                                      "compute it")
-        if not _idc_enabled():
-            raise HTTPException(404, "not materialized, and this server cannot fetch "
-                                     "IDC series (idc extra not installed)")
-        jid = executor.find_inflight(key)      # single flight: ride an existing run
-        initiated = jid is None
-        if jid is None:
+        initiated = False
+        if jid is None:                        # authed, nothing running: initiate
+            if not _idc_enabled():
+                raise HTTPException(404, "not materialized, and this server cannot "
+                                         "fetch IDC series (idc extra not installed)")
+            initiated = True
             jid, jdir = executor.new_job_dir()
             try:
                 executor.submit(jid, jdir, None, task, {},
@@ -833,7 +835,17 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             return FileResponse(src_path, media_type="application/octet-stream",
                                 filename=f"{task}_{uuid[:8]}.seg.nrrd", headers=headers)
         if snap.get("state") == "failed":
+            if not is_authed:                  # for anonymous the resource just is not there
+                raise HTTPException(404, "not materialized")
             raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
+        if not is_authed:                      # watcher's view: no job vocabulary
+            p = snap.get("progress") or {}
+            return JSONResponse({"state": "materializing",
+                                 "progress": {"stage": p.get("stage"),
+                                              "fraction": p.get("fraction")}},
+                                status_code=202,
+                                headers={"Retry-After": "10",
+                                         "Cache-Control": "no-store"})
         return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
                              "initiated": initiated,       # did THIS request start it?
                              "progress": snap.get("progress")},
@@ -877,14 +889,19 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     return app
 
 
-def create_public_app(key_fn, cache_get, tasks_fn):
+def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
     """The anonymous read-only twin: cache hits and nothing else.
 
     Contains no compute path at all - it cannot spend a GPU cent by
     construction, which is the right worst case for a public face. Misses are
-    404 (the resource genuinely does not exist yet) with a hint body.
+    404 (the resource genuinely does not exist yet) with a hint body - unless
+    ``inflight(key)`` reports an authorized computation in progress, in which
+    case the caller gets 202 + Retry-After (and may long-poll it with
+    Prefer: wait): watching a flight is read-only; only starting one needs auth.
     """
-    from fastapi import FastAPI, HTTPException
+    import asyncio
+
+    from fastapi import FastAPI, HTTPException, Request, Response
     from fastapi.responses import FileResponse, JSONResponse
 
     app = FastAPI(title="nnseg public cache", version=_version())
@@ -898,20 +915,59 @@ def create_public_app(key_fn, cache_get, tasks_fn):
     def tasks():
         return {"tasks": tasks_fn()}
 
-    @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
-    def resource(uuid: str, task: str):
+    def _key_or_404(uuid: str, task: str):
         uuid = uuid.strip().lower()
         if not re.fullmatch(CRDC_RE, uuid) or task not in tasks_fn():
             raise HTTPException(404, "unknown resource")
-        key = key_fn(uuid, task)
-        hit = cache_get(key)
-        if hit is None:
-            raise HTTPException(404, "not materialized; authenticated access can "
-                                     "compute it")
+        return uuid, key_fn(uuid, task)
+
+    def _serve(hit, uuid, task, key):
         return FileResponse(hit[0], media_type="application/octet-stream",
                             filename=f"{task}_{uuid[:8]}.seg.nrrd",
                             headers={"Cache-Control": "public, max-age=3600",
                                      "ETag": f'"{key[:32]}"'})
+
+    @app.head("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
+    def probe(uuid: str, task: str):
+        uuid, key = _key_or_404(uuid, task)
+        if cache_get(key) is not None:
+            return Response(status_code=200)
+        if inflight is not None and inflight(key):
+            return Response(status_code=202, headers={"Retry-After": "10"})
+        raise HTTPException(404, "not materialized")
+
+    @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
+    async def resource(request: Request, uuid: str, task: str):
+        uuid, key = _key_or_404(uuid, task)
+        hit = cache_get(key)
+        if hit is not None:
+            return _serve(hit, uuid, task, key)
+        state = inflight(key) if inflight is not None else None
+        if not state:
+            raise HTTPException(404, "not materialized; authenticated access can "
+                                     "compute it")
+        deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
+        while time.time() < deadline:          # watch only - nothing here computes
+            await asyncio.sleep(0.7)
+            hit = cache_get(key)
+            if hit is not None:
+                return _serve(hit, uuid, task, key)
+            state = inflight(key)
+            if not state:
+                break
+        hit = cache_get(key)
+        if hit is not None:
+            return _serve(hit, uuid, task, key)
+        if state:
+            p = state.get("progress") or {}
+            return JSONResponse({"state": "materializing",
+                                 "progress": {"stage": p.get("stage"),
+                                              "fraction": p.get("fraction")}},
+                                status_code=202,
+                                headers={"Retry-After": "10",
+                                         "Cache-Control": "no-store"})
+        raise HTTPException(404, "not materialized; authenticated access can "
+                                 "compute it")
 
     @app.get("/v1/idc/{uuid}/{task}/meta.json")
     def meta(uuid: str, task: str):

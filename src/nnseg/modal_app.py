@@ -368,4 +368,13 @@ if PUBLIC:
                 pass
             return cache.get(key)
 
-        return create_public_app(key_fn, get, seg.tasks)
+        def inflight(key):
+            jid = jobs_dict.get(f"inflight:{key}")
+            if not jid:
+                return None
+            meta = jobs_dict.get(jid) or {}
+            if meta.get("state") not in ("queued", "running"):
+                return None
+            return {"progress": meta.get("progress")}
+
+        return create_public_app(key_fn, get, seg.tasks, inflight=inflight)
