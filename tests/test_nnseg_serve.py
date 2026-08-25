@@ -701,3 +701,83 @@ def test_202s_carry_progress_headers(tmp_path):
     assert h.headers["nnseg-fraction"] == "0.420"
     g = client.get(url, headers={"Prefer": "wait=0"})
     assert g.status_code == 202 and g.headers["nnseg-fraction"] == "0.420"
+
+
+# -- prefetch: the CPU downloader runs parallel to the GPU job ---------------
+
+def _idc_submit(client, uuid):
+    r = client.post("/v1/jobs", data={"task": "total_fast",
+                                      "source": json.dumps([{"kind": "idc",
+                                                             "crdc_series_uuid": uuid}])})
+    assert r.status_code == 202, r.text
+    return r.json()["id"]
+
+
+def test_prefetch_overlaps_running_job(tmp_path, monkeypatch):
+    """While job A holds the GPU, job B's series is downloaded; B's dispatch
+    then uses the prefetched directory instead of fetching again."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    fetched = []
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "slice.dcm").write_bytes(b"dcm")
+        fetched.append(series)
+        return d
+
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    ua = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    ub = "77aabbcc-9410-47ff-9c9f-a44b26a4bd55"
+    a = _idc_submit(client, ua)
+    wait_state(client, a, ("running",))
+    b = _idc_submit(client, ub)
+
+    t0 = time.time()                       # A is gated: any B fetch now overlaps
+    while ub not in fetched:
+        assert time.time() - t0 < 5, f"B was not prefetched; log {fetched}"
+        time.sleep(0.01)
+    assert client.get(f"/v1/jobs/{a}").json()["state"] == "running"
+
+    gate.set()
+    wait_state(client, a, ("done",))
+    sb = wait_state(client, b, ("done",))
+    assert fetched == [ua, ub]             # exactly once each - no refetch at dispatch
+    assert sb["input_identity"] == [f"idc:{ub}"]
+    assert seg.calls[1][0].endswith("series")
+
+
+def test_prefetch_failure_falls_back_to_inline_fetch(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    calls = []
+
+    def fake_fetch(series, jobdir):
+        calls.append(series)
+        if len(calls) == 2:                # the prefetch attempt for B
+            raise RuntimeError("bucket hiccup")
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "slice.dcm").write_bytes(b"dcm")
+        return d
+
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    a = _idc_submit(client, "0be27d1c-9410-47ff-9c9f-a44b26a4bd55")
+    wait_state(client, a, ("running",))
+    b = _idc_submit(client, "77aabbcc-9410-47ff-9c9f-a44b26a4bd55")
+    t0 = time.time()
+    while len(calls) < 2:                  # wait out the failed prefetch
+        assert time.time() - t0 < 5
+        time.sleep(0.01)
+    gate.set()
+    wait_state(client, a, ("done",))
+    sb = wait_state(client, b, ("done",))
+    assert sb["state"] == "done"
+    assert len(calls) == 3                 # A, failed prefetch, B's inline retry

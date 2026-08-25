@@ -39,6 +39,7 @@ once published, so a deploy is pinned to a version instead of a working tree.
 """
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -77,6 +78,80 @@ weights_vol = modal.Volume.from_name("nnseg-weights", create_if_missing=True)
 jobs_vol = modal.Volume.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
+
+
+def _prefetch_base(series: str) -> Path:
+    return Path("/dev/shm") / f"prefetch_{series}"
+
+
+def _prefetched_or_none(series: str, rep) -> Path | None:
+    """If a prefetch for this series exists or is in flight, wait for its
+    ``.done`` marker (cancellable) and hand back the directory. A directory
+    without the marker is a writer mid-flight - never read it. On timeout the
+    caller fetches into its own separate directory, so the two writers can
+    never collide."""
+    base = _prefetch_base(series)
+    if not base.exists():
+        return None
+    deadline = time.time() + 180
+    while not (base / ".done").exists():
+        if not base.exists() or time.time() > deadline:
+            return None                    # writer failed (dir removed) or hung
+        rep.check()
+        time.sleep(0.2)
+    return base / "series"
+
+
+def _prefetch_next(current_jid: str, stop) -> None:
+    """Best-effort CPU downloader, parallel to this GPU job: watch the shared
+    jobs Dict for the oldest OTHER queued idc job and fetch its series into
+    /dev/shm. Scans every 2 s for the length of the run - a single scan at job
+    start misses jobs whose submit lands moments later (the warm-chain case).
+    With max_containers=1 the same container serves the next input, so the
+    prefetch is always warm-handed. One-ahead only, marker-committed
+    (``.done``), removed after use; failures leave nothing behind."""
+    import shutil
+    import threading
+
+    def scan_once():
+        cands = []
+        for k in jobs_dict.keys():
+            if str(k).startswith("inflight:") or k == current_jid:
+                continue
+            m = jobs_dict.get(k) or {}
+            if m.get("state") != "queued":
+                continue
+            src = (m.get("source") or [{}])[0]
+            if src.get("kind") == "idc" and src.get("crdc_series_uuid"):
+                cands.append((m.get("created", 0), src["crdc_series_uuid"]))
+        return min(cands)[1] if cands else None
+
+    def work():
+        base = None
+        try:
+            from nnseg.serve import _fetch_idc_series
+            while not stop.is_set():
+                series = scan_once()
+                if series is None:
+                    stop.wait(2.0)
+                    continue
+                base = _prefetch_base(series)
+                try:
+                    base.mkdir(parents=True)   # atomic claim: one writer per series
+                except FileExistsError:
+                    return                     # done, or another thread is on it
+                t_f = time.time()
+                _fetch_idc_series(series, base)
+                (base / ".done").touch()
+                print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
+                      f"(parallel to {current_jid})", flush=True)
+                return                         # one-ahead only
+        except Exception as e:
+            print(f"[prefetch] failed: {e}", flush=True)
+            if base is not None:
+                shutil.rmtree(str(base), ignore_errors=True)
+
+    threading.Thread(target=work, name="nnseg-prefetch", daemon=True).start()
 
 
 def _emit(jid: str, update: dict) -> None:
@@ -148,7 +223,10 @@ class Worker:
                 _emit(jid, {"progress": asdict(p)})
 
         token = CancelToken()
+        series = None
         _emit(jid, {"state": "running", "started": time.time()})
+        prefetch_stop = threading.Event()
+        _prefetch_next(jid, prefetch_stop)   # CPU downloader, parallel to this GPU job
         try:
             if meta["task"] not in self._ensured:
                 # a Volume.commit scans the whole multi-GB weights tree - measured as
@@ -160,8 +238,16 @@ class Worker:
             src = (meta.get("source") or [{"kind": "upload"}])[0]
             if src.get("kind") == "idc":
                 rep = Reporter.of(on_progress, cancel=token)
-                rep.stage("fetch", str(src.get("crdc_series_uuid", ""))[:13])
-                input_path = _fetch_idc_series(src["crdc_series_uuid"], Path("/dev/shm"))
+                series = src["crdc_series_uuid"]
+                input_path = _prefetched_or_none(series, rep)
+                if input_path is not None:
+                    rep.stage("fetch", "prefetched")
+                    print(f"[fetch] {series[:13]} prefetched", flush=True)
+                else:
+                    rep.stage("fetch", series[:13])
+                    t_f = time.time()
+                    input_path = _fetch_idc_series(series, Path("/dev/shm"))
+                    print(f"[fetch] {series[:13]} inline {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
             else:
                 jobs_vol.reload()
@@ -189,6 +275,11 @@ class Worker:
             _emit(jid, {"state": "failed", "finished": time.time(),
                         "error": f"{type(e).__name__}: {e}"})
         finally:
+            prefetch_stop.set()            # end the scan loop with the run
+            if series is not None:         # bound tmpfs: drop this job's staged input
+                import shutil
+                shutil.rmtree(str(_prefetch_base(series)), ignore_errors=True)
+                shutil.rmtree(f"/dev/shm/{series}", ignore_errors=True)
             if meta.get("cache_key"):
                 try:
                     del jobs_dict[f"inflight:{meta['cache_key']}"]

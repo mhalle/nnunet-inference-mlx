@@ -173,6 +173,9 @@ class JobRecord:
     cache_key: str | None = None
     cancel_token: CancelToken = field(default_factory=CancelToken)
     subscribers: list = field(default_factory=list)   # (event_loop, asyncio.Queue)
+    fetch_claimed: bool = False                   # exactly one fetcher per record
+    fetch_done: threading.Event | None = None
+    fetch_ok: bool = False
 
 
 class LocalExecutor:
@@ -243,8 +246,11 @@ class LocalExecutor:
             self._pending.append(jid)
             if rec.cache_key:
                 self._inflight[rec.cache_key] = jid
+            busy = any(r.state == "running" for r in self._jobs.values())
             self._cv.notify()
         self._emit(rec)
+        if busy:
+            self._prefetch_next()          # overlap this fetch with the running job
         return rec
 
     # -- cache face (shared by the path surface and the public tier) ---------
@@ -354,13 +360,27 @@ class LocalExecutor:
                 rec.state, rec.started = "running", time.time()
             self._emit(rec)
             self._requeue_positions()
+            self._prefetch_next()          # the CPU downloader, parallel to this GPU job
             try:
                 reporter = Reporter.of(progress=lambda p, r=rec: self._on_progress(r, p),
                                        cancel=rec.cancel_token)
                 src = rec.source[0] if rec.source else {"kind": "upload"}
                 if src.get("kind") == "idc":
-                    reporter.stage("fetch", str(src.get("crdc_series_uuid", ""))[:13])
-                    rec.input_path = Path(self._fetch_idc(src["crdc_series_uuid"], rec.dir))
+                    with self._cv:
+                        theirs = rec.fetch_claimed
+                        if not theirs:
+                            rec.fetch_claimed = True
+                    dest = rec.dir / "series"
+                    if theirs:
+                        reporter.stage("fetch", "prefetched")
+                        while not rec.fetch_done.wait(0.2):
+                            reporter.check()   # cancellable while the prefetch runs
+                    if rec.fetch_ok:
+                        rec.input_path = dest
+                    else:
+                        reporter.stage("fetch", str(src.get("crdc_series_uuid", ""))[:13])
+                        rec.input_path = Path(self._fetch_idc(src["crdc_series_uuid"], rec.dir))
+                        rec.fetch_ok = True
                     reporter.check()
                 seg = self._segment(rec.input_path, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
@@ -390,6 +410,38 @@ class LocalExecutor:
                         self._inflight.pop(rec.cache_key, None)
                 self._emit(rec)
                 self._evict()
+
+    def _prefetch_next(self) -> None:
+        """Best-effort: download the HEAD queued idc job's series on a background
+        thread while the GPU runs the current one. The fetch releases the GIL
+        (Rust + file IO), so it costs the GPU loop nothing. Claim-once protocol:
+        whoever flips ``fetch_claimed`` under the cv owns the record's single
+        fetch; the dispatcher waits on ``fetch_done`` instead of racing a second
+        writer into the same directory. On failure the partial directory is
+        removed and the dispatcher falls back to an inline fetch. This is the
+        pre-loading half of the IO-prefetch pipeline - it hides the fetch;
+        hiding the read is the follow-on."""
+        with self._cv:
+            nxt = self._jobs.get(self._pending[0]) if self._pending else None
+            if (nxt is None or nxt.state != "queued" or nxt.fetch_claimed
+                    or not nxt.source or nxt.source[0].get("kind") != "idc"
+                    or not nxt.source[0].get("crdc_series_uuid")):
+                return
+            nxt.fetch_claimed = True
+            nxt.fetch_done = threading.Event()
+        series = nxt.source[0]["crdc_series_uuid"]
+
+        def fetch(rec=nxt):
+            import shutil
+            try:
+                self._fetch_idc(series, rec.dir)
+                rec.fetch_ok = True
+            except Exception:
+                shutil.rmtree(rec.dir / "series", ignore_errors=True)
+            finally:
+                rec.fetch_done.set()
+
+        threading.Thread(target=fetch, name="nnseg-prefetch", daemon=True).start()
 
     def _on_progress(self, rec: JobRecord, p) -> None:
         rec.progress = asdict(p)
