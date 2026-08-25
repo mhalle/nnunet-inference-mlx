@@ -170,12 +170,17 @@ class SeriesCache:
         return token
 
     def _teardown_claim(self, entry: Path, token: str) -> None:
-        """Remove a failed claim - only while this writer still owns it."""
+        """Remove a failed claim - only while this writer PROVABLY owns it.
+        Unprovable (unreadable/absent .owner) means refuse: the successor's
+        claim exists ownerless between its mkdir and its .owner write, and a
+        writer whose own .owner write failed must not stay licensed to
+        delete whatever later occupies the path. An abandoned claim costs
+        one claim_timeout - the reclaim path collects it."""
         try:
             if (entry / ".owner").read_text() != token:
                 return                     # reclaimed by a successor: not ours
         except OSError:
-            pass                           # our own partial claim: still ours
+            return                         # cannot prove ownership: never delete
         shutil.rmtree(entry, ignore_errors=True)
 
     def _hb_start(self, entry: Path):
@@ -229,15 +234,20 @@ class SeriesCache:
                 entry.mkdir(parents=True)      # atomic claim: one writer per series
             except FileExistsError:
                 deadline = time.time() + self.claim_timeout
+                extensions = 0
                 while not marker.exists():
                     if not entry.exists():
                         break                  # writer failed and cleaned up; reclaim
                     if time.time() > deadline:
-                        if self._writer_alive(entry):
+                        if self._writer_alive(entry) and extensions < 3:
                             # slow but alive: extend rather than destroy - a
                             # timeout teardown of a LIVE writer aliases two
                             # writers onto one path and they destroy each
-                            # other's work
+                            # other's work. BOUNDED: the heartbeat proves the
+                            # process lives, not that the fetch progresses; a
+                            # hung fetch must not wedge this waiter forever
+                            # (owner tokens make the eventual reclaim safe).
+                            extensions += 1
                             deadline = time.time() + self.claim_timeout
                         else:
                             # dead claim: rename to a graveyard name first so
@@ -911,7 +921,13 @@ class LocalExecutor:
                     rec.state = "done"
 
                 def _set_pending(key: str) -> None:
-                    self._artifacts_pending[key] = rec.id
+                    # refuse-if-present: a duplicate flight must not ACQUIRE
+                    # ownership by stomping - it would then legally clear the
+                    # marker while the sibling's overlap still renders, and
+                    # probes would read a definitive 404 for artifacts that
+                    # land seconds later. The owner's finish clears; then a
+                    # later flight may set again.
+                    self._artifacts_pending.setdefault(key, rec.id)
 
                 def _clear_pending(key: str) -> None:
                     # only the owner clears: a duplicate flight's finish must
@@ -943,6 +959,8 @@ class LocalExecutor:
                 pass
             except Cancelled:
                 rec.state = "cancelled"
+                if rec.cache_key and self._artifacts_pending.get(rec.cache_key) == rec.id:
+                    self._artifacts_pending.pop(rec.cache_key, None)
             except Exception as e:             # noqa: BLE001 - reported to the client
                 rec.state = "failed"
                 rec.error = f"{type(e).__name__}: {e}"
@@ -1379,12 +1397,38 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         lister = getattr(executor, "cache_list", None)
         entries = lister() if lister else []
         keep = []                          # advertise only links that resolve
+        wv_memo: dict = {}                 # weights per task, once per request
         for e in entries:                  # on THIS app's mounted sources
             p = e.get("path") or ""
             parts = p.split("/", 3)
             pfx = parts[2] if len(parts) > 2 else None
-            if pfx is None or pfx in sources:
-                keep.append(e)
+            if pfx is not None and pfx not in sources:
+                continue
+            t = e.get("task")
+            canonical = canon_task(str(t)) if t is not None else None
+            if t is not None and canonical is None:
+                continue                   # task this catalog cannot serve
+            ident = (e.get("identity") or [None])[0]
+            key = e.get("key")
+            if canonical and ident and key:
+                # key round-trip: a stale-keyed entry's link 404s WITH a
+                # recompute hint - following the listing's own remedy would
+                # duplicate GPU work for bytes already cached
+                try:
+                    if _key_override is not None:
+                        fresh = _key_override(ident, canonical,
+                                              e.get("options") or {})
+                    else:
+                        if canonical not in wv_memo:
+                            wv_memo[canonical] = weights_versions_of(seg, canonical)
+                        fresh = result_key((ident,), canonical,
+                                           e.get("options") or {},
+                                           wv_memo[canonical])
+                    if fresh != key:
+                        continue
+                except Exception:
+                    pass
+            keep.append(e)
         return {"segmentations": keep}
 
     @app.get("/v1/tasks/{task}")
@@ -1613,21 +1657,34 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
     # -- the IDC path surface: results addressed like the source data ---------
     def _resource_headers(key: str) -> dict:
-        return {"Cache-Control": "public, max-age=3600", "ETag": f'"{key[:32]}"'}
+        # Vary: the 200s differ (Preference-Applied) by the Prefer header,
+        # and these are the public-cacheable responses
+        return {"Cache-Control": "public, max-age=3600",
+                "ETag": f'"{key[:32]}"', "Vary": "Prefer"}
 
     def _pref_headers(request, key: str) -> dict:
-        """Resource headers + the RFC 7240 echo: every route that applied a
-        Prefer: wait must say so - labels and artifacts alike."""
+        """Resource headers + the RFC 7240 echo of the token the client
+        SENT (respond-async is echoed as itself, never rewritten to
+        wait=0); applied uniformly - labels and artifacts, waits and
+        cache hits alike (a hit trivially satisfies wait=N)."""
         h = _resource_headers(key)
-        w = _prefer_wait_raw(request, wait_max)
-        if w is not None:
-            h["Preference-Applied"] = f"wait={int(w)}"
+        for raw in request.headers.getlist("prefer"):
+            for token in raw.split(","):
+                token = token.strip().lower()
+                if token == "respond-async":
+                    h["Preference-Applied"] = "respond-async"
+                    return h
+                if token.startswith("wait="):
+                    w = _prefer_wait_raw(request, wait_max)
+                    if w is not None:
+                        h["Preference-Applied"] = f"wait={int(w)}"
+                    return h
         return h
 
-    # Registered BEFORE the GET: Starlette auto-adds HEAD to GET routes, which
-    # would run the full handler - a `curl -I` on a miss would start a GPU job.
-    # HEAD is the compute-free probe, and the one place status codes distinguish
-    # in-flight: 200 materialized / 202 computing (authorized view) / 404 absent.
+    # The explicit HEAD registration is the compute-free probe, and the one
+    # place status codes distinguish in-flight: 200 materialized / 202
+    # computing / 404 absent. (FastAPI's APIRoute does NOT auto-add HEAD to
+    # GETs - registering probes first is belt-and-braces, not load-bearing.)
     def _mount_source(prefix: str, srcobj) -> None:
         """The path surface for one data source: probe / blocking GET / evict /
         meta / preview, all parameterized by the source's prefix, identifier
@@ -1696,7 +1753,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if hit is not None:
                     return FileResponse(hit[0], media_type="application/octet-stream",
                                         filename=fname,
-                                        headers=_resource_headers(key))
+                                        headers=_pref_headers(request, key))
                 jid = executor.find_inflight(key)  # single flight: ride an existing run
                 is_authed = authed(request)
                 if not is_authed and jid is None:
@@ -1737,13 +1794,18 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     await asyncio.sleep(0.5)
                     nxt = executor.status_of(jid)
                     if nxt is None:        # record purged mid-watch: the cache
-                        nxt = ({"state": "done"}   # is the remaining truth
-                               if executor.cache_get(key) is not None
-                               else {"state": "failed",
-                                     "error": "job no longer tracked"})
+                        if executor.cache_get(key) is not None:
+                            nxt = {"state": "done"}
+                        else:              # job gone, bytes gone - the honest
+                                           # answer is absence, NOT a
+                                           # synthesized failure (the job may
+                                           # have succeeded under no cache)
+                            raise HTTPException(404, "not materialized")
                     snap = nxt
-                if snap.get("state") == "done":
-                    hit = executor.cache_get(key)
+                hit = executor.cache_get(key)
+                if snap.get("state") == "done" or hit is not None:
+                    # a hit wins even against a failed/cancelled marker:
+                    # under duplicate flights the sibling may have published
                     headers = _pref_headers(request, key)
                     src_path = hit[0] if hit else executor.result_file(jid)[1]
                     if src_path is None:       # evicted between done and read
@@ -1837,15 +1899,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 key = keyed(norm(ident), task, gopts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
+                w = _prefer_wait_raw(request, wait_max)
+                deadline = None if w is None else time.time() + w
                 hit = executor.cache_get(key)
                 if hit is None:
-                    w = _prefer_wait_raw(request, wait_max)
-                    deadline = None if w is None else time.time() + w
                     hit = await _materialize_entry(request, norm(ident),
                                                    canon_task(task), gopts, key,
                                                    deadline)
                 png = await _await_artifact(request, key, hit,
-                                            "preview.png", "preview")
+                                            "preview.png", "preview",
+                                            deadline=deadline)
                 return FileResponse(png, media_type="image/png",
                                     headers=_pref_headers(request, key))
 
@@ -1859,8 +1922,11 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             from any derived resource; implicit reads (no Prefer - e.g. bulk
             <img> preview embeds) never compute, and anonymous never computes
             anywhere. WATCHING an already-running flight is read-only and
-            open to anyone, exactly as on the labels URL - the gates guard
-            initiation only. Returns the cache hit, or raises 202/404/429."""
+            open to anyone, as on the labels URL - the gates guard initiation
+            only. (Deliberate asymmetry: without Prefer this returns
+            immediately - implicit reads never hold a connection - while the
+            labels URL holds wait_default for watchers.) Returns the cache
+            hit, or raises 202/404/429."""
             jid = executor.find_inflight(key)
             if jid is None:
                 if not authed(request):
@@ -1894,33 +1960,41 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 await asyncio.sleep(0.5)
                 nxt = executor.status_of(jid)
                 if nxt is None:            # record purged mid-watch
-                    nxt = ({"state": "done"}
-                           if executor.cache_get(key) is not None
-                           else {"state": "failed",
-                                 "error": "job no longer tracked"})
+                    if executor.cache_get(key) is not None:
+                        nxt = {"state": "done"}
+                    else:                  # job gone, bytes gone: absence,
+                                           # never a synthesized failure
+                        raise HTTPException(404, "not materialized")
                 snap = nxt
-            if snap.get("state") == "failed":
+            hit = executor.cache_get(key)
+            if hit is not None:            # a hit wins even against a failed/
+                return hit                 # cancelled marker (duplicate flights)
+            st = snap.get("state")
+            if st == "cancelled":          # terminal without a result: absence
+                raise HTTPException(404, "not materialized")   # (202 here looped
+            if st == "failed":                                 # a poller forever)
                 if not authed(request):    # watcher's view: it just is not there
                     raise HTTPException(404, "not materialized")
                 raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
-            hit = executor.cache_get(key)
-            if hit is None:                    # in flight; patience exhausted (or 0)
-                raise HTTPException(202, detail="materializing",
-                                    headers=_progress_headers(snap.get("progress"),
-                                                              {"Retry-After": "5"}))
-            return hit
+            raise HTTPException(202, detail="materializing",
+                                headers=_progress_headers(snap.get("progress"),
+                                                          {"Retry-After": "5"}))
 
-        async def _await_artifact(request, key, hit, filename: str, what: str):
+        async def _await_artifact(request, key, hit, filename: str, what: str,
+                                  deadline: float | None = None):
             """The artifact file, waiting out a pending overlap thread. 202 +
             Retry-After while pending (or Prefer: wait exhausted); 404 only
-            when its absence is definitive."""
+            when its absence is definitive. ``deadline`` is the REQUEST's one
+            Prefer budget, shared with the materialize leg - two legs must
+            not each spend wait_max."""
             path = Path(hit[0]).parent / filename
             if path.exists():
                 return path
             state_fn = getattr(executor, "artifact_state", None)
             pending = state_fn is not None and state_fn(key) == "pending"
             if pending:
-                deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                if deadline is None:
+                    deadline = time.time()
                 while time.time() < deadline:
                     await asyncio.sleep(0.2)
                     if path.exists():
@@ -1943,20 +2017,21 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 key = keyed(norm(ident), task, opts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
+                w = _prefer_wait_raw(request, wait_max)
+                deadline = None if w is None else time.time() + w
                 hit = executor.cache_get(key)
                 if hit is None:
-                    w = _prefer_wait_raw(request, wait_max)
-                    deadline = None if w is None else time.time() + w
                     hit = await _materialize_entry(request, norm(ident),
                                                    canon_task(task), opts, key,
                                                    deadline)
-                return key, hit
+                return key, hit, deadline
 
             @app.get(base + f"/statistics{tok}.json")
             async def statistics_json(request: Request, ident: str, task: str):
-                key, hit = await _stats_key(request, ident, task, gopts)
+                key, hit, deadline = await _stats_key(request, ident, task, gopts)
                 sj = await _await_artifact(request, key, hit,
-                                           "statistics.json", "statistics")
+                                           "statistics.json", "statistics",
+                                           deadline=deadline)
                 return JSONResponse(json.loads(sj.read_text()),
                                     headers=_pref_headers(request, key))
 
@@ -1964,9 +2039,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             async def statistics_tsv_view(request: Request, ident: str, task: str):
                 from fastapi import Response
                 from .statistics import statistics_tsv
-                key, hit = await _stats_key(request, ident, task, gopts)
+                key, hit, deadline = await _stats_key(request, ident, task, gopts)
                 sj = await _await_artifact(request, key, hit,
-                                           "statistics.json", "statistics")
+                                           "statistics.json", "statistics",
+                                           deadline=deadline)
                 return Response(statistics_tsv(json.loads(sj.read_text())),
                                 media_type="text/tab-separated-values",
                                 headers=_pref_headers(request, key))

@@ -2273,3 +2273,129 @@ def test_claim_teardown_respects_ownership(tmp_path):
         assert sc._writer_alive(e2), "live writer declared dead"
     finally:
         hb.set()
+
+
+def _idc_app(tmp_path, monkeypatch, seg=None):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = seg or FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    return seg, ex, TestClient(create_app(ex))
+
+
+def test_purged_record_resolves_via_cache_not_failure(tmp_path, monkeypatch):
+    """Opus verification round: a job record purged mid-watch resolves
+    through the cache - 200 promptly when the bytes exist, 404 'not
+    materialized' when they don't. Never a synthesized 502 for a job that
+    may have succeeded."""
+    seg, ex, client = _idc_app(tmp_path, monkeypatch)
+    u = "3be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert client.get(url, headers={"Prefer": "wait=30"}).status_code == 200
+    key = next(d.name for d in (tmp_path / "rc").iterdir())
+
+    monkeypatch.setattr(LocalExecutor, "find_inflight", lambda self, k: "zombie")
+    monkeypatch.setattr(LocalExecutor, "status_of", lambda self, j: None)
+    hit = ex.cache.get(key)
+
+    def gated_get(self, k):                # miss at route entry, hit in-loop
+        calls["n"] += 1
+        return None if calls["n"] == 1 else (hit if k == key else None)
+
+    calls = {"n": 0}
+    monkeypatch.setattr(LocalExecutor, "cache_get", gated_get)
+    t0 = time.time()
+    r = client.get(url, headers={"Prefer": "wait=30"})
+    assert r.status_code == 200
+    assert time.time() - t0 < 10, "burned the deadline on a purged record"
+    # bytes gone too: absence, not failure
+    monkeypatch.setattr(LocalExecutor, "cache_get", lambda self, k: None)
+    r = client.get(url, headers={"Prefer": "wait=30"})
+    assert r.status_code == 404
+    assert "failed" not in r.text
+
+
+def test_cancelled_flight_artifact_is_absent_not_forever_202(tmp_path, monkeypatch):
+    """Opus verification round: a cancelled flight must not leave artifact
+    URLs answering 'materializing' 202 forever - terminal without a result
+    is absence."""
+    seg, ex, client = _idc_app(tmp_path, monkeypatch)
+    u = "4be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    monkeypatch.setattr(LocalExecutor, "find_inflight", lambda self, k: "zombie")
+    monkeypatch.setattr(LocalExecutor, "status_of",
+                        lambda self, j: {"state": "cancelled"})
+    r = client.get(f"/v1/idc/{u}/total_fast/statistics.tsv",
+                   headers={"Prefer": "wait=0"})
+    assert r.status_code == 404, r.status_code
+    # failed flight, anonymous watcher: 404 with no job vocabulary or error
+    app2 = create_app(ex, token="s3cret")
+    client2 = TestClient(app2)
+    monkeypatch.setattr(LocalExecutor, "status_of",
+                        lambda self, j: {"state": "failed", "error": "boom"})
+    r = client2.get(f"/v1/idc/{u}/total_fast/preview.png",
+                    headers={"Prefer": "wait=0"})
+    assert r.status_code == 404 and "boom" not in r.text
+
+
+def test_listing_advertises_only_resolvable_links(tmp_path, monkeypatch):
+    """Opus verification round: the listing filters unknown-task and
+    stale-key entries - a stale link 404s WITH a recompute hint, so
+    following the listing's own remedy would duplicate GPU work."""
+    from nnseg.serve import result_key, weights_versions_of
+    seg, ex, client = _idc_app(tmp_path, monkeypatch)
+    u = "5be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    src = tmp_path / "l.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bx")
+    good = result_key((f"idc:{u}",), "total_fast", {},
+                      weights_versions_of(seg, "total_fast"))
+    ex.cache.put(good, src, {}, {"identity": [f"idc:{u}"], "task": "total_fast",
+                                 "options": {}})
+    ex.cache.put("stalekey123", src, {}, {"identity": [f"idc:{u}"],
+                                          "task": "total_fast", "options": {}})
+    ex.cache.put("ghosttask456", src, {}, {"identity": [f"idc:{u}"],
+                                           "task": "no_such_task", "options": {}})
+    got = {e["key"] for e in client.get("/v1/segmentations").json()["segmentations"]}
+    assert good in got
+    assert "stalekey123" not in got        # link would 404-and-suggest-recompute
+    assert "ghosttask456" not in got       # task this catalog cannot serve
+
+
+def test_preference_echo_uniform_and_varied(tmp_path, monkeypatch):
+    """Opus verification round: the echo is uniform (labels cache hits too),
+    respond-async is echoed as itself, and the 200s declare Vary: Prefer."""
+    seg, ex, client = _idc_app(tmp_path, monkeypatch)
+    u = "6be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert client.get(url, headers={"Prefer": "wait=30"}).status_code == 200
+    r = client.get(url, headers={"Prefer": "wait=7"})   # cache hit WITH Prefer
+    assert r.headers.get("Preference-Applied") == "wait=7"
+    assert r.headers.get("Vary") == "Prefer"
+    r = client.get(url, headers={"Prefer": "respond-async"})
+    assert r.headers.get("Preference-Applied") == "respond-async"
+    r = client.get(url)
+    assert "preference-applied" not in {k.lower() for k in r.headers}
+
+
+def test_result_cache_temp_names_unique_per_writer(tmp_path, monkeypatch):
+    from nnseg.serve import ResultCache
+    rc = ResultCache(tmp_path / "rc", keep=5)
+    src = tmp_path / "l.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bx")
+    seen = []
+    import os as _os
+    real = _os.replace
+    monkeypatch.setattr("os.replace",
+                        lambda a, b: (seen.append(Path(a).name), real(a, b))[1])
+    from pathlib import Path
+    rc.put("k", src, {}, {})
+    rc.put("k", src, {}, {})
+    labels_tmps = [n for n in seen if n.startswith("labels")]
+    assert len(labels_tmps) == 2 and labels_tmps[0] != labels_tmps[1]

@@ -100,13 +100,45 @@ jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
-def _clear_own_artifacts_marker(jid: str, meta: dict) -> None:
-    """Best-effort: drop this job's artifacts-pending marker on a failure
-    path (the overlap worker owns it on success). Without this a put that
-    raised after set_pending left probes answering 202 until the sweep."""
-    key = meta.get("cache_key")
-    if not key:
-        return
+# -- marker operations -------------------------------------------------------
+# The ownership rules for the two marker namespaces, at module level so unit
+# tests can reach them (the closures they used to live in survived every
+# mutation). The Dict has no CAS: each guard is get-then-op, which closes the
+# always-loses cases; the residual one-RPC window is irreducible here.
+
+def _install_inflight(key: str, jid: str) -> None:
+    """Guarded install: never stomp a newer flight's marker. (A fresh submit
+    installs directly - a submit is always the genuinely newest flight.)"""
+    if jobs_dict.get(f"inflight:{key}") in (None, jid):
+        jobs_dict[f"inflight:{key}"] = jid
+
+
+def _release_inflight(key: str, jid: str) -> None:
+    """Compare-and-delete: under duplicate flights the marker names the
+    LATEST job, and this one may not be it - deleting unconditionally made
+    probes 404 while the survivor still ran and left DELETE unable to
+    cancel it."""
+    if jobs_dict.get(f"inflight:{key}") == jid:
+        try:
+            del jobs_dict[f"inflight:{key}"]
+        except Exception:
+            pass
+
+
+def _set_pending_marker(key: str, jid: str) -> None:
+    """Refuse-if-present: a duplicate flight must not ACQUIRE ownership by
+    stomping - it would then legally clear the marker while the sibling's
+    overlap still renders, and probes would read a definitive 404 for
+    artifacts that land seconds later."""
+    if jobs_dict.get(f"artifacts:{key}") is None:
+        jobs_dict[f"artifacts:{key}"] = {"state": "pending",
+                                         "t": time.time(), "job": jid}
+
+
+def _clear_pending_marker(key: str, jid: str) -> None:
+    """Owner-only clear. A legacy marker without a job field (pre-ownership
+    deploys) is treated as unowned and clearable by anyone - the sweep's
+    rule."""
     m = jobs_dict.get(f"artifacts:{key}")
     if isinstance(m, dict) and m.get("job") not in (None, jid):
         return
@@ -114,6 +146,15 @@ def _clear_own_artifacts_marker(jid: str, meta: dict) -> None:
         del jobs_dict[f"artifacts:{key}"]
     except Exception:
         pass
+
+
+def _clear_own_artifacts_marker(jid: str, meta: dict) -> None:
+    """Failure-path cleanup: drop this job's artifacts-pending marker (the
+    overlap worker owns it on success). Without this a put that raised
+    after set_pending left probes answering 202 until the sweep."""
+    key = meta.get("cache_key")
+    if key:
+        _clear_pending_marker(key, jid)
 
 
 def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
@@ -130,8 +171,11 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
     def scan_once():
         cands = []
         for k in jobs_dict.keys():
-            if str(k).startswith("inflight:") or k == current_jid:
-                continue
+            if ":" in str(k) or k == current_jid:
+                continue                   # namespaced markers (inflight:/
+                                           # artifacts:/cancel:) are not job
+                                           # records; cancel: values are bare
+                                           # floats and crashed this scan
             m = jobs_dict.get(k) or {}
             if m.get("state") != "queued" or m.get("kind") == "prepare":
                 continue                       # prepare has no input to stage
@@ -368,12 +412,7 @@ class Worker:
             except Exception as e:
                 print(f"[artifacts] overlap failed: {e}", flush=True)
             finally:
-                m = jobs_dict.get(f"artifacts:{cache_key}")
-                if not (isinstance(m, dict) and m.get("job") not in (None, jid)):
-                    try:                   # only the owner clears (duplicate
-                        del jobs_dict[f"artifacts:{cache_key}"]   # flights)
-                    except Exception:
-                        pass
+                _clear_pending_marker(cache_key, jid)
 
         artifact_overlap(pair, task, ARTIFACTS,
                          preview_out=Path("/dev/shm") / f"preview_{jid}.png",
@@ -481,31 +520,16 @@ class Worker:
             from nnseg.serve import publish_completion
 
             def _migrate(old_key: str, new_key: str) -> None:
-                # compare-and-delete / guarded install, the Local rule: under
-                # duplicate flights a marker names the LATEST job, and this
-                # job may not be it
-                if jobs_dict.get(f"inflight:{old_key}") == jid:
-                    try:
-                        del jobs_dict[f"inflight:{old_key}"]
-                    except Exception:
-                        pass
-                if jobs_dict.get(f"inflight:{new_key}") in (None, jid):
-                    jobs_dict[f"inflight:{new_key}"] = jid
+                _release_inflight(old_key, jid)
+                _install_inflight(new_key, jid)
                 meta["cache_key"] = new_key
                 _emit(jid, {"cache_key": new_key})
 
             def _set_pending(key: str) -> None:
-                jobs_dict[f"artifacts:{key}"] = {"state": "pending",
-                                                 "t": time.time(), "job": jid}
+                _set_pending_marker(key, jid)
 
             def _clear_pending(key: str) -> None:
-                m = jobs_dict.get(f"artifacts:{key}")
-                if isinstance(m, dict) and m.get("job") not in (None, jid):
-                    return                 # a duplicate flight owns it now
-                try:                       # worker never started: clear so
-                    del jobs_dict[f"artifacts:{key}"]   # probes don't wait
-                except Exception:          # out the sweep
-                    pass
+                _clear_pending_marker(key, jid)
 
             def _put(key: str) -> None:
                 ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
@@ -547,16 +571,8 @@ class Worker:
             prefetch_stop.set()            # end the scan loop with the run
             with self._vol_lock:
                 _bound_jobs_store(jid)
-            # compare-and-delete, the Local dispatcher's rule: under duplicate
-            # flights the marker names the LATEST job - deleting it
-            # unconditionally made probes 404 while the survivor still ran
-            # and left DELETE unable to cancel it
-            if (meta.get("cache_key")
-                    and jobs_dict.get(f"inflight:{meta['cache_key']}") == jid):
-                try:
-                    del jobs_dict[f"inflight:{meta['cache_key']}"]
-                except Exception:
-                    pass
+            if meta.get("cache_key"):
+                _release_inflight(meta["cache_key"], jid)
 
 
 class ModalExecutor:
@@ -602,20 +618,31 @@ class ModalExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return jid, d
 
+    _weights_reload_lock = threading.Lock()
+    _weights_reloaded_at = 0.0
+
     def _fresh_weights_versions(self, task):
         """weights_versions_of, but stale-proof: an API container's mounted
         weights volume is frozen at container start, so after the worker
         first-installs a task this side kept deriving weights=["unknown"] -
         every probe missed the re-keyed entry and every Prefer'd GET
         recomputed, for the container's remaining lifetime. On "unknown",
-        reload the volume once and re-derive."""
+        reload the volume and re-derive - THROTTLED to once per 30 s per
+        container: "unknown" is also the honest permanent answer for weights
+        nnseg did not install (TS-installed, hand-copied), and an unthrottled
+        version reloaded a multi-GB volume on every HEAD probe forever."""
         from nnseg.serve import weights_versions_of
         wv = weights_versions_of(self.segmenter, task)
         if any("unknown" in str(v) for v in wv):
-            try:
-                weights_vol.reload()
-            except Exception:
-                return wv
+            cls = type(self)
+            with cls._weights_reload_lock:
+                if time.time() - cls._weights_reloaded_at < 30.0:
+                    return wv
+                cls._weights_reloaded_at = time.time()
+                try:
+                    weights_vol.reload()
+                except Exception:
+                    return wv
             wv = weights_versions_of(self.segmenter, task)
         return wv
 
