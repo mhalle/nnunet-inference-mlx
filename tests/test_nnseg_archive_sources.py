@@ -190,3 +190,87 @@ def test_token_header_reaches_fetch_and_never_leaks(tmp_path):
     assert "sekrit" not in client.get("/v1/jobs").text
     assert "sekrit" not in client.get("/v1/segmentations").text
     assert "source_tokens" not in st
+
+
+def test_slashed_identifiers_get_the_full_path_surface(tmp_path, monkeypatch):
+    """Multi-segment identifiers (hf paths, zenodo recid/file!member) live in
+    ordinary URLs via greedy right-to-left routes: blocking GET initiates,
+    HEAD probes, meta and preview serve, DELETE evicts, and the listing links
+    the slashed path."""
+    import json as _json
+
+    import numpy as np
+    import SimpleITK as sitk
+    from fastapi.testclient import TestClient
+
+    from nnseg.serve import LocalExecutor, create_app
+    from test_nnseg_serve import FakeSegmenter
+
+    class DeepSource:
+        prefix = "deep"
+        id_pattern = r"[a-z0-9]+/[a-z0-9@.]+/[a-z0-9._/!-]+"
+        description = ""
+
+        def enabled(self):
+            return True
+
+        def identity(self, i):
+            return f"deep:{i}"
+
+        def describe(self):
+            return {"prefix": "deep", "id_pattern": self.id_pattern,
+                    "enabled": True, "description": ""}
+
+        def fetch(self, ident, dest_dir, *, credentials=None):
+            d = dest_dir / "series"
+            d.mkdir(parents=True, exist_ok=True)
+            a = np.full((16, 24, 24), -1000, np.int16)
+            a[4:12, 6:18, 6:18] = 40
+            sitk.WriteImage(sitk.GetImageFromArray(a), str(d / "vol.nii.gz"))
+            return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((16, 24, 24), np.uint8)
+                    a[5:10, 8:16, 8:16] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.2 0.6 0.9")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 1.0}
+                provenance = {}
+            return R()
+
+    seg = SavingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       sources=[DeepSource()])
+    client = TestClient(create_app(ex))
+    ident = "org1/repo@abc123.def/images/case7.nii.gz!inner/ct.nii.gz"
+    url = f"/v1/deep/{ident}/total_fast/labels.seg.nrrd"
+
+    r = client.get(url, headers={"Prefer": "wait=30"})   # blocking GET initiates
+    assert r.status_code == 200, r.text
+    assert client.head(url).status_code == 200           # probe sees it
+    m = client.get(f"/v1/deep/{ident}/total_fast/meta.json")
+    assert m.status_code == 200
+    try:
+        import matplotlib  # noqa: F401
+        p = client.get(f"/v1/deep/{ident}/total_fast/preview.png")
+        assert p.status_code == 200 and p.content[:4] == b"\x89PNG"
+    except ImportError:
+        pass
+    segs = client.get("/v1/segmentations").json()["segmentations"]
+    e = next(x for x in segs if x["identity"] == [f"deep:{ident}"])
+    assert e["path"] == url                              # slashed path listed
+    d = client.delete(url)
+    assert d.status_code == 200 and d.json()["deleted"]
+    assert client.head(url).status_code == 404           # gone
+    assert len(seg.calls) == 1

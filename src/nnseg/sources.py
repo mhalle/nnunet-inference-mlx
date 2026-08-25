@@ -328,7 +328,9 @@ class ArchiveReadingSource(DataSource):
         try:
             if not member:                 # plain file: stream it down whole
                 url, _size = self.resolve(outer, credentials)
-                name = Path(outer).name or "image"
+                name = Path(outer).name
+                if not name or name in (".", ".."):
+                    name = "image"
                 req = urllib.request.Request(url, headers=self._headers(credentials))
                 with urllib.request.urlopen(req, timeout=1800) as r,                         open(dest / name, "wb") as f:
                     shutil.copyfileobj(r, f, 1 << 20)

@@ -297,10 +297,9 @@ class ResultCache:
                     and not str(ident[0]).startswith("sha256:")
                     and not meta.get("options")):
                 prefix, one = str(ident[0]).split(":", 1)
-                if "/" not in one:             # multi-segment ids are not path-addressable
-                    entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
-                    if has_preview:
-                        entry["preview"] = f"/v1/{prefix}/{one}/{meta.get('task')}/preview.png"
+                entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
+                if has_preview:
+                    entry["preview"] = f"/v1/{prefix}/{one}/{meta.get('task')}/preview.png"
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]
@@ -1173,11 +1172,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     # in-flight: 200 materialized / 202 computing (authorized view) / 404 absent.
     def _mount_source(prefix: str, srcobj) -> None:
         """The path surface for one data source: probe / blocking GET / evict /
-        meta, all parameterized by the source's prefix, identifier pattern, and
-        identity. Adding a repository is defining a DataSource - these routes
-        come for free."""
+        meta / preview, all parameterized by the source's prefix, identifier
+        pattern, and identity. Routes are greedy catch-alls parsed
+        RIGHT-TO-LEFT: the artifact name is fixed and the task is exactly one
+        segment, so everything between the prefix and them is the identifier -
+        which is what lets multi-segment identifiers (hf repo@sha paths,
+        openneuro file paths, zenodo recid/file!member) live in ordinary URLs
+        with no percent-encoded slashes for proxies to mangle. The source's
+        id_pattern remains the validation boundary either way."""
         pat = srcobj.id_pattern
-        base = f"/v1/{prefix}/{{ident}}/{{task}}"
+        base = f"/v1/{prefix}/{{ident:path}}/{{task}}"
 
         def norm(ident: str) -> str:
             ident = ident.strip()
@@ -1370,7 +1374,7 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
 
     def _mount(prefix: str, srcobj) -> None:
         pat = srcobj.id_pattern
-        base = f"/v1/{prefix}/{{ident}}/{{task}}"
+        base = f"/v1/{prefix}/{{ident:path}}/{{task}}"
 
         def norm(ident: str) -> str:
             ident = ident.strip()
