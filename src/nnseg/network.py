@@ -207,6 +207,24 @@ def choose_accumulate(policy: str, *, device: torch.device, K: int, shape, bytes
                   f"{reserve / 1e9:.1f} GB vs {budget / 1e9:.2f} GB free on {device} (unmeasured)")
 
 
+def inverse_perm(perm) -> tuple:
+    """The permutation that undoes ``perm``."""
+    out = [0] * len(perm)
+    for i, p in enumerate(perm):
+        out[p] = i
+    return tuple(out)
+
+
+def canonical_spacing(spacing_t, fwd) -> tuple:
+    """Plans spacing (expressed in the transpose_forward frame) mapped back to
+    canonical (z, y, x) axis order: transposed axis ``k`` IS canonical axis
+    ``fwd[k]``, so its spacing lands at index ``fwd[k]``."""
+    out = [0.0] * len(fwd)
+    for k, sp in zip(fwd, spacing_t):
+        out[k] = float(sp)
+    return tuple(out)
+
+
 def available_folds(folder, folds) -> tuple:
     """The requested folds, restricted to the ``fold_*`` directories that exist.
 
@@ -256,6 +274,7 @@ class TorchModel:
     """
 
     def __init__(self, folder, *, folds=(0,), device="auto", dtype: str = "fp16", channels_last: bool = True,
+                 allow_transpose: bool = False,
                  surgery: bool = True, accumulate: str = "auto", step_size: float = 0.5,
                  activation_reserve_gb: float = DEFAULT_ACTIVATION_RESERVE_GB, batch_size="auto",
                  defer_device: bool = False):
@@ -288,16 +307,32 @@ class TorchModel:
         self.label_manager = p.label_manager
         self.K = int(p.label_manager.num_segmentation_heads)
         self.patch = tuple(int(x) for x in p.configuration_manager.patch_size)
-        self.spacing_zyx = tuple(float(x) for x in p.configuration_manager.spacing)
-        self.transpose_forward = tuple(p.plans_manager.transpose_forward)
-        if tuple(self.transpose_forward) != (0, 1, 2):
-            # nnU-Net permutes the spatial axes before preprocessing, and configuration_manager
-            # .spacing is already expressed in that permuted frame - so ignoring it silently
-            # resamples to the wrong spacing per axis. Refuse rather than be quietly wrong.
+        # nnU-Net permutes the spatial axes before preprocessing (transpose_forward), and
+        # configuration_manager.spacing and patch_size are expressed in that permuted frame.
+        # nnseg keeps everything OUTSIDE the network in canonical (z, y, x) order: spacing_zyx
+        # is mapped back to canonical here, and predict_logits permutes the tensor into the
+        # transposed frame only around the network itself (kernel anisotropy must see the
+        # axis order it was trained on), permuting the logits straight back. self.patch stays
+        # in the transposed frame - it is only ever applied to the permuted tensor.
+        self.transpose_forward = tuple(int(i) for i in p.plans_manager.transpose_forward)
+        self.transpose_backward = inverse_perm(self.transpose_forward)
+        declared_bwd = tuple(int(i) for i in getattr(p.plans_manager, "transpose_backward",
+                                                     self.transpose_backward))
+        if declared_bwd != self.transpose_backward:
             raise UnsupportedModel(
-                f"{self.folder.name}: plans set transpose_forward={self.transpose_forward}; nnseg "
-                "only supports the identity (0, 1, 2) today. The model spacing is expressed in the "
-                "transposed frame, so running it unpermuted would resample the wrong axes.")
+                f"{self.folder.name}: plans transpose_backward {declared_bwd} is not the "
+                f"inverse of transpose_forward {self.transpose_forward}")
+        self.spacing_zyx = canonical_spacing(p.configuration_manager.spacing,
+                                             self.transpose_forward)
+        if self.transpose_forward != (0, 1, 2) and not allow_transpose:
+            # The transposed path is implemented and spec-tested, but not yet confirmed
+            # against an external oracle (e.g. moosez output on the same case). Opt in
+            # deliberately rather than getting a silently-unvalidated geometry path.
+            raise UnsupportedModel(
+                f"{self.folder.name}: plans set transpose_forward={self.transpose_forward}. "
+                "nnseg implements transposed models but has not yet confirmed them against "
+                "an external oracle - pass allow_transpose=True to run this model, and "
+                "treat the output as pending confirmation.")
         self.fold_params = list(p.list_of_parameters)
         # Everything up to here is CPU work (checkpoint read, architecture build, surgery) and
         # safe to do on a helper thread. The device move is deliberately separate: a helper
@@ -371,6 +406,10 @@ class TorchModel:
 
         self.to_device()
         x = x.to(self.dtype)
+        transposed = self.transpose_forward != (0, 1, 2)
+        if transposed:
+            # the network's kernel anisotropy matches the frame it was trained on
+            x = x.permute((0, *(f + 1 for f in self.transpose_forward))).contiguous()
         padded, revert = pad_nd_image(x, self.patch, "constant", {"value": 0}, True, None)
         slicers = self.predictor._internal_get_sliding_window_slicers(padded.shape[1:])
         total = None
@@ -394,7 +433,10 @@ class TorchModel:
             torch.cuda.synchronize()
         elif self.device.type == "mps":
             torch.mps.synchronize()
-        return total[(slice(None), *revert[1:])]
+        out = total[(slice(None), *revert[1:])]
+        if transposed:
+            out = out.permute((0, *(b + 1 for b in self.transpose_backward))).contiguous()
+        return out
 
     def _patch(self, padded: torch.Tensor, sl):
         pred = self.net(padded[sl][None].to(self.device))[0]

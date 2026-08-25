@@ -19,7 +19,7 @@ from .tasks import TaskCatalog
 from .weights import as_store
 
 # Set once per deployment, and overridable per call.
-POLICY = ("device", "dtype", "weights", "folds", "accumulate", "batch_size",
+POLICY = ("device", "dtype", "weights", "folds", "accumulate", "batch_size", "allow_transpose",
           "resampling_order", "envelope_mm", "convention", "interp", "grid", "configuration")
 
 
@@ -40,7 +40,8 @@ class Segmenter:
                  catalog=None, folds=(0,), accumulate: str = "auto", batch_size="auto",
                  resampling_order: int = 3, envelope_mm: float | None = 20.0,
                  convention: str = "auto", interp: str = "linear", grid="input",
-                 configuration: str | None = None, cache_models: int = 1):
+                 configuration: str | None = None, cache_models: int = 1,
+                 allow_transpose: bool = False):
         self.models = ModelCache(capacity=cache_models)
         self.weights = as_store(weights)
         if catalog is None:
@@ -51,7 +52,7 @@ class Segmenter:
                            accumulate=accumulate, batch_size=batch_size,
                            resampling_order=resampling_order, envelope_mm=envelope_mm,
                            convention=convention, interp=interp, grid=grid,
-                           configuration=configuration)
+                           configuration=configuration, allow_transpose=allow_transpose)
 
     def resolve_task(self, task) -> str:
         """The canonical (ecosystem-qualified, unversioned) name for any

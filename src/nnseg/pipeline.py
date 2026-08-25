@@ -70,6 +70,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
             envelope_mm: float | None = 20.0, configuration: str | None = None,
+            allow_transpose: bool = False,
             models=None, cancel=None, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
@@ -128,7 +129,9 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     T: dict[str, float] = {}
     t0 = time.perf_counter()
     lock = device_lock(device)                            # reentrant: a Job already holds it
-    catalog = catalog or TaskCatalog("totalsegmentator")
+    if catalog is None:
+        from .ecosystems import EcosystemCatalog
+        catalog = EcosystemCatalog(root=as_store(weights).root)
     models = models if models is not None else ModelCache()   # no caching unless asked
     spec = _resolve_spec(task, catalog)
     # nnU-Net-native models were trained on their own preprocessing: skimage's half-pixel
@@ -171,7 +174,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     def load(wid):
         folder = store.resolve(wid, configuration=configuration)
         m = models.get(folder, folds=folds, device=device, dtype=dtype,
-                       accumulate=accumulate, batch_size=batch_size)
+                       accumulate=accumulate, batch_size=batch_size,
+                       allow_transpose=allow_transpose)
         # the folder name does NOT identify the weights version - Dataset297 ships as both
         # v2.0.0 and v2.0.4 and both unpack to the same name - so read what fetch_one recorded
         from .weights_fetch import installed_version
@@ -179,7 +183,10 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         prov["models"].append({"weights": str(wid), "folder": folder.name,
                                "version": rec.get("tag", "unknown"), "sha256": rec.get("sha256"),
                                "folds": list(available_folds(folder, folds)), "K": m.K,
-                               "spacing": tuple(round(v, 4) for v in m.spacing_zyx)})
+                               "spacing": tuple(round(v, 4) for v in m.spacing_zyx),
+                               **({"transpose_forward": list(m.transpose_forward),
+                                   "transpose_validated": False}
+                                  if m.transpose_forward != (0, 1, 2) else {})})
         return m
 
     def model_frame(model):

@@ -35,25 +35,29 @@ class ModelCache:
         self.misses = 0
 
     @staticmethod
-    def _key(folder, *, folds, device, dtype, accumulate, batch_size) -> tuple:
+    def _key(folder, *, folds, device, dtype, accumulate, batch_size,
+             allow_transpose=False) -> tuple:
         # every argument that changes what gets built or where it lives is part of the key;
         # reusing a model built under a different policy would silently ignore the new one
         f = folds if isinstance(folds, str) else tuple(int(x) for x in folds)
-        return (str(Path(folder)), f, str(device), str(dtype), str(accumulate), str(batch_size))
+        return (str(Path(folder)), f, str(device), str(dtype), str(accumulate),
+                str(batch_size), bool(allow_transpose))
 
     def get(self, folder, *, folds=(0,), device="auto", dtype="fp16", accumulate="auto",
-            batch_size="auto"):
+            batch_size="auto", allow_transpose=False):
         """A model for ``folder`` under this policy, warm if it is cached."""
         from .network import TorchModel
         key = self._key(folder, folds=folds, device=device, dtype=dtype,
-                        accumulate=accumulate, batch_size=batch_size)
+                        accumulate=accumulate, batch_size=batch_size,
+                        allow_transpose=allow_transpose)
         if key in self._warm:
             self.hits += 1
             self._warm.move_to_end(key)
             return self._warm[key]
         self.misses += 1
         model = TorchModel(folder, folds=folds, device=device, dtype=dtype,
-                           accumulate=accumulate, batch_size=batch_size).to_device()
+                           accumulate=accumulate, batch_size=batch_size,
+                           allow_transpose=allow_transpose).to_device()
         if self.capacity:
             self._warm[key] = model
             while len(self._warm) > self.capacity:
