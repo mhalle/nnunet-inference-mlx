@@ -1802,3 +1802,46 @@ def test_segmentations_listing_requires_auth_when_token_set(tmp_path):
     r = client.get("/v1/segmentations",
                    headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 200
+
+
+def test_first_install_rekeys_at_completion(tmp_path, monkeypatch):
+    """Review C7: a job keyed while weights versions were 'unknown' re-keys
+    at completion, so the entry is findable by every later probe instead of
+    orphaned under the unknown-key."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    class InstallingSeg(FakeSegmenter):
+        installed = False
+
+        def describe(self, task):
+            d = super().describe(task)
+            if self.installed:
+                d["weights_installed"] = [{"id": "297", "version": "v2"}]
+            return d
+
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            out = super().segment(image, task, progress=progress,
+                                  cancel=cancel, **options)
+            type(self).installed = True        # weights land during the run
+            return out
+
+    InstallingSeg.installed = False
+    seg = InstallingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert client.get(url, headers={"Prefer": "wait=30"}).status_code == 200
+    # post-install probes key with the REAL versions and must hit
+    assert client.head(url).status_code == 200
+    r = client.get(url)
+    assert r.status_code == 200
+    assert len(seg.calls) == 1                 # no recompute

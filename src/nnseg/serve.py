@@ -735,6 +735,22 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
+                # First run of a freshly-installed task: the key was built
+                # while weights versions were still "unknown"; they are
+                # knowable NOW, so re-key - otherwise this entry is orphaned
+                # under the unknown-key and every later probe misses forever.
+                if rec.cache_key:
+                    try:
+                        fresh = result_key(rec.input_identity, rec.task, rec.options,
+                                           weights_versions_of(self.segmenter, rec.task))
+                        if fresh != rec.cache_key:
+                            with self._cv:
+                                if self._inflight.get(rec.cache_key) == rec.id:
+                                    self._inflight.pop(rec.cache_key, None)
+                                self._inflight[fresh] = rec.id
+                                rec.cache_key = fresh
+                    except Exception:
+                        pass
                 pair = None
                 try:                       # only the LOAD stays inline (input alive,
                                            # ~0.3 s); render + statistics overlap with

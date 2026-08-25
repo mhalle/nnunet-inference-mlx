@@ -467,6 +467,22 @@ class Worker:
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
                       "provenance": s.provenance}
+            if meta.get("cache_key"):      # re-key now that weights versions are knowable
+                try:
+                    from nnseg.serve import result_key, weights_versions_of
+                    fresh = result_key(tuple(meta.get("input_identity") or ()),
+                                       meta["task"], meta.get("options") or {},
+                                       weights_versions_of(self.seg, meta["task"]))
+                    if fresh != meta["cache_key"]:
+                        try:
+                            del jobs_dict[f"inflight:{meta['cache_key']}"]
+                        except Exception:
+                            pass
+                        jobs_dict[f"inflight:{fresh}"] = jid
+                        meta["cache_key"] = fresh
+                        _emit(jid, {"cache_key": fresh})
+                except Exception:
+                    pass
             if meta.get("cache_key"):
                 ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
                     meta["cache_key"], jdir / RESULT_NAME, result,
