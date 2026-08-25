@@ -249,6 +249,17 @@ class ModalExecutor:
         meta = jobs_dict.get(jid) or {}
         return jid if meta.get("state") in ("queued", "running") else None
 
+    def cache_delete(self, key):
+        from nnseg.serve import ResultCache
+        try:
+            cache_vol.reload()
+        except Exception:
+            pass
+        deleted = ResultCache(CACHE_ROOT, keep=10 ** 6).delete(key)
+        if deleted:
+            cache_vol.commit()
+        return deleted
+
     def status_of(self, jid):
         meta = jobs_dict.get(jid)
         if meta is None:

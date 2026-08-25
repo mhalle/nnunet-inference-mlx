@@ -543,3 +543,51 @@ def test_public_app_is_read_only_by_construction(tmp_path):
     miss = client.get(f"/v1/idc/{'a'*8}-1111-2222-3333-{'b'*12}/total_fast/labels.seg.nrrd")
     assert miss.status_code == 404 and "authenticated" in miss.json()["detail"]
     assert client.post("/v1/jobs").status_code in (404, 405)   # no job routes exist
+
+
+def test_idc_delete_evicts_and_cancels_inflight(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate, steps=2)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex, token="s3cret"))
+    auth = {"Authorization": "Bearer s3cret"}
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+
+    assert client.delete(url).status_code == 401                  # anonymous: never
+    assert client.delete(url, headers=auth).status_code == 404    # nothing yet
+
+    gate.set()
+    assert client.get(url, headers={**auth, "Prefer": "wait=10"}).status_code == 200
+    r = client.delete(url, headers=auth)
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert client.delete(url, headers=auth).status_code == 404    # already gone
+    assert client.get(url, headers={**auth, "Prefer": "wait=10"}).status_code == 200
+    assert len(seg.calls) == 2                                    # recomputed after evict
+
+    gate.clear()
+    r202 = client.get(url, headers={**auth, "Prefer": "wait=0"})  # start compute #3... cached!
+    assert r202.status_code == 200                                # cache hit from run 2
+    client.delete(url, headers=auth)                              # clear again
+    r202 = client.get(url, headers={**auth, "Prefer": "wait=0"})
+    assert r202.status_code == 202                                # now computing, gated
+    jid = r202.json()["job"]
+    rd = client.delete(url, headers=auth)                         # delete mid-flight
+    assert rd.json().get("cancelled_job") == jid
+    gate.set()
+    t0 = time.time()
+    st = {}
+    while time.time() - t0 < 5:
+        st = client.get(f"/v1/jobs/{jid}", headers=auth).json()
+        if st.get("state") in ("cancelled", "done"):
+            break
+        time.sleep(0.02)
+    assert st.get("state") in ("cancelled", "done")

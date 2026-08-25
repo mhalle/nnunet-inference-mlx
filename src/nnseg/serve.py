@@ -126,6 +126,15 @@ class ResultCache:
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
         self.evict()
 
+    def delete(self, key: str) -> bool:
+        """Remove one entry; True if it existed."""
+        import shutil
+        d = self.root / key
+        if not d.is_dir():
+            return False
+        shutil.rmtree(d, ignore_errors=True)
+        return True
+
     def evict(self) -> None:
         import shutil
         dirs = [d for d in self.root.iterdir() if d.is_dir()]
@@ -247,6 +256,9 @@ class LocalExecutor:
             jid = self._inflight.get(key)
             rec = self._jobs.get(jid) if jid else None
         return jid if rec is not None and rec.state in ACTIVE else None
+
+    def cache_delete(self, key: str) -> bool:
+        return self.cache.delete(key) if self.cache is not None else False
 
     # -- introspection -------------------------------------------------------
     def get(self, jid: str) -> JobRecord | None:
@@ -803,6 +815,29 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                              "progress": snap.get("progress")},
                             status_code=202,
                             headers={"Retry-After": "10", "Cache-Control": "no-store"})
+
+    @app.delete("/v1/idc/{uuid}/{task}")
+    @app.delete("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
+    def idc_delete(request: Request, uuid: str, task: str):
+        """Evict the cached entry (authorized only). Also cancels any in-flight
+        single-flight compute for the same key - otherwise the entry would
+        repopulate moments after being cleared. DELETE + GET = recompute with
+        whatever is installed now; the jobs API's no_cache is the per-job form."""
+        require_auth(request)
+        uuid = uuid.strip().lower()
+        if not re.fullmatch(CRDC_RE, uuid) or task not in seg.tasks():
+            raise HTTPException(404, "unknown resource")
+        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
+        jid = executor.find_inflight(key)
+        if jid is not None:
+            executor.cancel(jid)
+        deleted = executor.cache_delete(key)
+        if not deleted and jid is None:
+            raise HTTPException(404, "not materialized")
+        out = {"deleted": deleted}
+        if jid is not None:
+            out["cancelled_job"] = jid
+        return out
 
     @app.get("/v1/idc/{uuid}/{task}/meta.json")
     def idc_meta(uuid: str, task: str):
