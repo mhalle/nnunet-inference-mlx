@@ -305,6 +305,9 @@ class ResultCache:
                     if has_preview:
                         entry["preview"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
                                             f"preview{infix}.png")
+                    if (d / "statistics.json").exists():
+                        entry["statistics"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
+                                               f"statistics{infix}.tsv")
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]
@@ -323,7 +326,7 @@ class ResultCache:
         return labels, result
 
     def put(self, key: str, labels_path, result: dict, meta: dict,
-            preview_path=None) -> None:
+            preview_path=None, statistics_path=None) -> None:
         import shutil
         d = self.root / key
         d.mkdir(parents=True, exist_ok=True)
@@ -333,6 +336,8 @@ class ResultCache:
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
         if preview_path and Path(preview_path).exists():
             shutil.copy2(preview_path, d / "preview.png")
+        if statistics_path and Path(statistics_path).exists():
+            shutil.copy2(statistics_path, d / "statistics.json")
         shutil.copy2(labels_path, d / RESULT_NAME)
         self.evict()
 
@@ -655,20 +660,27 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
-                preview = None
+                preview, stats = None, None
                 try:                       # best-effort: a preview never fails a job
                     from .preview import render_preview
                     preview = render_preview(inp, rec.labels_path,
                                              rec.dir / "preview.png", title=rec.task)
                 except Exception:
                     preview = None
+                try:                       # ditto statistics
+                    from .statistics import compute_statistics
+                    stats = compute_statistics(inp, rec.labels_path,
+                                               rec.dir / "statistics.json")
+                except Exception:
+                    stats = None
                 # cache BEFORE flipping state: anything that observes "done"
                 # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:
                     self.cache.put(rec.cache_key, rec.labels_path, rec.result,
                                    {"identity": list(rec.input_identity), "task": rec.task,
                                     "options": rec.options, "computed": rec.started,
-                                    "job": rec.id}, preview_path=preview)
+                                    "job": rec.id}, preview_path=preview,
+                                   statistics_path=stats)
                 rec.state = "done"
             except _PrepareDone:
                 pass
@@ -1392,6 +1404,36 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                     headers=_resource_headers(key))
 
         _grid_routes(_register_preview)
+
+        def _register_statistics(tok: str, gopts: dict):
+            def _stats_or_404(ident, task, opts):
+                key = keyed(norm(ident), task, opts)
+                if key is None:
+                    raise HTTPException(404, "unknown resource")
+                hit = executor.cache_get(key)
+                if hit is None:
+                    raise HTTPException(404, "not materialized")
+                sj = Path(hit[0]).parent / "statistics.json"
+                if not sj.exists():
+                    raise HTTPException(404, "no statistics for this result")
+                return key, sj
+
+            @app.get(base + f"/statistics{tok}.json")
+            def statistics_json(ident: str, task: str, _opts=gopts):
+                key, sj = _stats_or_404(ident, task, _opts)
+                return JSONResponse(json.loads(sj.read_text()),
+                                    headers=_resource_headers(key))
+
+            @app.get(base + f"/statistics{tok}.tsv")
+            def statistics_tsv_view(ident: str, task: str, _opts=gopts):
+                from fastapi import Response
+                from .statistics import statistics_tsv
+                key, sj = _stats_or_404(ident, task, _opts)
+                return Response(statistics_tsv(json.loads(sj.read_text())),
+                                media_type="text/tab-separated-values",
+                                headers=_resource_headers(key))
+
+        _grid_routes(_register_statistics)
 
     for _prefix, _srcobj in sources.items():
         _mount_source(_prefix, _srcobj)

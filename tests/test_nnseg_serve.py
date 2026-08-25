@@ -1386,3 +1386,76 @@ def test_grid_variant_1mm_is_a_distinct_addressable_resource(tmp_path, monkeypat
     assert d.status_code == 200 and d.json()["deleted"]
     assert client.head(f"{base}/labels_res-1mm.seg.nrrd").status_code == 404
     assert client.head(f"{base}/labels.seg.nrrd").status_code == 200   # default untouched
+
+
+def test_statistics_computed_and_served_json_and_tsv(tmp_path, monkeypatch):
+    """First-order statistics land beside the labels at completion and serve
+    as canonical JSON plus a derived TSV whose column names carry units."""
+    import numpy as np
+    import SimpleITK as sitk
+
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        a = np.full((20, 20, 20), -1000, np.int16)
+        a[5:15, 5:15, 5:15] = 100                       # the blob is 100 HU
+        img = sitk.GetImageFromArray(a)
+        img.SetSpacing((2.0, 2.0, 2.0))
+        sitk.WriteImage(img, str(d / "vol.nii.gz"))
+        return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((20, 20, 20), np.uint8)
+                    a[5:15, 5:15, 5:15] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetSpacing((2.0, 2.0, 2.0))
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.2 0.6 0.9")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 8.0}
+                provenance = {}
+            return R()
+
+    seg = SavingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    base = f"/v1/idc/{u}/total_fast"
+    assert client.get(f"{base}/labels.seg.nrrd",
+                      headers={"Prefer": "wait=30"}).status_code == 200
+
+    j = client.get(f"{base}/statistics.json")
+    assert j.status_code == 200
+    stats = j.json()
+    assert stats["units"]["intensity"] == "hu"
+    s0 = stats["structures"][0]
+    assert s0["structure"] == "blob"
+    assert s0["voxels"] == 1000                          # 10^3 voxels
+    assert abs(s0["volume_ml"] - 8.0) < 1e-6             # 1000 x 8 mm^3
+    assert s0["mean"] == 100.0 and s0["std"] == 0.0      # uniform blob
+
+    t = client.get(f"{base}/statistics.tsv")
+    assert t.status_code == 200
+    header = t.text.splitlines()[0].split("\t")
+    assert "volume_ml" in header and "mean_hu" in header  # units in columns
+    assert "centroid_r_mm" in header
+    row = t.text.splitlines()[1].split("\t")
+    assert row[0] == "blob" and row[3] == "8.0"
+
+    segs = client.get("/v1/segmentations").json()["segmentations"]
+    e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
+    assert e["statistics"] == f"{base}/statistics.tsv"
+    assert client.get(f"{base}/statistics_res-1mm.json").status_code == 404

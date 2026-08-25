@@ -375,7 +375,7 @@ class Worker:
             with self._vol_lock:
                 s.save(jdir / RESULT_NAME)
                 jobs_vol.commit()
-            preview = None
+            preview, stats = None, None
             try:                           # best-effort: a preview never fails a job -
                                            # rendered before the finally deletes the input
                 from nnseg.preview import render_preview
@@ -384,6 +384,12 @@ class Worker:
                                          title=meta["task"])
             except Exception:
                 preview = None
+            try:                           # ditto statistics
+                from nnseg.statistics import compute_statistics
+                stats = compute_statistics(input_path, jdir / RESULT_NAME,
+                                           Path("/dev/shm") / f"stats_{jid}.json")
+            except Exception:
+                stats = None
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
@@ -393,10 +399,12 @@ class Worker:
                     meta["cache_key"], jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
-                     "computed": meta.get("started")}, preview_path=preview)
+                     "computed": meta.get("started")}, preview_path=preview,
+                    statistics_path=stats)
                 cache_vol.commit()
-            if preview:
-                Path(preview).unlink(missing_ok=True)
+            for tmp_artifact in (preview, stats):
+                if tmp_artifact:
+                    Path(tmp_artifact).unlink(missing_ok=True)
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
