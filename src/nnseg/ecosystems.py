@@ -103,10 +103,14 @@ class TSEcosystem(ModelEcosystem):
         if version is not None:
             for pth in paths:
                 rec = installed_version(pth) or {}
-                if rec.get("tag") not in (version, None):
+                # exact-or-error: an UNKNOWN installed tag (no sidecar - TS's
+                # own downloader or a hand copy) must NOT silently satisfy a
+                # pin. The whole point of @version is reproducibility.
+                if rec.get("tag") != version:
+                    have = rec.get("tag") or "unknown (no version sidecar)"
                     raise ModelNotFound(
                         f"{task}@{version}: {Path(pth).name} is installed at "
-                        f"tag {rec.get('tag')!r} - remove it to switch versions")
+                        f"tag {have!r} - remove it to install the pinned version")
 
     def spec(self, task: str, root) -> TaskSpec:
         return self._catalog.get(task)
@@ -140,20 +144,30 @@ class MooseEcosystem(ModelEcosystem):
         return d.is_dir() and any(d.rglob("dataset.json"))
 
     def ensure(self, task: str, root, progress=None, version=None) -> None:
+        from .weights_fetch import installed_version
         entry = self._entries[task]
-        if version is not None and version != entry.get("tag"):
-            from .weights_fetch import installed_version
+        if version is not None:
+            # check the INSTALLED tag, always - matching the manifest tag is
+            # not proof the bytes ON DISK are that release (a regenerated
+            # manifest bumps the tag; the old folder keeps its old sidecar)
             rec = installed_version(self._folder(task, root)) or {}
             if rec.get("tag") == version:
-                return                     # an older manifest installed it; fine
-            raise ModelNotFound(
-                f"{task}@{version}: this manifest offers tag "
-                f"{entry.get('tag')!r} only")
+                return                     # provably the pinned bytes
+            if self.materialized(task, root):
+                have = rec.get("tag") or "unknown (no version sidecar)"
+                raise ModelNotFound(
+                    f"{task}@{version}: installed at tag {have!r} - remove "
+                    f"{self._folder(task, root).name} to install the pinned version")
+            if version != entry.get("tag"):
+                raise ModelNotFound(
+                    f"{task}@{version}: this manifest offers tag "
+                    f"{entry.get('tag')!r} only")
         if self.materialized(task, root):
             return
         dest_parent = Path(root).expanduser() / "moose"
         dest_parent.mkdir(parents=True, exist_ok=True)
-        _download_and_extract_zip(entry["url"], dest_parent, progress=progress)
+        _download_and_extract_zip(entry["url"], dest_parent, progress=progress,
+                                  sha256=entry.get("sha256"))
         folder = self._folder(task, root)
         if not folder.is_dir():
             raise ModelNotFound(
@@ -214,9 +228,13 @@ class NativeEcosystem(ModelEcosystem):
         return TaskSpec.from_model_folder(self._models[task], name=task)
 
 
-def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None) -> None:
-    """Fetch a release zip and unpack it under ``dest_parent``, refusing any
+def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None,
+                              sha256: str | None = None) -> None:
+    """Fetch a release zip and unpack it under ``dest_parent`` atomically,
+    verifying ``sha256`` when the manifest supplies one and refusing any
     member whose path would escape (zip-slip)."""
+    import os
+    import shutil
     import tempfile
     import urllib.request
     import zipfile
@@ -231,16 +249,37 @@ def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None) -> 
         except Exception as e:
             tmp_path.unlink(missing_ok=True)
             raise InputError(f"weights download failed: {e}") from e
+    if sha256:
+        import hashlib
+        h = hashlib.sha256()
+        with open(tmp_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sha256:
+            tmp_path.unlink(missing_ok=True)
+            raise InputError(f"weights zip digest mismatch: expected {sha256}, "
+                             f"got {h.hexdigest()}")
+    # extract into a sibling temp dir, then os.replace into place: an
+    # interrupted unpack must never leave a folder that materialized() calls
+    # complete (dataset.json present, checkpoints missing) - the exact trap
+    # fetch_one's temp+rename avoids on the TS side
+    staging = Path(tempfile.mkdtemp(dir=dest_parent, prefix=".unzip-"))
     try:
         with zipfile.ZipFile(tmp_path) as z:
-            base = dest_parent.resolve()
+            base = staging.resolve()
             for m in z.infolist():
-                target = (dest_parent / m.filename).resolve()
+                target = (staging / m.filename).resolve()
                 if not target.is_relative_to(base):
                     raise InputError(f"zip member escapes destination: {m.filename!r}")
-            z.extractall(dest_parent)
+            z.extractall(staging)
+        for child in staging.iterdir():        # move the unpacked top-level
+            dest = dest_parent / child.name     # folder(s) into place atomically
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            os.replace(child, dest)
     finally:
         tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def registry(ecosystems=None) -> dict:

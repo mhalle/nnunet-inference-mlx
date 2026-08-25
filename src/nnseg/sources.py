@@ -21,6 +21,7 @@ Identity strings are ``"<prefix>:<identifier>"`` - the result-cache key
 component - so the ``idc`` source reproduces the established ``idc:<uuid>``
 identities byte for byte.
 """
+import os
 import re
 from pathlib import Path
 
@@ -103,15 +104,17 @@ class UrlTemplateSource(DataSource):
         return name if name and name not in (".", "..") else "image"
 
     def fetch(self, identifier: str, dest_dir: Path, *, credentials=None) -> Path:
-        import urllib.request
+        if _has_dotdot(identifier):
+            raise InputError(f"{self.prefix}:{identifier}: '..' path segment refused")
         url = self.url_template.format(id=identifier)
         dest = Path(dest_dir) / "series"
         dest.mkdir(exist_ok=True)
         out = dest / self._filename(identifier)
         try:
-            with urllib.request.urlopen(url, timeout=300) as r, open(out, "wb") as f:
-                while chunk := r.read(1 << 20):
-                    f.write(chunk)
+            with _OPENER.open(url, timeout=300) as r, open(out, "wb") as f:
+                _copy_capped(r, f, MAX_FETCH_BYTES, f"{self.prefix}:{identifier}")
+        except InputError:
+            raise
         except Exception as e:
             raise InputError(f"fetch of {self.prefix}:{identifier} failed: {e}") from e
         return dest
@@ -154,11 +157,17 @@ class IDCSource(DataSource):
         dest.mkdir(exist_ok=True)
 
         def one(k):
-            with open(dest / k.rsplit("/", 1)[-1], "wb") as f:
+            base = k.rsplit("/", 1)[-1]
+            if not base or base in (".", ".."):
+                return                     # bucket pseudo-dir key; skip
+            with open(dest / base, "wb") as f:
                 f.write(bytes(store.get(k).bytes()))
 
-        with ThreadPoolExecutor(32) as ex:
-            list(ex.map(one, keys))
+        try:
+            with ThreadPoolExecutor(32) as ex:
+                list(ex.map(one, keys))
+        except Exception as e:
+            raise InputError(f"fetch of idc:{identifier} failed: {e}") from e
         return dest
 
 
@@ -192,10 +201,20 @@ class TCIASource(DataSource):
                     f.write(chunk)
             n = 0
             with zipfile.ZipFile(tmp) as z:
+                if sum(zi.file_size for zi in z.infolist()) > MAX_FETCH_BYTES:
+                    raise InputError(f"tcia:{identifier}: series exceeds the "
+                                     f"{MAX_FETCH_BYTES}-byte cap")
+                seen: dict = {}
                 for m in z.infolist():
                     name = Path(m.filename).name   # flatten: zip paths never touch disk
                     if m.is_dir() or not name or name.startswith("."):
                         continue
+                    if name in seen:
+                        seen[name] += 1
+                        stem, dot, ext = name.partition(".")
+                        name = f"{stem}-{seen[name]}{dot}{ext}"
+                    else:
+                        seen[name] = 0
                     with z.open(m) as src, open(dest / name, "wb") as out:
                         shutil.copyfileobj(src, out)
                     n += 1
@@ -217,9 +236,59 @@ def openneuro_source() -> UrlTemplateSource:
     the jobs API, not the single-segment path surface)."""
     return UrlTemplateSource(
         "openneuro",
-        r"ds[0-9]{6}/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}",
+        r"(?!.*(?:^|/)\.\.(?:/|$))ds[0-9]{6}/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}",
         "https://s3.amazonaws.com/openneuro.org/{id}",
         description="OpenNeuro (CC0), by ds<number>/<file path>")
+
+
+MAX_FETCH_BYTES = int(float(os.environ.get("NNSEG_MAX_FETCH_GB", "16")) * (1 << 30))
+
+
+def _has_dotdot(identifier: str) -> bool:
+    """True if any path segment is '..' - such an identifier steers a
+    template/resolve URL off the operator's prefix (the remote or a proxy may
+    apply remove_dot_segments). The id_patterns also exclude it; this is the
+    belt to that suspenders, at the one place every fetch passes through."""
+    return any(seg == ".." for seg in re.split(r"[/\\]", identifier))
+
+
+def _copy_capped(src, dst, cap: int, what: str) -> int:
+    """copyfileobj with a hard byte ceiling - a server that lies about
+    Content-Length (or a bomb) cannot fill the disk."""
+    n = 0
+    while True:
+        chunk = src.read(1 << 20)
+        if not chunk:
+            return n
+        n += len(chunk)
+        if n > cap:
+            raise InputError(f"{what}: exceeded the {cap}-byte fetch cap")
+        dst.write(chunk)
+    return n
+
+
+def _safe_opener():
+    """A urllib opener that DROPS Authorization on a cross-host redirect.
+    urllib copies every header across redirects except content-*, so a
+    per-request source token would otherwise follow a first-hop redirect to
+    any host it names. httpx (the client) already does this; sources.py did
+    not."""
+    import urllib.request
+    from urllib.parse import urlparse
+
+    class _StripCrossHostAuth(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new is not None and urlparse(newurl).netloc != urlparse(
+                    req.full_url).netloc:
+                for k in [h for h in new.headers if h.lower() == "authorization"]:
+                    del new.headers[k]
+            return new
+
+    return urllib.request.build_opener(_StripCrossHostAuth)
+
+
+_OPENER = _safe_opener()
 
 
 class RangeFile:
@@ -260,10 +329,19 @@ class RangeFile:
         hi = min(self.size, lo + self.block_size) - 1
         req = urllib.request.Request(self.url,
                                      headers={**self.headers, "Range": f"bytes={lo}-{hi}"})
-        with urllib.request.urlopen(req, timeout=300) as r:
-            if r.status not in (200, 206):
-                raise InputError(f"range request refused ({r.status}) by {self.url}")
+        with _OPENER.open(req, timeout=300) as r:
+            if r.status != 206:
+                # a 200 means the server ignored Range and is streaming the
+                # WHOLE body - on a multi-GB archive that is an unbounded read
+                # into memory; refuse rather than pull it
+                raise InputError(
+                    f"range request not honored (status {r.status}) by "
+                    f"{self.url}; server does not support HTTP Range")
             data = r.read()
+        want = hi - lo + 1
+        if len(data) != want:
+            raise InputError(f"short/over range read from {self.url}: got "
+                             f"{len(data)} bytes, asked {want}")
         self._blocks[i] = data
         while len(self._blocks) > self.max_blocks:
             self._blocks.popitem(last=False)
@@ -305,16 +383,21 @@ class ArchiveReadingSource(DataSource):
         return {"Authorization": f"Bearer {credentials}"} if credentials else {}
 
     def _zip(self, outer: str, credentials=None):
-        """The parsed archive, opened once per source instance and reused for
-        the process lifetime (identifiers pin content, so reuse is safe; the
-        first opener's credentials ride along in the RangeFile headers)."""
+        """The parsed archive, cached per ``(outer, credentials)``. Keying on
+        the credential is load-bearing, not an optimization: on a cache hit
+        ``resolve`` is skipped, and ``resolve`` is the ONLY place the
+        restricted-access gate runs and the token is bound to the archive's
+        RangeFile. Caching by ``outer`` alone let a tokenless caller reuse an
+        earlier caller's authenticated archive - reading gated content and
+        replaying that caller's token upstream (round-4 finding)."""
         import zipfile
         cache = self.__dict__.setdefault("_archives", {})
-        z = cache.get(outer)
+        ck = (outer, credentials)
+        z = cache.get(ck)
         if z is None:
             url, size = self.resolve(outer, credentials)
             z = zipfile.ZipFile(RangeFile(url, size, headers=self._headers(credentials)))
-            cache[outer] = z
+            cache[ck] = z
             while len(cache) > 4:
                 cache.pop(next(iter(cache)))
         return z
@@ -323,6 +406,9 @@ class ArchiveReadingSource(DataSource):
         import shutil
         import urllib.request
         outer, _, member = identifier.partition("!")
+        if _has_dotdot(outer):             # the outer id steers the URL; the
+                                           # member is neutralized by flatten
+            raise InputError(f"{self.prefix}:{identifier}: '..' path segment refused")
         dest = Path(dest_dir) / "series"
         dest.mkdir(exist_ok=True)
         try:
@@ -332,8 +418,8 @@ class ArchiveReadingSource(DataSource):
                 if not name or name in (".", ".."):
                     name = "image"
                 req = urllib.request.Request(url, headers=self._headers(credentials))
-                with urllib.request.urlopen(req, timeout=1800) as r,                         open(dest / name, "wb") as f:
-                    shutil.copyfileobj(r, f, 1 << 20)
+                with _OPENER.open(req, timeout=1800) as r, open(dest / name, "wb") as f:
+                    _copy_capped(r, f, MAX_FETCH_BYTES, f"{self.prefix}:{identifier}")
                 return dest
             z = self._zip(outer, credentials)
             members = ([m for m in z.namelist()
@@ -341,10 +427,24 @@ class ArchiveReadingSource(DataSource):
                        if member.endswith("/") else [member])
             if not members:
                 raise InputError(f"{self.prefix}:{identifier}: no such member in archive")
+            # refuse a decompression bomb by declared uncompressed size BEFORE
+            # opening anything (the central directory is already parsed)
+            want = set(members)
+            total = sum(zi.file_size for zi in z.infolist() if zi.filename in want)
+            if total > MAX_FETCH_BYTES:
+                raise InputError(f"{self.prefix}:{identifier}: members total "
+                                 f"{total} bytes, over the {MAX_FETCH_BYTES} cap")
+            seen: dict = {}
             for m in members:
                 name = Path(m).name        # flatten: archive paths never touch disk
                 if not name or name.startswith("."):
                     continue
+                if name in seen:           # basename collision: disambiguate
+                    seen[name] += 1        # rather than silently overwrite
+                    stem, dot, ext = name.partition(".")
+                    name = f"{stem}-{seen[name]}{dot}{ext}"
+                else:
+                    seen[name] = 0
                 with z.open(m) as src, open(dest / name, "wb") as f:
                     shutil.copyfileobj(src, f, 1 << 20)
         except InputError:
@@ -363,7 +463,8 @@ class ZenodoSource(ArchiveReadingSource):
     readable by every cache reader regardless of who fetched the input."""
 
     prefix = "zenodo"
-    id_pattern = r"[0-9]{4,9}/[A-Za-z0-9._-]+(?:![A-Za-z0-9._ /-]+)?"
+    id_pattern = (r"(?!.*(?:^|/)\.\.(?:/|!|$))"
+                  r"[0-9]{4,9}/[A-Za-z0-9._-]+(?:![A-Za-z0-9._ /-]+)?")
     description = "Zenodo records, by record id / filename (!member for zip contents)"
 
     def __init__(self, *, allow_restricted: bool = False):
@@ -375,13 +476,16 @@ class ZenodoSource(ArchiveReadingSource):
         recid, _, filename = outer.partition("/")
         req = urllib.request.Request(f"https://zenodo.org/api/records/{recid}",
                                      headers=self._headers(credentials))
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with _OPENER.open(req, timeout=60) as r:
             rec = _json.load(r)
         access = ((rec.get("metadata") or {}).get("access_right")
-                  or (rec.get("access") or {}).get("files") or "open")
+                  or (rec.get("access") or {}).get("files") or "")
+        # fail CLOSED: absent/empty access fields (a narrowed API response, a
+        # schema move) must not read as "open"
         if access not in ("open", "public") and not self.allow_restricted:
             raise InputError(
-                f"zenodo record {recid} is {access!r}; this server only fetches open "
+                f"zenodo record {recid} is {access or 'of undeclared access'!r}; "
+                "this server only fetches open "
                 "records (operator opt-in required for restricted data - cached "
                 "results are readable by every cache reader)")
         for f in rec.get("files", []):
@@ -403,7 +507,8 @@ class HuggingFaceSource(ArchiveReadingSource):
     follow the same operator opt-in rule as Zenodo restricted records."""
 
     prefix = "hf"
-    id_pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+    id_pattern = (r"(?!.*(?:^|/)\.\.(?:/|!|$))"
+                  r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
                   r"@[0-9a-f]{40}/[A-Za-z0-9._/-]+(?:![A-Za-z0-9._ /-]+)?")
     description = "Hugging Face datasets, by org/name@commit-sha/path (!member for zips)"
 
@@ -418,7 +523,7 @@ class HuggingFaceSource(ArchiveReadingSource):
         req = urllib.request.Request(url, method="HEAD",
                                      headers=self._headers(credentials))
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with _OPENER.open(req, timeout=60) as r:
                 size = int(r.headers.get("Content-Length") or 0)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):

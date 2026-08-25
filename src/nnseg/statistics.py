@@ -55,6 +55,9 @@ def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | Non
         flat = lab.ravel()
         idx = np.flatnonzero(flat)
         labs = flat[idx].astype(np.int64)
+        keep = labs > 0                    # segment ids are positive; a signed
+        if not keep.all():                 # labelmap's negatives are not
+            idx, labs = idx[keep], labs[keep]   # structures (and crash bincount)
         vals_fg = gray.ravel()[idx]
         K = int(labs.max()) + 1 if labs.size else 1
         counts = np.bincount(labs, minlength=K)
@@ -72,10 +75,14 @@ def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | Non
         # Percentiles are nearest-rank on the exact distribution. Float grids
         # (resampled variants) take the sort path below.
         hist = None
-        if np.issubdtype(vals_fg.dtype, np.integer):
+        if labs.size and np.issubdtype(vals_fg.dtype, np.integer):
             vmin = int(vals_fg.min())
             nb = int(vals_fg.max()) - vmin + 1
-            if 0 < nb <= 1 << 16:
+            # K*nb is the histogram's footprint; nb alone was capped, but K is
+            # max_label_id+1 and a stray id in a stock model's dataset.json can
+            # blow it up (a daemon-thread MemoryError is swallowed; a cgroup
+            # OOM-kill is not). Fall to the sort path past ~128 MB.
+            if 0 < nb <= 1 << 16 and K * nb <= 1 << 24:
                 keys = labs * nb + (vals_fg.astype(np.int64) - vmin)
                 hist = np.bincount(keys, minlength=K * nb).reshape(K, nb)
                 bin_vals = np.arange(vmin, vmin + nb, dtype=np.float64)
@@ -104,10 +111,15 @@ def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | Non
                 stats_row = (mean, var ** 0.5, vmin_v, vmax_v, med, p10, p90)
             else:
                 seg_vals = vals[starts[v]:ends[v]]
-                p10, med, p90 = np.percentile(seg_vals, (10, 50, 90))
+                sv = np.sort(seg_vals)     # nearest-rank, matching the
+                                           # histogram path's searchsorted(cum,
+                                           # q*n, "left") on value-ordered bins
+                def _nr(q, sv=sv, n=n):
+                    k = min(n - 1, max(0, int(np.ceil(q * n)) - 1))
+                    return float(sv[k])
                 stats_row = (float(seg_vals.mean()), float(seg_vals.std()),
-                             float(seg_vals.min()), float(seg_vals.max()),
-                             float(med), float(p10), float(p90))
+                             float(sv[0]), float(sv[-1]),
+                             _nr(0.50), _nr(0.10), _nr(0.90))
             cz, cy, cx = (sums["z"][v] / n, sums["y"][v] / n, sums["x"][v] / n)
             pt = seg_r.TransformContinuousIndexToPhysicalPoint(
                 (float(cx), float(cy), float(cz)))
@@ -136,6 +148,11 @@ def statistics_tsv(stats: dict) -> str:
     """The cached statistics JSON rendered as a TSV: one row per structure,
     units carried in the column names (user decision) - volume_ml, mean_hu /
     mean_intensity, centroid_r_mm, ... Same numbers by construction."""
+    def _cell(x):
+        # a third-party structure name with a tab/newline would shift or split
+        # the row; collapse all whitespace-control to a single space
+        return " ".join(str(x).split()) if isinstance(x, str) else str(x)
+
     u = (stats.get("units") or {}).get("intensity", "intensity")
     cols = ["structure", "label", "voxels", "volume_ml",
             f"mean_{u}", f"std_{u}", f"min_{u}", f"max_{u}",
@@ -143,10 +160,11 @@ def statistics_tsv(stats: dict) -> str:
             "centroid_r_mm", "centroid_a_mm", "centroid_s_mm"]
     lines = ["\t".join(cols)]
     for s in stats.get("structures", []):
-        c = s.get("centroid_ras_mm") or ["", "", ""]
+        c = list(s.get("centroid_ras_mm") or [])
+        c = (c + ["", "", ""])[:3]         # tolerate a short/absent centroid
         row = [s.get("structure", ""), s.get("label", ""), s.get("voxels", ""),
                s.get("volume_ml", ""), s.get("mean", ""), s.get("std", ""),
                s.get("min", ""), s.get("max", ""), s.get("median", ""),
                s.get("p10", ""), s.get("p90", ""), c[0], c[1], c[2]]
-        lines.append("\t".join(str(x) for x in row))
+        lines.append("\t".join(_cell(x) for x in row))
     return "\n".join(lines) + "\n"

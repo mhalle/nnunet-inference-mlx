@@ -105,3 +105,75 @@ def test_version_selector_pins_installs(tmp_path):
     moose = MooseEcosystem()
     with pytest.raises(Exception, match="offers tag"):
         moose.ensure("clin_ct_fast_organs", tmp_path, version="not-a-tag")
+
+
+def test_ts_pin_refuses_unknown_installed_version(tmp_path, monkeypatch):
+    """Round 4 (E1): a sidecar-less weights folder (TS's own downloader, or a
+    hand copy) must NOT silently satisfy an @version pin."""
+    from nnseg.ecosystems import TSEcosystem
+    from nnseg.errors import ModelNotFound
+
+    eco = TSEcosystem()
+    folder = tmp_path / "Dataset297_Total"
+    folder.mkdir()
+    (folder / "dataset.json").write_text("{}")     # present, but NO version sidecar
+    monkeypatch.setattr("nnseg.weights_fetch.ensure_task_weights",
+                        lambda *a, **k: [folder])
+    with pytest.raises(ModelNotFound, match="unknown|remove"):
+        eco.ensure("total", tmp_path, version="v2.0.0")
+
+
+def test_moose_pin_checks_installed_not_manifest_tag(tmp_path):
+    """Round 4 (E2): matching the manifest tag is not proof the bytes on disk
+    are that release - a stale folder with an old sidecar must be refused."""
+    from nnseg.ecosystems import MooseEcosystem
+    from nnseg.errors import ModelNotFound
+    from nnseg.weights_fetch import _write_sidecar
+
+    moose = MooseEcosystem()
+    task = moose.tasks()[0]
+    entry = moose._entries[task]
+    folder = moose._folder(task, tmp_path)
+    folder.mkdir(parents=True)
+    (folder / "dataset.json").write_text("{}")     # materialized...
+    _write_sidecar(folder, "x", "OLD-RELEASE", {"url": "u"}, None)
+    with pytest.raises(ModelNotFound, match="OLD-RELEASE|remove"):
+        moose.ensure(task, tmp_path, version=entry["tag"])   # == manifest tag
+    # the matching installed tag passes
+    _write_sidecar(folder, "x", entry["tag"], {"url": "u"}, None)
+    moose.ensure(task, tmp_path, version=entry["tag"])        # no raise
+
+
+def test_moose_extract_is_atomic_and_digest_checked(tmp_path):
+    """Round 4 (E3): a digest mismatch is refused, and an interrupted unpack
+    leaves nothing materialized (temp dir + os.replace)."""
+    import io
+    import zipfile
+
+    from nnseg.ecosystems import _download_and_extract_zip
+    from nnseg.errors import InputError
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w") as z:
+        z.writestr("Dataset001/dataset.json", "{}")
+        z.writestr("Dataset001/fold_0/checkpoint.pth", b"weights")
+    payload = zbuf.getvalue()
+
+    import urllib.request
+    from unittest import mock
+
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    dest = tmp_path / "moose"
+    dest.mkdir()
+    with mock.patch.object(urllib.request, "urlopen",
+                           lambda *a, **k: R(payload)):
+        with pytest.raises(InputError, match="digest"):
+            _download_and_extract_zip("http://h/w.zip", dest, sha256="00" * 32)
+        assert not any(dest.iterdir())         # nothing left half-written
+        _download_and_extract_zip("http://h/w.zip", dest)   # no digest: ok
+    assert (dest / "Dataset001" / "dataset.json").exists()
+    assert (dest / "Dataset001" / "fold_0" / "checkpoint.pth").exists()
+    assert not list(dest.glob(".unzip-*"))     # staging cleaned

@@ -1199,9 +1199,12 @@ def _prefer_wait(request, default: float, maximum: float) -> float:
                 return 0.0
             if token.startswith("wait="):
                 try:
-                    return max(0.0, min(float(token[5:]), maximum))
+                    w = float(token[5:])
                 except ValueError:
-                    pass
+                    continue
+                if w != w:                 # NaN: min/max would pass it through
+                    return 0.0             # (order-dependent); pin it explicitly
+                return max(0.0, min(w, maximum))
     return default
 
 
@@ -1217,9 +1220,12 @@ def _prefer_wait_raw(request, maximum: float) -> float | None:
                 return 0.0
             if token.startswith("wait="):
                 try:
-                    return max(0.0, min(float(token[5:]), maximum))
+                    w = float(token[5:])
                 except ValueError:
-                    pass
+                    continue
+                if w != w:                 # NaN: min/max would pass it through
+                    return 0.0             # (order-dependent); pin it explicitly
+                return max(0.0, min(w, maximum))
     return None
 
 

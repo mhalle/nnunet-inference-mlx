@@ -1161,7 +1161,7 @@ def test_openneuro_is_a_data_only_source(tmp_path, monkeypatch):
         seen["url"] = url
         return FakeResp(b"\x1f\x8bmri")
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    monkeypatch.setattr("nnseg.sources._OPENER", type("O", (), {"open": staticmethod(fake_open)})())
     got = src.fetch("ds000001/sub-01/anat/sub-01_T1w.nii.gz", tmp_path)
     assert seen["url"].endswith("openneuro.org/ds000001/sub-01/anat/sub-01_T1w.nii.gz")
     assert (got / "sub-01_T1w.nii.gz").exists()          # basename keeps the format
@@ -2443,3 +2443,16 @@ def test_stale_pending_marker_ages_out(tmp_path):
     assert "K" not in ex._artifacts_pending
     ex._artifacts_pending["K"] = ("live-jid", time.time())
     assert ex.artifact_state("K") == "pending"
+
+
+def test_prefer_wait_never_nan():
+    """Round 4: wait=nan must not become a NaN deadline (min/max would pass it
+    through, order-dependent, and a NaN deadline never terminates a loop)."""
+    from types import SimpleNamespace
+
+    from nnseg.serve import _prefer_wait_raw
+    for tok in ("wait=nan", "wait=NaN", "wait=inf", "wait=1e309", "wait=-5"):
+        req = SimpleNamespace(headers=type("H", (), {
+            "getlist": lambda self, k, _t=tok: [_t]})())
+        w = _prefer_wait_raw(req, 110.0)
+        assert w is None or (w == w and 0.0 <= w <= 110.0), (tok, w)

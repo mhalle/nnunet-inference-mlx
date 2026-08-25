@@ -27,12 +27,31 @@ class RemoteClient:
             raise InputError("the remote client needs httpx: uv sync --extra remote "
                              "(or pip install 'nnseg[remote]')") from e
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self._httpx = httpx
         self._http = httpx.Client(base_url=server.rstrip("/"), headers=headers,
                                   timeout=timeout, follow_redirects=True)
 
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     # -- plumbing ------------------------------------------------------------
-    def _json(self, method: str, path: str, **kw) -> dict:
-        r = self._http.request(method, path, **kw)
+    def _json(self, method: str, path: str, *, _retries: int = 3, **kw) -> dict:
+        for attempt in range(_retries + 1):
+            r = self._http.request(method, path, **kw)
+            if r.status_code in (429, 503) and attempt < _retries:
+                try:
+                    wait = float(r.headers.get("Retry-After", "5"))
+                except ValueError:
+                    wait = 5.0
+                time.sleep(min(max(wait, 0.0), 60.0))
+                continue
+            break
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)
@@ -80,15 +99,24 @@ class RemoteClient:
         return self._json("DELETE", f"/v1/jobs/{job_id}")
 
     def fetch(self, job_id: str, output) -> Path:
+        import os
         out = Path(output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        part = out.with_name(out.name + ".part")
+        n = 0
         with self._http.stream("GET", f"/v1/jobs/{job_id}/result") as r:
             if r.status_code >= 400:
                 r.read()
                 raise RemoteError(f"result -> {r.status_code}: {r.text}")
-            out.parent.mkdir(parents=True, exist_ok=True)
-            with open(out, "wb") as f:
+            declared = r.headers.get("Content-Length")
+            with open(part, "wb") as f:
                 for chunk in r.iter_bytes():
                     f.write(chunk)
+                    n += len(chunk)
+        if declared is not None and n != int(declared):
+            part.unlink(missing_ok=True)   # truncated: leave no partial file
+            raise RemoteError(f"result truncated: got {n} of {declared} bytes")
+        os.replace(part, out)              # complete: publish atomically
         return out
 
     # -- progress ------------------------------------------------------------
@@ -96,7 +124,7 @@ class RemoteClient:
         """Status snapshots from the SSE stream; raises on transport failure -
         callers that need robustness use :meth:`wait`, which falls back to polling."""
         with self._http.stream("GET", f"/v1/jobs/{job_id}/events",
-                               timeout=None) as r:
+                               timeout=self._httpx.Timeout(None, read=45.0)) as r:
             if r.status_code >= 400:
                 r.read()
                 raise RemoteError(f"events -> {r.status_code}")

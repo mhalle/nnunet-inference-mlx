@@ -277,3 +277,76 @@ def test_slashed_identifiers_get_the_full_path_surface(tmp_path, monkeypatch):
     assert d.status_code == 200 and d.json()["deleted"]
     assert client.head(url).status_code == 404           # gone
     assert len(seg.calls) == 1
+
+
+def test_archive_cache_isolates_credentials(range_server, tmp_path):
+    """Round 4 (HIGH): the archive cache keys on (outer, credentials), so a
+    caller with no token cannot reuse an earlier caller's authenticated
+    archive - resolve() (the access gate + token binding) runs for each."""
+    url, size = range_server
+    src = _Src(url, size)
+    for sub in ("a", "b", "c"):
+        (tmp_path / sub).mkdir()
+    src.fetch("archive.zip!case1/ct.nii.gz", tmp_path / "a", credentials="ALICE")
+    src.fetch("archive.zip!case2/ct.nii.gz", tmp_path / "b", credentials=None)
+    # both callers triggered a resolve(): the tokenless one was NOT served
+    # from Alice's cached archive
+    assert "ALICE" in src.seen_credentials and None in src.seen_credentials
+    # same credential reuses the cached archive (one resolve for two members)
+    before = len(src.seen_credentials)
+    src.fetch("archive.zip!case1/seg.nii.gz", tmp_path / "c", credentials="ALICE")
+    assert len(src.seen_credentials) == before        # cache hit, no re-resolve
+
+
+def test_rangefile_refuses_status_200(tmp_path):
+    """Round 4: a server that ignores Range and streams the whole body (200)
+    is refused, not pulled into memory."""
+    class _Ignore(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)                    # ignores Range
+            self.send_header("Content-Length", "8")
+            self.end_headers()
+            self.wfile.write(b"WHOLEBODY"[:8])
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Ignore)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rf = RangeFile(f"http://127.0.0.1:{srv.server_address[1]}/x", 8, block=4)
+        with pytest.raises(InputError, match="Range"):
+            rf.read(4)
+    finally:
+        srv.shutdown()
+
+
+def test_dotdot_identifier_refused(range_server, tmp_path):
+    """Round 4: a '..' segment in the OUTER identifier is refused (it would
+    steer the resolve/template URL off the operator's prefix)."""
+    url, size = range_server
+    src = _Src(url, size)
+    with pytest.raises(InputError, match=r"\.\."):
+        src.fetch("../../secret/archive.zip!case1/ct.nii.gz", tmp_path)
+
+
+def test_zenodo_access_fails_closed(monkeypatch):
+    """Round 4: absent/empty access fields must read as restricted, not open."""
+    import urllib.request
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(req, timeout=None):
+        return FakeResp(json.dumps({"files": [{"key": "x.nii.gz", "size": 10,
+                        "links": {"content": "http://h/x"}}]}).encode())
+
+    import nnseg.sources as srcmod
+    monkeypatch.setattr(srcmod._OPENER, "open", fake_open)
+    z = ZenodoSource()                                 # allow_restricted=False
+    with pytest.raises(InputError, match="undeclared access|restricted|only fetches"):
+        z.resolve("1234567/x.nii.gz")
