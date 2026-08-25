@@ -387,6 +387,7 @@ class Worker:
 
         token = CancelToken()
         started = time.time()
+        pinned_key = None
         _emit(jid, {"state": "running", "started": started})
         prefetch_stop = threading.Event()
         _prefetch_next(jid, prefetch_stop, self.series_cache,
@@ -414,6 +415,8 @@ class Worker:
                 rep = Reporter.of(on_progress, cancel=token)
                 ident = src.get("id") or src.get("crdc_series_uuid")
                 key = f"{kind}:{ident}"
+                self.series_cache.pin(key)
+                pinned_key = key
                 if self.series_cache.has(key):
                     how = "cached"
                 elif self.series_cache.staging(key):
@@ -484,6 +487,8 @@ class Worker:
             _emit(jid, {"state": "failed", "finished": time.time(),
                         "error": f"{type(e).__name__}: {e}"})
         finally:
+            if pinned_key is not None:
+                self.series_cache.unpin(pinned_key)
             prefetch_stop.set()            # end the scan loop with the run
             with self._vol_lock:
                 _bound_jobs_store(jid)

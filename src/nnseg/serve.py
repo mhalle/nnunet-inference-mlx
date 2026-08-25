@@ -114,7 +114,8 @@ class SeriesCache:
         self.fetch = fetch_fn                  # fetch_fn(series, entry_dir) -> content dir
         self.budget = int(budget_bytes)
         self.claim_timeout = float(claim_timeout)
-        self._lock = threading.Lock()          # eviction bookkeeping only
+        self._lock = threading.Lock()          # eviction + pin bookkeeping
+        self._pins: dict = {}                  # entry name -> refcount
 
     def _entry(self, series: str) -> Path:
         # Keys become directory names. Filesystem-safe keys keep their readable
@@ -136,6 +137,34 @@ class SeriesCache:
     def path(self, series: str) -> Path:
         """Content directory of a committed entry (valid only when has())."""
         return self._entry(series) / "series"
+
+    def pin(self, series: str) -> None:
+        """Protect an in-use entry from LRU eviction - the marker mtime ages
+        for a whole run, so without a pin the CURRENT job's input can be
+        evicted mid-read under budget pressure. Refcounted; pair with unpin
+        in a finally."""
+        name = self._entry(series).name
+        with self._lock:
+            self._pins[name] = self._pins.get(name, 0) + 1
+
+    def unpin(self, series: str) -> None:
+        name = self._entry(series).name
+        with self._lock:
+            n = self._pins.get(name, 0) - 1
+            if n <= 0:
+                self._pins.pop(name, None)
+            else:
+                self._pins[name] = n
+
+    def _writer_alive(self, entry: Path) -> bool:
+        """A live writer keeps producing files - the newest mtime under the
+        entry is its heartbeat. A timeout alone proves nothing about death."""
+        try:
+            newest = max((f.stat().st_mtime for f in entry.rglob("*")),
+                         default=entry.stat().st_mtime)
+        except OSError:
+            return False
+        return (time.time() - newest) < self.claim_timeout
 
     def staging(self, series: str) -> bool:
         e = self._entry(series)
@@ -159,8 +188,22 @@ class SeriesCache:
                     if not entry.exists():
                         break                  # writer failed and cleaned up; reclaim
                     if time.time() > deadline:
-                        shutil.rmtree(entry, ignore_errors=True)   # hung writer
-                        break
+                        if self._writer_alive(entry):
+                            # slow but alive: extend rather than destroy - a
+                            # timeout teardown of a LIVE writer aliases two
+                            # writers onto one path and they destroy each
+                            # other's work
+                            deadline = time.time() + self.claim_timeout
+                        else:
+                            # dead claim: rename to a graveyard name first so
+                            # the old writer's paths stop aliasing the reclaim
+                            grave = entry.parent / f"{entry.name}.stale{int(time.time())}"
+                            try:
+                                entry.rename(grave)
+                            except OSError:
+                                pass
+                            shutil.rmtree(grave, ignore_errors=True)
+                            break
                     if check is not None:
                         check()
                     time.sleep(0.2)
@@ -201,6 +244,7 @@ class SeriesCache:
 
     def _evict(self, keep) -> None:
         with self._lock:
+            protected = set(keep) | set(self._pins)
             entries, kept_bytes = [], 0
             for e in self.root.iterdir():
                 m = e / self.MARKER
@@ -210,7 +254,7 @@ class SeriesCache:
                     mtime, size = m.stat().st_mtime, int(m.read_text() or 0)
                 except (OSError, ValueError):
                     continue
-                if e.name in keep:
+                if e.name in protected:
                     kept_bytes += size
                 else:
                     entries.append((mtime, size, e))
@@ -636,9 +680,13 @@ class LocalExecutor:
                 jid = self._pending.popleft()
                 rec = self._jobs[jid]
                 rec.state, rec.started = "running", time.time()
-            self._emit(rec)
-            self._requeue_positions()
-            self._prefetch_next()          # the CPU downloader, parallel to this GPU job
+            try:                           # nothing before the handler may kill
+                self._emit(rec)            # the ONLY dispatcher thread
+                self._requeue_positions()
+                self._prefetch_next()      # the CPU downloader, parallel to this GPU job
+            except Exception:
+                pass
+            pinned_key = None
             try:
                 reporter = Reporter.of(progress=lambda p, r=rec: self._on_progress(r, p),
                                        cancel=rec.cancel_token)
@@ -653,6 +701,8 @@ class LocalExecutor:
                 if kind != "upload":
                     ident = src.get("id") or src.get("crdc_series_uuid")
                     key = f"{kind}:{ident}"
+                    self.series_cache.pin(key)
+                    pinned_key = key
                     if self.series_cache.has(key):
                         reporter.stage("fetch", "cached")
                     elif self.series_cache.staging(key):
@@ -717,10 +767,16 @@ class LocalExecutor:
                 rec.state = "failed"
                 rec.error = f"{type(e).__name__}: {e}"
             finally:
+                if pinned_key is not None:
+                    self.series_cache.unpin(pinned_key)
                 rec.finished = time.time()
                 with self._cv:
                     self._done_order.append(rec.id)
-                    if rec.cache_key:
+                    # compare-and-pop: under duplicate flights for one key the
+                    # marker names the LATEST job - popping unconditionally
+                    # made probes 404 while the survivor still ran and left
+                    # DELETE unable to cancel it
+                    if rec.cache_key and self._inflight.get(rec.cache_key) == rec.id:
                         self._inflight.pop(rec.cache_key, None)
                 self._emit(rec)
                 self._evict()

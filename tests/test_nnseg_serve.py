@@ -1736,3 +1736,59 @@ def test_public_twin_variant_urls_key_on_variant_options(tmp_path):
     cache.put(key_fn(f"idc:{u}", "total_fast", {"grid": 1.0}), v, {"names": {}}, {})
     r = client.get(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd")
     assert r.status_code == 200 and r.content == b"\x1f\x8bvariant"
+
+
+def test_pinned_entries_survive_eviction_and_live_writers_survive_timeouts(tmp_path):
+    """Review C5: (a) a pinned in-use entry is never LRU-evicted even over
+    budget; (b) a waiter at claim-timeout extends for a writer that is still
+    producing files, and reclaims only a truly dead claim."""
+    import threading as _t
+    import time as _time
+
+    from nnseg.serve import SeriesCache
+
+    fetched = []
+
+    def fetch(key, entry):
+        d = entry / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "f").write_bytes(b"x" * 120)
+        fetched.append(key)
+        return d
+
+    sc = SeriesCache(tmp_path / "sc", fetch, budget_bytes=150)
+    sc.get_or_fetch("u1")
+    sc.pin("u1")
+    try:
+        sc.get_or_fetch("u2")                 # over budget; u1 pinned -> u2's
+        assert sc.has("u1")                   # commit evicts nothing usable...
+        sc.get_or_fetch("u3")                 # ...now u2 (unpinned) must go
+        assert sc.has("u1") and not sc.has("u2")
+    finally:
+        sc.unpin("u1")
+
+    # live-writer fence: slow writer keeps writing; waiter must not destroy it
+    sc2 = SeriesCache(tmp_path / "sc2", fetch, claim_timeout=0.3)
+
+    def slow_fetch(key, entry):
+        d = entry / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(6):
+            (d / f"f{i}").write_bytes(b"y")
+            _time.sleep(0.15)                 # heartbeat via file mtimes
+        return d
+
+    sc2.fetch = slow_fetch
+    t = _t.Thread(target=lambda: sc2.prefetch("s1"))
+    t.start()
+    _time.sleep(0.05)
+    got = sc2.get_or_fetch("s1")              # waits ~0.9s > claim_timeout
+    t.join()
+    assert got.exists() and len(list(got.iterdir())) == 6   # writer's work intact
+
+    # dead claim: bare directory, no writes -> reclaimed after timeout
+    sc3 = SeriesCache(tmp_path / "sc3", fetch, claim_timeout=0.2)
+    (sc3.root / "dead").mkdir()
+    _time.sleep(0.3)
+    assert sc3.get_or_fetch("dead").exists()  # reclaimed and fetched
+    assert "dead" in fetched
