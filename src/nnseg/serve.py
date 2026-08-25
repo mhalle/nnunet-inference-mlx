@@ -59,10 +59,12 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .errors import Cancelled, InputError, NnsegError
+from .errors import Cancelled, InputError, NnsegError, ResourceError
 from .progress import CancelToken, Reporter
 
 ACTIVE = ("queued", "running")
+ARTIFACT_PENDING_TTL = 900.0   # a pending marker older than this is a dead
+                               # overlap thread's leavings (mirrors Modal's sweep)
 TERMINAL = ("done", "failed", "cancelled")
 RESULT_NAME = "labels.seg.nrrd"          # the information-preserving default artifact
 from .sources import CRDC_RE, IDC_BUCKETS, registry as _source_registry  # noqa: E402
@@ -239,16 +241,28 @@ class SeriesCache:
                     if not entry.exists():
                         break                  # writer failed and cleaned up; reclaim
                     if time.time() > deadline:
-                        if self._writer_alive(entry) and extensions < 3:
-                            # slow but alive: extend rather than destroy - a
-                            # timeout teardown of a LIVE writer aliases two
-                            # writers onto one path and they destroy each
-                            # other's work. BOUNDED: the heartbeat proves the
-                            # process lives, not that the fetch progresses; a
-                            # hung fetch must not wedge this waiter forever
-                            # (owner tokens make the eventual reclaim safe).
-                            extensions += 1
-                            deadline = time.time() + self.claim_timeout
+                        if self._writer_alive(entry):
+                            if extensions < 3:
+                                # slow but alive: extend rather than destroy -
+                                # a timeout teardown of a LIVE writer aliases
+                                # two writers onto one path and they destroy
+                                # each other's work
+                                extensions += 1
+                                deadline = time.time() + self.claim_timeout
+                            else:
+                                # STILL alive after 4x claim_timeout: give up
+                                # loudly. A live writer is NEVER reclaimed -
+                                # the owner token guards teardown, not
+                                # _commit, and a round-4 probe showed the
+                                # reclaim committing a MIXED series (two
+                                # writers' slices in one entry) as complete.
+                                # One writer per series is the invariant; the
+                                # waiter's job fails retryably instead.
+                                raise ResourceError(
+                                    f"staging of {series!r} has been held for "
+                                    f"{4 * self.claim_timeout:.0f}s by a writer "
+                                    "that is still alive; giving up rather "
+                                    "than risk a mixed series - retry later")
                         else:
                             # dead claim: rename to a graveyard name first so
                             # the old writer's paths stop aliasing the reclaim
@@ -268,7 +282,7 @@ class SeriesCache:
             try:
                 dest = Path(self.fetch(series, entry, credentials=credentials)
                             if credentials is not None else self.fetch(series, entry))
-                self._commit(entry, key=series)
+                self._commit(entry, key=series, token=token)
                 return dest
             except BaseException:
                 self._teardown_claim(entry, token)
@@ -290,7 +304,7 @@ class SeriesCache:
         hb = self._hb_start(entry)
         try:
             self.fetch(series, entry)
-            self._commit(entry, key=series)
+            self._commit(entry, key=series, token=token)
             return True
         except Exception:
             self._teardown_claim(entry, token)
@@ -298,7 +312,16 @@ class SeriesCache:
         finally:
             hb.set()
 
-    def _commit(self, entry: Path, key: str | None = None) -> None:
+    def _commit(self, entry: Path, key: str | None = None,
+                token: str | None = None) -> None:
+        if token is not None:
+            try:
+                if (entry / ".owner").read_text() != token:
+                    raise ResourceError(
+                        f"claim for {key or entry.name!r} was reclaimed while "
+                        "fetching; discarding this writer's result")
+            except OSError:
+                pass                       # unprovable = our own failed write
         # budget = content bytes; bookkeeping dotfiles (.owner/.key/.done)
         # stay out of the arithmetic
         size = sum(f.stat().st_size for f in entry.rglob("*")
@@ -654,7 +677,7 @@ class LocalExecutor:
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
         self.artifacts = set(artifacts or ())
-        self._artifacts_pending: dict = {}   # cache_key -> owning job id
+        self._artifacts_pending: dict = {}   # cache_key -> (owner jid, set at)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -757,7 +780,16 @@ class LocalExecutor:
         """"pending" while the overlap thread is still placing this entry's
         artifacts; "absent" once it finished (or never ran) - at which point a
         missing artifact file is definitive."""
-        return "pending" if key in self._artifacts_pending else "absent"
+        cur = self._artifacts_pending.get(key)
+        if cur is None:
+            return "absent"
+        if time.time() - cur[1] > ARTIFACT_PENDING_TTL:
+            # a killed/hung overlap thread left its marker; without this the
+            # refuse-if-present set makes it immortal and every artifact GET
+            # 202s forever (Modal has the same rule as a 900s Dict sweep)
+            self._artifacts_pending.pop(key, None)
+            return "absent"
+        return "pending"
 
     # -- introspection -------------------------------------------------------
     def get(self, jid: str) -> JobRecord | None:
@@ -927,12 +959,14 @@ class LocalExecutor:
                     # probes would read a definitive 404 for artifacts that
                     # land seconds later. The owner's finish clears; then a
                     # later flight may set again.
-                    self._artifacts_pending.setdefault(key, rec.id)
+                    cur = self._artifacts_pending.get(key)
+                    if cur is None or time.time() - cur[1] > ARTIFACT_PENDING_TTL:
+                        self._artifacts_pending[key] = (rec.id, time.time())
 
                 def _clear_pending(key: str) -> None:
                     # only the owner clears: a duplicate flight's finish must
                     # not turn our still-pending artifacts into definitive 404s
-                    if self._artifacts_pending.get(key) == rec.id:
+                    if self._artifacts_pending.get(key, (None,))[0] == rec.id:
                         self._artifacts_pending.pop(key, None)
 
                 def _start(pair, key: str) -> None:
@@ -959,12 +993,14 @@ class LocalExecutor:
                 pass
             except Cancelled:
                 rec.state = "cancelled"
-                if rec.cache_key and self._artifacts_pending.get(rec.cache_key) == rec.id:
+                if (rec.cache_key and self._artifacts_pending.get(
+                        rec.cache_key, (None,))[0] == rec.id):
                     self._artifacts_pending.pop(rec.cache_key, None)
             except Exception as e:             # noqa: BLE001 - reported to the client
                 rec.state = "failed"
                 rec.error = f"{type(e).__name__}: {e}"
-                if rec.cache_key and self._artifacts_pending.get(rec.cache_key) == rec.id:
+                if (rec.cache_key and self._artifacts_pending.get(
+                        rec.cache_key, (None,))[0] == rec.id):
                     self._artifacts_pending.pop(rec.cache_key, None)   # failed after pending add
             finally:
                 if pinned_key is not None:
@@ -988,7 +1024,7 @@ class LocalExecutor:
         only when this job still owns it."""
 
         def _finish(placed) -> None:
-            if self._artifacts_pending.get(cache_key) == owner:
+            if self._artifacts_pending.get(cache_key, (None,))[0] == owner:
                 self._artifacts_pending.pop(cache_key, None)
 
         artifact_overlap(

@@ -2399,3 +2399,47 @@ def test_result_cache_temp_names_unique_per_writer(tmp_path, monkeypatch):
     rc.put("k", src, {}, {})
     labels_tmps = [n for n in seen if n.startswith("labels")]
     assert len(labels_tmps) == 2 and labels_tmps[0] != labels_tmps[1]
+
+
+def test_live_writer_is_never_reclaimed(tmp_path):
+    """Round 4 (HIGH): a waiter that exhausts its extensions against a
+    writer that is STILL ALIVE gives up loudly - reclaiming a live writer
+    aliased two writers onto one path and committed a MIXED series as
+    complete (silently corrupt cache). One writer per series, always."""
+    from nnseg.errors import ResourceError
+    from nnseg.serve import SeriesCache
+    hold = threading.Event()
+
+    def slow_fetch(key, entry):
+        d = entry / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "f").write_bytes(b"x")
+        hold.wait(20)                      # alive (heartbeating) but slow
+        return d
+
+    sc = SeriesCache(tmp_path / "sc", fetch_fn=slow_fetch)
+    sc.claim_timeout = 0.15
+    t = threading.Thread(target=lambda: sc.get_or_fetch("s1"), daemon=True)
+    t.start()
+    time.sleep(0.1)                        # writer holds the claim
+    t0 = time.time()
+    with pytest.raises(ResourceError):
+        sc.get_or_fetch("s1")
+    assert 0.4 < time.time() - t0 < 8      # 4x timeout, then gave up
+    assert sc._entry("s1").exists(), "live writer's claim was destroyed"
+    hold.set()
+    t.join(5)
+    assert sc.has("s1")                    # the one writer committed cleanly
+
+
+def test_stale_pending_marker_ages_out(tmp_path):
+    """Round 4: a hung/killed overlap thread's pending marker must not be
+    immortal - refuse-if-present made it unrecoverable, so artifact GETs
+    202'd forever. Stale markers age out (Local mirror of the Modal sweep)."""
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc")
+    ex._artifacts_pending["K"] = ("dead-jid", time.time() - 1000)
+    assert ex.artifact_state("K") == "absent"    # aged out (and cleaned)
+    assert "K" not in ex._artifacts_pending
+    ex._artifacts_pending["K"] = ("live-jid", time.time())
+    assert ex.artifact_state("K") == "pending"

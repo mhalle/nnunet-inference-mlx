@@ -129,15 +129,25 @@ def test_fresh_weights_versions_reloads_once(monkeypatch):
     ex = modal_app.ModalExecutor()
     ex.segmenter = Seg()
     type(ex)._weights_reloaded_at = 0.0
+    type(ex)._wv_cache = {}
     wv = ex._fresh_weights_versions("t")
     assert Vol.n == 1 and not any("unknown" in v for v in wv), wv
-    # a task that stays unknown does not reload again inside the throttle
+    # within the cache window the segmenter is not even consulted (the
+    # listing derives per entry - this is what keeps it cheap)
+    class Boom(Seg):
+        def describe(self, task):
+            raise AssertionError("described during the cache window")
+    ex.segmenter = Boom()
+    assert ex._fresh_weights_versions("t") == wv
+    # cache aged out but reload throttled: stays unknown without reloading
     class Never(Seg):
         def describe(self, task):
             return {"weights_installed": [{"id": "297"}]}
     ex.segmenter = Never()
+    type(ex)._wv_cache = {}
     wv = ex._fresh_weights_versions("t")
     assert Vol.n == 1                       # throttled
     type(ex)._weights_reloaded_at = _t.time() - 60
+    type(ex)._wv_cache = {}
     ex._fresh_weights_versions("t")
     assert Vol.n == 2                       # window elapsed: one more

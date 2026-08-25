@@ -620,6 +620,7 @@ class ModalExecutor:
 
     _weights_reload_lock = threading.Lock()
     _weights_reloaded_at = 0.0
+    _wv_cache: dict = {}                   # task -> (versions, stamped at)
 
     def _fresh_weights_versions(self, task):
         """weights_versions_of, but stale-proof: an API container's mounted
@@ -632,9 +633,14 @@ class ModalExecutor:
         nnseg did not install (TS-installed, hand-copied), and an unthrottled
         version reloaded a multi-GB volume on every HEAD probe forever."""
         from nnseg.serve import weights_versions_of
+        cls = type(self)
+        cached = cls._wv_cache.get(task)
+        if cached is not None and time.time() - cached[1] < 30.0:
+            return cached[0]               # the listing derives per ENTRY -
+                                           # without this that is a describe()
+                                           # volume walk per row
         wv = weights_versions_of(self.segmenter, task)
         if any("unknown" in str(v) for v in wv):
-            cls = type(self)
             with cls._weights_reload_lock:
                 if time.time() - cls._weights_reloaded_at < 30.0:
                     return wv
@@ -642,8 +648,10 @@ class ModalExecutor:
                 try:
                     weights_vol.reload()
                 except Exception:
+                    cls._wv_cache[task] = (wv, time.time())
                     return wv
             wv = weights_versions_of(self.segmenter, task)
+        cls._wv_cache[task] = (wv, time.time())
         return wv
 
     def resource_key(self, identity: str, task: str, opts=None) -> str:
