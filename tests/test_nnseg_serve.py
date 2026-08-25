@@ -413,3 +413,133 @@ def test_real_segmenter_accepts_cancel_override(tmp_path, monkeypatch):
     Segmenter(weights=tmp_path).segment("x.nii.gz", "total_fast",
                                         cancel=token, progress=None)
     assert seen["cancel"] is token
+
+
+# -- result cache, path surface, tiering -------------------------------------
+
+def make_cached(tmp_path, **kw):
+    seg = FakeSegmenter(**{k: v for k, v in kw.items() if k in ("gate", "steps", "fail")})
+    ex = LocalExecutor(seg, workdir=tmp_path / "work", cache_dir=tmp_path / "cache",
+                       max_pending=kw.get("max_pending", 4))
+    return seg, ex, TestClient(create_app(ex, token=kw.get("token")))
+
+
+def test_result_cache_hit_skips_compute(tmp_path):
+    seg, ex, client = make_cached(tmp_path)
+    a = submit(client)
+    wait_state(client, a, ("done",))
+    b = submit(client)                        # identical upload -> identical identity
+    s = client.get(f"/v1/jobs/{b}").json()
+    assert s["state"] == "done" and s["cached"] is True
+    assert s["result"]["volumes_ml"] == {"spleen": 210.0}
+    assert len(seg.calls) == 1                # computed once, served twice
+    r = client.get(f"/v1/jobs/{b}/result")
+    assert r.status_code == 200 and r.content.startswith(b"\x1f\x8b")
+
+
+def test_no_cache_forces_recompute_and_options_key(tmp_path):
+    seg, ex, client = make_cached(tmp_path)
+    a = submit(client); wait_state(client, a, ("done",))
+    b = submit(client, options={"no_cache": True}); wait_state(client, b, ("done",))
+    assert len(seg.calls) == 2
+    assert client.get(f"/v1/jobs/{b}").json().get("cached") is None
+    c = submit(client, options={"interp": "nearest"})   # different options = new key
+    wait_state(client, c, ("done",))
+    assert len(seg.calls) == 3
+    assert seg.calls[-1][2] == {"interp": "nearest"}    # no_cache never reaches segment
+
+
+def test_idc_path_surface_blocking_and_cache(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    seg = FakeSegmenter(steps=3)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={"Prefer": "wait=10"})
+    assert r.status_code == 200, r.text                 # blocked through the compute
+    assert r.headers["preference-applied"] == "wait=10"
+    assert "etag" in r.headers and r.content.startswith(b"\x1f\x8b")
+    r2 = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd")
+    assert r2.status_code == 200 and len(seg.calls) == 1    # second read: pure cache
+    meta = client.get(f"/v1/idc/{u}/total_fast/meta.json")
+    assert meta.status_code == 200 and meta.json()["volumes_ml"] == {"spleen": 210.0}
+
+
+def test_idc_path_wait_zero_gives_202(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={"Prefer": "respond-async"})
+    assert r.status_code == 202
+    assert r.headers["retry-after"] and r.headers["cache-control"] == "no-store"
+    jid = r.json()["job"]
+    r2 = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                    headers={"Prefer": "wait=0"})
+    assert r2.status_code == 202 and r2.json()["job"] == jid   # single flight
+    gate.set()
+    wait_state(client, jid, ("done",))
+    assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 200
+
+
+def test_token_tiering_local(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    seg = FakeSegmenter(steps=2)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex, token="s3cret"))
+    auth = {"Authorization": "Bearer s3cret"}
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    # anonymous: health/tasks fine, jobs and compute-on-miss are not
+    assert client.get("/v1/health").status_code == 200
+    assert client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                       data={"task": "total_fast"}).status_code == 401
+    assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 404
+    assert len(seg.calls) == 0                          # the miss spent nothing
+    # authed: materialize
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={**auth, "Prefer": "wait=10"})
+    assert r.status_code == 200
+    # now anonymous reads the cache
+    assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 200
+    assert len(seg.calls) == 1
+
+
+def test_public_app_is_read_only_by_construction(tmp_path):
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    cache = ResultCache(tmp_path / "c")
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
+    src = tmp_path / "labels.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
+    cache.put(key_fn(u, "total_fast"), src, {"volumes_ml": {"spleen": 1.0}}, {})
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
+    client = TestClient(app)
+    assert client.get("/v1/health").json()["mode"] == "public-cache"
+    assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 200
+    miss = client.get(f"/v1/idc/{'a'*8}-1111-2222-3333-{'b'*12}/total_fast/labels.seg.nrrd")
+    assert miss.status_code == 404 and "authenticated" in miss.json()["detail"]
+    assert client.post("/v1/jobs").status_code in (404, 405)   # no job routes exist

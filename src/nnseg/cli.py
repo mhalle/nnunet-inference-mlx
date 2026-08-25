@@ -48,6 +48,11 @@ def main(argv=None) -> int:
     sv.add_argument("--max-pending", type=int, default=16, help="queue bound; past it POST returns 429")
     sv.add_argument("--keep-finished", type=int, default=50, help="finished jobs (and files) retained")
     sv.add_argument("--workdir", default=None, help="job storage (default: a temp directory)")
+    sv.add_argument("--cache-dir", default=None,
+                    help="result cache (default: ~/.cache/nnseg/results; durable, unlike the workdir)")
+    sv.add_argument("--no-result-cache", action="store_true")
+    sv.add_argument("--token", default=None,
+                    help="bearer token; without it a request gets health/tasks/cached reads only")
 
     mo = sub.add_parser("modal", help="deploy the server to Modal (needs the modal extra)")
     mosub = mo.add_subparsers(dest="mcmd", required=True)
@@ -130,7 +135,7 @@ def main(argv=None) -> int:
                 print(c.submit(args.input, args.task))
                 return 0
             stem = args.input[4:16] if args.input.startswith("idc:") else args.input.rsplit(".nii", 1)[0].rstrip("/")
-            out = args.output or f"{stem}_{args.task}.nii.gz"
+            out = args.output or f"{stem}_{args.task}.seg.nrrd"
             last = {}
             def show(s, _last=last):
                 p = s.get("progress") or {}

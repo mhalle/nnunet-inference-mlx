@@ -48,7 +48,8 @@ SCALEDOWN = int(os.environ.get("NNSEG_SCALEDOWN", "600"))
 GPU_SNAPSHOT = os.environ.get("NNSEG_GPU_SNAPSHOT", "0") not in ("0", "false", "no", "")
 SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) or GPU_SNAPSHOT
 WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
-WEIGHTS_ROOT, JOBS_ROOT = "/weights", "/jobs"
+WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
+PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 
 
 def _pkg_dir() -> Path:
@@ -71,6 +72,7 @@ app = modal.App(APP_NAME, image=image)
 weights_vol = modal.Volume.from_name("nnseg-weights", create_if_missing=True)
 jobs_vol = modal.Volume.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
+cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
 def _emit(jid: str, update: dict) -> None:
@@ -83,7 +85,7 @@ _cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAP
 
 
 @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
-         volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol},
+         volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
          enable_memory_snapshot=SNAPSHOT, **_cls_extra)
 class Worker:
     def _gpu_setup(self):
@@ -159,20 +161,34 @@ class Worker:
             else:
                 jobs_vol.reload()
                 input_path = next(jdir.glob("input_*"))
+            from nnseg.serve import RESULT_NAME, ResultCache
             s = self.seg.segment(input_path, meta["task"], progress=on_progress,
                                  cancel=token, **(meta.get("options") or {}))
-            s.save(jdir / "labels.nii.gz")
+            s.save(jdir / RESULT_NAME)
             jobs_vol.commit()
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
                       "provenance": s.provenance}
+            if meta.get("cache_key"):
+                ResultCache(CACHE_ROOT, keep=10 ** 6).put(
+                    meta["cache_key"], jdir / RESULT_NAME, result,
+                    {"identity": meta.get("input_identity"), "task": meta["task"],
+                     "options": meta.get("options"), "job": jid,
+                     "computed": meta.get("started")})
+                cache_vol.commit()
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
         except Exception as e:               # noqa: BLE001 - reported to the client
             _emit(jid, {"state": "failed", "finished": time.time(),
                         "error": f"{type(e).__name__}: {e}"})
+        finally:
+            if meta.get("cache_key"):
+                try:
+                    del jobs_dict[f"inflight:{meta['cache_key']}"]
+                except Exception:
+                    pass
 
 
 class ModalExecutor:
@@ -188,24 +204,57 @@ class ModalExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return jid, d
 
-    def submit(self, jid, jdir, input_path, task, options, *, source=None, identity=()):
+    def submit(self, jid, jdir, input_path, task, options, *, source=None,
+               identity=(), no_cache: bool = False):
+        from nnseg.serve import result_key, weights_versions_of
         jobs_vol.commit()                    # make any upload visible to the worker
+        key = None
+        if identity:
+            key = result_key(identity, task, options,
+                             weights_versions_of(self.segmenter, task))
+            if not no_cache:
+                hit = self.cache_get(key)
+                if hit is not None:
+                    meta = {"id": jid, "task": task, "options": options,
+                            "input_identity": list(identity), "state": "done",
+                            "cached": True, "created": time.time(),
+                            "started": time.time(), "finished": time.time(),
+                            "result": hit[1], "cache_path": str(hit[0])}
+                    jobs_dict[jid] = meta
+                    return meta
         meta = {"id": jid, "task": task, "options": options,
                 "source": list(source or [{"kind": "upload"}]),
-                "input_identity": list(identity),
+                "input_identity": list(identity), "cache_key": key,
                 "state": "queued", "created": time.time()}
         jobs_dict[jid] = meta
+        if key:
+            jobs_dict[f"inflight:{key}"] = jid
         call = Worker().run_job.spawn(jid)
         meta["call_id"] = call.object_id
         jobs_dict[jid] = meta
         return meta
+
+    def cache_get(self, key):
+        from nnseg.serve import ResultCache
+        try:
+            cache_vol.reload()
+        except Exception:
+            pass
+        return ResultCache(CACHE_ROOT, keep=10 ** 6).get(key)
+
+    def find_inflight(self, key):
+        jid = jobs_dict.get(f"inflight:{key}")
+        if not jid:
+            return None
+        meta = jobs_dict.get(jid) or {}
+        return jid if meta.get("state") in ("queued", "running") else None
 
     def status_of(self, jid):
         meta = jobs_dict.get(jid)
         if meta is None:
             return None
         keys = ("id", "task", "state", "created", "started", "finished",
-                "progress", "error", "input_identity")
+                "progress", "error", "input_identity", "cached")
         d = {k: meta.get(k) for k in keys if meta.get(k) is not None}
         if meta.get("state") == "done" and meta.get("result") is not None:
             d["result"] = meta["result"]
@@ -247,16 +296,25 @@ class ModalExecutor:
         return state, True
 
     def result_file(self, jid):
-        s = self.status_of(jid)
-        if s is None:
+        from nnseg.serve import RESULT_NAME
+        meta = jobs_dict.get(jid)
+        if meta is None:
             return None, None
+        if meta.get("cache_path"):
+            p = Path(meta["cache_path"])
+            try:
+                cache_vol.reload()
+            except Exception:
+                pass
+            return meta["state"], (p if p.exists() else None)
         jobs_vol.reload()
-        p = Path(JOBS_ROOT) / jid / "labels.nii.gz"
-        return s["state"], (p if p.exists() else None)
+        p = Path(JOBS_ROOT) / jid / RESULT_NAME
+        return meta["state"], (p if p.exists() else None)
 
 
 @app.function(cpu=2.0, memory=2048, scaledown_window=300,
-              volumes={JOBS_ROOT: jobs_vol, WEIGHTS_ROOT: weights_vol})
+              volumes={JOBS_ROOT: jobs_vol, WEIGHTS_ROOT: weights_vol,
+                       CACHE_ROOT: cache_vol})
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app(requires_proxy_auth=PROXY_AUTH)
 def api():
@@ -269,3 +327,34 @@ def api():
     # catalog/describe only - jobs run on the Worker; device string is cosmetic here
     ex.segmenter = Segmenter(device="cpu", weights=WEIGHTS_ROOT)
     return create_app(ex)
+
+
+if PUBLIC:
+    @app.function(cpu=1.0, memory=1024, scaledown_window=300,
+                  volumes={CACHE_ROOT: cache_vol, WEIGHTS_ROOT: weights_vol})
+    @modal.concurrent(max_inputs=100)
+    @modal.asgi_app(requires_proxy_auth=False)
+    def public():
+        """The anonymous read-only twin (NNSEG_PUBLIC=1): cache hits only, no
+        compute path in the function at all - it cannot spend GPU by
+        construction. Shares the cache volume with the authed api."""
+        _pkg_dir()
+        os.environ["TOTALSEG_WEIGHTS_PATH"] = WEIGHTS_ROOT
+        from nnseg import Segmenter
+        from nnseg.serve import (ResultCache, create_public_app, result_key,
+                                 weights_versions_of)
+        seg = Segmenter(device="cpu", weights=WEIGHTS_ROOT)
+        cache = ResultCache(CACHE_ROOT, keep=10 ** 6)
+
+        def key_fn(uuid, task):
+            return result_key((f"idc:{uuid}",), task, {},
+                              weights_versions_of(seg, task))
+
+        def get(key):
+            try:
+                cache_vol.reload()
+            except Exception:
+                pass
+            return cache.get(key)
+
+        return create_public_app(key_fn, get, seg.tasks)
