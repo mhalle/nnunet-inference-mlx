@@ -263,7 +263,8 @@ def test_slashed_identifiers_get_the_full_path_surface(tmp_path, monkeypatch):
     assert m.status_code == 200
     try:
         import matplotlib  # noqa: F401
-        p = client.get(f"/v1/deep/{ident}/total_fast/preview.png")
+        from test_nnseg_serve import wait_artifact
+        p = wait_artifact(client, f"/v1/deep/{ident}/total_fast/preview.png")
         assert p.status_code == 200 and p.content[:4] == b"\x89PNG"
     except ImportError:
         pass

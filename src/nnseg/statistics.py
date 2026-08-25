@@ -49,43 +49,75 @@ def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | Non
         sp = seg_r.GetSpacing()
         voxel_ml = float(sp[0] * sp[1] * sp[2]) / 1000.0
 
-        # only labeled voxels matter: on a torso CT that is ~10-20 % of the
-        # volume, and sorting 40M beats sorting 400M by an order of magnitude
-        # (the full-volume argsort was measured costing ~20 s per job)
-        fz, fy, fx = np.nonzero(lab)
-        labs = lab[fz, fy, fx].astype(np.int32)
-        vals_fg = gray[fz, fy, fx].astype(np.float32)
+        # Only labeled voxels matter (~10-20 % of a torso). One flatnonzero,
+        # coordinates by arithmetic - no triple index-array construction.
+        Z, Y, X = lab.shape
+        flat = lab.ravel()
+        idx = np.flatnonzero(flat)
+        labs = flat[idx].astype(np.int64)
+        vals_fg = gray.ravel()[idx]
         K = int(labs.max()) + 1 if labs.size else 1
         counts = np.bincount(labs, minlength=K)
 
-        order = np.argsort(labs, kind="stable")
-        vals = vals_fg[order]
-        starts = np.searchsorted(labs[order], np.arange(K))
-        ends = np.concatenate([starts[1:], [labs.size]])
-
-        # centroids from the foreground indices alone
+        fz = idx // (Y * X)
+        rem = idx - fz * (Y * X)
+        fy = rem // X
+        fx = rem - fy * X
         sums = {"z": np.bincount(labs, weights=fz, minlength=K),
                 "y": np.bincount(labs, weights=fy, minlength=K),
                 "x": np.bincount(labs, weights=fx, minlength=K)}
+
+        # Integer intensities (every native CT/MR grid): exact statistics from
+        # a per-label histogram - one bincount instead of a 60M-element sort.
+        # Percentiles are nearest-rank on the exact distribution. Float grids
+        # (resampled variants) take the sort path below.
+        hist = None
+        if np.issubdtype(vals_fg.dtype, np.integer):
+            vmin = int(vals_fg.min())
+            nb = int(vals_fg.max()) - vmin + 1
+            if 0 < nb <= 1 << 16:
+                keys = labs * nb + (vals_fg.astype(np.int64) - vmin)
+                hist = np.bincount(keys, minlength=K * nb).reshape(K, nb)
+                bin_vals = np.arange(vmin, vmin + nb, dtype=np.float64)
+        if hist is None:
+            order = np.argsort(labs, kind="stable")
+            vals = vals_fg[order].astype(np.float32)
+            starts = np.searchsorted(labs[order], np.arange(K))
+            ends = np.concatenate([starts[1:], [labs.size]])
 
         structures = []
         for v in sorted(names):
             n = int(counts[v]) if v < K else 0
             if n == 0:
                 continue
-            seg_vals = vals[starts[v]:ends[v]]
+            if hist is not None:
+                h = hist[v]
+                cum = h.cumsum()
+                s1 = float((h * bin_vals).sum())
+                s2 = float((h * bin_vals * bin_vals).sum())
+                mean = s1 / n
+                var = max(s2 / n - mean * mean, 0.0)
+                nz = np.flatnonzero(h)
+                vmin_v, vmax_v = bin_vals[nz[0]], bin_vals[nz[-1]]
+                p10, med, p90 = (bin_vals[np.searchsorted(cum, q * n, side="left")]
+                                 for q in (0.10, 0.50, 0.90))
+                stats_row = (mean, var ** 0.5, vmin_v, vmax_v, med, p10, p90)
+            else:
+                seg_vals = vals[starts[v]:ends[v]]
+                p10, med, p90 = np.percentile(seg_vals, (10, 50, 90))
+                stats_row = (float(seg_vals.mean()), float(seg_vals.std()),
+                             float(seg_vals.min()), float(seg_vals.max()),
+                             float(med), float(p10), float(p90))
             cz, cy, cx = (sums["z"][v] / n, sums["y"][v] / n, sums["x"][v] / n)
             pt = seg_r.TransformContinuousIndexToPhysicalPoint(
                 (float(cx), float(cy), float(cz)))
             centroid_ras = [-pt[0], -pt[1], pt[2]]        # LPS -> RAS
-            p10, med, p90 = np.percentile(seg_vals, (10, 50, 90))
+            mean, std, vmn, vmx, med, p10, p90 = stats_row
             structures.append({
                 "structure": names[v], "label": int(v), "voxels": n,
                 "volume_ml": round(n * voxel_ml, 3),
-                "mean": round(float(seg_vals.mean()), 3),
-                "std": round(float(seg_vals.std()), 3),
-                "min": round(float(seg_vals.min()), 3),
-                "max": round(float(seg_vals.max()), 3),
+                "mean": round(float(mean), 3), "std": round(float(std), 3),
+                "min": round(float(vmn), 3), "max": round(float(vmx), 3),
                 "median": round(float(med), 3),
                 "p10": round(float(p10), 3), "p90": round(float(p90), 3),
                 "centroid_ras_mm": [round(float(c), 2) for c in centroid_ras],

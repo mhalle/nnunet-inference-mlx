@@ -341,6 +341,22 @@ class ResultCache:
         shutil.copy2(labels_path, d / RESULT_NAME)
         self.evict()
 
+    def add_artifact(self, key: str, name: str, src_path) -> bool:
+        """Place an eventually-consistent artifact (preview.png,
+        statistics.json) into an existing entry, atomically (temp + rename) -
+        the overlap thread calls this after "done" has already been served.
+        False if the entry no longer exists (evicted meanwhile) - skip, never
+        recreate."""
+        import os
+        import shutil
+        d = self.root / key
+        if not (d / RESULT_NAME).exists():
+            return False
+        tmp = d / (name + ".tmp")
+        shutil.copy2(src_path, tmp)
+        os.replace(tmp, d / name)
+        return True
+
     def delete(self, key: str) -> bool:
         """Remove one entry; True if it existed."""
         import shutil
@@ -423,6 +439,7 @@ class LocalExecutor:
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
         self.artifacts = set(artifacts or ())
+        self._artifacts_pending: set = set()
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -520,6 +537,12 @@ class LocalExecutor:
 
     def cache_list(self) -> list:
         return self.cache.list() if self.cache is not None else []
+
+    def artifact_state(self, key: str) -> str:
+        """"pending" while the overlap thread is still placing this entry's
+        artifacts; "absent" once it finished (or never ran) - at which point a
+        missing artifact file is definitive."""
+        return "pending" if key in self._artifacts_pending else "absent"
 
     # -- introspection -------------------------------------------------------
     def get(self, jid: str) -> JobRecord | None:
@@ -662,34 +685,30 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
-                preview, stats = None, None
-                try:                       # best-effort: artifacts never fail a job;
-                                           # one shared load feeds both; the artifacts
-                                           # set is deployment policy (throughput
-                                           # deployments may run with none)
-                    if self.artifacts:
-                        from .preview import load_oriented_pair, render_preview
-                        from .statistics import compute_statistics
+                pair = None
+                try:                       # only the LOAD stays inline (input alive,
+                                           # ~0.3 s); render + statistics overlap with
+                                           # the next job on a thread, and their
+                                           # artifacts are eventually consistent
+                    if self.artifacts and self.cache is not None and rec.cache_key:
+                        from .preview import load_oriented_pair
                         pair = load_oriented_pair(inp, rec.labels_path)
-                        if "preview" in self.artifacts:
-                            preview = render_preview(inp, rec.labels_path,
-                                                     rec.dir / "preview.png",
-                                                     title=rec.task, pair=pair)
-                        if "statistics" in self.artifacts:
-                            stats = compute_statistics(inp, rec.labels_path,
-                                                       rec.dir / "statistics.json",
-                                                       pair=pair)
                 except Exception:
-                    pass
+                    pair = None
                 # cache BEFORE flipping state: anything that observes "done"
                 # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:
                     self.cache.put(rec.cache_key, rec.labels_path, rec.result,
                                    {"identity": list(rec.input_identity), "task": rec.task,
                                     "options": rec.options, "computed": rec.started,
-                                    "job": rec.id}, preview_path=preview,
-                                   statistics_path=stats)
+                                    "job": rec.id})
+                if pair is not None:
+                    self._artifacts_pending.add(rec.cache_key)
                 rec.state = "done"
+                if pair is not None:
+                    threading.Thread(target=self._artifact_worker,
+                                     args=(pair, rec.cache_key, rec.dir, rec.task),
+                                     name="nnseg-artifacts", daemon=True).start()
             except _PrepareDone:
                 pass
             except Cancelled:
@@ -705,6 +724,29 @@ class LocalExecutor:
                         self._inflight.pop(rec.cache_key, None)
                 self._emit(rec)
                 self._evict()
+
+    def _artifact_worker(self, pair, cache_key: str, jdir: Path, task: str) -> None:
+        """Post-completion artifacts on an overlap thread: preview and
+        statistics computed from the already-loaded pair (no disk or input
+        dependence), placed atomically into the cache entry - which may have
+        been evicted meanwhile, in which case they are simply dropped."""
+        try:
+            from .preview import render_preview
+            from .statistics import compute_statistics
+            if "preview" in self.artifacts:
+                png = render_preview(None, None, jdir / "preview.png",
+                                     title=task, pair=pair)
+                if png:
+                    self.cache.add_artifact(cache_key, "preview.png", png)
+            if "statistics" in self.artifacts:
+                sj = compute_statistics(None, None, jdir / "statistics.json",
+                                        pair=pair)
+                if sj:
+                    self.cache.add_artifact(cache_key, "statistics.json", sj)
+        except Exception:
+            pass
+        finally:
+            self._artifacts_pending.discard(cache_key)
 
     def _prefetch_next(self) -> None:
         """Best-effort: download the HEAD queued idc job's series into the
@@ -1398,45 +1440,71 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         def _register_preview(tok: str, gopts: dict):
             @app.get(base + f"/preview{tok}.png")
-            def preview(ident: str, task: str, _opts=gopts):
+            async def preview(request: Request, ident: str, task: str, _opts=gopts):
                 key = keyed(norm(ident), task, _opts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
                     raise HTTPException(404, "not materialized")
-                png = Path(hit[0]).parent / "preview.png"
-                if not png.exists():
-                    raise HTTPException(404, "no preview for this result")
+                png = await _await_artifact(request, key, hit,
+                                            "preview.png", "preview")
                 return FileResponse(png, media_type="image/png",
                                     headers=_resource_headers(key))
 
         _grid_routes(_register_preview)
 
+        async def _await_artifact(request, key, hit, filename: str, what: str):
+            """The artifact file, waiting out a pending overlap thread. 202 +
+            Retry-After while pending (or Prefer: wait exhausted); 404 only
+            when its absence is definitive."""
+            path = Path(hit[0]).parent / filename
+            if path.exists():
+                return path
+            state_fn = getattr(executor, "artifact_state", None)
+            pending = state_fn is not None and state_fn(key) == "pending"
+            if pending:
+                deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                while time.time() < deadline:
+                    await asyncio.sleep(0.2)
+                    if path.exists():
+                        return path
+                    if state_fn(key) != "pending":
+                        break
+                if path.exists():
+                    return path
+                if state_fn(key) == "pending":
+                    raise HTTPException(202, headers={"Retry-After": "2"},
+                                        detail=f"{what} still materializing")
+            raise HTTPException(404, f"no {what} for this result")
+
         def _register_statistics(tok: str, gopts: dict):
-            def _stats_or_404(ident, task, opts):
+            def _stats_key(ident, task, opts):
                 key = keyed(norm(ident), task, opts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
                     raise HTTPException(404, "not materialized")
-                sj = Path(hit[0]).parent / "statistics.json"
-                if not sj.exists():
-                    raise HTTPException(404, "no statistics for this result")
-                return key, sj
+                return key, hit
 
             @app.get(base + f"/statistics{tok}.json")
-            def statistics_json(ident: str, task: str, _opts=gopts):
-                key, sj = _stats_or_404(ident, task, _opts)
+            async def statistics_json(request: Request, ident: str, task: str,
+                                      _opts=gopts):
+                key, hit = _stats_key(ident, task, _opts)
+                sj = await _await_artifact(request, key, hit,
+                                           "statistics.json", "statistics")
                 return JSONResponse(json.loads(sj.read_text()),
                                     headers=_resource_headers(key))
 
             @app.get(base + f"/statistics{tok}.tsv")
-            def statistics_tsv_view(ident: str, task: str, _opts=gopts):
+            async def statistics_tsv_view(request: Request, ident: str, task: str,
+                                          _opts=gopts):
                 from fastapi import Response
                 from .statistics import statistics_tsv
-                key, sj = _stats_or_404(ident, task, _opts)
+                key, hit = _stats_key(ident, task, _opts)
+                sj = await _await_artifact(request, key, hit,
+                                           "statistics.json", "statistics")
                 return Response(statistics_tsv(json.loads(sj.read_text())),
                                 media_type="text/tab-separated-values",
                                 headers=_resource_headers(key))

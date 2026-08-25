@@ -228,6 +228,13 @@ def _bound_jobs_store(current_jid: str) -> None:
                         del jobs_dict[k]
                     except Exception:
                         pass
+            elif k.startswith("artifacts:"):   # a killed overlap thread leaves
+                m = jobs_dict.get(k) or {}     # a stale pending marker behind
+                if now - float(m.get("t") or 0) > 900:
+                    try:
+                        del jobs_dict[k]
+                    except Exception:
+                        pass
         if purged:
             print(f"[purge] {len(purged)} finished jobs past {JOBS_TTL_H:g}h TTL", flush=True)
         jobs_vol.commit()
@@ -295,6 +302,50 @@ class Worker:
         self._vol_lock = threading.Lock()    # scan-thread reload vs save+commit
         if not hasattr(self, "seg"):
             self._gpu_setup()
+
+    def _artifact_worker(self, pair, cache_key: str, jid: str, task: str) -> None:
+        """Post-done artifacts on an overlap thread: computed from the
+        in-RAM pair (no input/disk dependence), placed atomically into the
+        cache entry under the volume lock, committed, logged. Dropped if the
+        entry was evicted meanwhile."""
+        try:
+            from nnseg.preview import render_preview
+            from nnseg.serve import ResultCache
+            from nnseg.statistics import compute_statistics
+            cache = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP)
+            t0 = time.time()
+            placed = []
+            if "preview" in ARTIFACTS:
+                png = render_preview(None, None,
+                                     Path("/dev/shm") / f"preview_{jid}.png",
+                                     title=task, pair=pair)
+                if png:
+                    with self._vol_lock:
+                        if cache.add_artifact(cache_key, "preview.png", png):
+                            placed.append("preview")
+                    Path(png).unlink(missing_ok=True)
+            t1 = time.time()
+            if "statistics" in ARTIFACTS:
+                sj = compute_statistics(None, None,
+                                        Path("/dev/shm") / f"stats_{jid}.json",
+                                        pair=pair)
+                if sj:
+                    with self._vol_lock:
+                        if cache.add_artifact(cache_key, "statistics.json", sj):
+                            placed.append("statistics")
+                    Path(sj).unlink(missing_ok=True)
+            if placed:
+                with self._vol_lock:
+                    cache_vol.commit()
+            print(f"[artifacts] overlap preview {t1 - t0:.1f}s statistics "
+                  f"{time.time() - t1:.1f}s placed={placed}", flush=True)
+        except Exception as e:
+            print(f"[artifacts] overlap failed: {e}", flush=True)
+        finally:
+            try:
+                del jobs_dict[f"artifacts:{cache_key}"]
+            except Exception:
+                pass
 
     @modal.method()
     def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
@@ -377,33 +428,17 @@ class Worker:
             with self._vol_lock:
                 s.save(jdir / RESULT_NAME)
                 jobs_vol.commit()
-            preview, stats = None, None
-            try:                           # best-effort: artifacts never fail a job -
-                                           # one shared load, done before the finally
-                                           # deletes the input, timed for visibility.
-                                           # NNSEG_ARTIFACTS selects them (measured
-                                           # ~3 s preview + ~7 s statistics per big
-                                           # computed case; a throughput deployment
-                                           # can set it empty)
-                if ARTIFACTS:
-                    from nnseg.preview import load_oriented_pair, render_preview
-                    from nnseg.statistics import compute_statistics
-                    t_l = time.time()
+            pair = None
+            try:                           # only the LOAD stays inline (input alive,
+                                           # ~0.3 s); render + statistics run on an
+                                           # overlap thread after "done", so the next
+                                           # chained job starts immediately and the
+                                           # artifacts land eventually consistent
+                if ARTIFACTS and meta.get("cache_key"):
+                    from nnseg.preview import load_oriented_pair
                     pair = load_oriented_pair(input_path, jdir / RESULT_NAME)
-                    t_p = time.time()
-                    if "preview" in ARTIFACTS:
-                        preview = render_preview(input_path, jdir / RESULT_NAME,
-                                                 Path("/dev/shm") / f"preview_{jid}.png",
-                                                 title=meta["task"], pair=pair)
-                    t_s = time.time()
-                    if "statistics" in ARTIFACTS:
-                        stats = compute_statistics(input_path, jdir / RESULT_NAME,
-                                                   Path("/dev/shm") / f"stats_{jid}.json",
-                                                   pair=pair)
-                    print(f"[artifacts] load {t_p - t_l:.1f}s preview {t_s - t_p:.1f}s "
-                          f"statistics {time.time() - t_s:.1f}s", flush=True)
             except Exception:
-                pass
+                pair = None
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
@@ -413,13 +448,15 @@ class Worker:
                     meta["cache_key"], jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
-                     "computed": meta.get("started")}, preview_path=preview,
-                    statistics_path=stats)
+                     "computed": meta.get("started")})
                 cache_vol.commit()
-            for tmp_artifact in (preview, stats):
-                if tmp_artifact:
-                    Path(tmp_artifact).unlink(missing_ok=True)
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
+            if pair is not None:
+                jobs_dict[f"artifacts:{meta['cache_key']}"] = {"state": "pending",
+                                                               "t": time.time()}
+                threading.Thread(target=self._artifact_worker,
+                                 args=(pair, meta["cache_key"], jid, meta["task"]),
+                                 name="nnseg-artifacts", daemon=True).start()
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
         except Exception as e:               # noqa: BLE001 - reported to the client
@@ -450,6 +487,10 @@ class ModalExecutor:
         jobs_dict[jid] = meta
         Worker().run_job.spawn(jid)
         return meta
+
+    def artifact_state(self, key: str) -> str:
+        m = jobs_dict.get(f"artifacts:{key}")
+        return "pending" if isinstance(m, dict) and m.get("state") == "pending" else "absent"
 
     def cache_list(self):
         from nnseg.serve import ResultCache

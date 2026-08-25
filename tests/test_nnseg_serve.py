@@ -82,6 +82,17 @@ def submit(client, task="total_fast", options=None):
     return r.json()["id"]
 
 
+def wait_artifact(client, url, timeout=5.0):
+    """Artifacts are eventually consistent (overlap thread): poll briefly."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        r = client.get(url)
+        if r.status_code == 200:
+            return r
+        time.sleep(0.02)
+    return r
+
+
 def wait_state(client, jid, want=("done", "failed", "cancelled"), timeout=5.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -1303,10 +1314,11 @@ def test_preview_renders_and_serves(tmp_path, monkeypatch):
     r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
                    headers={"Prefer": "wait=30"})
     assert r.status_code == 200
-    p = client.get(f"/v1/idc/{u}/total_fast/preview.png")
+    p = wait_artifact(client, f"/v1/idc/{u}/total_fast/preview.png")
     assert p.status_code == 200
     assert p.headers["content-type"] == "image/png"
     assert p.content[:8] == b"\x89PNG\r\n\x1a\n" and len(p.content) > 5000
+    wait_artifact(client, f"/v1/idc/{u}/total_fast/preview.png")
     segs = client.get("/v1/segmentations").json()["segmentations"]
     e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
     assert e["preview"] == f"/v1/idc/{u}/total_fast/preview.png"
@@ -1437,7 +1449,7 @@ def test_statistics_computed_and_served_json_and_tsv(tmp_path, monkeypatch):
     assert client.get(f"{base}/labels.seg.nrrd",
                       headers={"Prefer": "wait=30"}).status_code == 200
 
-    j = client.get(f"{base}/statistics.json")
+    j = wait_artifact(client, f"{base}/statistics.json")
     assert j.status_code == 200
     stats = j.json()
     assert stats["units"]["intensity"] == "hu"
@@ -1455,7 +1467,73 @@ def test_statistics_computed_and_served_json_and_tsv(tmp_path, monkeypatch):
     row = t.text.splitlines()[1].split("\t")
     assert row[0] == "blob" and row[3] == "8.0"
 
+    wait_artifact(client, f"{base}/statistics.json")
     segs = client.get("/v1/segmentations").json()["segmentations"]
     e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
     assert e["statistics"] == f"{base}/statistics.tsv"
     assert client.get(f"{base}/statistics_res-1mm.json").status_code == 404
+
+
+def test_artifact_pending_vs_definitive_absence(tmp_path, monkeypatch):
+    """While the overlap thread runs, artifact GETs say 202 retry-later (and
+    Prefer: wait blocks until placed); once it finished, a missing artifact
+    is a definitive 404 - a poller can never wait forever on a dead end."""
+    import numpy as np
+    import SimpleITK as sitk
+
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        a = np.full((16, 16, 16), -1000, np.int16)
+        a[4:12, 4:12, 4:12] = 50
+        sitk.WriteImage(sitk.GetImageFromArray(a), str(d / "vol.nii.gz"))
+        return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((16, 16, 16), np.uint8)
+                    a[5:10, 5:10, 5:10] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.5 0.5 0.5")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 1.0}
+                provenance = {}
+            return R()
+
+    seg = SavingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    base = f"/v1/idc/{u}/total_fast"
+    assert client.get(f"{base}/labels.seg.nrrd",
+                      headers={"Prefer": "wait=30"}).status_code == 200
+
+    # Prefer: wait on the artifact blocks until the overlap thread places it
+    r = client.get(f"{base}/statistics.json", headers={"Prefer": "wait=10"})
+    assert r.status_code == 200
+    assert r.json()["structures"][0]["structure"] == "blob"
+
+    # once the thread finished, a variant that never computed is definitive
+    assert client.get(f"{base}/statistics_res-1mm.json").status_code == 404
+
+    # artifacts disabled: absence is definitive immediately, never a 202
+    ex2 = LocalExecutor(seg, workdir=tmp_path / "w2", cache_dir=tmp_path / "rc2",
+                        fetch_idc_fn=fake_fetch, artifacts=())
+    client2 = TestClient(create_app(ex2))
+    assert client2.get(f"{base}/labels.seg.nrrd",
+                       headers={"Prefer": "wait=30"}).status_code == 200
+    assert client2.get(f"{base}/statistics.json").status_code == 404
+    assert client2.get(f"{base}/preview.png").status_code == 404
