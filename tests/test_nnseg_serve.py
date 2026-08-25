@@ -1537,3 +1537,73 @@ def test_artifact_pending_vs_definitive_absence(tmp_path, monkeypatch):
                        headers={"Prefer": "wait=30"}).status_code == 200
     assert client2.get(f"{base}/statistics.json").status_code == 404
     assert client2.get(f"{base}/preview.png").status_code == 404
+
+
+def test_statistics_get_can_initiate_the_whole_chain(tmp_path, monkeypatch):
+    """The refined rule: an authorized GET of statistics.tsv WITH Prefer: wait
+    materializes segment -> statistics in one request. Without the header it
+    stays read-only (bulk <img>-style GETs can never compute); anonymous
+    stays read-only regardless."""
+    import numpy as np
+    import SimpleITK as sitk
+
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        a = np.full((16, 16, 16), -1000, np.int16)
+        a[4:12, 4:12, 4:12] = 70
+        sitk.WriteImage(sitk.GetImageFromArray(a), str(d / "vol.nii.gz"))
+        return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((16, 16, 16), np.uint8)
+                    a[5:10, 5:10, 5:10] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.5 0.5 0.5")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 1.0}
+                provenance = {}
+            return R()
+
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    base = f"/v1/idc/{u}/total_fast"
+
+    # authorized + Prefer: one GET runs the whole chain and returns the TSV
+    seg = SavingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    r = client.get(f"{base}/statistics.tsv", headers={"Prefer": "wait=15"})
+    assert r.status_code == 200, r.text
+    assert r.text.splitlines()[1].startswith("blob\t")
+    assert len(seg.calls) == 1                            # it computed
+
+    # without Prefer: read-only, 404 with the hint, nothing computed
+    seg2 = SavingSeg()
+    ex2 = LocalExecutor(seg2, workdir=tmp_path / "w2", cache_dir=tmp_path / "rc2",
+                        fetch_idc_fn=fake_fetch)
+    client2 = TestClient(create_app(ex2))
+    r2 = client2.get(f"{base}/statistics.tsv")
+    assert r2.status_code == 404 and "Prefer" in r2.json()["detail"]
+    assert seg2.calls == []
+
+    # anonymous with Prefer on a token-gated server: still read-only
+    seg3 = SavingSeg()
+    ex3 = LocalExecutor(seg3, workdir=tmp_path / "w3", cache_dir=tmp_path / "rc3",
+                        fetch_idc_fn=fake_fetch)
+    client3 = TestClient(create_app(ex3, token="s3cret"))
+    r3 = client3.get(f"{base}/statistics.tsv", headers={"Prefer": "wait=15"})
+    assert r3.status_code == 404 and seg3.calls == []

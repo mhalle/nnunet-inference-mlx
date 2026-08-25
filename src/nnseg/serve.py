@@ -1446,13 +1446,59 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
-                    raise HTTPException(404, "not materialized")
+                    deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                    hit = await _materialize_entry(request, norm(ident),
+                                                   canon_task(task), _opts, key,
+                                                   deadline)
                 png = await _await_artifact(request, key, hit,
                                             "preview.png", "preview")
                 return FileResponse(png, media_type="image/png",
                                     headers=_resource_headers(key))
 
         _grid_routes(_register_preview)
+
+        async def _materialize_entry(request, ident: str, task: str, opts: dict,
+                                     key: str, deadline: float):
+            """Initiate the segmentation chain from an artifact GET - the
+            refined rule (user decision): authorized callers with explicit
+            intent (Prefer: wait) may materialize the whole dependency chain
+            from any derived resource; implicit reads (no Prefer - e.g. bulk
+            <img> preview embeds) never compute, and anonymous never computes
+            anywhere. Returns the cache hit, or raises 202/404/429."""
+            if not authed(request):
+                raise HTTPException(404, "not materialized; authenticated access "
+                                         "can compute it")
+            if deadline <= time.time():
+                raise HTTPException(404, "not materialized; send Prefer: wait to "
+                                         "compute it from this URL")
+            jid = executor.find_inflight(key)
+            if jid is None:
+                if not _source_enabled(srcobj):
+                    raise HTTPException(404, "not materialized, and this server "
+                                             f"cannot fetch {prefix} data")
+                jid, jdir = executor.new_job_dir()
+                srcdict = {"kind": prefix, "id": ident}
+                if prefix == "idc":
+                    srcdict["crdc_series_uuid"] = ident
+                try:
+                    executor.submit(jid, jdir, None, task, dict(opts),
+                                    source=[srcdict],
+                                    identity=(srcobj.identity(ident),),
+                                    source_tokens=source_tokens_of(request))
+                except QueueFull as e:
+                    raise HTTPException(429, str(e),
+                                        headers={"Retry-After": "30"}) from e
+            snap = executor.status_of(jid) or {}
+            while snap.get("state") not in TERMINAL and time.time() < deadline:
+                await asyncio.sleep(0.5)
+                snap = executor.status_of(jid) or {}
+            if snap.get("state") == "failed":
+                raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
+            hit = executor.cache_get(key)
+            if hit is None:                    # still computing when time ran out
+                raise HTTPException(202, headers={"Retry-After": "5"},
+                                    detail="materializing")
+            return hit
 
         async def _await_artifact(request, key, hit, filename: str, what: str):
             """The artifact file, waiting out a pending overlap thread. 202 +
@@ -1479,19 +1525,22 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             raise HTTPException(404, f"no {what} for this result")
 
         def _register_statistics(tok: str, gopts: dict):
-            def _stats_key(ident, task, opts):
+            async def _stats_key(request, ident, task, opts):
                 key = keyed(norm(ident), task, opts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
-                    raise HTTPException(404, "not materialized")
+                    deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                    hit = await _materialize_entry(request, norm(ident),
+                                                   canon_task(task), opts, key,
+                                                   deadline)
                 return key, hit
 
             @app.get(base + f"/statistics{tok}.json")
             async def statistics_json(request: Request, ident: str, task: str,
                                       _opts=gopts):
-                key, hit = _stats_key(ident, task, _opts)
+                key, hit = await _stats_key(request, ident, task, _opts)
                 sj = await _await_artifact(request, key, hit,
                                            "statistics.json", "statistics")
                 return JSONResponse(json.loads(sj.read_text()),
@@ -1502,7 +1551,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                           _opts=gopts):
                 from fastapi import Response
                 from .statistics import statistics_tsv
-                key, hit = _stats_key(ident, task, _opts)
+                key, hit = await _stats_key(request, ident, task, _opts)
                 sj = await _await_artifact(request, key, hit,
                                            "statistics.json", "statistics")
                 return Response(statistics_tsv(json.loads(sj.read_text())),
