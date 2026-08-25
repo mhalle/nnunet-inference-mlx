@@ -1607,3 +1607,72 @@ def test_statistics_get_can_initiate_the_whole_chain(tmp_path, monkeypatch):
     client3 = TestClient(create_app(ex3, token="s3cret"))
     r3 = client3.get(f"{base}/statistics.tsv", headers={"Prefer": "wait=15"})
     assert r3.status_code == 404 and seg3.calls == []
+
+
+def test_wait_zero_expresses_intent_with_impatience(tmp_path, monkeypatch):
+    """Prefer: wait=0 on an artifact GET fires the job and returns 202 with
+    progress headers immediately - intent without patience. Polling with
+    wait=0 rides the same single flight; a later patient GET collects."""
+    import numpy as np
+    import SimpleITK as sitk
+
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        a = np.full((16, 16, 16), -1000, np.int16)
+        a[4:12, 4:12, 4:12] = 70
+        sitk.WriteImage(sitk.GetImageFromArray(a), str(d / "vol.nii.gz"))
+        return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+            if self.gate is not None:
+                self.gate.wait(timeout=5)
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((16, 16, 16), np.uint8)
+                    a[5:10, 5:10, 5:10] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.5 0.5 0.5")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 1.0}
+                provenance = {}
+            return R()
+
+    gate = threading.Event()
+    seg = SavingSeg(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/statistics.tsv"
+
+    r = client.get(url, headers={"Prefer": "wait=0"})     # fire...
+    assert r.status_code == 202 and "Retry-After" in r.headers
+    r2 = client.get(url, headers={"Prefer": "wait=0"})    # ...poll: same flight
+    assert r2.status_code == 202
+    gate.set()
+    r3 = wait_artifact_with_prefer(client, url)
+    assert r3.status_code == 200
+    assert r3.text.splitlines()[1].startswith("blob\t")
+    assert len(seg.calls) == 1                            # single flight held
+
+
+def wait_artifact_with_prefer(client, url, timeout=10.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        r = client.get(url, headers={"Prefer": "wait=5"})
+        if r.status_code == 200:
+            return r
+        time.sleep(0.05)
+    return r

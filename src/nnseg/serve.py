@@ -916,6 +916,24 @@ def _prefer_wait(request, default: float, maximum: float) -> float:
     return default
 
 
+def _prefer_wait_raw(request, maximum: float) -> float | None:
+    """Like :func:`_prefer_wait`, but None when no Prefer token was sent -
+    header PRESENCE expresses intent, the duration expresses patience:
+    wait=0 means "materialize this, but do not hold my connection"
+    (respond-async likewise)."""
+    for raw in request.headers.getlist("prefer"):
+        for token in raw.split(","):
+            token = token.strip().lower()
+            if token == "respond-async":
+                return 0.0
+            if token.startswith("wait="):
+                try:
+                    return max(0.0, min(float(token[5:]), maximum))
+                except ValueError:
+                    pass
+    return None
+
+
 def create_app(executor: LocalExecutor, *, token: str | None = None,
                wait_default: float = 30.0, wait_max: float = 110.0):
     """The FastAPI app over an executor. Import cost lives here, behind the
@@ -1446,7 +1464,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
-                    deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                    w = _prefer_wait_raw(request, wait_max)
+                    deadline = None if w is None else time.time() + w
                     hit = await _materialize_entry(request, norm(ident),
                                                    canon_task(task), _opts, key,
                                                    deadline)
@@ -1468,9 +1487,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             if not authed(request):
                 raise HTTPException(404, "not materialized; authenticated access "
                                          "can compute it")
-            if deadline <= time.time():
+            if deadline is None:
                 raise HTTPException(404, "not materialized; send Prefer: wait to "
-                                         "compute it from this URL")
+                                         "compute it from this URL (wait=0 fires "
+                                         "the job and returns 202 immediately)")
             jid = executor.find_inflight(key)
             if jid is None:
                 if not _source_enabled(srcobj):
@@ -1495,9 +1515,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             if snap.get("state") == "failed":
                 raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
             hit = executor.cache_get(key)
-            if hit is None:                    # still computing when time ran out
-                raise HTTPException(202, headers={"Retry-After": "5"},
-                                    detail="materializing")
+            if hit is None:                    # initiated; patience exhausted (or 0)
+                raise HTTPException(202, detail="materializing",
+                                    headers={"Retry-After": "5",
+                                             **_progress_headers(snap.get("progress"))})
             return hit
 
         async def _await_artifact(request, key, hit, filename: str, what: str):
@@ -1531,7 +1552,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
                 if hit is None:
-                    deadline = time.time() + _prefer_wait(request, 0.0, wait_max)
+                    w = _prefer_wait_raw(request, wait_max)
+                    deadline = None if w is None else time.time() + w
                     hit = await _materialize_entry(request, norm(ident),
                                                    canon_task(task), opts, key,
                                                    deadline)
