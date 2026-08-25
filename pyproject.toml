@@ -30,6 +30,8 @@ remote = ["httpx"]
 serve = ["fastapi", "uvicorn", "python-multipart"]
 # Server-side fetch of IDC series by UUID (source kind "idc").
 idc = ["obstore"]
+# Deploying the server to Modal (nnseg modal deploy).
+modal = ["modal"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
 test = ["pytest", "pydicom", "fastapi", "httpx", "python-multipart"]

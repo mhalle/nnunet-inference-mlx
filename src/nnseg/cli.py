@@ -49,6 +49,17 @@ def main(argv=None) -> int:
     sv.add_argument("--keep-finished", type=int, default=50, help="finished jobs (and files) retained")
     sv.add_argument("--workdir", default=None, help="job storage (default: a temp directory)")
 
+    mo = sub.add_parser("modal", help="deploy the server to Modal (needs the modal extra)")
+    mosub = mo.add_subparsers(dest="mcmd", required=True)
+    md = mosub.add_parser("deploy", help="deploy the packaged app to your Modal account")
+    md.add_argument("--gpu", default=None, help="worker GPU (default L40S; A10 is the economical fast-mode choice)")
+    md.add_argument("--app-name", default=None)
+    md.add_argument("--scaledown", type=int, default=None,
+                    help="seconds a warm worker lingers after its last job (Modal caps at 1200)")
+    md.add_argument("--no-proxy-auth", action="store_true",
+                    help="deploy WITHOUT auth - smoke tests only; anyone with the URL can spend your GPU credit")
+    mosub.add_parser("app-path", help="print the deployable app file's path")
+
     rc = sub.add_parser("remote", help="talk to an nnseg server (needs the remote extra)")
     rc.add_argument("--server", default=None,
                     help="server URL, e.g. http://gpu-box:8790 (or set NNSEG_SERVER)")
@@ -69,6 +80,30 @@ def main(argv=None) -> int:
     rsub.add_parser("tasks", help="what the server can segment")
 
     args = ap.parse_args(argv)
+    if args.cmd == "modal":
+        from importlib.resources import files
+        apppath = str(files("nnseg").joinpath("modal_app.py"))
+        if args.mcmd == "app-path":
+            print(apppath)
+            return 0
+        try:
+            import modal  # noqa: F401
+        except ImportError:
+            print("needs the modal extra: uv sync --extra modal "
+                  "(or pip install 'nnseg[modal]')", file=sys.stderr)
+            return 2
+        import os
+        import subprocess
+        env = dict(os.environ)
+        if args.gpu:
+            env["NNSEG_GPU"] = args.gpu
+        if args.app_name:
+            env["NNSEG_APP_NAME"] = args.app_name
+        if args.scaledown:
+            env["NNSEG_SCALEDOWN"] = str(args.scaledown)
+        if args.no_proxy_auth:
+            env["NNSEG_PROXY_AUTH"] = "0"
+        return subprocess.call([sys.executable, "-m", "modal", "deploy", apppath], env=env)
     if args.cmd == "serve":
         from .serve import main_serve
         return main_serve(args)

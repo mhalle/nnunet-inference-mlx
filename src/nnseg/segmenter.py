@@ -54,7 +54,7 @@ class Segmenter:
     def segment(self, image, task, **overrides):
         """Segment ``image`` with ``task``; any policy argument may be overridden for this call."""
         from .pipeline import segment
-        unknown = set(overrides) - set(POLICY) - {"progress", "outside"}
+        unknown = set(overrides) - set(POLICY) - {"progress", "outside", "cancel"}
         if unknown:
             raise TypeError(f"unknown argument(s) {sorted(unknown)}; policy is {sorted(POLICY)}")
         kw = {**self.policy, **overrides}

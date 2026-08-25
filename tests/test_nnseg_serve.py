@@ -379,3 +379,37 @@ def test_idc_identifier_fields_are_explicit(tmp_path, monkeypatch):
     assert r.status_code == 422 and "8-4-4-4-12" in r.json()["detail"]
     r = post({})
     assert r.status_code == 422
+
+
+def test_sse_poll_branch_for_pushless_executors(tmp_path):
+    """Executors without push (the ModalExecutor shape) stream via server-side
+    polling of the same snapshots - same contract, different transport."""
+    seg = FakeSegmenter(steps=3)
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    ex.supports_push = False
+    client = TestClient(create_app(ex))
+    jid = submit(client)
+    states = []
+    with client.stream("GET", f"/v1/jobs/{jid}/events") as r:
+        for line in r.iter_lines():
+            if line.startswith("data:"):
+                snap = json.loads(line[5:])
+                states.append(snap["state"])
+                if snap["state"] in ("done", "failed", "cancelled"):
+                    break
+    assert states[-1] == "done"
+
+
+def test_real_segmenter_accepts_cancel_override(tmp_path, monkeypatch):
+    """Regression from the first Modal smoke: Segmenter.segment's override
+    whitelist rejected `cancel`, which pipeline.segment legitimately takes - both
+    executors pass it, and only a fake segmenter let the tests miss it."""
+    from nnseg import Segmenter, pipeline
+
+    seen = {}
+    monkeypatch.setattr(pipeline, "segment",
+                        lambda image, task, **kw: seen.update(kw) or FakeSeg())
+    token = object()
+    Segmenter(weights=tmp_path).segment("x.nii.gz", "total_fast",
+                                        cancel=token, progress=None)
+    assert seen["cancel"] is token

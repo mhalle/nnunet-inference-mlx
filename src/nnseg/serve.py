@@ -163,12 +163,16 @@ class LocalExecutor:
                 return None
 
     # -- control -------------------------------------------------------------
-    def cancel(self, jid: str) -> str | None:
-        """Cancel an active job; delete a finished one. Returns the state seen."""
+    def cancel(self, jid: str):
+        """Cancel an active job; delete a finished one.
+
+        Returns ``(state, deleted)`` - ``deleted`` is True only when a finished
+        job's record and files were actually removed, never for a transition into
+        ``cancelled``. ``(None, False)`` for an unknown job."""
         with self._cv:
             rec = self._jobs.get(jid)
             if rec is None:
-                return None
+                return None, False
             if rec.state == "queued":
                 self._pending.remove(jid)
                 rec.state, rec.finished = "cancelled", time.time()
@@ -180,11 +184,11 @@ class LocalExecutor:
             else:
                 self._jobs.pop(jid)
                 self._rm(rec)
-                return rec.state
+                return rec.state, True
         if state == "cancelled":
             self._emit(rec)
             self._requeue_positions()
-        return state
+        return state, False
 
     def close(self) -> None:
         with self._cv:
@@ -283,6 +287,26 @@ class LocalExecutor:
     def _rm(rec: JobRecord) -> None:
         import shutil
         shutil.rmtree(rec.dir, ignore_errors=True)
+
+    # -- the executor protocol create_app depends on -------------------------
+    # (ModalExecutor in modal_app.py implements the same surface over Modal
+    # primitives: new_job_dir, accepting, submit, status_of, statuses, cancel,
+    # result_file, and supports_push=False for the SSE poll branch.)
+    supports_push = True
+
+    def status_of(self, jid: str) -> dict | None:
+        rec = self.get(jid)
+        return None if rec is None else self.status(rec)
+
+    def statuses(self) -> list[dict]:
+        return [self.status(r, brief=True) for r in self.jobs()]
+
+    def result_file(self, jid: str):
+        """(state, labels path or None); (None, None) for an unknown job."""
+        rec = self.get(jid)
+        if rec is None:
+            return None, None
+        return rec.state, rec.labels_path
 
     # -- serialization -------------------------------------------------------
     def status(self, rec: JobRecord, *, brief: bool = False) -> dict:
@@ -478,50 +502,68 @@ def create_app(executor: LocalExecutor):
                                          "needs /v1/resolve)")
             input_path, identity = None, (f"idc:{series}",)
         try:
-            rec = executor.submit(jid, jdir, input_path, task, opts,
-                                  source=src, identity=identity)
+            executor.submit(jid, jdir, input_path, task, opts,
+                            source=src, identity=identity)
         except QueueFull as e:
             import shutil
             shutil.rmtree(jdir, ignore_errors=True)
             raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
-        return executor.status(rec)
+        return executor.status_of(jid)
 
     @app.get("/v1/jobs")
     def jobs():
-        return {"jobs": [executor.status(r, brief=True) for r in executor.jobs()]}
+        return {"jobs": executor.statuses()}
 
-    def _rec_or_404(jid: str) -> JobRecord:
-        rec = executor.get(jid)
-        if rec is None:
+    def _status_or_404(jid: str) -> dict:
+        s = executor.status_of(jid)
+        if s is None:
             raise HTTPException(404, f"no job {jid!r}")
-        return rec
+        return s
 
     @app.get("/v1/jobs/{jid}")
     def status(jid: str):
-        return executor.status(_rec_or_404(jid))
+        return _status_or_404(jid)
 
     @app.get("/v1/jobs/{jid}/events")
     async def events(jid: str):
-        rec = _rec_or_404(jid)
-        loop = asyncio.get_running_loop()
-        q: asyncio.Queue = asyncio.Queue()
-        executor.subscribe(jid, loop, q)
+        first = _status_or_404(jid)
+        push = bool(getattr(executor, "supports_push", False))
+        loop = q = None
+        if push:
+            loop = asyncio.get_running_loop()
+            q = asyncio.Queue()
+            executor.subscribe(jid, loop, q)
 
         def sse(payload: dict) -> str:
             return f"event: status\ndata: {json.dumps(payload)}\n\n"
 
         async def stream():
+            snap = first
+            quiet = time.time()
             try:
-                snap = executor.status(rec)
                 yield sse(snap)
                 while snap["state"] not in TERMINAL:
-                    try:
-                        snap = await asyncio.wait_for(q.get(), timeout=15.0)
-                        yield sse(snap)
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
+                    if push:
+                        try:
+                            snap = await asyncio.wait_for(q.get(), timeout=15.0)
+                            yield sse(snap)
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                    else:                       # poll branch: Modal, or any pushless executor
+                        await asyncio.sleep(0.7)
+                        nxt = executor.status_of(jid)
+                        if nxt is None:
+                            break
+                        if nxt != snap:
+                            snap = nxt
+                            quiet = time.time()
+                            yield sse(snap)
+                        elif time.time() - quiet > 15:
+                            quiet = time.time()
+                            yield ": keepalive\n\n"
             finally:
-                executor.unsubscribe(jid, loop, q)
+                if push:
+                    executor.unsubscribe(jid, loop, q)
 
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -529,20 +571,23 @@ def create_app(executor: LocalExecutor):
 
     @app.get("/v1/jobs/{jid}/result")
     def result(jid: str):
-        rec = _rec_or_404(jid)
-        if rec.state != "done":
-            raise HTTPException(409, f"job is {rec.state}, not done")
-        return FileResponse(rec.labels_path, media_type="application/gzip",
-                            filename=f"{rec.task}_{rec.id}.nii.gz")
+        state, path = executor.result_file(jid)
+        if state is None:
+            raise HTTPException(404, f"no job {jid!r}")
+        if state != "done" or path is None:
+            raise HTTPException(409, f"job is {state}, not done")
+        task_name = (executor.status_of(jid) or {}).get("task", "labels")
+        return FileResponse(path, media_type="application/gzip",
+                            filename=f"{task_name}_{jid}.nii.gz")
 
     @app.delete("/v1/jobs/{jid}")
     def cancel(jid: str):
-        state = executor.cancel(jid)
+        state, deleted = executor.cancel(jid)
         if state is None:
             raise HTTPException(404, f"no job {jid!r}")
-        if state in TERMINAL:
+        if deleted:
             return {"id": jid, "deleted": True, "state": state}
-        return {"id": jid, "cancelling": True, "state": state}
+        return {"id": jid, "cancelling": state not in TERMINAL, "state": state}
 
     return app
 
