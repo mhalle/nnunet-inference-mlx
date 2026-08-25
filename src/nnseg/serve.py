@@ -447,6 +447,89 @@ class QueueFull(NnsegError):
     """The pending queue is at its bound; the caller should retry later."""
 
 
+def publish_completion(*, segmenter, task, identity, options, cache_key,
+                       labels_path, input_image, artifacts, cache_enabled,
+                       migrate_key, set_pending, clear_pending, put,
+                       mark_done, start_worker):
+    """The one correct publication order for a finished segmentation, shared
+    by both executors so ordering fixes cannot drift apart (in the 2026-08-25
+    review, C7 and C8 each had to be written twice):
+
+      1. re-key: the job may have been keyed while weights versions were
+         still "unknown" (first install); they are knowable now, so migrate
+         the key and the single-flight marker together - otherwise the entry
+         is orphaned and every later probe misses forever.
+      2. load the artifact pair while the input is still staged - the only
+         inline artifact cost (~0.3 s).
+      3. pending marker BEFORE the entry is visible: a probe that finds the
+         fresh entry with no artifact must read "pending", never a
+         definitive absence it would treat as a 404.
+      4. the cache put (the entry's labels file is its commit marker).
+      5. done becomes observable.
+      6. the artifact worker starts; a start failure clears pending and must
+         never disturb the already-observable done.
+
+    The environment differences (in-process set vs Dict markers, volume
+    commits, _emit vs a state field) ride in the callables; the ORDER lives
+    here. Returns (cache_key, pair)."""
+    if cache_key:
+        try:
+            fresh = result_key(identity, task, options,
+                               weights_versions_of(segmenter, task))
+            if fresh != cache_key:
+                migrate_key(cache_key, fresh)
+                cache_key = fresh
+        except Exception:
+            pass
+    pair = None
+    if artifacts and cache_enabled and cache_key:
+        try:
+            from .preview import load_oriented_pair
+            pair = load_oriented_pair(input_image, labels_path)
+        except Exception:
+            pair = None
+    if pair is not None:
+        set_pending(cache_key)
+    if cache_enabled and cache_key:
+        put(cache_key)
+    mark_done()
+    if pair is not None:
+        try:
+            start_worker(pair, cache_key)
+        except Exception:
+            clear_pending(cache_key)
+    return cache_key, pair
+
+
+def artifact_overlap(pair, task, artifacts, *, preview_out, statistics_out,
+                     place, finish):
+    """The overlap thread's body, shared by both executors: render and
+    compute from the in-RAM pair (no input or disk dependence), hand each
+    file to ``place(name, path) -> bool`` (atomic within the cache; False
+    when the entry was evicted meanwhile - dropped, never recreated), and
+    ALWAYS run ``finish(placed)`` - the pending-marker clear, plus any
+    commit/logging the environment wants. ``placed`` is [(name, seconds)]
+    for what actually landed."""
+    placed = []
+    try:
+        from .preview import render_preview
+        from .statistics import compute_statistics
+        if "preview" in artifacts:
+            t0 = time.time()
+            png = render_preview(None, None, preview_out, title=task, pair=pair)
+            if png and place("preview.png", png):
+                placed.append(("preview", time.time() - t0))
+        if "statistics" in artifacts:
+            t0 = time.time()
+            sj = compute_statistics(None, None, statistics_out, pair=pair)
+            if sj and place("statistics.json", sj):
+                placed.append(("statistics", time.time() - t0))
+    except Exception:
+        pass
+    finally:
+        finish(placed)
+
+
 @dataclass
 class JobRecord:
     """Everything the server knows about one job. Mutated only under the executor's
@@ -759,54 +842,37 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
-                # First run of a freshly-installed task: the key was built
-                # while weights versions were still "unknown"; they are
-                # knowable NOW, so re-key - otherwise this entry is orphaned
-                # under the unknown-key and every later probe misses forever.
-                if rec.cache_key:
-                    try:
-                        fresh = result_key(rec.input_identity, rec.task, rec.options,
-                                           weights_versions_of(self.segmenter, rec.task))
-                        if fresh != rec.cache_key:
-                            with self._cv:
-                                if self._inflight.get(rec.cache_key) == rec.id:
-                                    self._inflight.pop(rec.cache_key, None)
-                                self._inflight[fresh] = rec.id
-                                rec.cache_key = fresh
-                    except Exception:
-                        pass
-                pair = None
-                try:                       # only the LOAD stays inline (input alive,
-                                           # ~0.3 s); render + statistics overlap with
-                                           # the next job on a thread, and their
-                                           # artifacts are eventually consistent
-                    if self.artifacts and self.cache is not None and rec.cache_key:
-                        from .preview import load_oriented_pair
-                        pair = load_oriented_pair(inp, rec.labels_path)
-                except Exception:
-                    pair = None
-                # pending BEFORE the put: the instant the entry is visible,
-                # artifact probes must read "pending", never a definitive
-                # absence they would cache as a 404
-                if pair is not None:
-                    self._artifacts_pending.add(rec.cache_key)
-                # cache BEFORE flipping state: anything that observes "done"
-                # (HEAD probes, the segmentations listing) must find the entry
-                if self.cache is not None and rec.cache_key:
-                    self.cache.put(rec.cache_key, rec.labels_path, rec.result,
-                                   {"identity": list(rec.input_identity), "task": rec.task,
-                                    "options": rec.options, "computed": rec.started,
-                                    "job": rec.id})
-                rec.state = "done"
-                if pair is not None:
-                    try:               # a start failure here must not fall to
-                                       # the failure path and rewrite a "done"
-                                       # that watchers may have observed
-                        threading.Thread(target=self._artifact_worker,
-                                         args=(pair, rec.cache_key, rec.dir, rec.task),
-                                         name="nnseg-artifacts", daemon=True).start()
-                    except Exception:
-                        self._artifacts_pending.discard(rec.cache_key)
+
+                def _migrate(old_key: str, new_key: str) -> None:
+                    with self._cv:
+                        if self._inflight.get(old_key) == rec.id:
+                            self._inflight.pop(old_key, None)
+                        self._inflight[new_key] = rec.id
+                        rec.cache_key = new_key
+
+                def _mark_done() -> None:
+                    rec.state = "done"
+
+                def _start(pair, key: str) -> None:
+                    threading.Thread(target=self._artifact_worker,
+                                     args=(pair, key, rec.dir, rec.task),
+                                     name="nnseg-artifacts", daemon=True).start()
+
+                rec.cache_key, _ = publish_completion(
+                    segmenter=self.segmenter, task=rec.task,
+                    identity=rec.input_identity, options=rec.options,
+                    cache_key=rec.cache_key, labels_path=rec.labels_path,
+                    input_image=inp, artifacts=self.artifacts,
+                    cache_enabled=self.cache is not None,
+                    migrate_key=_migrate,
+                    set_pending=self._artifacts_pending.add,
+                    clear_pending=self._artifacts_pending.discard,
+                    put=lambda key: self.cache.put(
+                        key, rec.labels_path, rec.result,
+                        {"identity": list(rec.input_identity), "task": rec.task,
+                         "options": rec.options, "computed": rec.started,
+                         "job": rec.id}),
+                    mark_done=_mark_done, start_worker=_start)
             except _PrepareDone:
                 pass
             except Cancelled:
@@ -832,27 +898,14 @@ class LocalExecutor:
                 self._evict()
 
     def _artifact_worker(self, pair, cache_key: str, jdir: Path, task: str) -> None:
-        """Post-completion artifacts on an overlap thread: preview and
-        statistics computed from the already-loaded pair (no disk or input
-        dependence), placed atomically into the cache entry - which may have
-        been evicted meanwhile, in which case they are simply dropped."""
-        try:
-            from .preview import render_preview
-            from .statistics import compute_statistics
-            if "preview" in self.artifacts:
-                png = render_preview(None, None, jdir / "preview.png",
-                                     title=task, pair=pair)
-                if png:
-                    self.cache.add_artifact(cache_key, "preview.png", png)
-            if "statistics" in self.artifacts:
-                sj = compute_statistics(None, None, jdir / "statistics.json",
-                                        pair=pair)
-                if sj:
-                    self.cache.add_artifact(cache_key, "statistics.json", sj)
-        except Exception:
-            pass
-        finally:
-            self._artifacts_pending.discard(cache_key)
+        """Post-completion artifacts via the shared overlap body; placement
+        is the cache's atomic add_artifact, finish clears the pending set."""
+        artifact_overlap(
+            pair, task, self.artifacts,
+            preview_out=jdir / "preview.png",
+            statistics_out=jdir / "statistics.json",
+            place=lambda name, path: self.cache.add_artifact(cache_key, name, path),
+            finish=lambda placed: self._artifacts_pending.discard(cache_key))
 
     def _prefetch_next(self) -> None:
         """Best-effort: download the HEAD queued idc job's series into the

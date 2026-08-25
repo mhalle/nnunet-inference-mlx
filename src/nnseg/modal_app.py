@@ -322,48 +322,38 @@ class Worker:
             self._gpu_setup()
 
     def _artifact_worker(self, pair, cache_key: str, jid: str, task: str) -> None:
-        """Post-done artifacts on an overlap thread: computed from the
-        in-RAM pair (no input/disk dependence), placed atomically into the
-        cache entry under the volume lock, committed, logged. Dropped if the
-        entry was evicted meanwhile."""
-        try:
-            from nnseg.preview import render_preview
-            from nnseg.serve import ResultCache
-            from nnseg.statistics import compute_statistics
-            cache = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP)
-            t0 = time.time()
-            placed = []
-            if "preview" in ARTIFACTS:
-                png = render_preview(None, None,
-                                     Path("/dev/shm") / f"preview_{jid}.png",
-                                     title=task, pair=pair)
-                if png:
-                    with self._vol_lock:
-                        if cache.add_artifact(cache_key, "preview.png", png):
-                            placed.append("preview")
-                    Path(png).unlink(missing_ok=True)
-            t1 = time.time()
-            if "statistics" in ARTIFACTS:
-                sj = compute_statistics(None, None,
-                                        Path("/dev/shm") / f"stats_{jid}.json",
-                                        pair=pair)
-                if sj:
-                    with self._vol_lock:
-                        if cache.add_artifact(cache_key, "statistics.json", sj):
-                            placed.append("statistics")
-                    Path(sj).unlink(missing_ok=True)
-            if placed:
-                with self._vol_lock:
-                    cache_vol.commit()
-            print(f"[artifacts] overlap preview {t1 - t0:.1f}s statistics "
-                  f"{time.time() - t1:.1f}s placed={placed}", flush=True)
-        except Exception as e:
-            print(f"[artifacts] overlap failed: {e}", flush=True)
-        finally:
+        """Post-done artifacts via the shared overlap body; this side's place
+        is vol-locked add_artifact + tmpfs cleanup, and finish commits once,
+        logs, and always deletes the pending marker."""
+        from nnseg.serve import ResultCache, artifact_overlap
+        cache = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP)
+
+        def _place(name: str, path) -> bool:
+            with self._vol_lock:
+                ok = cache.add_artifact(cache_key, name, path)
+            Path(path).unlink(missing_ok=True)
+            return ok
+
+        def _finish(placed) -> None:
             try:
-                del jobs_dict[f"artifacts:{cache_key}"]
-            except Exception:
-                pass
+                if placed:
+                    with self._vol_lock:
+                        cache_vol.commit()
+                print("[artifacts] overlap "
+                      + " ".join(f"{n} {dt:.1f}s" for n, dt in placed)
+                      + f" placed={[n for n, _ in placed]}", flush=True)
+            except Exception as e:
+                print(f"[artifacts] overlap failed: {e}", flush=True)
+            finally:
+                try:
+                    del jobs_dict[f"artifacts:{cache_key}"]
+                except Exception:
+                    pass
+
+        artifact_overlap(pair, task, ARTIFACTS,
+                         preview_out=Path("/dev/shm") / f"preview_{jid}.png",
+                         statistics_out=Path("/dev/shm") / f"stats_{jid}.json",
+                         place=_place, finish=_finish)
 
     @modal.method()
     def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
@@ -452,61 +442,65 @@ class Worker:
             with self._vol_lock:
                 s.save(jdir / RESULT_NAME)
                 jobs_vol.commit()
-            pair = None
-            try:                           # only the LOAD stays inline (input alive,
-                                           # ~0.3 s); render + statistics run on an
-                                           # overlap thread after "done", so the next
-                                           # chained job starts immediately and the
-                                           # artifacts land eventually consistent
-                if ARTIFACTS and meta.get("cache_key"):
-                    from nnseg.preview import load_oriented_pair
-                    pair = load_oriented_pair(input_path, jdir / RESULT_NAME)
-            except Exception:
-                pair = None
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
                       "provenance": s.provenance}
-            if meta.get("cache_key"):      # re-key now that weights versions are knowable
+            # The publication order (re-key, pair load, pending marker,
+            # cache put, done, overlap start) lives in one place -
+            # nnseg.serve.publish_completion; this side supplies the Dict
+            # markers, the volume commit, and _emit. The marker landing
+            # before the put also closes the last C8-class window here:
+            # the entry becomes visible at commit, and the marker must
+            # never trail it.
+            from nnseg.serve import publish_completion
+
+            def _migrate(old_key: str, new_key: str) -> None:
                 try:
-                    from nnseg.serve import result_key, weights_versions_of
-                    fresh = result_key(tuple(meta.get("input_identity") or ()),
-                                       meta["task"], meta.get("options") or {},
-                                       weights_versions_of(self.seg, meta["task"]))
-                    if fresh != meta["cache_key"]:
-                        try:
-                            del jobs_dict[f"inflight:{meta['cache_key']}"]
-                        except Exception:
-                            pass
-                        jobs_dict[f"inflight:{fresh}"] = jid
-                        meta["cache_key"] = fresh
-                        _emit(jid, {"cache_key": fresh})
+                    del jobs_dict[f"inflight:{old_key}"]
                 except Exception:
                     pass
-            if meta.get("cache_key"):
+                jobs_dict[f"inflight:{new_key}"] = jid
+                meta["cache_key"] = new_key
+                _emit(jid, {"cache_key": new_key})
+
+            def _set_pending(key: str) -> None:
+                jobs_dict[f"artifacts:{key}"] = {"state": "pending",
+                                                 "t": time.time()}
+
+            def _clear_pending(key: str) -> None:
+                try:                       # worker never started: clear so
+                    del jobs_dict[f"artifacts:{key}"]   # probes don't wait
+                except Exception:          # out the sweep
+                    pass
+
+            def _put(key: str) -> None:
                 ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
-                    meta["cache_key"], jdir / RESULT_NAME, result,
+                    key, jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
                      "computed": started})
                 cache_vol.commit()
-            if pair is not None:           # marker BEFORE "done" is visible: a
-                                           # watcher that sees done and probes an
-                                           # artifact must read pending, never a
-                                           # definitive absence
-                jobs_dict[f"artifacts:{meta['cache_key']}"] = {"state": "pending",
-                                                               "t": time.time()}
-            _emit(jid, {"state": "done", "finished": time.time(), "result": result})
-            if pair is not None:
-                try:
-                    threading.Thread(target=self._artifact_worker,
-                                     args=(pair, meta["cache_key"], jid, meta["task"]),
-                                     name="nnseg-artifacts", daemon=True).start()
-                except Exception:          # never started: clear the marker so
-                    try:                   # probes don't wait out the 900s sweep
-                        del jobs_dict[f"artifacts:{meta['cache_key']}"]
-                    except Exception:
-                        pass
+
+            def _mark_done() -> None:
+                _emit(jid, {"state": "done", "finished": time.time(),
+                            "result": result})
+
+            def _start(pair, key: str) -> None:
+                threading.Thread(target=self._artifact_worker,
+                                 args=(pair, key, jid, meta["task"]),
+                                 name="nnseg-artifacts", daemon=True).start()
+
+            meta["cache_key"], _ = publish_completion(
+                segmenter=self.seg, task=meta["task"],
+                identity=tuple(meta.get("input_identity") or ()),
+                options=meta.get("options") or {},
+                cache_key=meta.get("cache_key"),
+                labels_path=jdir / RESULT_NAME, input_image=input_path,
+                artifacts=ARTIFACTS, cache_enabled=True,
+                migrate_key=_migrate, set_pending=_set_pending,
+                clear_pending=_clear_pending, put=_put,
+                mark_done=_mark_done, start_worker=_start)
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
         except Exception as e:               # noqa: BLE001 - reported to the client
