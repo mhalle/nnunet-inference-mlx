@@ -490,13 +490,23 @@ class Worker:
                      "options": meta.get("options"), "job": jid,
                      "computed": started})
                 cache_vol.commit()
-            _emit(jid, {"state": "done", "finished": time.time(), "result": result})
-            if pair is not None:
+            if pair is not None:           # marker BEFORE "done" is visible: a
+                                           # watcher that sees done and probes an
+                                           # artifact must read pending, never a
+                                           # definitive absence
                 jobs_dict[f"artifacts:{meta['cache_key']}"] = {"state": "pending",
                                                                "t": time.time()}
-                threading.Thread(target=self._artifact_worker,
-                                 args=(pair, meta["cache_key"], jid, meta["task"]),
-                                 name="nnseg-artifacts", daemon=True).start()
+            _emit(jid, {"state": "done", "finished": time.time(), "result": result})
+            if pair is not None:
+                try:
+                    threading.Thread(target=self._artifact_worker,
+                                     args=(pair, meta["cache_key"], jid, meta["task"]),
+                                     name="nnseg-artifacts", daemon=True).start()
+                except Exception:          # never started: clear the marker so
+                    try:                   # probes don't wait out the 900s sweep
+                        del jobs_dict[f"artifacts:{meta['cache_key']}"]
+                    except Exception:
+                        pass
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
         except Exception as e:               # noqa: BLE001 - reported to the client

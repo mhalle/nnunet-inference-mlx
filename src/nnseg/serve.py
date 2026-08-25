@@ -371,18 +371,29 @@ class ResultCache:
 
     def put(self, key: str, labels_path, result: dict, meta: dict,
             preview_path=None, statistics_path=None) -> None:
+        import os
         import shutil
         d = self.root / key
         d.mkdir(parents=True, exist_ok=True)
-        # labels lands LAST: get() and list() gate on its existence, so writing
-        # the sidecars first makes an entry appear atomically complete
-        (d / "result.json").write_text(json.dumps(result))
-        (d / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        def _place(name: str, write) -> None:
+            # temp + rename, every file: an overwriting put (no_cache
+            # recompute) must never truncate a file an open reader is
+            # streaming, and a crash mid-copy must not leave a partial
+            # gate file that get() would serve
+            tmp = d / (name + ".tmp")
+            write(tmp)
+            os.replace(tmp, d / name)
+
+        # sidecars first, labels LAST: get() and list() gate on the labels
+        # file's existence, so an entry appears atomically complete
+        _place("result.json", lambda t: t.write_text(json.dumps(result)))
+        _place("meta.json", lambda t: t.write_text(json.dumps(meta, indent=2)))
         if preview_path and Path(preview_path).exists():
-            shutil.copy2(preview_path, d / "preview.png")
+            _place("preview.png", lambda t: shutil.copy2(preview_path, t))
         if statistics_path and Path(statistics_path).exists():
-            shutil.copy2(statistics_path, d / "statistics.json")
-        shutil.copy2(labels_path, d / RESULT_NAME)
+            _place("statistics.json", lambda t: shutil.copy2(statistics_path, t))
+        _place(RESULT_NAME, lambda t: shutil.copy2(labels_path, t))
         self.evict()
 
     def add_artifact(self, key: str, name: str, src_path) -> bool:
@@ -761,6 +772,11 @@ class LocalExecutor:
                         pair = load_oriented_pair(inp, rec.labels_path)
                 except Exception:
                     pair = None
+                # pending BEFORE the put: the instant the entry is visible,
+                # artifact probes must read "pending", never a definitive
+                # absence they would cache as a 404
+                if pair is not None:
+                    self._artifacts_pending.add(rec.cache_key)
                 # cache BEFORE flipping state: anything that observes "done"
                 # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:
@@ -768,13 +784,16 @@ class LocalExecutor:
                                    {"identity": list(rec.input_identity), "task": rec.task,
                                     "options": rec.options, "computed": rec.started,
                                     "job": rec.id})
-                if pair is not None:
-                    self._artifacts_pending.add(rec.cache_key)
                 rec.state = "done"
                 if pair is not None:
-                    threading.Thread(target=self._artifact_worker,
-                                     args=(pair, rec.cache_key, rec.dir, rec.task),
-                                     name="nnseg-artifacts", daemon=True).start()
+                    try:               # a start failure here must not fall to
+                                       # the failure path and rewrite a "done"
+                                       # that watchers may have observed
+                        threading.Thread(target=self._artifact_worker,
+                                         args=(pair, rec.cache_key, rec.dir, rec.task),
+                                         name="nnseg-artifacts", daemon=True).start()
+                    except Exception:
+                        self._artifacts_pending.discard(rec.cache_key)
             except _PrepareDone:
                 pass
             except Cancelled:
@@ -782,6 +801,8 @@ class LocalExecutor:
             except Exception as e:             # noqa: BLE001 - reported to the client
                 rec.state = "failed"
                 rec.error = f"{type(e).__name__}: {e}"
+                if rec.cache_key:              # a put that failed after the
+                    self._artifacts_pending.discard(rec.cache_key)  # pending add
             finally:
                 if pinned_key is not None:
                     self.series_cache.unpin(pinned_key)
@@ -1273,6 +1294,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             loop = asyncio.get_running_loop()
             q = asyncio.Queue()
             executor.subscribe(jid, loop, q)
+            # a transition between the first fetch and the subscribe was never
+            # pushed; re-fetch so the stream can't idle on a stale snapshot
+            first = executor.status_of(jid) or first
 
         def sse(payload: dict) -> str:
             return f"event: status\ndata: {json.dumps(payload)}\n\n"

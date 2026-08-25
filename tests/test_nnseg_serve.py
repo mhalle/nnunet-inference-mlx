@@ -1845,3 +1845,84 @@ def test_first_install_rekeys_at_completion(tmp_path, monkeypatch):
     r = client.get(url)
     assert r.status_code == 200
     assert len(seg.calls) == 1                 # no recompute
+
+
+def test_pending_marker_set_before_entry_visible(tmp_path, monkeypatch):
+    """Review C8: the artifacts-pending marker must be observable no later
+    than the cache entry itself - a probe that finds the entry but no artifact
+    must read 'pending', never a definitive 404."""
+    import nnseg.preview
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(nnseg.preview, "load_oriented_pair",
+                        lambda *a, **kw: ("pair",))   # force the artifact path
+    seen = []
+    orig_put = serve_mod.ResultCache.put
+
+    def spying_put(self, key, *a, **kw):
+        seen.append(key in ex._artifacts_pending)
+        return orig_put(self, key, *a, **kw)
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc")
+    ex.cache.put = spying_put.__get__(ex.cache, serve_mod.ResultCache)
+    client = TestClient(create_app(ex))
+    jid = submit(client)
+    wait_state(client, jid)
+    assert seen == [True], "cache.put ran before the pending marker was set"
+    # and the worker eventually clears it
+    t0 = time.time()
+    while ex._artifacts_pending and time.time() - t0 < 5:
+        time.sleep(0.02)
+    assert not ex._artifacts_pending
+
+
+def test_result_cache_put_overwrite_atomic(tmp_path):
+    """Review C8: an overwriting put must swap files by rename - an open
+    reader keeps the old complete bytes, and no .tmp debris remains."""
+    from nnseg.serve import RESULT_NAME, ResultCache
+    rc = ResultCache(tmp_path / "rc", keep=5)
+    src = tmp_path / "labels.seg.nrrd"
+    src.write_bytes(b"OLD" * 100)
+    rc.put("k1", src, {"v": 1}, {"m": 1})
+    entry = rc.get("k1")[0]
+    with open(entry, "rb") as held:          # a client mid-download
+        src.write_bytes(b"NEW" * 200)
+        rc.put("k1", src, {"v": 2}, {"m": 2})
+        assert held.read() == b"OLD" * 100   # rename preserved the old inode
+    labels, result = rc.get("k1")
+    assert labels.read_bytes() == b"NEW" * 200
+    assert result == {"v": 2}
+    assert not list((tmp_path / "rc").rglob("*.tmp"))
+
+
+def test_events_refetches_after_subscribe(tmp_path, monkeypatch):
+    """Review C8: a job that turns terminal between the first status fetch and
+    the SSE subscribe must not leave the stream idling on the stale snapshot
+    (no event for the transition was ever pushed)."""
+    seg, ex, client = make(tmp_path)
+    jid = submit(client)
+    wait_state(client, jid)
+
+    real = LocalExecutor.status_of
+    calls = {"n": 0}
+
+    def stale_once(self, j):
+        calls["n"] += 1
+        s = real(self, j)
+        if calls["n"] == 1 and s is not None:
+            s = dict(s)
+            s["state"] = "running"           # the pre-subscribe view
+        return s
+
+    monkeypatch.setattr(LocalExecutor, "status_of", stale_once)
+    out = {}
+
+    def read():
+        with client.stream("GET", f"/v1/jobs/{jid}/events") as r:
+            out["body"] = b"".join(r.iter_raw())
+
+    t = threading.Thread(target=read, daemon=True)
+    t.start()
+    t.join(8)
+    assert not t.is_alive(), "events stream hung on a stale pre-subscribe snapshot"
+    assert b'"done"' in out["body"]
