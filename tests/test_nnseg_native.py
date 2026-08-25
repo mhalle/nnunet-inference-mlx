@@ -228,3 +228,22 @@ def test_region_labels_raise_unsupportedmodel(tmp_path):
     ds = _model_tree(tmp_path, ["3d_fullres"], labels={"background": 0, "whole": [1, 2]})
     with pytest.raises(errors.UnsupportedModel):
         TaskSpec.from_model_folder(ds)
+
+
+def test_fold_all_layout_satisfies_any_fold_request(tmp_path):
+    """nnU-Net's --fold all layout (a single fold_all directory - how MOOSE
+    ships its models) satisfies numeric fold requests and folds='all' alike;
+    numeric folds still win when they exist."""
+    from nnseg.network import available_folds
+
+    only_all = tmp_path / "a"
+    (only_all / "fold_all").mkdir(parents=True)
+    assert available_folds(only_all, (0,)) == ("all",)
+    assert available_folds(only_all, "all") == ("all",)
+    assert available_folds(only_all, None) == ("all",)
+
+    mixed = tmp_path / "b"
+    (mixed / "fold_all").mkdir(parents=True)
+    (mixed / "fold_0").mkdir()
+    assert available_folds(mixed, (0,)) == (0,)
+    assert available_folds(mixed, "all") == (0,)   # numeric folds enumerate

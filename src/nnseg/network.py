@@ -212,19 +212,27 @@ def available_folds(folder, folds) -> tuple:
 
     TotalSegmentator ships fold_0 only, so ``folds=(0,)`` is the right default - but a stock
     nnU-Net result folder may hold any subset (the knee reference model ships only fold_1).
-    ``folds="all"`` takes whatever is on disk. Asking for folds that are all missing is an
-    error naming what is there, rather than nnU-Net's bare file-not-found.
+    ``folds="all"`` takes whatever is on disk. A folder holding only ``fold_all``
+    (nnU-Net's ``--fold all`` layout - how MOOSE ships) satisfies any request, since
+    that single model was trained on all the data. Asking for numeric folds that are
+    all missing is otherwise an error naming what is there, rather than nnU-Net's
+    bare file-not-found.
     """
     root = Path(folder)
     have = sorted(int(p.name.split("_")[1]) for p in root.glob("fold_*")
                   if p.is_dir() and p.name.split("_")[-1].isdigit())
-    if not have:
+    has_all = (root / "fold_all").is_dir()   # nnU-Net's --fold all layout (MOOSE ships these)
+    if not have and not has_all:
         raise ModelNotFound(f"no fold_* directory in {root}")
     if folds is None or (isinstance(folds, str) and folds == "all"):
-        return tuple(have)
+        return tuple(have) or ("all",)
     want = [int(f) for f in ((folds,) if isinstance(folds, int) else folds)]
     keep = [f for f in want if f in have]
     if not keep:
+        if has_all:
+            # fold_all is the model trained on ALL data - it subsumes any
+            # numeric fold request when it is the only thing on disk
+            return ("all",)
         raise ModelNotFound(f"{root.name}: requested fold(s) {want} not present; have {have}")
     return tuple(keep)
 
