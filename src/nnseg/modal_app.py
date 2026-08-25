@@ -476,6 +476,12 @@ class Worker:
 class ModalExecutor:
     """The :func:`nnseg.serve.create_app` executor protocol over Modal primitives."""
 
+    # One lock per API container: a jobs_vol.reload() here discards other
+    # requests' uncommitted upload writes (the api function runs many inputs
+    # concurrently), so every reload and every upload-write+commit serialize
+    # through it. The worker has its own _vol_lock for the same reason.
+    volume_guard = threading.Lock()
+
     @property
     def sources(self):
         from nnseg.sources import registry
@@ -513,7 +519,8 @@ class ModalExecutor:
     def submit(self, jid, jdir, input_path, task, options, *, source=None,
                identity=(), no_cache: bool = False, source_tokens=None):
         from nnseg.serve import result_key, weights_versions_of
-        jobs_vol.commit()                    # make any upload visible to the worker
+        with self.volume_guard:
+            jobs_vol.commit()                # make any upload visible to the worker
         key = None
         if identity:
             key = result_key(identity, task, options,
@@ -624,7 +631,8 @@ class ModalExecutor:
             except Exception:
                 pass
             return meta["state"], (p if p.exists() else None)
-        jobs_vol.reload()
+        with self.volume_guard:
+            jobs_vol.reload()
         p = Path(JOBS_ROOT) / jid / RESULT_NAME
         return meta["state"], (p if p.exists() else None)
 

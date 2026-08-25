@@ -1111,11 +1111,15 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             if src[0].get("part", "file") != "file":
                 raise HTTPException(422, "only the multipart part name 'file' is "
                                          "supported for now")
+            import contextlib
             import hashlib
             h = hashlib.sha256()
             name = Path(file.filename or "input.nii.gz").name
             input_path = jdir / f"input_{name}"
-            with open(input_path, "wb") as f:
+            # executors backed by a snapshot-consistent volume expose a guard:
+            # a concurrent reload elsewhere would discard this uncommitted write
+            guard = getattr(executor, "volume_guard", None) or contextlib.nullcontext()
+            with guard, open(input_path, "wb") as f:
                 while chunk := await file.read(1 << 20):
                     h.update(chunk)
                     f.write(chunk)
