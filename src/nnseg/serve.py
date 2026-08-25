@@ -156,6 +156,48 @@ class SeriesCache:
             else:
                 self._pins[name] = n
 
+    def _claim_owner(self, entry: Path) -> str:
+        """Stamp a fresh claim with an owner token. A writer may only tear
+        down a claim it still owns: after a false-dead reclaim (graveyard
+        rename + re-claim), the ORIGINAL writer's path names the successor's
+        claim, and deleting by bare path destroyed the successor's staging
+        (adversarial round, 2026-08-25)."""
+        token = uuid.uuid4().hex
+        try:
+            (entry / ".owner").write_text(token)
+        except OSError:
+            pass
+        return token
+
+    def _teardown_claim(self, entry: Path, token: str) -> None:
+        """Remove a failed claim - only while this writer still owns it."""
+        try:
+            if (entry / ".owner").read_text() != token:
+                return                     # reclaimed by a successor: not ours
+        except OSError:
+            pass                           # our own partial claim: still ours
+        shutil.rmtree(entry, ignore_errors=True)
+
+    def _hb_start(self, entry: Path):
+        """Tick the claim's mtime while the fetch runs. _writer_alive reads
+        file mtimes as the heartbeat, but a fetch that buffers in memory
+        (IDC reads whole objects before writing) is disk-silent for minutes -
+        long enough to be declared dead while alive. The ticker makes
+        liveness mean process-liveness, which is what reclaim must key on."""
+        stop = threading.Event()
+        beat = entry / ".owner"            # a FILE: _writer_alive scans files
+                                           # (rglob), a directory utime is
+                                           # invisible to it
+        def tick():
+            while not stop.wait(min(10.0, self.claim_timeout / 6)):
+                try:
+                    os.utime(beat if beat.exists() else entry)
+                except OSError:
+                    return
+
+        threading.Thread(target=tick, name="nnseg-claim-hb", daemon=True).start()
+        return stop
+
     def _writer_alive(self, entry: Path) -> bool:
         """A live writer keeps producing files - the newest mtime under the
         entry is its heartbeat. A timeout alone proves nothing about death."""
@@ -211,14 +253,18 @@ class SeriesCache:
                         check()
                     time.sleep(0.2)
                 continue
+            token = self._claim_owner(entry)
+            hb = self._hb_start(entry)
             try:
                 dest = Path(self.fetch(series, entry, credentials=credentials)
                             if credentials is not None else self.fetch(series, entry))
                 self._commit(entry, key=series)
                 return dest
             except BaseException:
-                shutil.rmtree(entry, ignore_errors=True)
+                self._teardown_claim(entry, token)
                 raise
+            finally:
+                hb.set()
 
     def prefetch(self, series: str) -> bool:
         """Claim + fetch + commit without blocking on other writers. False if
@@ -230,16 +276,23 @@ class SeriesCache:
             entry.mkdir(parents=True)
         except FileExistsError:
             return False
+        token = self._claim_owner(entry)
+        hb = self._hb_start(entry)
         try:
             self.fetch(series, entry)
             self._commit(entry, key=series)
             return True
         except Exception:
-            shutil.rmtree(entry, ignore_errors=True)
+            self._teardown_claim(entry, token)
             return False
+        finally:
+            hb.set()
 
     def _commit(self, entry: Path, key: str | None = None) -> None:
-        size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+        # budget = content bytes; bookkeeping dotfiles (.owner/.key/.done)
+        # stay out of the arithmetic
+        size = sum(f.stat().st_size for f in entry.rglob("*")
+                   if f.is_file() and not f.name.startswith("."))
         if key is not None and entry.name != key:
             (entry / ".key").write_text(key)   # readable name for hashed entries
         (entry / self.MARKER).write_text(str(size))
@@ -383,8 +436,9 @@ class ResultCache:
             # temp + rename, every file: an overwriting put (no_cache
             # recompute) must never truncate a file an open reader is
             # streaming, and a crash mid-copy must not leave a partial
-            # gate file that get() would serve
-            tmp = d / (name + ".tmp")
+            # gate file that get() would serve. The temp name is unique
+            # per writer - concurrent same-key writers must not share it.
+            tmp = d / f"{name}.{uuid.uuid4().hex[:8]}.tmp"
             write(tmp)
             os.replace(tmp, d / name)
 
@@ -410,7 +464,7 @@ class ResultCache:
         d = self.root / key
         if not (d / RESULT_NAME).exists():
             return False
-        tmp = d / (name + ".tmp")
+        tmp = d / f"{name}.{uuid.uuid4().hex[:8]}.tmp"   # unique per writer
         shutil.copy2(src_path, tmp)
         os.replace(tmp, d / name)
         return True
@@ -590,7 +644,7 @@ class LocalExecutor:
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
         self.artifacts = set(artifacts or ())
-        self._artifacts_pending: set = set()
+        self._artifacts_pending: dict = {}   # cache_key -> owning job id
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -727,7 +781,9 @@ class LocalExecutor:
                 self._pending.remove(jid)
                 rec.state, rec.finished = "cancelled", time.time()
                 self._done_order.append(jid)
-                if rec.cache_key:
+                # compare-and-pop, same rule as the dispatcher's finally:
+                # under duplicate flights the marker names the LATEST job
+                if rec.cache_key and self._inflight.get(rec.cache_key) == jid:
                     self._inflight.pop(rec.cache_key, None)
                 state = rec.state
             elif rec.state == "running":
@@ -847,15 +903,25 @@ class LocalExecutor:
                     with self._cv:
                         if self._inflight.get(old_key) == rec.id:
                             self._inflight.pop(old_key, None)
-                        self._inflight[new_key] = rec.id
+                        if self._inflight.get(new_key) in (None, rec.id):
+                            self._inflight[new_key] = rec.id   # never stomp a newer flight
                         rec.cache_key = new_key
 
                 def _mark_done() -> None:
                     rec.state = "done"
 
+                def _set_pending(key: str) -> None:
+                    self._artifacts_pending[key] = rec.id
+
+                def _clear_pending(key: str) -> None:
+                    # only the owner clears: a duplicate flight's finish must
+                    # not turn our still-pending artifacts into definitive 404s
+                    if self._artifacts_pending.get(key) == rec.id:
+                        self._artifacts_pending.pop(key, None)
+
                 def _start(pair, key: str) -> None:
                     threading.Thread(target=self._artifact_worker,
-                                     args=(pair, key, rec.dir, rec.task),
+                                     args=(pair, key, rec.dir, rec.task, rec.id),
                                      name="nnseg-artifacts", daemon=True).start()
 
                 rec.cache_key, _ = publish_completion(
@@ -865,8 +931,8 @@ class LocalExecutor:
                     input_image=inp, artifacts=self.artifacts,
                     cache_enabled=self.cache is not None,
                     migrate_key=_migrate,
-                    set_pending=self._artifacts_pending.add,
-                    clear_pending=self._artifacts_pending.discard,
+                    set_pending=_set_pending,
+                    clear_pending=_clear_pending,
                     put=lambda key: self.cache.put(
                         key, rec.labels_path, rec.result,
                         {"identity": list(rec.input_identity), "task": rec.task,
@@ -880,8 +946,8 @@ class LocalExecutor:
             except Exception as e:             # noqa: BLE001 - reported to the client
                 rec.state = "failed"
                 rec.error = f"{type(e).__name__}: {e}"
-                if rec.cache_key:              # a put that failed after the
-                    self._artifacts_pending.discard(rec.cache_key)  # pending add
+                if rec.cache_key and self._artifacts_pending.get(rec.cache_key) == rec.id:
+                    self._artifacts_pending.pop(rec.cache_key, None)   # failed after pending add
             finally:
                 if pinned_key is not None:
                     self.series_cache.unpin(pinned_key)
@@ -897,15 +963,22 @@ class LocalExecutor:
                 self._emit(rec)
                 self._evict()
 
-    def _artifact_worker(self, pair, cache_key: str, jdir: Path, task: str) -> None:
+    def _artifact_worker(self, pair, cache_key: str, jdir: Path, task: str,
+                         owner: str) -> None:
         """Post-completion artifacts via the shared overlap body; placement
-        is the cache's atomic add_artifact, finish clears the pending set."""
+        is the cache's atomic add_artifact, finish clears the pending marker
+        only when this job still owns it."""
+
+        def _finish(placed) -> None:
+            if self._artifacts_pending.get(cache_key) == owner:
+                self._artifacts_pending.pop(cache_key, None)
+
         artifact_overlap(
             pair, task, self.artifacts,
             preview_out=jdir / "preview.png",
             statistics_out=jdir / "statistics.json",
             place=lambda name, path: self.cache.add_artifact(cache_key, name, path),
-            finish=lambda placed: self._artifacts_pending.discard(cache_key))
+            finish=_finish)
 
     def _prefetch_next(self) -> None:
         """Best-effort: download the HEAD queued idc job's series into the
@@ -1150,6 +1223,11 @@ class CacheOnlyExecutor:
         st = self._inflight(key) if self._inflight is not None else None
         if st:
             return {"state": "running", "progress": st.get("progress")}
+        if self._get(key) is not None:
+            # completion window: the writer fills the cache BEFORE clearing
+            # its marker, so miss-then-no-marker must recheck before
+            # declaring failure
+            return {"state": "done"}
         return {"state": "failed"}     # flight gone, nothing cached: stop watching
 
     def result_file(self, jid):
@@ -1299,7 +1377,15 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if not read_only:
             require_auth(request)
         lister = getattr(executor, "cache_list", None)
-        return {"segmentations": lister() if lister else []}
+        entries = lister() if lister else []
+        keep = []                          # advertise only links that resolve
+        for e in entries:                  # on THIS app's mounted sources
+            p = e.get("path") or ""
+            parts = p.split("/", 3)
+            pfx = parts[2] if len(parts) > 2 else None
+            if pfx is None or pfx in sources:
+                keep.append(e)
+        return {"segmentations": keep}
 
     @app.get("/v1/tasks/{task}")
     def describe(task: str):
@@ -1529,6 +1615,15 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     def _resource_headers(key: str) -> dict:
         return {"Cache-Control": "public, max-age=3600", "ETag": f'"{key[:32]}"'}
 
+    def _pref_headers(request, key: str) -> dict:
+        """Resource headers + the RFC 7240 echo: every route that applied a
+        Prefer: wait must say so - labels and artifacts alike."""
+        h = _resource_headers(key)
+        w = _prefer_wait_raw(request, wait_max)
+        if w is not None:
+            h["Preference-Applied"] = f"wait={int(w)}"
+        return h
+
     # Registered BEFORE the GET: Starlette auto-adds HEAD to GET routes, which
     # would run the full handler - a `curl -I` on a miss would start a GPU job.
     # HEAD is the compute-free probe, and the one place status codes distinguish
@@ -1640,12 +1735,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 snap = executor.status_of(jid) or {}
                 while snap.get("state") not in TERMINAL and time.time() < deadline:
                     await asyncio.sleep(0.5)
-                    snap = executor.status_of(jid) or {}
+                    nxt = executor.status_of(jid)
+                    if nxt is None:        # record purged mid-watch: the cache
+                        nxt = ({"state": "done"}   # is the remaining truth
+                               if executor.cache_get(key) is not None
+                               else {"state": "failed",
+                                     "error": "job no longer tracked"})
+                    snap = nxt
                 if snap.get("state") == "done":
                     hit = executor.cache_get(key)
-                    headers = _resource_headers(key)
-                    if _prefer_wait_raw(request, wait_max) is not None:
-                        headers["Preference-Applied"] = f"wait={int(wait)}"
+                    headers = _pref_headers(request, key)
                     src_path = hit[0] if hit else executor.result_file(jid)[1]
                     if src_path is None:       # evicted between done and read
                         raise HTTPException(404, "not materialized")
@@ -1748,7 +1847,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 png = await _await_artifact(request, key, hit,
                                             "preview.png", "preview")
                 return FileResponse(png, media_type="image/png",
-                                    headers=_resource_headers(key))
+                                    headers=_pref_headers(request, key))
 
         _grid_routes(_register_preview)
 
@@ -1759,16 +1858,19 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             intent (Prefer: wait) may materialize the whole dependency chain
             from any derived resource; implicit reads (no Prefer - e.g. bulk
             <img> preview embeds) never compute, and anonymous never computes
-            anywhere. Returns the cache hit, or raises 202/404/429."""
-            if not authed(request):
-                raise HTTPException(404, "not materialized; authenticated access "
-                                         "can compute it")
-            if deadline is None:
-                raise HTTPException(404, "not materialized; send Prefer: wait to "
-                                         "compute it from this URL (wait=0 fires "
-                                         "the job and returns 202 immediately)")
+            anywhere. WATCHING an already-running flight is read-only and
+            open to anyone, exactly as on the labels URL - the gates guard
+            initiation only. Returns the cache hit, or raises 202/404/429."""
             jid = executor.find_inflight(key)
             if jid is None:
+                if not authed(request):
+                    raise HTTPException(404, "not materialized; authenticated "
+                                             "access can compute it")
+                if deadline is None:
+                    raise HTTPException(404, "not materialized; send Prefer: wait "
+                                             "to compute it from this URL (wait=0 "
+                                             "fires the job and returns 202 "
+                                             "immediately)")
                 if not _source_enabled(srcobj):
                     raise HTTPException(404, "not materialized, and this server "
                                              f"cannot fetch {prefix} data")
@@ -1787,13 +1889,22 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     raise HTTPException(429, str(e),
                                         headers={"Retry-After": "30"}) from e
             snap = executor.status_of(jid) or {}
-            while snap.get("state") not in TERMINAL and time.time() < deadline:
+            wait_until = time.time() if deadline is None else deadline
+            while snap.get("state") not in TERMINAL and time.time() < wait_until:
                 await asyncio.sleep(0.5)
-                snap = executor.status_of(jid) or {}
+                nxt = executor.status_of(jid)
+                if nxt is None:            # record purged mid-watch
+                    nxt = ({"state": "done"}
+                           if executor.cache_get(key) is not None
+                           else {"state": "failed",
+                                 "error": "job no longer tracked"})
+                snap = nxt
             if snap.get("state") == "failed":
+                if not authed(request):    # watcher's view: it just is not there
+                    raise HTTPException(404, "not materialized")
                 raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
             hit = executor.cache_get(key)
-            if hit is None:                    # initiated; patience exhausted (or 0)
+            if hit is None:                    # in flight; patience exhausted (or 0)
                 raise HTTPException(202, detail="materializing",
                                     headers=_progress_headers(snap.get("progress"),
                                                               {"Retry-After": "5"}))
@@ -1819,7 +1930,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if path.exists():
                     return path
                 if state_fn(key) == "pending":
-                    raise HTTPException(202, headers={"Retry-After": "2"},
+                    raise HTTPException(202,
+                                        headers=_progress_headers(
+                                            None, {"Retry-After": "2"}),
                                         detail=f"{what} still materializing")
             if path.exists():                  # placed between our probe and the
                 return path                    # pending flag clearing
@@ -1845,7 +1958,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 sj = await _await_artifact(request, key, hit,
                                            "statistics.json", "statistics")
                 return JSONResponse(json.loads(sj.read_text()),
-                                    headers=_resource_headers(key))
+                                    headers=_pref_headers(request, key))
 
             @app.get(base + f"/statistics{tok}.tsv")
             async def statistics_tsv_view(request: Request, ident: str, task: str):
@@ -1856,7 +1969,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                            "statistics.json", "statistics")
                 return Response(statistics_tsv(json.loads(sj.read_text())),
                                 media_type="text/tab-separated-values",
-                                headers=_resource_headers(key))
+                                headers=_pref_headers(request, key))
 
         _grid_routes(_register_statistics)
 

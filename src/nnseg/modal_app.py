@@ -100,6 +100,22 @@ jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
+def _clear_own_artifacts_marker(jid: str, meta: dict) -> None:
+    """Best-effort: drop this job's artifacts-pending marker on a failure
+    path (the overlap worker owns it on success). Without this a put that
+    raised after set_pending left probes answering 202 until the sweep."""
+    key = meta.get("cache_key")
+    if not key:
+        return
+    m = jobs_dict.get(f"artifacts:{key}")
+    if isinstance(m, dict) and m.get("job") not in (None, jid):
+        return
+    try:
+        del jobs_dict[f"artifacts:{key}"]
+    except Exception:
+        pass
+
+
 def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
     """Best-effort CPU downloader, parallel to this GPU job: watch the shared
     jobs Dict for the oldest OTHER queued idc job and stage its series into the
@@ -352,10 +368,12 @@ class Worker:
             except Exception as e:
                 print(f"[artifacts] overlap failed: {e}", flush=True)
             finally:
-                try:
-                    del jobs_dict[f"artifacts:{cache_key}"]
-                except Exception:
-                    pass
+                m = jobs_dict.get(f"artifacts:{cache_key}")
+                if not (isinstance(m, dict) and m.get("job") not in (None, jid)):
+                    try:                   # only the owner clears (duplicate
+                        del jobs_dict[f"artifacts:{cache_key}"]   # flights)
+                    except Exception:
+                        pass
 
         artifact_overlap(pair, task, ARTIFACTS,
                          preview_out=Path("/dev/shm") / f"preview_{jid}.png",
@@ -463,19 +481,27 @@ class Worker:
             from nnseg.serve import publish_completion
 
             def _migrate(old_key: str, new_key: str) -> None:
-                try:
-                    del jobs_dict[f"inflight:{old_key}"]
-                except Exception:
-                    pass
-                jobs_dict[f"inflight:{new_key}"] = jid
+                # compare-and-delete / guarded install, the Local rule: under
+                # duplicate flights a marker names the LATEST job, and this
+                # job may not be it
+                if jobs_dict.get(f"inflight:{old_key}") == jid:
+                    try:
+                        del jobs_dict[f"inflight:{old_key}"]
+                    except Exception:
+                        pass
+                if jobs_dict.get(f"inflight:{new_key}") in (None, jid):
+                    jobs_dict[f"inflight:{new_key}"] = jid
                 meta["cache_key"] = new_key
                 _emit(jid, {"cache_key": new_key})
 
             def _set_pending(key: str) -> None:
                 jobs_dict[f"artifacts:{key}"] = {"state": "pending",
-                                                 "t": time.time()}
+                                                 "t": time.time(), "job": jid}
 
             def _clear_pending(key: str) -> None:
+                m = jobs_dict.get(f"artifacts:{key}")
+                if isinstance(m, dict) and m.get("job") not in (None, jid):
+                    return                 # a duplicate flight owns it now
                 try:                       # worker never started: clear so
                     del jobs_dict[f"artifacts:{key}"]   # probes don't wait
                 except Exception:          # out the sweep
@@ -510,16 +536,23 @@ class Worker:
                 mark_done=_mark_done, start_worker=_start)
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})
+            _clear_own_artifacts_marker(jid, meta)
         except Exception as e:               # noqa: BLE001 - reported to the client
             _emit(jid, {"state": "failed", "finished": time.time(),
                         "error": f"{type(e).__name__}: {e}"})
-        finally:
-            if pinned_key is not None:
+            _clear_own_artifacts_marker(jid, meta)   # a put that failed after
+        finally:                                     # set_pending must not 202
+            if pinned_key is not None:               # until the sweep
                 self.series_cache.unpin(pinned_key)
             prefetch_stop.set()            # end the scan loop with the run
             with self._vol_lock:
                 _bound_jobs_store(jid)
-            if meta.get("cache_key"):
+            # compare-and-delete, the Local dispatcher's rule: under duplicate
+            # flights the marker names the LATEST job - deleting it
+            # unconditionally made probes 404 while the survivor still ran
+            # and left DELETE unable to cancel it
+            if (meta.get("cache_key")
+                    and jobs_dict.get(f"inflight:{meta['cache_key']}") == jid):
                 try:
                     del jobs_dict[f"inflight:{meta['cache_key']}"]
                 except Exception:
@@ -569,15 +602,37 @@ class ModalExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return jid, d
 
+    def _fresh_weights_versions(self, task):
+        """weights_versions_of, but stale-proof: an API container's mounted
+        weights volume is frozen at container start, so after the worker
+        first-installs a task this side kept deriving weights=["unknown"] -
+        every probe missed the re-keyed entry and every Prefer'd GET
+        recomputed, for the container's remaining lifetime. On "unknown",
+        reload the volume once and re-derive."""
+        from nnseg.serve import weights_versions_of
+        wv = weights_versions_of(self.segmenter, task)
+        if any("unknown" in str(v) for v in wv):
+            try:
+                weights_vol.reload()
+            except Exception:
+                return wv
+            wv = weights_versions_of(self.segmenter, task)
+        return wv
+
+    def resource_key(self, identity: str, task: str, opts=None) -> str:
+        from nnseg.serve import result_key
+        return result_key((identity,), task, opts or {},
+                          self._fresh_weights_versions(task))
+
     def submit(self, jid, jdir, input_path, task, options, *, source=None,
                identity=(), no_cache: bool = False, source_tokens=None):
-        from nnseg.serve import result_key, weights_versions_of
+        from nnseg.serve import result_key
         with self.volume_guard:
             jobs_vol.commit()                # make any upload visible to the worker
         key = None
         if identity:
             key = result_key(identity, task, options,
-                             weights_versions_of(self.segmenter, task))
+                             self._fresh_weights_versions(task))
             if not no_cache:
                 hit = self.cache_get(key)
                 if hit is not None:

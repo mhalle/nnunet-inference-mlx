@@ -2088,3 +2088,188 @@ def test_public_twin_without_lister_is_listing_free(tmp_path):
         (identity,), task, opts or {}, ["w=1"])
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
     assert TestClient(app).get("/v1/segmentations").status_code in (404, 405)
+
+
+def test_task_allowlist_is_load_bearing_for_identity_fallback(tmp_path):
+    """Adversarial round R-1: the old B9 test passed with the allowlist
+    deleted, because every fake resolver already refused bad names. This one
+    models the actual threat - a catalog whose resolve_task falls back to
+    identity (Segmenter does exactly that for catalogs without resolve()) -
+    so only the wire allowlist stands between a path and the pipeline."""
+    class Passthrough(FakeSegmenter):
+        def resolve_task(self, t):
+            return str(t)                  # identity fallback: accepts anything
+
+    seg = Passthrough()
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    client = TestClient(create_app(ex))
+    for bad in ("../weights", "..", ".hidden", "a\\b", "/etc/passwd"):
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                        data={"task": bad})
+        assert r.status_code in (404, 422), (bad, r.status_code)
+    assert len(seg.calls) == 0
+    # and a legitimate name still flows through the same resolver
+    ok = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                     data={"task": "total_fast"})
+    assert ok.status_code == 202
+
+
+def test_cancel_of_duplicate_does_not_clobber_survivor_marker(tmp_path):
+    """Adversarial round F3: cancelling one of two queued duplicate jobs
+    (same content, same key) must leave the survivor's single-flight marker
+    in place - popping unconditionally made probes 404 while the survivor
+    still ran and left DELETE unable to reach it."""
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc")
+    client = TestClient(create_app(ex))
+    try:
+        j0 = submit(client)                # occupies the dispatcher (blocked)
+        j1 = submit(client)                # queued, keyed K
+        j2 = submit(client)                # queued duplicate, marker now = j2
+        key = next(k for k, v in ex._inflight.items() if v == j2)
+        assert client.delete(f"/v1/jobs/{j1}").status_code == 200
+        assert ex._inflight.get(key) == j2, "survivor's marker was clobbered"
+        assert client.delete(f"/v1/jobs/{j2}").status_code == 200
+        assert key not in ex._inflight     # own marker: popped
+    finally:
+        gate.set()
+        ex.close()
+
+
+def test_add_artifact_overwrite_is_atomic(tmp_path):
+    """Adversarial round: add_artifact must swap by rename like put - an open
+    reader keeps complete bytes, and concurrent writers cannot share a temp."""
+    from nnseg.serve import ResultCache
+    rc = ResultCache(tmp_path / "rc", keep=5)
+    src = tmp_path / "l.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bx")
+    rc.put("k", src, {}, {})
+    a1 = tmp_path / "p1.png"
+    a1.write_bytes(b"OLDPNG" * 50)
+    assert rc.add_artifact("k", "preview.png", a1)
+    entry = rc.get("k")[0].parent / "preview.png"
+    with open(entry, "rb") as held:
+        a2 = tmp_path / "p2.png"
+        a2.write_bytes(b"NEWPNG" * 90)
+        assert rc.add_artifact("k", "preview.png", a2)
+        assert held.read() == b"OLDPNG" * 50
+    assert entry.read_bytes() == b"NEWPNG" * 90
+    assert not list((tmp_path / "rc").rglob("*.tmp"))
+
+
+def test_cache_only_status_rechecks_cache_before_failed(tmp_path):
+    """Adversarial round F6: the writer fills the cache BEFORE clearing its
+    inflight marker; a reader probing in the same order can miss both and
+    must recheck the cache before synthesizing a terminal 'failed'."""
+    from nnseg.serve import CacheOnlyExecutor, ResultCache
+    cache = ResultCache(tmp_path / "c")
+    calls = {"n": 0}
+
+    def get_flip(key):                     # miss on the first read, hit after
+        calls["n"] += 1                    # (the completion window, collapsed)
+        return None if calls["n"] == 1 else cache.get(key)
+
+    src = tmp_path / "l.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bx")
+    cache.put("K", src, {}, {})
+    ex = CacheOnlyExecutor(get_flip, lambda i, t, o=None: "K",
+                           lambda: ["total_fast"], inflight_fn=lambda k: None)
+    assert ex.status_of("K")["state"] == "done"
+
+
+def test_twin_artifact_watchability_matches_labels(tmp_path):
+    """Adversarial round 4a: an anonymous caller watching an authorized
+    flight sees 202 on preview/statistics exactly as on labels - the
+    auth/Prefer gates guard initiation, not watching."""
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    cache = ResultCache(tmp_path / "c")
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda identity, task, opts=None: result_key(
+        (identity,), task, opts or {}, ["w=1"])
+    flights = {key_fn(f"idc:{u}", "total_fast"):
+               {"progress": {"stage": "predict", "fraction": 0.5}}}
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
+                            inflight=lambda k: flights.get(k))
+    client = TestClient(app)
+    for what in ("labels.seg.nrrd", "preview.png", "statistics.tsv",
+                 "statistics.json"):
+        r = client.get(f"/v1/idc/{u}/total_fast/{what}",
+                       headers={"Prefer": "wait=0"})   # watch, don't hold
+        assert r.status_code == 202, (what, r.status_code)
+    # a true miss (no flight) stays a definitive 404 on artifacts
+    u2 = "1be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    assert client.get(f"/v1/idc/{u2}/total_fast/preview.png").status_code == 404
+
+
+def test_preference_applied_on_artifact_200(tmp_path, monkeypatch):
+    """Adversarial round 4b: a statistics GET that applied Prefer: wait
+    echoes Preference-Applied exactly as the labels GET does."""
+    import nnseg.preview
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    monkeypatch.setattr(nnseg.preview, "load_oriented_pair",
+                        lambda *a, **kw: None)   # no artifacts computed
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "2be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={"Prefer": "wait=30"})
+    assert r.status_code == 200
+    # place a statistics artifact by hand, then read it WITH Prefer
+    key = next(d.name for d in (tmp_path / "rc").iterdir())
+    sj = tmp_path / "s.json"
+    sj.write_text(json.dumps({"units": {"intensity": "hu"}, "structures": []}))
+    ex.cache.add_artifact(key, "statistics.json", sj)
+    r = client.get(f"/v1/idc/{u}/total_fast/statistics.tsv",
+                   headers={"Prefer": "wait=5"})
+    assert r.status_code == 200
+    assert r.headers.get("Preference-Applied") == "wait=5"
+    r = client.get(f"/v1/idc/{u}/total_fast/statistics.tsv")
+    assert "preference-applied" not in {k.lower() for k in r.headers}
+
+
+def test_claim_teardown_respects_ownership(tmp_path):
+    """Adversarial round F1: after a false-dead reclaim, the original
+    writer's cleanup must not delete the successor's claim - and the
+    heartbeat keeps a disk-silent live writer from being declared dead."""
+    from nnseg.serve import SeriesCache
+    sc = SeriesCache(tmp_path / "sc", fetch_fn=lambda *a: None)
+    entry = sc._entry("s1")
+    entry.mkdir(parents=True)
+    token_a = sc._claim_owner(entry)       # writer 1's claim
+    # reclaim: graveyard rename + re-claim by writer 2
+    import shutil as _sh
+    grave = entry.parent / (entry.name + ".stale0")
+    entry.rename(grave)
+    _sh.rmtree(grave)
+    entry.mkdir(parents=True)
+    token_b = sc._claim_owner(entry)
+    (entry / "series").mkdir()
+    (entry / "series" / "f").write_bytes(b"x")
+    sc._teardown_claim(entry, token_a)     # writer 1's late cleanup
+    assert entry.exists(), "stale writer deleted the successor's claim"
+    assert (entry / "series" / "f").exists()
+    sc._teardown_claim(entry, token_b)     # the owner may
+    assert not entry.exists()
+
+    # heartbeat: a fetch that writes nothing still reads as alive
+    sc.claim_timeout = 0.6
+    e2 = sc._entry("s2")
+    e2.mkdir(parents=True)
+    sc._claim_owner(e2)
+    hb = sc._hb_start(e2)
+    try:
+        time.sleep(0.9)                    # > claim_timeout, zero writes
+        assert sc._writer_alive(e2), "live writer declared dead"
+    finally:
+        hb.set()
