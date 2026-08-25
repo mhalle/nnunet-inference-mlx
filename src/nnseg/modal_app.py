@@ -75,7 +75,14 @@ def _pkg_dir() -> Path:
 # env at deploy time - a deploy-shell variable does not otherwise exist in the
 # container (found the hard way: a TTL override that never took effect).
 _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP",
-                  "NNSEG_WARM_TASK", "NNSEG_ARTIFACTS")
+                  "NNSEG_WARM_TASK", "NNSEG_ARTIFACTS",
+                  # NNSEG_PUBLIC gates a module-level `if PUBLIC:` around the
+                  # twin function. The deploy-time import registers it, but
+                  # the CONTAINER re-imports this module - without the knob
+                  # forwarded, its PUBLIC is False, the attribute never
+                  # exists, and every request 303s while the runner crash-
+                  # loops on AttributeError (hit live 2026-08-25).
+                  "NNSEG_PUBLIC")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
