@@ -663,8 +663,8 @@ if PUBLIC:
         seg = Segmenter(device="cpu", weights=WEIGHTS_ROOT)
         cache = ResultCache(CACHE_ROOT, keep=RESULTS_KEEP)
 
-        def key_fn(identity, task):
-            return result_key((identity,), task, {},
+        def key_fn(identity, task, opts=None):
+            return result_key((identity,), task, opts or {},
                               weights_versions_of(seg, task))
 
         def get(key):

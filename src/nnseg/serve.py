@@ -1642,10 +1642,7 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
                 raise HTTPException(404, "unknown resource")
             if not re.fullmatch(pat, ident):
                 raise HTTPException(404, "unknown resource")
-            try:
-                return ident, key_fn(srcobj.identity(ident), task, opts or {})
-            except TypeError:                  # older two-argument key_fn
-                return ident, key_fn(srcobj.identity(ident), task)
+            return ident, key_fn(srcobj.identity(ident), task, opts or {})
 
         def _serve(hit, ident, task, key):
             return FileResponse(hit[0], media_type="application/octet-stream",

@@ -544,7 +544,7 @@ def test_public_app_is_read_only_by_construction(tmp_path):
     from nnseg.serve import ResultCache, create_public_app, result_key
     cache = ResultCache(tmp_path / "c")
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
+    key_fn = lambda identity, task, opts=None: result_key((identity,), task, opts or {}, ["w=1"])
     src = tmp_path / "labels.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
     cache.put(key_fn(f"idc:{u}", "total_fast"), src, {"volumes_ml": {"spleen": 1.0}}, {})
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
@@ -676,7 +676,7 @@ def test_public_app_shows_inflight_and_waits(tmp_path):
     from nnseg.serve import ResultCache, create_public_app, result_key
     cache = ResultCache(tmp_path / "c")
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
+    key_fn = lambda identity, task, opts=None: result_key((identity,), task, opts or {}, ["w=1"])
     flights = {}
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
                             inflight=lambda k: flights.get(k))
@@ -698,7 +698,7 @@ def test_202s_carry_progress_headers(tmp_path):
     body) and header-only clients see stage and fraction."""
     from nnseg.serve import ResultCache, create_public_app, result_key
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
-    key_fn = lambda identity, task: result_key((identity,), task, {}, ["w=1"])
+    key_fn = lambda identity, task, opts=None: result_key((identity,), task, opts or {}, ["w=1"])
     flights = {key_fn(f"idc:{u}", "total_fast"):
                {"progress": {"stage": "predict", "fraction": 0.42}}}
     cache = ResultCache(tmp_path / "c")
@@ -1710,3 +1710,29 @@ def test_query_params_cannot_inject_key_material(tmp_path, monkeypatch):
     spec = client.get("/openapi.json").json()
     txt = json.dumps(spec)
     assert "_opts" not in txt and "_tok" not in txt
+
+
+def test_public_twin_variant_urls_key_on_variant_options(tmp_path):
+    """Regression for the arity-fallback bug: the twin must never serve a
+    differently-keyed entry under a variant URL. With only the default entry
+    cached, the res-1mm URL is a 404 - not the default bytes."""
+    from nnseg.serve import ResultCache, create_public_app, result_key
+
+    cache = ResultCache(tmp_path / "rc")
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda identity, task, opts=None: result_key((identity,), task,
+                                                          opts or {}, ["w=1"])
+    src = tmp_path / "labels.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bdefault")
+    cache.put(key_fn(f"idc:{u}", "total_fast"), src, {"names": {}}, {})
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
+    client = TestClient(app)
+    assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 200
+    assert client.get(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd").status_code == 404
+    assert client.head(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd").status_code == 404
+    # and the variant serves once its OWN entry exists
+    v = tmp_path / "v.seg.nrrd"
+    v.write_bytes(b"\x1f\x8bvariant")
+    cache.put(key_fn(f"idc:{u}", "total_fast", {"grid": 1.0}), v, {"names": {}}, {})
+    r = client.get(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd")
+    assert r.status_code == 200 and r.content == b"\x1f\x8bvariant"
