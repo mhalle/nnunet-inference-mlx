@@ -1083,7 +1083,14 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     def canon_task(t: str):
         """Canonical task name for any accepted form (short, eco:name,
         eco:name@version) - None when unknown/ambiguous. All forms converge to
-        one canonical name and therefore one result-cache key."""
+        one canonical name and therefore one result-cache key.
+
+        Path-bearing names are refused BEFORE resolution: the in-process
+        API's freedom to run a model-folder path must not cross the wire,
+        and a catalog without resolve() would pass the string through
+        (Segmenter.resolve_task falls back to identity)."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@-]*", t or ""):
+            return None
         if hasattr(seg, "resolve_task"):
             try:
                 return seg.resolve_task(t)

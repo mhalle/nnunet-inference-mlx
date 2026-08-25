@@ -2006,3 +2006,24 @@ def test_preference_applied_only_with_prefer(tmp_path, monkeypatch):
     assert r.status_code == 200
     assert "preference-applied" not in {k.lower() for k in r.headers}
     assert len(seg.calls) == 1
+
+
+def test_task_names_with_path_separators_refused(tmp_path):
+    """Review B9: a wire task name is a catalog name only - separator or
+    dot-leading forms must die at canon_task, before any resolver that might
+    pass a filesystem path through (Segmenter.resolve_task's identity
+    fallback would; the in-process folder-path freedom must not cross the
+    wire)."""
+    seg, ex, client = make(tmp_path)
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    for bad in ("../weights", "a/b", "..", ".hidden", "a\\b", "ts:", "@v1", ""):
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                        data={"task": bad})
+        assert r.status_code in (404, 422), (bad, r.status_code)
+        # the path surface swallows slashes into {ident:path}, so a slashed
+        # "task" simply fails identifier validation - but dotted and escaped
+        # forms reach canon_task and must 404 there
+        if "/" not in bad and bad:
+            g = client.get(f"/v1/idc/{u}/{bad}/labels.seg.nrrd")
+            assert g.status_code in (404, 422), (bad, g.status_code)
+    assert len(seg.calls) == 0
