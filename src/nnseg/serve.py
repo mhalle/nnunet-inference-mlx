@@ -1096,8 +1096,69 @@ def _prefer_wait_raw(request, maximum: float) -> float | None:
     return None
 
 
+class CacheOnlyExecutor:
+    """The executor protocol over a result cache and nothing else: no queue,
+    no dispatcher, no compute path at all. ``create_app(..., read_only=True)``
+    over one of these IS the public twin (review R4) - the same route code as
+    the main app, so filenames, headers, grid variants, artifact routes and
+    the listing cannot drift from it.
+
+    ``key_fn(identity, task, opts)`` pins key derivation - the twin must key
+    exactly as the writer did, including the weights-version component it has
+    no segmenter to recompute. ``inflight_fn(key)`` optionally exposes an
+    authorized flight's progress ({"progress": {...}} or None) so anonymous
+    callers can watch it; the KEY doubles as the watch handle."""
+
+    supports_push = False
+    accepting = False
+
+    class _TaskView:
+        def __init__(self, tasks_fn, resolve_fn):
+            self._tasks, self._resolve = tasks_fn, resolve_fn
+
+        def tasks(self):
+            return self._tasks()
+
+        def resolve_task(self, t):
+            if self._resolve is not None:
+                return self._resolve(t)
+            if t in self._tasks():
+                return t
+            raise LookupError(f"unknown task {t!r}")
+
+    def __init__(self, cache_get, key_fn, tasks_fn, *, inflight_fn=None,
+                 resolve_fn=None, list_fn=None, sources=None):
+        self._get, self._key, self._inflight = cache_get, key_fn, inflight_fn
+        self.segmenter = self._TaskView(tasks_fn, resolve_fn)
+        self.sources = _source_registry(sources)
+        if list_fn is not None:
+            self.cache_list = list_fn
+
+    def resource_key(self, identity: str, task: str, opts=None) -> str:
+        return self._key(identity, task, opts or {})
+
+    def cache_get(self, key: str):
+        return self._get(key)
+
+    def find_inflight(self, key: str):
+        st = self._inflight(key) if self._inflight is not None else None
+        return key if st else None
+
+    def status_of(self, key: str) -> dict:
+        if self._get(key) is not None:
+            return {"state": "done"}
+        st = self._inflight(key) if self._inflight is not None else None
+        if st:
+            return {"state": "running", "progress": st.get("progress")}
+        return {"state": "failed"}     # flight gone, nothing cached: stop watching
+
+    def result_file(self, jid):
+        return None, None
+
+
 def create_app(executor: LocalExecutor, *, token: str | None = None,
-               wait_default: float = 30.0, wait_max: float = 110.0):
+               wait_default: float = 30.0, wait_max: float = 110.0,
+               read_only: bool = False):
     """The FastAPI app over an executor. Import cost lives here, behind the
     ``serve`` extra.
 
@@ -1113,6 +1174,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
     seg = executor.segmenter
     sources = getattr(executor, "sources", None) or _source_registry(None)
+    _key_override = getattr(executor, "resource_key", None)
+
+    def derive_key(identity: str, task: str, opts: dict) -> str:
+        """One key derivation for every route. An executor may pin it
+        (CacheOnlyExecutor must: the twin has no segmenter to read weights
+        versions from); otherwise keys come from the segmenter's view."""
+        if _key_override is not None:
+            return _key_override(identity, task, opts)
+        return result_key((identity,), task, opts,
+                          weights_versions_of(seg, task))
 
     def _source_enabled(srcobj) -> bool:
         # _idc_enabled stays the patchable seam for the idc source
@@ -1154,6 +1225,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     app = FastAPI(title="nnseg", version=_version())
 
     def authed(request) -> bool:
+        if read_only:
+            return False               # the twin can never compute
         if token is None:
             return True
         return request.headers.get("authorization", "") == f"Bearer {token}"
@@ -1167,6 +1240,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     def health():
         policy = getattr(seg, "policy", {})
         return {"name": "nnseg", "version": _version(),
+                "mode": "public-cache" if read_only else "serve",
                 "device": str(policy.get("device", "?")),
                 "n_tasks": len(seg.tasks()), "accepting": executor.accepting,
                 "sources": ["upload"] + [k for k, v in sources.items()
@@ -1220,8 +1294,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         """Authorized only (review finding): the listing enumerates every
         cached result including sha256 identities of authenticated users'
         uploads - not part of the anonymous tier. The public twin's listing
-        stays an explicit operator opt-in (list_fn)."""
-        require_auth(request)
+        stays an explicit operator opt-in (list_fn): read_only serves it
+        anonymously when a lister exists and drops the route otherwise."""
+        if not read_only:
+            require_auth(request)
         lister = getattr(executor, "cache_list", None)
         return {"segmentations": lister() if lister else []}
 
@@ -1478,8 +1554,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             canonical = canon_task(task)
             if not re.fullmatch(pat, ident) or canonical is None:
                 return None
-            return result_key((srcobj.identity(ident),), canonical, opts or {},
-                              weights_versions_of(seg, canonical))
+            return derive_key(srcobj.identity(ident), canonical, opts or {})
 
         def _grid_routes(register):
             """Register an artifact route for the default grid and each token:
@@ -1520,8 +1595,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if canonical is None:
                     raise HTTPException(404, f"unknown task {task!r}")
                 task = canonical
-                key = result_key((srcobj.identity(ident),), task, gopts,
-                                 weights_versions_of(seg, task))
+                key = derive_key(srcobj.identity(ident), task, gopts)
                 fname = f"{_task_stem(task)}_{ident[:8]}{tok}.seg.nrrd"
                 hit = executor.cache_get(key)
                 if hit is not None:
@@ -1789,6 +1863,26 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     for _prefix, _srcobj in sources.items():
         _mount_source(_prefix, _srcobj)
 
+    if read_only:
+        # The read-only surface is the SAME routes minus everything that
+        # writes: jobs, prepare, describe (needs a real segmenter), every
+        # DELETE (path-surface evicts + job cancel), and the listing when
+        # no lister was provided. Removing them from the router is exactly
+        # never-registering them - a POST /v1/jobs 404s, it does not 401.
+        def _keep(r):
+            path = getattr(r, "path", "")
+            if path.startswith("/v1/jobs") or path in ("/v1/tasks/{task}",
+                                                       "/v1/tasks/{task}/prepare"):
+                return False
+            if "DELETE" in (getattr(r, "methods", None) or ()):
+                return False
+            if path == "/v1/segmentations" and getattr(executor, "cache_list",
+                                                       None) is None:
+                return False
+            return True
+
+        app.router.routes = [r for r in app.router.routes if _keep(r)]
+
     return app
 
 
@@ -1796,134 +1890,26 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
                       list_fn=None, resolve_fn=None):
     """The anonymous read-only twin: cache hits and nothing else.
 
-    Contains no compute path at all - it cannot spend a GPU cent by
-    construction, which is the right worst case for a public face. Misses are
-    404 (the resource genuinely does not exist yet) with a hint body - unless
-    ``inflight(key)`` reports an authorized computation in progress, in which
-    case the caller gets 202 + Retry-After (and may long-poll it with
-    Prefer: wait): watching a flight is read-only; only starting one needs auth.
+    Since review R4 this is create_app itself over a CacheOnlyExecutor with
+    ``read_only=True`` - the same route code as the main app, so filenames,
+    headers, grid variants, meta/preview/statistics routes and the listing
+    hold parity by construction instead of by copy. Read-only means: authed()
+    is constant-False (nothing can initiate) and every mutating route (jobs,
+    prepare, DELETEs) is absent from the router - it cannot spend a GPU cent
+    by construction, the right worst case for a public face. Misses are 404;
+    ``inflight(key)`` (optional) lets anonymous callers watch an authorized
+    flight with 202 + progress and long-poll it with Prefer: wait - watching
+    is read-only, only starting needs auth.
 
-    ``key_fn(identity, task)`` maps a source identity string ("idc:<uuid>") to
-    the result-cache key; routes are mounted per registered source, so the
-    twin's surface follows the main app's. ``list_fn`` (optional) backs
-    /v1/segmentations - omit it to keep the twin listing-free.
+    ``key_fn(identity, task, opts)`` maps a source identity string
+    ("idc:<uuid>") and grid options to the result-cache key - the twin must
+    key exactly as the writer did. ``list_fn`` (optional) backs
+    /v1/segmentations; omit it to keep the twin listing-free.
     """
-    import asyncio
-
-    from fastapi import FastAPI, HTTPException, Request, Response
-    from fastapi.responses import FileResponse, JSONResponse
-
-    app = FastAPI(title="nnseg public cache", version=_version())
-
-    @app.get("/v1/health")
-    def health():
-        return {"name": "nnseg", "version": _version(), "mode": "public-cache",
-                "n_tasks": len(tasks_fn())}
-
-    @app.get("/v1/tasks")
-    def tasks():
-        return {"tasks": tasks_fn()}
-
-    srcmap = _source_registry(sources)
-
-    if list_fn is not None:
-        @app.get("/v1/segmentations")
-        def list_segmentations():
-            return {"segmentations": list_fn()}
-
-    def _mount(prefix: str, srcobj) -> None:
-        pat = srcobj.id_pattern
-        base = f"/v1/{prefix}/{{ident:path}}/{{task}}"
-
-        def norm(ident: str) -> str:
-            ident = ident.strip()
-            return ident.lower() if prefix == "idc" else ident
-
-        def _key_or_404(ident, task, opts=None):
-            ident = norm(ident)
-            if resolve_fn is not None:
-                try:
-                    task = resolve_fn(task)
-                except LookupError:
-                    raise HTTPException(404, "unknown resource") from None
-            elif task not in tasks_fn():
-                raise HTTPException(404, "unknown resource")
-            if not re.fullmatch(pat, ident):
-                raise HTTPException(404, "unknown resource")
-            return ident, key_fn(srcobj.identity(ident), task, opts or {})
-
-        def _serve(hit, ident, task, key):
-            return FileResponse(hit[0], media_type="application/octet-stream",
-                                filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
-                                headers={"Cache-Control": "public, max-age=3600",
-                                         "ETag": f'"{key[:32]}"'})
-
-        def _register_public_probe(tok: str, gopts: dict):
-            @app.head(base + f"/labels{tok}.seg.nrrd")
-            def probe(ident: str, task: str):
-                ident, key = _key_or_404(ident, task, gopts)
-                if cache_get(key) is not None:
-                    return Response(status_code=200)
-                state = inflight(key) if inflight is not None else None
-                if state:
-                    return Response(status_code=202,
-                                    headers=_progress_headers(state.get("progress")))
-                raise HTTPException(404, "not materialized")
-
-        _grid_routes_pub = [("", {})] + [("_" + t, dict(o)) for t, o in GRID_TOKENS.items()]
-        for _tok, _o in _grid_routes_pub:
-            _register_public_probe(_tok, _o)
-
-        def _register_public_resource(tok: str, gopts: dict):
-            @app.get(base + f"/labels{tok}.seg.nrrd")
-            async def resource(request: Request, ident: str, task: str):
-                ident, key = _key_or_404(ident, task, gopts)
-                hit = cache_get(key)
-                if hit is not None:
-                    return _serve(hit, ident, task, key)
-                state = inflight(key) if inflight is not None else None
-                if not state:
-                    raise HTTPException(404, "not materialized; authenticated access "
-                                             "can compute it")
-                deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
-                while time.time() < deadline:  # watch only - nothing here computes
-                    await asyncio.sleep(0.7)
-                    hit = cache_get(key)
-                    if hit is not None:
-                        return _serve(hit, ident, task, key)
-                    state = inflight(key)
-                    if not state:
-                        break
-                hit = cache_get(key)
-                if hit is not None:
-                    return _serve(hit, ident, task, key)
-                if state:
-                    p = state.get("progress") or {}
-                    return JSONResponse({"state": "materializing",
-                                         "progress": {"stage": p.get("stage"),
-                                                      "fraction": p.get("fraction")}},
-                                        status_code=202,
-                                        headers=_progress_headers(state.get("progress")))
-                raise HTTPException(404, "not materialized; authenticated access can "
-                                         "compute it")
-
-        def _register_public_meta(tok: str, gopts: dict):
-            @app.get(base + f"/meta{tok}.json")
-            def meta(ident: str, task: str):
-                _, key = _key_or_404(ident, task, gopts)
-                hit = cache_get(key)
-                if hit is None:
-                    raise HTTPException(404, "not materialized")
-                return JSONResponse(hit[1])
-
-        for _tok, _o in _grid_routes_pub:
-            _register_public_resource(_tok, _o)
-            _register_public_meta(_tok, _o)
-
-    for _prefix, _srcobj in srcmap.items():
-        _mount(_prefix, _srcobj)
-
-    return app
+    ex = CacheOnlyExecutor(cache_get, key_fn, tasks_fn, inflight_fn=inflight,
+                           resolve_fn=resolve_fn, list_fn=list_fn,
+                           sources=sources)
+    return create_app(ex, read_only=True)
 
 
 def main_serve(args) -> int:

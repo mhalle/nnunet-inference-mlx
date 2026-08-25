@@ -2027,3 +2027,64 @@ def test_task_names_with_path_separators_refused(tmp_path):
             g = client.get(f"/v1/idc/{u}/{bad}/labels.seg.nrrd")
             assert g.status_code in (404, 422), (bad, g.status_code)
     assert len(seg.calls) == 0
+
+
+def test_public_twin_full_parity(tmp_path):
+    """Review R4: the twin IS create_app's route code. The artifact routes
+    exist and serve (old F6: they were missing), filenames and cache headers
+    match the main app (old F5: they drifted), and the mutating surface does
+    not exist at all - not 401, absent."""
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    cache = ResultCache(tmp_path / "c")
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda identity, task, opts=None: result_key(
+        (identity,), task, opts or {}, ["w=1"])
+    key = key_fn(f"idc:{u}", "total_fast")
+    src = tmp_path / "labels.seg.nrrd"
+    src.write_bytes(b"\x1f\x8bx")
+    cache.put(key, src, {"names": {"1": "spleen"}}, {"identity": [f"idc:{u}"],
+                                                     "task": "total_fast"})
+    png = tmp_path / "p.png"
+    png.write_bytes(b"\x89PNGxx")
+    sj = tmp_path / "s.json"
+    sj.write_text(json.dumps({"units": {"intensity": "hu"}, "structures": []}))
+    assert cache.add_artifact(key, "preview.png", png)
+    assert cache.add_artifact(key, "statistics.json", sj)
+
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
+                            list_fn=cache.list)
+    client = TestClient(app)
+    base = f"/v1/idc/{u}/total_fast"
+
+    r = client.get(f"{base}/labels.seg.nrrd")
+    assert r.status_code == 200
+    assert f"total_fast_{u[:8]}.seg.nrrd" in r.headers["content-disposition"]
+    assert r.headers["etag"] == f'"{key[:32]}"'
+    assert "max-age" in r.headers.get("cache-control", "")
+
+    assert client.get(f"{base}/meta.json").status_code == 200
+    p = client.get(f"{base}/preview.png")
+    assert p.status_code == 200 and p.content.startswith(b"\x89PNG")
+    t = client.get(f"{base}/statistics.tsv")
+    assert t.status_code == 200 and t.text.startswith("structure\t")
+    assert client.get(f"{base}/statistics.json").status_code == 200
+    assert client.get("/v1/segmentations").status_code == 200   # lister opt-in
+
+    assert client.delete(f"{base}/labels.seg.nrrd").status_code in (404, 405)
+    assert client.post("/v1/tasks/total_fast/prepare").status_code in (404, 405)
+    assert client.post("/v1/jobs").status_code in (404, 405)
+    assert client.get("/v1/jobs").status_code in (404, 405)
+    # and no Prefer header can make the twin compute
+    u2 = "1be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    r = client.get(f"/v1/idc/{u2}/total_fast/statistics.tsv",
+                   headers={"Prefer": "wait=30"})
+    assert r.status_code == 404
+
+
+def test_public_twin_without_lister_is_listing_free(tmp_path):
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    cache = ResultCache(tmp_path / "c")
+    key_fn = lambda identity, task, opts=None: result_key(
+        (identity,), task, opts or {}, ["w=1"])
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
+    assert TestClient(app).get("/v1/segmentations").status_code in (404, 405)
