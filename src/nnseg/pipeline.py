@@ -14,7 +14,7 @@ from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel, available_folds
-from .tasks import TaskCatalog, TaskSpec, resolve_model_folder
+from .tasks import ModelNotFound, TaskCatalog, TaskSpec, resolve_model_folder
 from .cache import ModelCache
 from .result import Segmentation
 from .progress import Reporter
@@ -57,6 +57,11 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
     if remap:
         lut[:] = 0
         for local, global_ in remap.items():
+            if not 0 <= int(local) < K:
+                raise ModelNotFound(
+                    f"catalog remap references local label {local} but the model "
+                    f"emits {K} channels - the task catalog does not match the "
+                    "installed weights (stale class map?)")
             lut[int(local)] = int(global_)
     return lut
 
