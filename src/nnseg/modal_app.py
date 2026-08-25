@@ -45,7 +45,9 @@ APP_NAME = os.environ.get("NNSEG_APP_NAME", "nnseg-serve")
 GPU = os.environ.get("NNSEG_GPU", "L40S")
 PROXY_AUTH = os.environ.get("NNSEG_PROXY_AUTH", "1") not in ("0", "false", "no")
 SCALEDOWN = int(os.environ.get("NNSEG_SCALEDOWN", "600"))
-SNAPSHOT = os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")
+GPU_SNAPSHOT = os.environ.get("NNSEG_GPU_SNAPSHOT", "0") not in ("0", "false", "no", "")
+SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) or GPU_SNAPSHOT
+WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
 WEIGHTS_ROOT, JOBS_ROOT = "/weights", "/jobs"
 
 
@@ -77,28 +79,45 @@ def _emit(jid: str, update: dict) -> None:
     jobs_dict[jid] = meta
 
 
+_cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
+
+
 @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
          volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol},
-         enable_memory_snapshot=SNAPSHOT)
+         enable_memory_snapshot=SNAPSHOT, **_cls_extra)
 class Worker:
-    @modal.enter(snap=SNAPSHOT)
-    def preload(self):
-        """The import bill, paid once per deploy when NNSEG_SNAPSHOT=1: Modal
-        snapshots memory after this and boots later cold containers from the
-        snapshot. CUDA must not be touched here - plain imports only."""
-        _pkg_dir()
-        import nnunetv2  # noqa: F401
-        import torch     # noqa: F401
-        import nnseg     # noqa: F401 - pulls the pipeline import chain
-
-    @modal.enter()
-    def setup(self):
-        """Post-restore, GPU attached: everything CUDA-adjacent lives here."""
-        _pkg_dir()
+    def _gpu_setup(self):
         os.environ["TOTALSEG_WEIGHTS_PATH"] = WEIGHTS_ROOT
         from nnseg import Segmenter
         self.seg = Segmenter(device="cuda", weights=WEIGHTS_ROOT, cache_models=5)
         self._ensured = set()            # tasks whose weights this container verified
+
+    @modal.enter(snap=SNAPSHOT)
+    def preload(self):
+        """The import bill, paid once per deploy: Modal snapshots memory after this
+        and boots later cold containers from the snapshot. With classic snapshots
+        CUDA must not be touched here - plain imports only. With the experimental
+        GPU snapshot (NNSEG_GPU_SNAPSHOT=1) the CUDA state itself is captured, so
+        the Segmenter is built and WARM_TASK's model loaded ONTO the GPU before the
+        snapshot - a restored cold container then starts with a loaded model."""
+        _pkg_dir()
+        import nnunetv2  # noqa: F401
+        import torch     # noqa: F401
+        import nnseg     # noqa: F401 - pulls the pipeline import chain
+        if GPU_SNAPSHOT:
+            from nnseg.weights_fetch import ensure_task_weights
+            self._gpu_setup()
+            ensure_task_weights(WARM_TASK, WEIGHTS_ROOT, progress=None)
+            self.seg.warm(WARM_TASK)
+            self._ensured.add(WARM_TASK)
+
+    @modal.enter()
+    def setup(self):
+        """Post-restore, GPU attached: everything CUDA-adjacent lives here (unless
+        the GPU snapshot already carries it)."""
+        _pkg_dir()
+        if not hasattr(self, "seg"):
+            self._gpu_setup()
 
     @modal.method()
     def run_job(self, jid: str) -> None:
