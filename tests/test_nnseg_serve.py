@@ -1219,3 +1219,37 @@ def test_prepare_requires_auth_when_token_set(tmp_path):
     r = client.post("/v1/tasks/total_fast/prepare",
                     headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 202
+
+
+def test_all_task_name_forms_converge_to_one_cache_key(tmp_path, monkeypatch):
+    """short, eco:name, and eco:name@version address the same resource: the
+    canonical name drives the result key, so a result computed under one form
+    is a cache hit under every other."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    seg.resolve_task = lambda t: {"total_fast": "ts:total_fast",
+                                  "ts:total_fast": "ts:total_fast",
+                                  "ts:total_fast@v1": "ts:total_fast"}.get(t) or (
+        (_ for _ in ()).throw(LookupError(t)))
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={"Prefer": "wait=30"})
+    assert r.status_code == 200                      # computed under the short form
+    assert len(seg.calls) == 1
+    for form in ("ts:total_fast", "ts:total_fast@v1", "total_fast"):
+        r2 = client.get(f"/v1/idc/{u}/{form}/labels.seg.nrrd")
+        assert r2.status_code == 200, form           # cache hit, no recompute
+    assert len(seg.calls) == 1
+    assert client.get(f"/v1/idc/{u}/bogus/labels.seg.nrrd").status_code == 404

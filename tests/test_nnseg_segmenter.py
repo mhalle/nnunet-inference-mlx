@@ -152,7 +152,9 @@ def test_structures_are_in_label_order():
 
 def test_tasks_lists_the_catalog():
     seg = Segmenter()
-    assert "total" in seg.tasks() and len(seg.tasks()) == len(seg.catalog)
+    assert "ts:total" in seg.tasks() and len(seg.tasks()) == len(seg.catalog)
+    assert seg.resolve_task("total") == "ts:total"          # short form resolves
+    assert seg.resolve_task("ts:total@v2.0.0") == "ts:total"
 
 
 def test_describe_works_for_a_union_task_and_lists_every_model():

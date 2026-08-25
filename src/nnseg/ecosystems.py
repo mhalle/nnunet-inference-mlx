@@ -22,6 +22,15 @@ same interface :class:`nnseg.tasks.TaskCatalog` exposes, so ``Segmenter`` and
 the server run unchanged. Tasks whose weights are not yet installed are
 listed but unmaterialized: ``info()`` says so without downloading, ``get()``
 installs on demand (the same behavior TS weights ids always had).
+
+Naming has three layers (user decision 2026-08-25): the **canonical name is
+ecosystem-qualified** (``ts:total_fast``, ``moose:clin_ct_fast_organs``) and
+is what listings, result-cache keys, and provenance carry; the **short name**
+is a resolution convenience, accepted when exactly one ecosystem offers it
+and refused with the qualified candidates when ambiguous - so two ecosystems
+may legitimately ship the same short name; beneath both sits the **hash**,
+the content-addressed result key. Nothing rejects collisions anymore; only
+the ambiguous short form becomes unusable.
 """
 import json
 import re
@@ -46,8 +55,10 @@ class ModelEcosystem:
         """Whether spec() can answer without installing anything."""
         raise NotImplementedError
 
-    def ensure(self, task: str, root, progress=None) -> None:
-        """Install the task's weights under ``root`` (idempotent)."""
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        """Install the task's weights under ``root`` (idempotent). ``version``
+        pins a release: an already-installed different version is an error,
+        never silently served."""
         raise NotImplementedError
 
     def spec(self, task: str, root) -> TaskSpec:
@@ -85,9 +96,17 @@ class TSEcosystem(ModelEcosystem):
     def materialized(self, task: str, root) -> bool:
         return True
 
-    def ensure(self, task: str, root, progress=None) -> None:
-        from .weights_fetch import ensure_task_weights
-        ensure_task_weights(task, root, catalog=self._catalog, progress=progress)
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        from .weights_fetch import ensure_task_weights, installed_version
+        paths = ensure_task_weights(task, root, catalog=self._catalog,
+                                    progress=progress, tag=version)
+        if version is not None:
+            for pth in paths:
+                rec = installed_version(pth) or {}
+                if rec.get("tag") not in (version, None):
+                    raise ModelNotFound(
+                        f"{task}@{version}: {Path(pth).name} is installed at "
+                        f"tag {rec.get('tag')!r} - remove it to switch versions")
 
     def spec(self, task: str, root) -> TaskSpec:
         return self._catalog.get(task)
@@ -120,10 +139,18 @@ class MooseEcosystem(ModelEcosystem):
         d = self._folder(task, root)
         return d.is_dir() and any(d.rglob("dataset.json"))
 
-    def ensure(self, task: str, root, progress=None) -> None:
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        entry = self._entries[task]
+        if version is not None and version != entry.get("tag"):
+            from .weights_fetch import installed_version
+            rec = installed_version(self._folder(task, root)) or {}
+            if rec.get("tag") == version:
+                return                     # an older manifest installed it; fine
+            raise ModelNotFound(
+                f"{task}@{version}: this manifest offers tag "
+                f"{entry.get('tag')!r} only")
         if self.materialized(task, root):
             return
-        entry = self._entries[task]
         dest_parent = Path(root).expanduser() / "moose"
         dest_parent.mkdir(parents=True, exist_ok=True)
         _download_and_extract_zip(entry["url"], dest_parent, progress=progress)
@@ -170,10 +197,17 @@ class NativeEcosystem(ModelEcosystem):
     def materialized(self, task: str, root) -> bool:
         return task in self._models and self._models[task].is_dir()
 
-    def ensure(self, task: str, root, progress=None) -> None:
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
         if not self.materialized(task, root):
             raise ModelNotFound(f"native task {task!r}: folder "
                                 f"{self._models.get(task)} does not exist")
+        if version is not None:
+            from .weights_fetch import installed_version
+            rec = installed_version(self._models[task]) or {}
+            if rec.get("tag") != version:
+                raise ModelNotFound(
+                    f"{task}@{version}: native folder records "
+                    f"{rec.get('tag') or 'no version metadata'}")
 
     def spec(self, task: str, root) -> TaskSpec:
         self.ensure(task, root)
@@ -210,17 +244,14 @@ def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None) -> 
 
 
 def registry(ecosystems=None) -> dict:
-    """Normalize a list of ecosystems into ``{name: ecosystem}``, rejecting
-    duplicate names and cross-ecosystem task-name collisions."""
-    out, seen_tasks = {}, {}
+    """Normalize a list of ecosystems into ``{name: ecosystem}``. Duplicate
+    ecosystem names are rejected; duplicate *task* names across ecosystems are
+    fine - the canonical ``eco:task`` form disambiguates, and only the short
+    form goes ambiguous."""
+    out = {}
     for e in (default_ecosystems() if ecosystems is None else list(ecosystems)):
-        if not e.name or e.name in out:
+        if not e.name or ":" in e.name or e.name in out:
             raise ValueError(f"bad or duplicate ecosystem name {e.name!r}")
-        for t in e.tasks():
-            if t in seen_tasks:
-                raise ValueError(f"task name {t!r} exists in both "
-                                 f"{seen_tasks[t]!r} and {e.name!r}")
-            seen_tasks[t] = e.name
         out[e.name] = e
     return out
 
@@ -232,51 +263,97 @@ def default_ecosystems() -> list:
 class EcosystemCatalog:
     """A TaskCatalog-compatible federation over an ecosystem registry.
 
-    ``get()`` materializes on demand (installing weights if the task needs
-    that - the same on-first-use behavior TS weights ids always had);
-    ``info()`` never downloads. A TaskSpec or a model-folder path passes
-    through ``get`` untouched, as with TaskCatalog."""
+    Canonical names are ``eco:task``; short names resolve when unique. ``get()``
+    materializes on demand (installing weights if needed - the same
+    on-first-use behavior TS weights ids always had); ``info()`` never
+    downloads. A TaskSpec or a model-folder path passes through ``get``
+    untouched, as with TaskCatalog."""
 
     def __init__(self, ecosystems=None, *, root=None):
         self.registry = registry(ecosystems)
         self.root = root
-        self._by_task = {t: e for e in self.registry.values() for t in e.tasks()}
+        self._short: dict[str, list] = {}
+        for ename, e in self.registry.items():
+            for t in e.tasks():
+                self._short.setdefault(t, []).append(ename)
 
     def names(self) -> list:
-        return sorted(self._by_task)
+        return sorted(f"{ename}:{t}" for t, enames in self._short.items()
+                      for ename in enames)
+
+    def resolve(self, name: str) -> tuple:
+        """``(ecosystem, short_task, canonical, version)`` for any name form.
+
+        The grammar is ``[eco:]name[@version]`` - three layers plus the hash
+        beneath: the short name resolves when exactly one ecosystem offers it,
+        the canonical form is ecosystem-qualified, and ``@version`` pins a
+        weights release at install time (the canonical name stays unversioned;
+        actual versions live in the result key's weights component). Unknown
+        names and ambiguous short names raise LookupError - the ambiguity
+        error lists the qualified candidates to use instead."""
+        name = str(name)
+        version = None
+        if "@" in name:
+            name, _, version = name.rpartition("@")
+            if not version or not name:
+                raise LookupError(f"malformed task name {name!r}@{version!r}")
+        if ":" in name:
+            ename, _, short = name.partition(":")
+            eco = self.registry.get(ename)
+            if eco is None or ename not in self._short.get(short, ()):
+                raise LookupError(f"unknown task {name!r}")
+            return eco, short, f"{ename}:{short}", version
+        enames = self._short.get(name)
+        if not enames:
+            raise LookupError(f"unknown task {name!r}; {len(self._short)} known, "
+                              f"e.g. {self.names()[:6]}")
+        if len(enames) > 1:
+            raise LookupError(f"short name {name!r} is ambiguous; use one of "
+                              + ", ".join(f"{e}:{name}" for e in sorted(enames)))
+        return self.registry[enames[0]], name, f"{enames[0]}:{name}", version
 
     def __contains__(self, name) -> bool:
-        return name in self._by_task
+        try:
+            self.resolve(name)
+            return True
+        except LookupError:
+            return False
 
     def __len__(self) -> int:
-        return len(self._by_task)
+        return sum(len(v) for v in self._short.values())
 
     def ecosystem_of(self, name: str):
-        return self._by_task.get(name)
+        try:
+            return self.resolve(name)[0]
+        except LookupError:
+            return None
 
     def get(self, name) -> TaskSpec:
         if isinstance(name, TaskSpec):
             return name
-        eco = self._by_task.get(str(name))
-        if eco is None:
-            raise LookupError(f"unknown task {name!r}; {len(self._by_task)} known, "
-                              f"e.g. {self.names()[:6]}")
-        if not eco.materialized(name, self.root):
-            eco.ensure(name, self.root)
-        return eco.spec(name, self.root)
+        eco, short, canonical, version = self.resolve(name)
+        if version is not None or not eco.materialized(short, self.root):
+            eco.ensure(short, self.root, version=version)
+        spec = eco.spec(short, self.root)
+        if spec.name != canonical:
+            import dataclasses
+            spec = dataclasses.replace(spec, name=canonical)
+        return spec
 
     __getitem__ = get
 
     def info(self, name: str) -> dict:
-        eco = self._by_task.get(name)
-        if eco is None:
-            raise LookupError(f"unknown task {name!r}")
-        return eco.info(name, self.root)
+        eco, short, canonical, version = self.resolve(name)
+        out = eco.info(short, self.root)
+        out["name"] = canonical
+        if version is not None:
+            out["version_requested"] = version
+        return out
 
     def prepare(self, name: str, progress=None) -> dict:
         """Install the task's weights now and return its full info."""
-        eco = self._by_task.get(name)
-        if eco is None:
-            raise LookupError(f"unknown task {name!r}")
-        eco.ensure(name, self.root, progress=progress)
-        return eco.info(name, self.root)
+        eco, short, canonical, version = self.resolve(name)
+        eco.ensure(short, self.root, progress=progress, version=version)
+        out = eco.info(short, self.root)
+        out["name"] = canonical
+        return out

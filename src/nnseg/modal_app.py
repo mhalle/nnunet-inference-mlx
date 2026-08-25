@@ -612,4 +612,4 @@ if PUBLIC:
             return ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).list()
 
         return create_public_app(key_fn, get, seg.tasks, inflight=inflight,
-                                 list_fn=list_fn)
+                                 list_fn=list_fn, resolve_fn=seg.resolve_task)

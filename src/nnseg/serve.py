@@ -799,6 +799,11 @@ def _progress_headers(progress: dict | None, extra: dict | None = None) -> dict:
     return h
 
 
+def _task_stem(task: str) -> str:
+    """The short task name for filenames - canonical names carry ':'."""
+    return task.rpartition(":")[2]
+
+
 def _prefer_wait(request, default: float, maximum: float) -> float:
     """RFC 7240: Prefer: wait=N / respond-async. Never in the query string -
     the URL stays the pure cache key, and 200s never Vary on Prefer."""
@@ -836,6 +841,17 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     def _source_enabled(srcobj) -> bool:
         # _idc_enabled stays the patchable seam for the idc source
         return _idc_enabled() if srcobj.prefix == "idc" else srcobj.enabled()
+
+    def canon_task(t: str):
+        """Canonical task name for any accepted form (short, eco:name,
+        eco:name@version) - None when unknown/ambiguous. All forms converge to
+        one canonical name and therefore one result-cache key."""
+        if hasattr(seg, "resolve_task"):
+            try:
+                return seg.resolve_task(t)
+            except LookupError:
+                return None
+        return t if t in seg.tasks() else None
 
     app = FastAPI(title="nnseg", version=_version())
 
@@ -880,8 +896,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         what first use does implicitly. Returns a job to watch; its result is
         the task's full description once materialized."""
         require_auth(request)
-        if task not in seg.tasks():
+        canonical = canon_task(task)
+        if canonical is None:
             raise HTTPException(404, f"unknown task {task!r}")
+        task = canonical
         if not executor.accepting:
             raise HTTPException(429, "queue is full, retry later",
                                 headers={"Retry-After": "30"})
@@ -937,11 +955,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if kind != "upload" and not _source_enabled(sources[kind]):
             raise HTTPException(422, f"source kind {kind!r} is not enabled on this "
                                      "server (missing dependency)")
-        names = seg.tasks()
-        if task not in names:              # catalog names only at the wire boundary
+        canonical = canon_task(task)
+        if canonical is None:              # catalog names only at the wire boundary
+            names = seg.tasks()
             raise HTTPException(404, f"unknown task {task!r}; this server offers "
                                      f"{len(names)} catalog tasks, e.g. "
                                      + ", ".join(names[:4]))
+        task = canonical
         try:                               # fail at submit where the spec already knows
             chan = (seg.describe(task) or {}).get("channel_names")
         except Exception:
@@ -1127,10 +1147,11 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             return ident.lower() if prefix == "idc" else ident
 
         def keyed(ident: str, task: str):
-            if not re.fullmatch(pat, ident) or task not in seg.tasks():
+            canonical = canon_task(task)
+            if not re.fullmatch(pat, ident) or canonical is None:
                 return None
-            return result_key((srcobj.identity(ident),), task, {},
-                              weights_versions_of(seg, task))
+            return result_key((srcobj.identity(ident),), canonical, {},
+                              weights_versions_of(seg, canonical))
 
         @app.head(base + "/labels.seg.nrrd")
         def probe(request: Request, ident: str, task: str):
@@ -1155,14 +1176,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             ident = norm(ident)
             if not re.fullmatch(pat, ident):
                 raise HTTPException(422, f"{ident!r} is not a valid {prefix} identifier")
-            if task not in seg.tasks():
+            canonical = canon_task(task)
+            if canonical is None:
                 raise HTTPException(404, f"unknown task {task!r}")
+            task = canonical
             key = result_key((srcobj.identity(ident),), task, {},
                              weights_versions_of(seg, task))
             hit = executor.cache_get(key)
             if hit is not None:
                 return FileResponse(hit[0], media_type="application/octet-stream",
-                                    filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                    filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
                                     headers=_resource_headers(key))
             jid = executor.find_inflight(key)  # single flight: ride an existing run
             is_authed = authed(request)
@@ -1197,7 +1220,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 headers["Preference-Applied"] = f"wait={int(wait)}"
                 src_path = hit[0] if hit else executor.result_file(jid)[1]
                 return FileResponse(src_path, media_type="application/octet-stream",
-                                    filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                    filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
                                     headers=headers)
             if snap.get("state") == "failed":
                 if not is_authed:              # for anonymous the resource just is not there
@@ -1255,7 +1278,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
 
 def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
-                      list_fn=None):
+                      list_fn=None, resolve_fn=None):
     """The anonymous read-only twin: cache hits and nothing else.
 
     Contains no compute path at all - it cannot spend a GPU cent by
@@ -1303,13 +1326,20 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
 
         def _key_or_404(ident, task):
             ident = norm(ident)
-            if not re.fullmatch(pat, ident) or task not in tasks_fn():
+            if resolve_fn is not None:
+                try:
+                    task = resolve_fn(task)
+                except LookupError:
+                    raise HTTPException(404, "unknown resource") from None
+            elif task not in tasks_fn():
+                raise HTTPException(404, "unknown resource")
+            if not re.fullmatch(pat, ident):
                 raise HTTPException(404, "unknown resource")
             return ident, key_fn(srcobj.identity(ident), task)
 
         def _serve(hit, ident, task, key):
             return FileResponse(hit[0], media_type="application/octet-stream",
-                                filename=f"{task}_{ident[:8]}.seg.nrrd",
+                                filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
                                 headers={"Cache-Control": "public, max-age=3600",
                                          "ETag": f'"{key[:32]}"'})
 

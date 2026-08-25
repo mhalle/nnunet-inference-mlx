@@ -53,6 +53,13 @@ class Segmenter:
                            convention=convention, interp=interp, grid=grid,
                            configuration=configuration)
 
+    def resolve_task(self, task) -> str:
+        """The canonical (ecosystem-qualified, unversioned) name for any
+        accepted form - short, eco:name, or eco:name@version."""
+        if hasattr(self.catalog, "resolve"):
+            return self.catalog.resolve(task)[2]
+        return str(task)
+
     def prepare(self, task, *, progress=None) -> dict:
         """Install the task's weights now (idempotent) and return describe().
 
