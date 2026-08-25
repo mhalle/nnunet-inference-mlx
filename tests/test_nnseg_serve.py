@@ -1312,3 +1312,77 @@ def test_preview_renders_and_serves(tmp_path, monkeypatch):
     assert e["preview"] == f"/v1/idc/{u}/total_fast/preview.png"
     # a result without a preview 404s cleanly rather than erroring
     assert client.get(f"/v1/idc/{u}/total/preview.png").status_code == 404
+    # grid-variant labels (different shape from the input) still render: the
+    # preview resamples the grayscale onto the labels grid
+    from nnseg.preview import render_preview
+    import SimpleITK as _sitk
+    import numpy as _np
+    fine = _sitk.GetImageFromArray(_np.zeros((48, 64, 64), _np.uint8))
+    fine.SetSpacing((0.5, 0.5, 0.5))
+    fine.SetMetaData("Segment0_Name", "blob")
+    fine.SetMetaData("Segment0_LabelValue", "1")
+    fine.SetMetaData("Segment0_Color", "0.9 0.3 0.2")
+    arr = _sitk.GetArrayFromImage(fine)
+    arr[18:30, 24:40, 24:40] = 1
+    fine2 = _sitk.GetImageFromArray(arr)
+    fine2.CopyInformation(fine)
+    for k in fine.GetMetaDataKeys():
+        fine2.SetMetaData(k, fine.GetMetaData(k))
+    vp = tmp_path / "variant.seg.nrrd"
+    _sitk.WriteImage(fine2, str(vp))
+    coarse_input = _sitk.GetImageFromArray(
+        _np.full((24, 32, 32), -1000, _np.int16))
+    coarse_input.SetSpacing((1.0, 1.0, 1.0))
+    out = render_preview(coarse_input, vp, tmp_path / "variant_preview.png")
+    assert out is not None and out.stat().st_size > 3000
+
+
+def test_grid_variant_1mm_is_a_distinct_addressable_resource(tmp_path, monkeypatch):
+    """labels_res-1mm.seg.nrrd keys and computes under {"grid": 1.0}: distinct
+    cache entry from the default, jobs-API submits converge onto the same key
+    (int 1 normalizes to 1.0), the listing derives the variant path, and
+    DELETE evicts only the variant."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    base = f"/v1/idc/{u}/total_fast"
+
+    r0 = client.get(f"{base}/labels.seg.nrrd", headers={"Prefer": "wait=30"})
+    assert r0.status_code == 200
+    assert seg.calls[-1][2] == {}                        # default: no options
+    r1 = client.get(f"{base}/labels_res-1mm.seg.nrrd", headers={"Prefer": "wait=30"})
+    assert r1.status_code == 200
+    assert seg.calls[-1][2] == {"grid": 1.0}             # the variant's options
+    assert len(seg.calls) == 2                           # two distinct computes
+    assert r0.headers["etag"] != r1.headers["etag"]      # two distinct resources
+
+    # jobs-API convergence: {"grid": 1} (int) lands on the same key -> no recompute
+    j = client.post("/v1/jobs", data={"task": "total_fast",
+                                      "options": json.dumps({"grid": 1}),
+                                      "source": json.dumps([{"kind": "idc",
+                                                             "crdc_series_uuid": u}])})
+    assert j.status_code == 202
+    s = wait_state(client, j.json()["id"], ("done",))
+    assert s["cached"] is True and len(seg.calls) == 2   # cache hit, not a third run
+
+    segs = client.get("/v1/segmentations").json()["segmentations"]
+    paths = {e.get("path") for e in segs}
+    assert f"{base}/labels.seg.nrrd" in paths
+    assert f"{base}/labels_res-1mm.seg.nrrd" in paths
+
+    assert client.head(f"{base}/labels_res-1mm.seg.nrrd").status_code == 200
+    d = client.delete(f"{base}/labels_res-1mm.seg.nrrd")
+    assert d.status_code == 200 and d.json()["deleted"]
+    assert client.head(f"{base}/labels_res-1mm.seg.nrrd").status_code == 404
+    assert client.head(f"{base}/labels.seg.nrrd").status_code == 200   # default untouched

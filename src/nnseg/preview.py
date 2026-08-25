@@ -40,6 +40,12 @@ def render_preview(image, labels_path, out_png, *, title: str | None = None,
         seg = sitk.ReadImage(str(labels_path))
         img = image if isinstance(image, sitk.Image) else read_image(image)
         img_r, seg_r = (sitk.DICOMOrient(v, "RAS") for v in (img, seg))
+        if (img_r.GetSize() != seg_r.GetSize()
+                or not np.allclose(img_r.GetSpacing(), seg_r.GetSpacing(), atol=1e-4)):
+            # grid-variant labels (e.g. 1mm output): resample the GRAYSCALE
+            # onto the labels' grid for display - the labels stay untouched
+            img_r = sitk.Resample(img_r, seg_r, sitk.Transform(),
+                                  sitk.sitkLinear, -1024.0, img_r.GetPixelID())
         gray = sitk.GetArrayFromImage(img_r).astype(np.float32)
         lab = sitk.GetArrayFromImage(seg_r).astype(np.int32)
         if gray.shape != lab.shape:

@@ -294,12 +294,17 @@ class ResultCache:
             has_preview = (d / "preview.png").exists()
             ident = meta.get("identity") or []
             if (len(ident) == 1 and ":" in str(ident[0])
-                    and not str(ident[0]).startswith("sha256:")
-                    and not meta.get("options")):
+                    and not str(ident[0]).startswith("sha256:")):
                 prefix, one = str(ident[0]).split(":", 1)
-                entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
-                if has_preview:
-                    entry["preview"] = f"/v1/{prefix}/{one}/{meta.get('task')}/preview.png"
+                opts = meta.get("options") or {}
+                tok = next((t for t, o in GRID_TOKENS.items() if o == opts), None)
+                infix = f"_{tok}" if tok else ""
+                if not opts or tok:            # default or a menu token: addressable
+                    entry["path"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
+                                     f"labels{infix}.seg.nrrd")
+                    if has_preview:
+                        entry["preview"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
+                                            f"preview{infix}.png")
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]
@@ -819,6 +824,15 @@ def _progress_headers(progress: dict | None, extra: dict | None = None) -> dict:
     return h
 
 
+# The path surface's grid-variant menu: entity token -> the canonical options
+# it keys and computes under. Naming is BIDS-inspired (key-value entities in
+# the stem: labels_res-1mm.seg.nrrd), NOT BIDS compliance - the entity form
+# namespaces the token grammar so future dimensions compose instead of
+# colliding. Absolute tokens only (a menu entry means the same thing for
+# every task, case, and weights version); grow it when a real user asks.
+GRID_TOKENS = {"res-1mm": {"grid": 1.0}}
+
+
 def _task_stem(task: str) -> str:
     """The short task name for filenames - canonical names carry ':'."""
     return task.rpartition(":")[2]
@@ -971,6 +985,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             opts = json.loads(options)
             if not isinstance(opts, dict):
                 raise ValueError("options must be a JSON object")
+            if isinstance(opts.get("grid"), (int, float)):
+                opts["grid"] = float(opts["grid"])   # {"grid": 1} == {"grid": 1.0} == labels.1mm
             src = json.loads(source) if source else [{"kind": "upload"}]
             if not (isinstance(src, list) and all(isinstance(x, dict) for x in src)):
                 raise ValueError("source must be a JSON list of objects")
@@ -1187,109 +1203,153 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             ident = ident.strip()
             return ident.lower() if prefix == "idc" else ident
 
-        def keyed(ident: str, task: str):
+        def keyed(ident: str, task: str, opts: dict | None = None):
             canonical = canon_task(task)
             if not re.fullmatch(pat, ident) or canonical is None:
                 return None
-            return result_key((srcobj.identity(ident),), canonical, {},
+            return result_key((srcobj.identity(ident),), canonical, opts or {},
                               weights_versions_of(seg, canonical))
 
-        @app.head(base + "/labels.seg.nrrd")
-        def probe(request: Request, ident: str, task: str):
-            from fastapi import Response
-            key = keyed(norm(ident), task)
-            if key is None:
-                raise HTTPException(404, "unknown resource")
-            hit = executor.cache_get(key)
-            if hit is not None:
-                return Response(status_code=200, headers=_resource_headers(key))
-            jid = executor.find_inflight(key)
-            if jid is not None:
-                # anonymous callers see this too (user decision): watching a flight
-                # for public data is harmless and tells them to check back
-                snap = executor.status_of(jid) or {}
-                return Response(status_code=202,
-                                headers=_progress_headers(snap.get("progress")))
-            raise HTTPException(404, "not materialized")
+        def _grid_routes(register):
+            """Register an artifact route for the default grid and each token:
+            labels.seg.nrrd plus labels.1mm.seg.nrrd and friends - the token
+            keys (and computes) under its canonical options."""
+            register("", {})
+            for tok, opts in GRID_TOKENS.items():
+                register("_" + tok, dict(opts))
 
-        @app.get(base + "/labels.seg.nrrd")
-        async def resource(request: Request, ident: str, task: str):
-            ident = norm(ident)
-            if not re.fullmatch(pat, ident):
-                raise HTTPException(422, f"{ident!r} is not a valid {prefix} identifier")
-            canonical = canon_task(task)
-            if canonical is None:
-                raise HTTPException(404, f"unknown task {task!r}")
-            task = canonical
-            key = result_key((srcobj.identity(ident),), task, {},
-                             weights_versions_of(seg, task))
-            hit = executor.cache_get(key)
-            if hit is not None:
-                return FileResponse(hit[0], media_type="application/octet-stream",
-                                    filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
-                                    headers=_resource_headers(key))
-            jid = executor.find_inflight(key)  # single flight: ride an existing run
-            is_authed = authed(request)
-            if not is_authed and jid is None:
-                raise HTTPException(404, "not materialized; authenticated access can "
-                                         "compute it")
-            initiated = False
-            if jid is None:                    # authed, nothing running: initiate
-                if not _source_enabled(srcobj):
-                    raise HTTPException(404, "not materialized, and this server cannot "
-                                             f"fetch {prefix} data (missing dependency)")
-                initiated = True
-                jid, jdir = executor.new_job_dir()
-                srcdict = {"kind": prefix, "id": ident}
-                if prefix == "idc":
-                    srcdict["crdc_series_uuid"] = ident
-                try:
-                    executor.submit(jid, jdir, None, task, {},
-                                    source=[srcdict],
-                                    identity=(srcobj.identity(ident),),
-                                    source_tokens=source_tokens_of(request))
-                except QueueFull as e:
-                    raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
-            wait = _prefer_wait(request, wait_default, wait_max)
-            deadline = time.time() + wait
-            snap = executor.status_of(jid) or {}
-            while snap.get("state") not in TERMINAL and time.time() < deadline:
-                await asyncio.sleep(0.5)
-                snap = executor.status_of(jid) or {}
-            if snap.get("state") == "done":
+        def _register_probe(tok: str, gopts: dict):
+            @app.head(base + f"/labels{tok}.seg.nrrd")
+            def probe(request: Request, ident: str, task: str,
+                      _opts=gopts):
+                from fastapi import Response
+                key = keyed(norm(ident), task, _opts)
+                if key is None:
+                    raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
-                headers = _resource_headers(key)
-                headers["Preference-Applied"] = f"wait={int(wait)}"
-                src_path = hit[0] if hit else executor.result_file(jid)[1]
-                return FileResponse(src_path, media_type="application/octet-stream",
-                                    filename=f"{_task_stem(task)}_{ident[:8]}.seg.nrrd",
-                                    headers=headers)
-            if snap.get("state") == "failed":
-                if not is_authed:              # for anonymous the resource just is not there
-                    raise HTTPException(404, "not materialized")
-                raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
-            if not is_authed:                  # watcher's view: no job vocabulary
-                p = snap.get("progress") or {}
-                return JSONResponse({"state": "materializing",
-                                     "progress": {"stage": p.get("stage"),
-                                                  "fraction": p.get("fraction")}},
+                if hit is not None:
+                    return Response(status_code=200, headers=_resource_headers(key))
+                jid = executor.find_inflight(key)
+                if jid is not None:
+                    # anonymous callers see this too (user decision): watching a
+                    # flight for public data is harmless - check back later
+                    snap = executor.status_of(jid) or {}
+                    return Response(status_code=202,
+                                    headers=_progress_headers(snap.get("progress")))
+                raise HTTPException(404, "not materialized")
+
+        _grid_routes(_register_probe)
+
+        def _register_resource(tok: str, gopts: dict):
+            @app.get(base + f"/labels{tok}.seg.nrrd")
+            async def resource(request: Request, ident: str, task: str,
+                               _tok=tok, _opts=gopts):
+                ident = norm(ident)
+                if not re.fullmatch(pat, ident):
+                    raise HTTPException(422, f"{ident!r} is not a valid {prefix} identifier")
+                canonical = canon_task(task)
+                if canonical is None:
+                    raise HTTPException(404, f"unknown task {task!r}")
+                task = canonical
+                key = result_key((srcobj.identity(ident),), task, _opts,
+                                 weights_versions_of(seg, task))
+                fname = f"{_task_stem(task)}_{ident[:8]}{_tok}.seg.nrrd"
+                hit = executor.cache_get(key)
+                if hit is not None:
+                    return FileResponse(hit[0], media_type="application/octet-stream",
+                                        filename=fname,
+                                        headers=_resource_headers(key))
+                jid = executor.find_inflight(key)  # single flight: ride an existing run
+                is_authed = authed(request)
+                if not is_authed and jid is None:
+                    raise HTTPException(404, "not materialized; authenticated access can "
+                                             "compute it")
+                initiated = False
+                if jid is None:                # authed, nothing running: initiate
+                    if not _source_enabled(srcobj):
+                        raise HTTPException(404, "not materialized, and this server cannot "
+                                                 f"fetch {prefix} data (missing dependency)")
+                    initiated = True
+                    jid, jdir = executor.new_job_dir()
+                    srcdict = {"kind": prefix, "id": ident}
+                    if prefix == "idc":
+                        srcdict["crdc_series_uuid"] = ident
+                    try:
+                        executor.submit(jid, jdir, None, task, dict(_opts),
+                                        source=[srcdict],
+                                        identity=(srcobj.identity(ident),),
+                                        source_tokens=source_tokens_of(request))
+                    except QueueFull as e:
+                        raise HTTPException(429, str(e),
+                                            headers={"Retry-After": "30"}) from e
+                wait = _prefer_wait(request, wait_default, wait_max)
+                deadline = time.time() + wait
+                snap = executor.status_of(jid) or {}
+                while snap.get("state") not in TERMINAL and time.time() < deadline:
+                    await asyncio.sleep(0.5)
+                    snap = executor.status_of(jid) or {}
+                if snap.get("state") == "done":
+                    hit = executor.cache_get(key)
+                    headers = _resource_headers(key)
+                    headers["Preference-Applied"] = f"wait={int(wait)}"
+                    src_path = hit[0] if hit else executor.result_file(jid)[1]
+                    return FileResponse(src_path, media_type="application/octet-stream",
+                                        filename=fname, headers=headers)
+                if snap.get("state") == "failed":
+                    if not is_authed:          # for anonymous the resource just is not there
+                        raise HTTPException(404, "not materialized")
+                    raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
+                if not is_authed:              # watcher's view: no job vocabulary
+                    p = snap.get("progress") or {}
+                    return JSONResponse({"state": "materializing",
+                                         "progress": {"stage": p.get("stage"),
+                                                      "fraction": p.get("fraction")}},
+                                        status_code=202,
+                                        headers=_progress_headers(snap.get("progress")))
+                return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
+                                     "initiated": initiated,  # did THIS request start it?
+                                     "progress": snap.get("progress")},
                                     status_code=202,
                                     headers=_progress_headers(snap.get("progress")))
-            return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
-                                 "initiated": initiated,   # did THIS request start it?
-                                 "progress": snap.get("progress")},
-                                status_code=202,
-                                headers=_progress_headers(snap.get("progress")))
 
+        _grid_routes(_register_resource)
+
+        def _register_evict(tok: str, gopts: dict):
+            paths = [base + f"/labels{tok}.seg.nrrd"]
+
+            def evict(request: Request, ident: str, task: str, _opts=gopts):
+                """Evict the cached entry (authorized only). Also cancels any
+                in-flight single-flight compute for the same key - otherwise
+                the entry would repopulate moments after being cleared.
+                DELETE + GET = recompute with whatever is installed now; the
+                jobs API's no_cache is the per-job form."""
+                require_auth(request)
+                key = keyed(norm(ident), task, _opts)
+                if key is None:
+                    raise HTTPException(404, "unknown resource")
+                jid = executor.find_inflight(key)
+                if jid is not None:
+                    executor.cancel(jid)
+                deleted = executor.cache_delete(key)
+                if not deleted and jid is None:
+                    raise HTTPException(404, "not materialized")
+                out = {"deleted": deleted}
+                if jid is not None:
+                    out["cancelled_job"] = jid
+                return out
+
+            for pth in paths:
+                app.delete(pth)(evict)
+
+        _grid_routes(_register_evict)
+
+        # The bare-task DELETE alias registers LAST: its greedy ident would
+        # otherwise swallow the variant URLs, capturing labels.1mm.seg.nrrd
+        # as the task segment.
         @app.delete(base)
-        @app.delete(base + "/labels.seg.nrrd")
-        def evict(request: Request, ident: str, task: str):
-            """Evict the cached entry (authorized only). Also cancels any in-flight
-            single-flight compute for the same key - otherwise the entry would
-            repopulate moments after being cleared. DELETE + GET = recompute with
-            whatever is installed now; the jobs API's no_cache is the per-job form."""
+        def evict_bare(request: Request, ident: str, task: str):
             require_auth(request)
-            key = keyed(norm(ident), task)
+            key = keyed(norm(ident), task, {})
             if key is None:
                 raise HTTPException(404, "unknown resource")
             jid = executor.find_inflight(key)
@@ -1303,29 +1363,35 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 out["cancelled_job"] = jid
             return out
 
-        @app.get(base + "/meta.json")
-        def meta(ident: str, task: str):
-            key = keyed(norm(ident), task)
-            if key is None:
-                raise HTTPException(404, "unknown resource")
-            hit = executor.cache_get(key)
-            if hit is None:
-                raise HTTPException(404, "not materialized")
-            return JSONResponse(hit[1], headers=_resource_headers(key))
+        def _register_meta(tok: str, gopts: dict):
+            @app.get(base + f"/meta{tok}.json")
+            def meta(ident: str, task: str, _opts=gopts):
+                key = keyed(norm(ident), task, _opts)
+                if key is None:
+                    raise HTTPException(404, "unknown resource")
+                hit = executor.cache_get(key)
+                if hit is None:
+                    raise HTTPException(404, "not materialized")
+                return JSONResponse(hit[1], headers=_resource_headers(key))
 
-        @app.get(base + "/preview.png")
-        def preview(ident: str, task: str):
-            key = keyed(norm(ident), task)
-            if key is None:
-                raise HTTPException(404, "unknown resource")
-            hit = executor.cache_get(key)
-            if hit is None:
-                raise HTTPException(404, "not materialized")
-            png = Path(hit[0]).parent / "preview.png"
-            if not png.exists():
-                raise HTTPException(404, "no preview for this result")
-            return FileResponse(png, media_type="image/png",
-                                headers=_resource_headers(key))
+        _grid_routes(_register_meta)
+
+        def _register_preview(tok: str, gopts: dict):
+            @app.get(base + f"/preview{tok}.png")
+            def preview(ident: str, task: str, _opts=gopts):
+                key = keyed(norm(ident), task, _opts)
+                if key is None:
+                    raise HTTPException(404, "unknown resource")
+                hit = executor.cache_get(key)
+                if hit is None:
+                    raise HTTPException(404, "not materialized")
+                png = Path(hit[0]).parent / "preview.png"
+                if not png.exists():
+                    raise HTTPException(404, "no preview for this result")
+                return FileResponse(png, media_type="image/png",
+                                    headers=_resource_headers(key))
+
+        _grid_routes(_register_preview)
 
     for _prefix, _srcobj in sources.items():
         _mount_source(_prefix, _srcobj)
@@ -1380,7 +1446,7 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
             ident = ident.strip()
             return ident.lower() if prefix == "idc" else ident
 
-        def _key_or_404(ident, task):
+        def _key_or_404(ident, task, opts=None):
             ident = norm(ident)
             if resolve_fn is not None:
                 try:
@@ -1391,7 +1457,10 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
                 raise HTTPException(404, "unknown resource")
             if not re.fullmatch(pat, ident):
                 raise HTTPException(404, "unknown resource")
-            return ident, key_fn(srcobj.identity(ident), task)
+            try:
+                return ident, key_fn(srcobj.identity(ident), task, opts or {})
+            except TypeError:                  # older two-argument key_fn
+                return ident, key_fn(srcobj.identity(ident), task)
 
         def _serve(hit, ident, task, key):
             return FileResponse(hit[0], media_type="application/octet-stream",
@@ -1399,56 +1468,67 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
                                 headers={"Cache-Control": "public, max-age=3600",
                                          "ETag": f'"{key[:32]}"'})
 
-        @app.head(base + "/labels.seg.nrrd")
-        def probe(ident: str, task: str):
-            ident, key = _key_or_404(ident, task)
-            if cache_get(key) is not None:
-                return Response(status_code=200)
-            state = inflight(key) if inflight is not None else None
-            if state:
-                return Response(status_code=202,
-                                headers=_progress_headers(state.get("progress")))
-            raise HTTPException(404, "not materialized")
+        def _register_public_probe(tok: str, gopts: dict):
+            @app.head(base + f"/labels{tok}.seg.nrrd")
+            def probe(ident: str, task: str, _opts=gopts):
+                ident, key = _key_or_404(ident, task, _opts)
+                if cache_get(key) is not None:
+                    return Response(status_code=200)
+                state = inflight(key) if inflight is not None else None
+                if state:
+                    return Response(status_code=202,
+                                    headers=_progress_headers(state.get("progress")))
+                raise HTTPException(404, "not materialized")
 
-        @app.get(base + "/labels.seg.nrrd")
-        async def resource(request: Request, ident: str, task: str):
-            ident, key = _key_or_404(ident, task)
-            hit = cache_get(key)
-            if hit is not None:
-                return _serve(hit, ident, task, key)
-            state = inflight(key) if inflight is not None else None
-            if not state:
-                raise HTTPException(404, "not materialized; authenticated access can "
-                                         "compute it")
-            deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
-            while time.time() < deadline:      # watch only - nothing here computes
-                await asyncio.sleep(0.7)
+        _grid_routes_pub = [("", {})] + [("_" + t, dict(o)) for t, o in GRID_TOKENS.items()]
+        for _tok, _o in _grid_routes_pub:
+            _register_public_probe(_tok, _o)
+
+        def _register_public_resource(tok: str, gopts: dict):
+            @app.get(base + f"/labels{tok}.seg.nrrd")
+            async def resource(request: Request, ident: str, task: str, _opts=gopts):
+                ident, key = _key_or_404(ident, task, _opts)
                 hit = cache_get(key)
                 if hit is not None:
                     return _serve(hit, ident, task, key)
-                state = inflight(key)
+                state = inflight(key) if inflight is not None else None
                 if not state:
-                    break
-            hit = cache_get(key)
-            if hit is not None:
-                return _serve(hit, ident, task, key)
-            if state:
-                p = state.get("progress") or {}
-                return JSONResponse({"state": "materializing",
-                                     "progress": {"stage": p.get("stage"),
-                                                  "fraction": p.get("fraction")}},
-                                    status_code=202,
-                                    headers=_progress_headers(state.get("progress")))
-            raise HTTPException(404, "not materialized; authenticated access can "
-                                     "compute it")
+                    raise HTTPException(404, "not materialized; authenticated access "
+                                             "can compute it")
+                deadline = time.time() + _prefer_wait(request, 30.0, 110.0)
+                while time.time() < deadline:  # watch only - nothing here computes
+                    await asyncio.sleep(0.7)
+                    hit = cache_get(key)
+                    if hit is not None:
+                        return _serve(hit, ident, task, key)
+                    state = inflight(key)
+                    if not state:
+                        break
+                hit = cache_get(key)
+                if hit is not None:
+                    return _serve(hit, ident, task, key)
+                if state:
+                    p = state.get("progress") or {}
+                    return JSONResponse({"state": "materializing",
+                                         "progress": {"stage": p.get("stage"),
+                                                      "fraction": p.get("fraction")}},
+                                        status_code=202,
+                                        headers=_progress_headers(state.get("progress")))
+                raise HTTPException(404, "not materialized; authenticated access can "
+                                         "compute it")
 
-        @app.get(base + "/meta.json")
-        def meta(ident: str, task: str):
-            _, key = _key_or_404(ident, task)
-            hit = cache_get(key)
-            if hit is None:
-                raise HTTPException(404, "not materialized")
-            return JSONResponse(hit[1])
+        def _register_public_meta(tok: str, gopts: dict):
+            @app.get(base + f"/meta{tok}.json")
+            def meta(ident: str, task: str, _opts=gopts):
+                _, key = _key_or_404(ident, task, _opts)
+                hit = cache_get(key)
+                if hit is None:
+                    raise HTTPException(404, "not materialized")
+                return JSONResponse(hit[1])
+
+        for _tok, _o in _grid_routes_pub:
+            _register_public_resource(_tok, _o)
+            _register_public_meta(_tok, _o)
 
     for _prefix, _srcobj in srcmap.items():
         _mount(_prefix, _srcobj)
