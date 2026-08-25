@@ -145,9 +145,56 @@ def read_image(path):
         image.SetDirection(direction)
         image.SetSpacing(spacing)
     else:
-        image = sitk.ReadImage(str(p))
+        try:
+            image = sitk.ReadImage(str(p))
+        except RuntimeError as e:
+            if "orthonormal" not in str(e):
+                raise
+            image = _read_with_snapped_affine(p, e)
     if image.GetDimension() != 3:
         raise InputError(f"expected a 3D image; {p} has {image.GetDimension()} dimensions")
+    return image
+
+
+def _read_with_snapped_affine(p, itk_error, tol: float = 1e-3):
+    """ITK refuses NIfTIs whose direction cosines are not exactly orthonormal;
+    several published datasets (the TotalSegmentator training data among them)
+    carry affines off by ~1e-4. When the deviation is tiny, snap to the
+    CLOSEST rotation via SVD polar decomposition and proceed - never QR,
+    whose sign indeterminacy can silently mirror the volume. Genuinely
+    sheared or oblique affines (deviation beyond ``tol``) still refuse: that
+    is real geometry, not float noise."""
+    import numpy as np
+    sitk = _sitk()
+    try:
+        import nibabel as nib
+    except ImportError:
+        raise InputError(f"{p}: non-orthonormal direction cosines and nibabel "
+                         f"is unavailable to snap them ({itk_error})") from itk_error
+    ni = nib.load(str(p))
+    if ni.ndim < 3:
+        raise InputError(f"expected a 3D image; {p} has {ni.ndim} dimensions")
+    aff = ni.affine
+    R = np.asarray(aff[:3, :3], dtype=float)
+    spacing = np.linalg.norm(R, axis=0)
+    if not np.all(spacing > 0):
+        raise InputError(f"{p}: degenerate affine (zero-length axis)")
+    U, _S, Vt = np.linalg.svd(R / spacing)
+    Rn = U @ Vt
+    deviation = float(np.abs(Rn - R / spacing).max())
+    if deviation > tol:
+        raise InputError(
+            f"{p}: direction cosines deviate from orthonormal by {deviation:.2e} "
+            f"(tolerance {tol:.0e}) - this looks like genuinely sheared/oblique "
+            "geometry, not float noise; refusing to guess") from itk_error
+    a = np.asanyarray(ni.dataobj)
+    if a.ndim == 4 and a.shape[3] == 1:
+        a = a[..., 0]
+    image = sitk.GetImageFromArray(np.ascontiguousarray(np.transpose(a, (2, 1, 0))))
+    image.SetSpacing(tuple(float(x) for x in spacing))
+    flip = np.diag([-1.0, -1.0, 1.0])          # nifti RAS -> ITK LPS
+    image.SetDirection(tuple((flip @ Rn).flatten()))
+    image.SetOrigin(tuple((flip @ aff[:3, 3]).tolist()))
     return image
 
 

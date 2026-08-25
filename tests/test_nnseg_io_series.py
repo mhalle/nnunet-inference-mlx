@@ -153,3 +153,44 @@ def test_directory_with_one_image_file_reads_as_that_file(tmp_path):
     (d / "second.txt").write_text("x")      # two files: ambiguous, still an error
     with pytest.raises(InputError):
         read_image(d)
+
+
+def test_near_orthonormal_affine_snaps_and_sheared_refuses(tmp_path):
+    """Published datasets (TS training data) carry affines off by ~1e-4: snap
+    via SVD polar and read. Genuinely sheared geometry still refuses."""
+    import nibabel as nib
+    import numpy as np
+    import pytest
+
+    from nnseg.errors import InputError
+    from nnseg.io import read_image
+
+    a = np.zeros((10, 12, 14), np.int16)
+    a[3:7, 4:8, 5:9] = 100
+
+    aff = np.diag([1.5, 1.5, 2.0, 1.0])
+    aff[:3, :3] += np.array([[0, 5e-5, 0], [-4e-5, 0, 0], [0, 0, 0]])
+    p1 = tmp_path / "near.nii.gz"
+    nib.save(nib.Nifti1Image(a, aff), str(p1))
+    # integration: read_image succeeds whichever side of ITK's own tolerance
+    # the perturbation lands on
+    img = read_image(p1)
+    assert img.GetSize() == (10, 12, 14)
+    assert np.allclose(img.GetSpacing(), (1.5, 1.5, 2.0), atol=1e-3)
+    D = np.array(img.GetDirection()).reshape(3, 3)
+    assert np.allclose(D @ D.T, np.eye(3), atol=1e-4)
+    assert np.linalg.det(D) > 0.99                       # not mirrored
+    # the snap path itself, forced: exactly orthonormal out, sign preserved
+    from nnseg.io import _read_with_snapped_affine
+    snapped = _read_with_snapped_affine(p1, RuntimeError("orthonormal"))
+    Ds = np.array(snapped.GetDirection()).reshape(3, 3)
+    assert np.allclose(Ds @ Ds.T, np.eye(3), atol=1e-12)
+    assert np.linalg.det(Ds) > 0.999
+    assert snapped.GetSize() == (10, 12, 14)
+
+    sheared = np.diag([1.5, 1.5, 2.0, 1.0])
+    sheared[0, 1] = 0.3                                  # real shear
+    p2 = tmp_path / "sheared.nii.gz"
+    nib.save(nib.Nifti1Image(a, sheared), str(p2))
+    with pytest.raises(InputError, match="sheared|orthonormal"):
+        read_image(p2)
