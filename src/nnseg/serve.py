@@ -291,6 +291,7 @@ class ResultCache:
                      "identity": meta.get("identity"),
                      "options": meta.get("options"),
                      "computed": meta.get("computed"), "bytes": st.st_size}
+            has_preview = (d / "preview.png").exists()
             ident = meta.get("identity") or []
             if (len(ident) == 1 and ":" in str(ident[0])
                     and not str(ident[0]).startswith("sha256:")
@@ -298,6 +299,8 @@ class ResultCache:
                 prefix, one = str(ident[0]).split(":", 1)
                 if "/" not in one:             # multi-segment ids are not path-addressable
                     entry["path"] = f"/v1/{prefix}/{one}/{meta.get('task')}/labels.seg.nrrd"
+                    if has_preview:
+                        entry["preview"] = f"/v1/{prefix}/{one}/{meta.get('task')}/preview.png"
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]
@@ -315,7 +318,8 @@ class ResultCache:
             result = {}
         return labels, result
 
-    def put(self, key: str, labels_path, result: dict, meta: dict) -> None:
+    def put(self, key: str, labels_path, result: dict, meta: dict,
+            preview_path=None) -> None:
         import shutil
         d = self.root / key
         d.mkdir(parents=True, exist_ok=True)
@@ -323,6 +327,8 @@ class ResultCache:
         # the sidecars first makes an entry appear atomically complete
         (d / "result.json").write_text(json.dumps(result))
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
+        if preview_path and Path(preview_path).exists():
+            shutil.copy2(preview_path, d / "preview.png")
         shutil.copy2(labels_path, d / RESULT_NAME)
         self.evict()
 
@@ -645,13 +651,20 @@ class LocalExecutor:
                     "provenance": seg.provenance,
                 }
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
+                preview = None
+                try:                       # best-effort: a preview never fails a job
+                    from .preview import render_preview
+                    preview = render_preview(inp, rec.labels_path,
+                                             rec.dir / "preview.png", title=rec.task)
+                except Exception:
+                    preview = None
                 # cache BEFORE flipping state: anything that observes "done"
                 # (HEAD probes, the segmentations listing) must find the entry
                 if self.cache is not None and rec.cache_key:
                     self.cache.put(rec.cache_key, rec.labels_path, rec.result,
                                    {"identity": list(rec.input_identity), "task": rec.task,
                                     "options": rec.options, "computed": rec.started,
-                                    "job": rec.id})
+                                    "job": rec.id}, preview_path=preview)
                 rec.state = "done"
             except _PrepareDone:
                 pass
@@ -1295,6 +1308,20 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             if hit is None:
                 raise HTTPException(404, "not materialized")
             return JSONResponse(hit[1], headers=_resource_headers(key))
+
+        @app.get(base + "/preview.png")
+        def preview(ident: str, task: str):
+            key = keyed(norm(ident), task)
+            if key is None:
+                raise HTTPException(404, "unknown resource")
+            hit = executor.cache_get(key)
+            if hit is None:
+                raise HTTPException(404, "not materialized")
+            png = Path(hit[0]).parent / "preview.png"
+            if not png.exists():
+                raise HTTPException(404, "no preview for this result")
+            return FileResponse(png, media_type="image/png",
+                                headers=_resource_headers(key))
 
     for _prefix, _srcobj in sources.items():
         _mount_source(_prefix, _srcobj)

@@ -27,7 +27,7 @@ nnseg = "nnseg.cli:main"
 # Remote weight download (store.download / download_archive).
 remote = ["httpx"]
 # The REST job server (nnseg serve).
-serve = ["fastapi", "uvicorn", "python-multipart"]
+serve = ["matplotlib", "fastapi", "uvicorn", "python-multipart"]
 # Server-side fetch of IDC series by UUID (source kind "idc").
 idc = ["obstore"]
 # Deploying the server to Modal (nnseg modal deploy).

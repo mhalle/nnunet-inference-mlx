@@ -78,7 +78,8 @@ _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("torch>=2.7", "numpy>=1.24", "triton", "nnunetv2>=2.5",
-                    "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart")
+                    "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart",
+                    "matplotlib")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -374,6 +375,15 @@ class Worker:
             with self._vol_lock:
                 s.save(jdir / RESULT_NAME)
                 jobs_vol.commit()
+            preview = None
+            try:                           # best-effort: a preview never fails a job -
+                                           # rendered before the finally deletes the input
+                from nnseg.preview import render_preview
+                preview = render_preview(input_path, jdir / RESULT_NAME,
+                                         Path("/dev/shm") / f"preview_{jid}.png",
+                                         title=meta["task"])
+            except Exception:
+                preview = None
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
@@ -383,8 +393,10 @@ class Worker:
                     meta["cache_key"], jdir / RESULT_NAME, result,
                     {"identity": meta.get("input_identity"), "task": meta["task"],
                      "options": meta.get("options"), "job": jid,
-                     "computed": meta.get("started")})
+                     "computed": meta.get("started")}, preview_path=preview)
                 cache_vol.commit()
+            if preview:
+                Path(preview).unlink(missing_ok=True)
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
         except Cancelled:
             _emit(jid, {"state": "cancelled", "finished": time.time()})

@@ -1253,3 +1253,62 @@ def test_all_task_name_forms_converge_to_one_cache_key(tmp_path, monkeypatch):
         assert r2.status_code == 200, form           # cache hit, no recompute
     assert len(seg.calls) == 1
     assert client.get(f"/v1/idc/{u}/bogus/labels.seg.nrrd").status_code == 404
+
+
+def test_preview_renders_and_serves(tmp_path, monkeypatch):
+    """A real (synthetic) volume through a fake segmenter that writes a real
+    seg.nrrd: the preview lands in the cache entry, serves at preview.png on
+    the path surface, and the listing links it."""
+    pytest.importorskip("matplotlib")
+    import numpy as np
+    import SimpleITK as sitk
+
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        a = np.full((24, 32, 32), -1000, np.int16)
+        a[8:16, 10:22, 10:22] = 40
+        img = sitk.GetImageFromArray(a)
+        sitk.WriteImage(img, str(d / "vol.nii.gz"))
+        return d
+
+    class SavingSeg(FakeSegmenter):
+        def segment(self, image, task, *, progress=None, cancel=None, **options):
+            self.calls.append((str(image), task, options))
+
+            class R:
+                def save(_, path):
+                    a = np.zeros((24, 32, 32), np.uint8)
+                    a[9:15, 12:20, 12:20] = 1
+                    img = sitk.GetImageFromArray(a)
+                    img.SetMetaData("Segment0_Name", "blob")
+                    img.SetMetaData("Segment0_LabelValue", "1")
+                    img.SetMetaData("Segment0_Color", "0.9 0.3 0.2")
+                    sitk.WriteImage(img, str(path))
+                    return path
+                schema = type("S", (), {"names": {1: "blob"}})()
+                def volumes_ml(_):
+                    return {"blob": 1.0}
+                provenance = {"task": "total_fast"}
+            return R()
+
+    seg = SavingSeg()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    r = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd",
+                   headers={"Prefer": "wait=30"})
+    assert r.status_code == 200
+    p = client.get(f"/v1/idc/{u}/total_fast/preview.png")
+    assert p.status_code == 200
+    assert p.headers["content-type"] == "image/png"
+    assert p.content[:8] == b"\x89PNG\r\n\x1a\n" and len(p.content) > 5000
+    segs = client.get("/v1/segmentations").json()["segmentations"]
+    e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
+    assert e["preview"] == f"/v1/idc/{u}/total_fast/preview.png"
+    # a result without a preview 404s cleanly rather than erroring
+    assert client.get(f"/v1/idc/{u}/total/preview.png").status_code == 404
