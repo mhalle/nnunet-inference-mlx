@@ -508,6 +508,20 @@ def _version() -> str:
         return "unknown"
 
 
+def _progress_headers(progress: dict | None, extra: dict | None = None) -> dict:
+    """202 progress as headers, so HEAD probes and header-only clients see how
+    far along a flight is (a HEAD response cannot carry a body)."""
+    h = {"Retry-After": "10", "Cache-Control": "no-store"}
+    if extra:
+        h.update(extra)
+    p = progress or {}
+    if p.get("stage"):
+        h["NNSeg-Stage"] = str(p["stage"])
+    if p.get("fraction") is not None:
+        h["NNSeg-Fraction"] = f"{float(p['fraction']):.3f}"
+    return h
+
+
 def _prefer_wait(request, default: float, maximum: float) -> float:
     """RFC 7240: Prefer: wait=N / respond-async. Never in the query string -
     the URL stays the pure cache key, and 200s never Vary on Prefer."""
@@ -782,12 +796,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         hit = executor.cache_get(key)
         if hit is not None:
             return Response(status_code=200, headers=_resource_headers(key))
-        if executor.find_inflight(key) is not None:
+        jid = executor.find_inflight(key)
+        if jid is not None:
             # anonymous callers see this too (user decision): watching a flight
             # for public data is harmless and tells them to check back
+            snap = executor.status_of(jid) or {}
             return Response(status_code=202,
-                            headers={"Retry-After": "10",
-                                     "Cache-Control": "no-store"})
+                            headers=_progress_headers(snap.get("progress")))
         raise HTTPException(404, "not materialized")
 
     @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
@@ -844,13 +859,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                  "progress": {"stage": p.get("stage"),
                                               "fraction": p.get("fraction")}},
                                 status_code=202,
-                                headers={"Retry-After": "10",
-                                         "Cache-Control": "no-store"})
+                                headers=_progress_headers(snap.get("progress")))
         return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
                              "initiated": initiated,       # did THIS request start it?
                              "progress": snap.get("progress")},
                             status_code=202,
-                            headers={"Retry-After": "10", "Cache-Control": "no-store"})
+                            headers=_progress_headers(snap.get("progress")))
 
     @app.delete("/v1/idc/{uuid}/{task}")
     @app.delete("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
@@ -932,8 +946,10 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
         uuid, key = _key_or_404(uuid, task)
         if cache_get(key) is not None:
             return Response(status_code=200)
-        if inflight is not None and inflight(key):
-            return Response(status_code=202, headers={"Retry-After": "10"})
+        state = inflight(key) if inflight is not None else None
+        if state:
+            return Response(status_code=202,
+                            headers=_progress_headers(state.get("progress")))
         raise HTTPException(404, "not materialized")
 
     @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
@@ -964,8 +980,7 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None):
                                  "progress": {"stage": p.get("stage"),
                                               "fraction": p.get("fraction")}},
                                 status_code=202,
-                                headers={"Retry-After": "10",
-                                         "Cache-Control": "no-store"})
+                                headers=_progress_headers(state.get("progress")))
         raise HTTPException(404, "not materialized; authenticated access can "
                                  "compute it")
 

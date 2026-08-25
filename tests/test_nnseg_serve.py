@@ -680,3 +680,24 @@ def test_public_app_shows_inflight_and_waits(tmp_path):
     src = tmp_path / "l.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
     cache.put(key_fn(u, "total_fast"), src, {}, {})
     assert client.get(url).status_code == 200              # materialized mid-watch
+
+
+def test_202s_carry_progress_headers(tmp_path):
+    """Progress rides 202 HEADERS too, so HEAD probes (which cannot have a
+    body) and header-only clients see stage and fraction."""
+    from nnseg.serve import ResultCache, create_public_app, result_key
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    key_fn = lambda uuid, task: result_key((f"idc:{uuid}",), task, {}, ["w=1"])
+    flights = {key_fn(u, "total_fast"):
+               {"progress": {"stage": "predict", "fraction": 0.42}}}
+    cache = ResultCache(tmp_path / "c")
+    app = create_public_app(key_fn, cache.get, lambda: ["total_fast"],
+                            inflight=lambda k: flights.get(k))
+    client = TestClient(app)
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    h = client.head(url)
+    assert h.status_code == 202
+    assert h.headers["nnseg-stage"] == "predict"
+    assert h.headers["nnseg-fraction"] == "0.420"
+    g = client.get(url, headers={"Prefer": "wait=0"})
+    assert g.status_code == 202 and g.headers["nnseg-fraction"] == "0.420"
