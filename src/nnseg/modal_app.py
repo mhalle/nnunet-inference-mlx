@@ -79,8 +79,8 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("torch>=2.7", "numpy>=1.24", "triton", "nnunetv2>=2.5",
                     "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart")
-    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
 
 app = modal.App(APP_NAME, image=image)
