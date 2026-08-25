@@ -1300,10 +1300,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         def _register_probe(tok: str, gopts: dict):
             @app.head(base + f"/labels{tok}.seg.nrrd")
-            def probe(request: Request, ident: str, task: str,
-                      _opts=gopts):
+            def probe(request: Request, ident: str, task: str):
                 from fastapi import Response
-                key = keyed(norm(ident), task, _opts)
+                key = keyed(norm(ident), task, gopts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
@@ -1322,8 +1321,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         def _register_resource(tok: str, gopts: dict):
             @app.get(base + f"/labels{tok}.seg.nrrd")
-            async def resource(request: Request, ident: str, task: str,
-                               _tok=tok, _opts=gopts):
+            async def resource(request: Request, ident: str, task: str):
                 ident = norm(ident)
                 if not re.fullmatch(pat, ident):
                     raise HTTPException(422, f"{ident!r} is not a valid {prefix} identifier")
@@ -1331,9 +1329,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if canonical is None:
                     raise HTTPException(404, f"unknown task {task!r}")
                 task = canonical
-                key = result_key((srcobj.identity(ident),), task, _opts,
+                key = result_key((srcobj.identity(ident),), task, gopts,
                                  weights_versions_of(seg, task))
-                fname = f"{_task_stem(task)}_{ident[:8]}{_tok}.seg.nrrd"
+                fname = f"{_task_stem(task)}_{ident[:8]}{tok}.seg.nrrd"
                 hit = executor.cache_get(key)
                 if hit is not None:
                     return FileResponse(hit[0], media_type="application/octet-stream",
@@ -1355,7 +1353,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     if prefix == "idc":
                         srcdict["crdc_series_uuid"] = ident
                     try:
-                        executor.submit(jid, jdir, None, task, dict(_opts),
+                        executor.submit(jid, jdir, None, task, dict(gopts),
                                         source=[srcdict],
                                         identity=(srcobj.identity(ident),),
                                         source_tokens=source_tokens_of(request))
@@ -1397,14 +1395,14 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         def _register_evict(tok: str, gopts: dict):
             paths = [base + f"/labels{tok}.seg.nrrd"]
 
-            def evict(request: Request, ident: str, task: str, _opts=gopts):
+            def evict(request: Request, ident: str, task: str):
                 """Evict the cached entry (authorized only). Also cancels any
                 in-flight single-flight compute for the same key - otherwise
                 the entry would repopulate moments after being cleared.
                 DELETE + GET = recompute with whatever is installed now; the
                 jobs API's no_cache is the per-job form."""
                 require_auth(request)
-                key = keyed(norm(ident), task, _opts)
+                key = keyed(norm(ident), task, gopts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 jid = executor.find_inflight(key)
@@ -1445,8 +1443,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         def _register_meta(tok: str, gopts: dict):
             @app.get(base + f"/meta{tok}.json")
-            def meta(ident: str, task: str, _opts=gopts):
-                key = keyed(norm(ident), task, _opts)
+            def meta(ident: str, task: str):
+                key = keyed(norm(ident), task, gopts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
@@ -1458,8 +1456,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         def _register_preview(tok: str, gopts: dict):
             @app.get(base + f"/preview{tok}.png")
-            async def preview(request: Request, ident: str, task: str, _opts=gopts):
-                key = keyed(norm(ident), task, _opts)
+            async def preview(request: Request, ident: str, task: str):
+                key = keyed(norm(ident), task, gopts)
                 if key is None:
                     raise HTTPException(404, "unknown resource")
                 hit = executor.cache_get(key)
@@ -1467,7 +1465,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     w = _prefer_wait_raw(request, wait_max)
                     deadline = None if w is None else time.time() + w
                     hit = await _materialize_entry(request, norm(ident),
-                                                   canon_task(task), _opts, key,
+                                                   canon_task(task), gopts, key,
                                                    deadline)
                 png = await _await_artifact(request, key, hit,
                                             "preview.png", "preview")
@@ -1560,20 +1558,18 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 return key, hit
 
             @app.get(base + f"/statistics{tok}.json")
-            async def statistics_json(request: Request, ident: str, task: str,
-                                      _opts=gopts):
-                key, hit = await _stats_key(request, ident, task, _opts)
+            async def statistics_json(request: Request, ident: str, task: str):
+                key, hit = await _stats_key(request, ident, task, gopts)
                 sj = await _await_artifact(request, key, hit,
                                            "statistics.json", "statistics")
                 return JSONResponse(json.loads(sj.read_text()),
                                     headers=_resource_headers(key))
 
             @app.get(base + f"/statistics{tok}.tsv")
-            async def statistics_tsv_view(request: Request, ident: str, task: str,
-                                          _opts=gopts):
+            async def statistics_tsv_view(request: Request, ident: str, task: str):
                 from fastapi import Response
                 from .statistics import statistics_tsv
-                key, hit = await _stats_key(request, ident, task, _opts)
+                key, hit = await _stats_key(request, ident, task, gopts)
                 sj = await _await_artifact(request, key, hit,
                                            "statistics.json", "statistics")
                 return Response(statistics_tsv(json.loads(sj.read_text())),
@@ -1659,8 +1655,8 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
 
         def _register_public_probe(tok: str, gopts: dict):
             @app.head(base + f"/labels{tok}.seg.nrrd")
-            def probe(ident: str, task: str, _opts=gopts):
-                ident, key = _key_or_404(ident, task, _opts)
+            def probe(ident: str, task: str):
+                ident, key = _key_or_404(ident, task, gopts)
                 if cache_get(key) is not None:
                     return Response(status_code=200)
                 state = inflight(key) if inflight is not None else None
@@ -1675,8 +1671,8 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
 
         def _register_public_resource(tok: str, gopts: dict):
             @app.get(base + f"/labels{tok}.seg.nrrd")
-            async def resource(request: Request, ident: str, task: str, _opts=gopts):
-                ident, key = _key_or_404(ident, task, _opts)
+            async def resource(request: Request, ident: str, task: str):
+                ident, key = _key_or_404(ident, task, gopts)
                 hit = cache_get(key)
                 if hit is not None:
                     return _serve(hit, ident, task, key)
@@ -1708,8 +1704,8 @@ def create_public_app(key_fn, cache_get, tasks_fn, inflight=None, sources=None,
 
         def _register_public_meta(tok: str, gopts: dict):
             @app.get(base + f"/meta{tok}.json")
-            def meta(ident: str, task: str, _opts=gopts):
-                _, key = _key_or_404(ident, task, _opts)
+            def meta(ident: str, task: str):
+                _, key = _key_or_404(ident, task, gopts)
                 hit = cache_get(key)
                 if hit is None:
                     raise HTTPException(404, "not materialized")

@@ -1676,3 +1676,37 @@ def wait_artifact_with_prefer(client, url, timeout=10.0):
             return r
         time.sleep(0.05)
     return r
+
+
+def test_query_params_cannot_inject_key_material(tmp_path, monkeypatch):
+    """Regression for the closure-default injection: _opts/_tok must not be
+    query parameters. A variant URL with ?_opts= must keep variant semantics;
+    junk ?_opts must not 500; the OpenAPI schema must not expose them."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    base = f"/v1/idc/{u}/total_fast"
+    assert client.get(f"{base}/labels.seg.nrrd",
+                      headers={"Prefer": "wait=30"}).status_code == 200
+
+    # only the default is cached: the variant URL must 404/202 regardless of
+    # query-string games, never serve the default entry
+    for q in ("?_opts=", "?_opts=zzz", "?_tok=", "?_opts=%7B%7D"):
+        r = client.head(f"{base}/labels_res-1mm.seg.nrrd{q}")
+        assert r.status_code in (404, 202), (q, r.status_code)
+        r2 = client.head(f"{base}/labels.seg.nrrd{q}")
+        assert r2.status_code == 200, (q, r2.status_code)   # and no 500s
+    spec = client.get("/openapi.json").json()
+    txt = json.dumps(spec)
+    assert "_opts" not in txt and "_tok" not in txt
