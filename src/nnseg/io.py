@@ -128,7 +128,14 @@ def read_image(path):
         reader = sitk.ImageSeriesReader()
         files = reader.GetGDCMSeriesFileNames(str(p))
         if not files:
-            raise InputError(f"no DICOM series found in {p}")
+            # not a DICOM series - but a directory holding exactly one image
+            # file reads as that file (how staged single-file sources arrive)
+            loose = [q for q in sorted(p.iterdir())
+                     if q.is_file() and not q.name.startswith(".")]
+            if len(loose) == 1:
+                return read_image(loose[0])
+            raise InputError(f"no DICOM series found in {p}"
+                             + (f" ({len(loose)} non-DICOM files)" if loose else ""))
         reader.SetFileNames(files)
         image = reader.Execute()
         # The reader decodes and stacks; the geometry comes from the tags. See

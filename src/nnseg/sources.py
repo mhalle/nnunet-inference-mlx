@@ -84,21 +84,29 @@ class UrlTemplateSource(DataSource):
     """
 
     def __init__(self, prefix: str, id_pattern: str, url_template: str, *,
-                 filename: str = "image", description: str = ""):
+                 filename: str | None = None, description: str = ""):
         if "{id}" not in url_template:
             raise ValueError("url_template needs an {id} placeholder")
         self.prefix, self.id_pattern = prefix, id_pattern
         self.url_template, self.filename = url_template, filename
         self.description = description or f"single-file fetch from {url_template}"
 
+    def _filename(self, identifier: str) -> str:
+        """The saved name defaults to the identifier's basename so the format
+        stays detectable (.nii.gz etc.); explicit ``filename`` overrides."""
+        if self.filename:
+            return self.filename
+        name = Path(identifier).name
+        return name if name and name not in (".", "..") else "image"
+
     def fetch(self, identifier: str, dest_dir: Path) -> Path:
         import urllib.request
         url = self.url_template.format(id=identifier)
         dest = Path(dest_dir) / "series"
         dest.mkdir(exist_ok=True)
-        out = dest / self.filename
+        out = dest / self._filename(identifier)
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(out, "wb") as f:
+            with urllib.request.urlopen(url, timeout=300) as r, open(out, "wb") as f:
                 while chunk := r.read(1 << 20):
                     f.write(chunk)
         except Exception as e:
@@ -151,9 +159,69 @@ class IDCSource(DataSource):
         return dest
 
 
+class TCIASource(DataSource):
+    """The Cancer Imaging Archive via its NBIA REST API: a DICOM series by
+    SeriesInstanceUID, anonymously, for fully public collections. The API
+    returns one zip per series; entries are flattened by basename on
+    extraction, which also makes zip-slip impossible by construction.
+
+    NOT version-pinned: TCIA serves the collection's current revision, so the
+    same SeriesInstanceUID can resolve to different bytes across data
+    releases. For version-pinned identity use the idc source - the two doors
+    deliberately have distinct identities (tcia:<uid> vs idc:<uuid>)."""
+
+    prefix = "tcia"
+    id_pattern = r"(?=.{10,64}$)[0-9]+(?:\.[0-9]+)+"   # DICOM UID: digits, dots, <=64
+    description = "The Cancer Imaging Archive (NBIA), by SeriesInstanceUID"
+    API = "https://services.cancerimagingarchive.net/nbia-api/services/v1/getImage"
+
+    def fetch(self, identifier: str, dest_dir: Path) -> Path:
+        import shutil
+        import urllib.request
+        import zipfile
+        dest = Path(dest_dir) / "series"
+        dest.mkdir(exist_ok=True)
+        tmp = Path(dest_dir) / "series.zip"
+        try:
+            with urllib.request.urlopen(f"{self.API}?SeriesInstanceUID={identifier}",
+                                        timeout=600) as r, open(tmp, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+            n = 0
+            with zipfile.ZipFile(tmp) as z:
+                for m in z.infolist():
+                    name = Path(m.filename).name   # flatten: zip paths never touch disk
+                    if m.is_dir() or not name or name.startswith("."):
+                        continue
+                    with z.open(m) as src, open(dest / name, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    n += 1
+            if n == 0:
+                raise InputError(f"TCIA returned an empty series for {identifier!r}")
+        except InputError:
+            raise
+        except Exception as e:
+            raise InputError(f"fetch of tcia:{identifier} failed: {e}") from e
+        finally:
+            tmp.unlink(missing_ok=True)
+        return dest
+
+
+def openneuro_source() -> UrlTemplateSource:
+    """OpenNeuro (CC0 neuroimaging, BIDS layout) straight off its public S3
+    bucket over HTTPS - the data-only case: identifiers are
+    ``ds<number>/<path-to-file>`` (slashed, so cache keys hash; reachable via
+    the jobs API, not the single-segment path surface)."""
+    return UrlTemplateSource(
+        "openneuro",
+        r"ds[0-9]{6}/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}",
+        "https://s3.amazonaws.com/openneuro.org/{id}",
+        description="OpenNeuro (CC0), by ds<number>/<file path>")
+
+
 def default_sources() -> list:
     """The sources a server carries unless told otherwise."""
-    return [IDCSource()]
+    return [IDCSource(), TCIASource(), openneuro_source()]
 
 
 def registry(sources=None) -> dict:

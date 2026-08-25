@@ -131,3 +131,25 @@ def test_reorient_lands_in_ras(tmp_path):
     img = io.to_image(np.zeros(geo.shape_zyx, dtype=np.uint8), geo)
     assert io.orientation_of(img) == io.CANONICAL
     assert original == "LPS"                                 # the stored frame
+
+
+def test_directory_with_one_image_file_reads_as_that_file(tmp_path):
+    """Staged single-file sources arrive as a directory holding one file."""
+    import numpy as np
+    import pytest
+    import SimpleITK as sitk
+
+    from nnseg.errors import InputError
+    from nnseg.io import read_image
+
+    d = tmp_path / "series"
+    d.mkdir()
+    img = sitk.GetImageFromArray(np.zeros((4, 5, 6), np.int16))
+    img.SetSpacing((2.0, 3.0, 4.0))
+    sitk.WriteImage(img, str(d / "vol.nii.gz"))
+    got = read_image(d)
+    assert got.GetSize() == (6, 5, 4) and got.GetSpacing() == (2.0, 3.0, 4.0)
+
+    (d / "second.txt").write_text("x")      # two files: ambiguous, still an error
+    with pytest.raises(InputError):
+        read_image(d)

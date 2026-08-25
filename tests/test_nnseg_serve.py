@@ -1089,3 +1089,105 @@ def test_slashed_identifiers_hash_into_the_cache(tmp_path):
             return True
 
     assert "doi" in registry([Doi()])          # slashed patterns are fine now
+
+
+def test_tcia_source_flattens_and_blocks_zip_slip(tmp_path, monkeypatch):
+    import io
+    import zipfile
+
+    from nnseg.sources import TCIASource
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("CPTAC/1-1.dcm", b"DICM1")
+        z.writestr("../../evil.txt", b"nope")
+        z.writestr("LICENSE", b"CC BY")
+        z.writestr("sub/dir/", b"")
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda url, timeout=0: FakeResp(buf.getvalue()))
+    src = TCIASource()
+    got = src.fetch("1.2.3.4.5.6.7", tmp_path)
+    names = sorted(p.name for p in got.iterdir())
+    assert names == ["1-1.dcm", "LICENSE", "evil.txt"]   # flattened, inside dest
+    assert not (tmp_path.parent / "evil.txt").exists()
+    assert import_re_fullmatch(src.id_pattern, "1.3.6.1.4.1.14519.5.2.1.7085.1")
+    assert not import_re_fullmatch(src.id_pattern, "1." + "2" * 70)  # >64 chars
+
+
+def import_re_fullmatch(pat, s):
+    import re as _re
+    return _re.fullmatch(pat, s) is not None
+
+
+def test_openneuro_is_a_data_only_source(tmp_path, monkeypatch):
+    import io
+
+    from nnseg.sources import openneuro_source, registry
+
+    src = openneuro_source()
+    assert "openneuro" in registry([src])
+    seen = {}
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(url, timeout=0):
+        seen["url"] = url
+        return FakeResp(b"\x1f\x8bmri")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    got = src.fetch("ds000001/sub-01/anat/sub-01_T1w.nii.gz", tmp_path)
+    assert seen["url"].endswith("openneuro.org/ds000001/sub-01/anat/sub-01_T1w.nii.gz")
+    assert (got / "sub-01_T1w.nii.gz").exists()          # basename keeps the format
+
+
+def test_catalog_remaps_match_installed_weights():
+    """For every TS task part whose weights are installed locally, the remap's
+    local labels must exist in the checkpoint's dataset.json AND map to a
+    global whose name matches the checkpoint's name for that local. This is
+    the drift guard that would have caught the stale total_mr class map
+    (organs silently dropping 14 structures and mislabeling 6)."""
+    import json
+    from pathlib import Path
+
+    import pytest
+
+    data = json.loads((Path("src/nnseg/data/ts_tasks.json")).read_text())
+    tasks = data["tasks"] if isinstance(data, dict) else data
+    roots = [Path.home() / ".totalsegmentator/nnunet/results"]
+    checked = 0
+    for t in tasks:
+        gmap = {int(k): v for k, v in (t.get("label_map") or {}).items()}
+        parts = t.get("union") or []
+        for part in parts:
+            wid = part.get("weights_id")
+            remap = part.get("label_remap") or {}
+            djs = [dj for r in roots if r.exists()
+                   for dj in r.glob(f"Dataset{wid}_*/**/dataset.json")]
+            if not djs or not remap:
+                continue
+            labels = json.loads(djs[0].read_text())["labels"]
+            local_names = {int(v): k for k, v in labels.items() if isinstance(v, int)}
+            for local, global_ in remap.items():
+                assert int(local) in local_names, (
+                    f"{t['name']}/{part.get('name')}: remap local {local} not in "
+                    f"Dataset{wid} checkpoint labels")
+                assert gmap.get(int(global_)) == local_names[int(local)], (
+                    f"{t['name']}/{part.get('name')}: local {local} "
+                    f"({local_names[int(local)]}) mapped to global {global_} "
+                    f"({gmap.get(int(global_))})")
+            checked += 1
+    if checked == 0:
+        pytest.skip("no TS weights installed locally")
