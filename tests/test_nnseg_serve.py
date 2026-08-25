@@ -591,3 +591,36 @@ def test_idc_delete_evicts_and_cancels_inflight(tmp_path, monkeypatch):
             break
         time.sleep(0.02)
     assert st.get("state") in ("cancelled", "done")
+
+
+def test_head_probe_never_computes_and_distinguishes_states(tmp_path, monkeypatch):
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate, steps=2)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    url = f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+
+    assert client.head(url).status_code == 404      # absent - and crucially:
+    assert len(seg.calls) == 0                      # the probe started NOTHING
+
+    r = client.get(url, headers={"Prefer": "wait=0"})   # initiate (gated)
+    assert r.status_code == 202 and r.json()["initiated"] is True
+    r2 = client.get(url, headers={"Prefer": "wait=0"})  # join the flight
+    assert r2.status_code == 202 and r2.json()["initiated"] is False
+    assert r2.json()["job"] == r.json()["job"]
+    assert client.head(url).status_code == 202          # probe sees in-flight
+
+    gate.set()
+    jid = r.json()["job"]
+    wait_state(client, jid, ("done",))
+    assert client.head(url).status_code == 200          # probe sees materialized
+    assert len(seg.calls) == 1

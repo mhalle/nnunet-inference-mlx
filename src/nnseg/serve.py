@@ -768,6 +768,28 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     def _resource_headers(key: str) -> dict:
         return {"Cache-Control": "public, max-age=3600", "ETag": f'"{key[:32]}"'}
 
+    # Registered BEFORE the GET: Starlette auto-adds HEAD to GET routes, which
+    # would run the full handler - a `curl -I` on a miss would start a GPU job.
+    # HEAD is the compute-free probe, and the one place status codes distinguish
+    # in-flight: 200 materialized / 202 computing (authorized view) / 404 absent.
+    @app.head("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
+    def idc_probe(request: Request, uuid: str, task: str):
+        from fastapi import Response
+        uuid = uuid.strip().lower()
+        if not re.fullmatch(CRDC_RE, uuid) or task not in seg.tasks():
+            raise HTTPException(404, "unknown resource")
+        key = result_key((f"idc:{uuid}",), task, {}, weights_versions_of(seg, task))
+        hit = executor.cache_get(key)
+        if hit is not None:
+            return Response(status_code=200, headers=_resource_headers(key))
+        if authed(request):
+            jid = executor.find_inflight(key)
+            if jid is not None:
+                return Response(status_code=202,
+                                headers={"Retry-After": "10",
+                                         "Cache-Control": "no-store"})
+        raise HTTPException(404, "not materialized")
+
     @app.get("/v1/idc/{uuid}/{task}/labels.seg.nrrd")
     async def idc_resource(request: Request, uuid: str, task: str):
         uuid = uuid.strip().lower()
@@ -788,6 +810,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             raise HTTPException(404, "not materialized, and this server cannot fetch "
                                      "IDC series (idc extra not installed)")
         jid = executor.find_inflight(key)      # single flight: ride an existing run
+        initiated = jid is None
         if jid is None:
             jid, jdir = executor.new_job_dir()
             try:
@@ -812,6 +835,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if snap.get("state") == "failed":
             raise HTTPException(502, f"segmentation failed: {snap.get('error')}")
         return JSONResponse({"state": snap.get("state", "queued"), "job": jid,
+                             "initiated": initiated,       # did THIS request start it?
                              "progress": snap.get("progress")},
                             status_code=202,
                             headers={"Retry-After": "10", "Cache-Control": "no-store"})
