@@ -665,6 +665,9 @@ def test_anonymous_watches_authorized_flight(tmp_path, monkeypatch):
     assert anon.json()["state"] == "materializing"
     assert "job" not in anon.json()                        # no job vocabulary leaked
     assert client.head(url).status_code == 202             # probe agrees
+    t0 = time.time()                           # wait=0 does not wait for the
+    while not seg.calls and time.time() - t0 < 5:          # dispatcher to ENTER
+        time.sleep(0.01)                       # segment(); a slow runner needs a beat
     assert len(seg.calls) == 1                             # one compute entered; watching added none
     gate.set()
     blocked = client.get(url, headers={"Prefer": "wait=10"})
