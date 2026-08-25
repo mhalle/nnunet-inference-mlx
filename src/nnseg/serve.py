@@ -117,6 +117,10 @@ class SeriesCache:
         self._lock = threading.Lock()          # eviction bookkeeping only
 
     def _entry(self, series: str) -> Path:
+        # keys become directory names; no source id_pattern, however sloppy,
+        # may reach outside the cache root
+        if "/" in series or "\x00" in series or series in (".", ".."):
+            raise InputError(f"invalid cache key {series!r}")
         return self.root / series
 
     def has(self, series: str) -> bool:

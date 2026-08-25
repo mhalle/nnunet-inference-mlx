@@ -1052,3 +1052,30 @@ def test_segmentations_listing_shape(tmp_path, monkeypatch):
     assert e["task"] == "total_fast" and e["identity"] == [f"idc:{u}"]
     assert e["bytes"] > 0 and e["computed"]
     assert e["path"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+
+
+def test_identifiers_cannot_traverse_the_cache(tmp_path):
+    """Defense in depth: even if a source's pattern admitted a slash, the
+    series cache refuses path-bearing keys, and the registry refuses such
+    patterns outright."""
+    import pytest as _pytest
+
+    from nnseg.errors import InputError as _IE
+    from nnseg.serve import SeriesCache
+    from nnseg.sources import registry
+
+    sc = SeriesCache(tmp_path / "sc", lambda i, d: d)
+    for bad in ("a/../../etc", "x/y", "..", "."):
+        with _pytest.raises(_IE):
+            sc.get_or_fetch(bad)
+
+    class Sloppy:
+        prefix = "sloppy"
+        id_pattern = r"[a-z/]+"
+        description = ""
+
+        def enabled(self):
+            return True
+
+    with _pytest.raises(ValueError):
+        registry([Sloppy()])
