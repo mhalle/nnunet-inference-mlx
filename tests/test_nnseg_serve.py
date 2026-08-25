@@ -870,3 +870,53 @@ def test_same_series_two_tasks_fetches_once(tmp_path, monkeypatch):
     wait_state(client, jb, ("done",))
     assert fetched == [uu]                 # one download for both tasks
     assert seg.calls[0][1] == "total_fast" and seg.calls[1][1] == "total"
+
+
+def test_prefetch_prereads_next_input(tmp_path, monkeypatch):
+    """The read half of the IO-prefetch pipeline: while job A holds the GPU,
+    job B's series is fetched AND read; B's segment receives the image object."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+    fetched, read = [], []
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "slice.dcm").write_bytes(b"dcm")
+        fetched.append(series)
+        return d
+
+    class FakeImage:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def __str__(self):
+            return f"PREREAD:{self.path}"
+
+    def fake_read(path):
+        read.append(str(path))
+        return FakeImage(path)
+
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, fetch_idc_fn=fake_fetch, read_fn=fake_read)
+    client = TestClient(create_app(ex))
+    ua = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    ub = "77aabbcc-9410-47ff-9c9f-a44b26a4bd55"
+    a = _idc_submit(client, ua)
+    wait_state(client, a, ("running",))
+    b = _idc_submit(client, ub)
+
+    t0 = time.time()                       # A is gated: read-ahead must land now
+    while not read:
+        assert time.time() - t0 < 5, "B was not pre-read"
+        time.sleep(0.01)
+    assert client.get(f"/v1/jobs/{a}").json()["state"] == "running"
+    assert ub in read[0]
+
+    gate.set()
+    wait_state(client, a, ("done",))
+    wait_state(client, b, ("done",))
+    assert fetched == [ua, ub]
+    assert seg.calls[1][0].startswith("PREREAD:")     # the object, not the path
+    assert seg.calls[0][0].endswith("series")         # A itself read inline

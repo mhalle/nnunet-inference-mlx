@@ -122,6 +122,10 @@ class SeriesCache:
     def has(self, series: str) -> bool:
         return (self._entry(series) / self.MARKER).exists()
 
+    def path(self, series: str) -> Path:
+        """Content directory of a committed entry (valid only when has())."""
+        return self._entry(series) / "series"
+
     def staging(self, series: str) -> bool:
         e = self._entry(series)
         return e.exists() and not (e / self.MARKER).exists()
@@ -202,6 +206,42 @@ class SeriesCache:
                     break
                 shutil.rmtree(e, ignore_errors=True)
                 total -= size
+
+
+def _read_image(path):
+    from . import io as nio
+    return nio.read_image(path)
+
+
+class ReadAhead:
+    """At most one pre-read image, keyed by series: the prefetch thread fills
+    it after staging bytes, the next run pops it. Capacity 1 by design - a
+    full CT is ~1 GB of RAM and one-ahead is the pipeline's depth. The image
+    is task-independent (stored orientation, IPP-corrected geometry via
+    :func:`nnseg.io.read_image`); the pipeline applies each task's own
+    reorientation exactly as it does for any caller-held image."""
+
+    def __init__(self, read_fn=None):
+        self.read = read_fn or _read_image
+        self._lock = threading.Lock()
+        self._key = None
+        self._image = None
+
+    def fill(self, series: str, path) -> bool:
+        try:
+            img = self.read(path)
+        except Exception:
+            return False
+        with self._lock:
+            self._key, self._image = series, img
+        return True
+
+    def pop(self, series: str):
+        with self._lock:
+            if self._key == series:
+                img, self._key, self._image = self._image, None, None
+                return img
+            return None
 
 
 class ResultCache:
@@ -299,7 +339,7 @@ class LocalExecutor:
     def __init__(self, segmenter, *, workdir, max_pending: int = 16,
                  keep_finished: int = 50, segment_fn=None, fetch_idc_fn=None,
                  cache_dir=None, keep_cached: int = 500,
-                 input_cache_bytes: int = 8 << 30):
+                 input_cache_bytes: int = 8 << 30, read_fn=None):
         self.segmenter = segmenter
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -309,6 +349,7 @@ class LocalExecutor:
         self._fetch_idc = fetch_idc_fn or _fetch_idc_series
         self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_idc,
                                         budget_bytes=input_cache_bytes)
+        self.read_ahead = ReadAhead(read_fn)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
         self._inflight: dict[str, str] = {}      # cache key -> active job id
         self._cv = threading.Condition()
@@ -487,7 +528,15 @@ class LocalExecutor:
                     rec.input_path = self.series_cache.get_or_fetch(
                         series, check=reporter.check)
                     reporter.check()
-                seg = self._segment(rec.input_path, rec.task, progress=reporter,
+                    preread = self.read_ahead.pop(series)
+                    if preread is not None:
+                        reporter.stage("read", "preread")
+                        inp = preread
+                    else:
+                        inp = rec.input_path
+                else:
+                    inp = rec.input_path
+                seg = self._segment(inp, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
                 rec.labels_path = Path(seg.save(rec.dir / RESULT_NAME))
                 rec.result = {
@@ -532,10 +581,14 @@ class LocalExecutor:
                     or not nxt.source[0].get("crdc_series_uuid")):
                 return
         series = nxt.source[0]["crdc_series_uuid"]
-        if self.series_cache.has(series) or self.series_cache.staging(series):
-            return
-        threading.Thread(target=lambda: self.series_cache.prefetch(series),
-                         name="nnseg-prefetch", daemon=True).start()
+        if self.series_cache.staging(series):
+            return                             # another writer is on it
+
+        def work():
+            if self.series_cache.has(series) or self.series_cache.prefetch(series):
+                self.read_ahead.fill(series, self.series_cache.path(series))
+
+        threading.Thread(target=work, name="nnseg-prefetch", daemon=True).start()
 
     def _on_progress(self, rec: JobRecord, p) -> None:
         rec.progress = asdict(p)

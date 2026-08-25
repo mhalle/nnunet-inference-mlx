@@ -81,7 +81,7 @@ jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
-def _prefetch_next(current_jid: str, stop, cache) -> None:
+def _prefetch_next(current_jid: str, stop, cache, read_ahead) -> None:
     """Best-effort CPU downloader, parallel to this GPU job: watch the shared
     jobs Dict for the oldest OTHER queued idc job and stage its series into the
     /dev/shm series cache. Scans every 2 s for the length of the run - a single
@@ -109,14 +109,21 @@ def _prefetch_next(current_jid: str, stop, cache) -> None:
         try:
             while not stop.is_set():
                 series = scan_once()
-                if series is None or cache.has(series) or cache.staging(series):
+                if series is None or cache.staging(series):
                     stop.wait(2.0)
                     continue
-                t_f = time.time()
-                if cache.prefetch(series):
+                if not cache.has(series):
+                    t_f = time.time()
+                    if not cache.prefetch(series):
+                        stop.wait(2.0)
+                        continue
                     print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
                           f"(parallel to {current_jid})", flush=True)
-                    return                     # one-ahead only
+                t_r = time.time()
+                if read_ahead.fill(series, cache.path(series)):
+                    print(f"[read-ahead] {series[:13]} read in {time.time() - t_r:.1f}s "
+                          f"(parallel to {current_jid})", flush=True)
+                return                         # one-ahead only
         except Exception as e:
             print(f"[prefetch] failed: {e}", flush=True)
 
@@ -167,9 +174,10 @@ class Worker:
         """Post-restore, GPU attached: everything CUDA-adjacent lives here (unless
         the GPU snapshot already carries it)."""
         _pkg_dir()
-        from nnseg.serve import SeriesCache, _fetch_idc_series
+        from nnseg.serve import ReadAhead, SeriesCache, _fetch_idc_series
         self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), _fetch_idc_series,
                                         budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
+        self.read_ahead = ReadAhead()
         if not hasattr(self, "seg"):
             self._gpu_setup()
 
@@ -197,7 +205,8 @@ class Worker:
         token = CancelToken()
         _emit(jid, {"state": "running", "started": time.time()})
         prefetch_stop = threading.Event()
-        _prefetch_next(jid, prefetch_stop, self.series_cache)   # CPU downloader
+        _prefetch_next(jid, prefetch_stop, self.series_cache,
+                       self.read_ahead)   # CPU downloader + pre-reader
         try:
             if meta["task"] not in self._ensured:
                 # a Volume.commit scans the whole multi-GB weights tree - measured as
@@ -221,6 +230,11 @@ class Worker:
                 input_path = self.series_cache.get_or_fetch(series, check=rep.check)
                 print(f"[fetch] {series[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
+                preread = self.read_ahead.pop(series)
+                if preread is not None:
+                    rep.stage("read", "preread")
+                    print(f"[read] {series[:13]} preread", flush=True)
+                    input_path = preread
             else:
                 jobs_vol.reload()
                 input_path = next(jdir.glob("input_*"))
