@@ -920,3 +920,43 @@ def test_prefetch_prereads_next_input(tmp_path, monkeypatch):
     assert fetched == [ua, ub]
     assert seg.calls[1][0].startswith("PREREAD:")     # the object, not the path
     assert seg.calls[0][0].endswith("series")         # A itself read inline
+
+
+def test_prefetch_prereads_next_upload(tmp_path, monkeypatch):
+    """Uploads generalize the same mechanism: bytes are already local, so the
+    pre-reader hides the read (the dominant warm cost for .nii.gz inputs)."""
+    read = []
+
+    class FakeImage:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def __str__(self):
+            return f"PREREAD:{self.path}"
+
+    def fake_read(path):
+        read.append(str(path))
+        return FakeImage(path)
+
+    gate = threading.Event()
+    seg = FakeSegmenter(gate=gate)
+    ex = LocalExecutor(seg, workdir=tmp_path, read_fn=fake_read)
+    client = TestClient(create_app(ex))
+    a = client.post("/v1/jobs", files={"file": ("a.nii.gz", b"\x1f\x8baaaa")},
+                    data={"task": "total_fast"}).json()["id"]
+    wait_state(client, a, ("running",))
+    b = client.post("/v1/jobs", files={"file": ("b.nii.gz", b"\x1f\x8bbbbb")},
+                    data={"task": "total_fast"}).json()["id"]
+
+    t0 = time.time()                       # A is gated: B's read must land now
+    while not read:
+        assert time.time() - t0 < 5, "B was not pre-read"
+        time.sleep(0.01)
+    assert client.get(f"/v1/jobs/{a}").json()["state"] == "running"
+    assert read[0].endswith("b.nii.gz")
+
+    gate.set()
+    wait_state(client, a, ("done",))
+    wait_state(client, b, ("done",))
+    assert seg.calls[1][0].startswith("PREREAD:")     # B got the object
+    assert seg.calls[0][0].endswith("a.nii.gz")       # A read inline

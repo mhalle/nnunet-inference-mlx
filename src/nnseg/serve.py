@@ -236,9 +236,13 @@ class ReadAhead:
             self._key, self._image = series, img
         return True
 
-    def pop(self, series: str):
+    def has(self, key: str) -> bool:
         with self._lock:
-            if self._key == series:
+            return self._key == key
+
+    def pop(self, key: str):
+        with self._lock:
+            if self._key == key:
                 img, self._key, self._image = self._image, None, None
                 return img
             return None
@@ -535,7 +539,12 @@ class LocalExecutor:
                     else:
                         inp = rec.input_path
                 else:
-                    inp = rec.input_path
+                    preread = self.read_ahead.pop(rec.id)
+                    if preread is not None:
+                        reporter.stage("read", "preread")
+                        inp = preread
+                    else:
+                        inp = rec.input_path
                 seg = self._segment(inp, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
                 rec.labels_path = Path(seg.save(rec.dir / RESULT_NAME))
@@ -576,17 +585,24 @@ class LocalExecutor:
         pipeline - it hides the fetch; hiding the read is the follow-on."""
         with self._cv:
             nxt = self._jobs.get(self._pending[0]) if self._pending else None
-            if (nxt is None or nxt.state != "queued"
-                    or not nxt.source or nxt.source[0].get("kind") != "idc"
-                    or not nxt.source[0].get("crdc_series_uuid")):
+            if nxt is None or nxt.state != "queued":
                 return
-        series = nxt.source[0]["crdc_series_uuid"]
-        if self.series_cache.staging(series):
-            return                             # another writer is on it
+        src = nxt.source[0] if nxt.source else {"kind": "upload"}
+        if src.get("kind") == "idc" and src.get("crdc_series_uuid"):
+            series = src["crdc_series_uuid"]
+            if self.series_cache.staging(series) or self.read_ahead.has(series):
+                return                         # another writer, or already read
 
-        def work():
-            if self.series_cache.has(series) or self.series_cache.prefetch(series):
-                self.read_ahead.fill(series, self.series_cache.path(series))
+            def work():
+                if self.series_cache.has(series) or self.series_cache.prefetch(series):
+                    self.read_ahead.fill(series, self.series_cache.path(series))
+        else:                                  # upload: bytes are local, hide the read
+            key, path = nxt.id, nxt.input_path
+            if self.read_ahead.has(key):
+                return
+
+            def work():
+                self.read_ahead.fill(key, path)
 
         threading.Thread(target=work, name="nnseg-prefetch", daemon=True).start()
 

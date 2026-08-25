@@ -81,7 +81,7 @@ jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
 
-def _prefetch_next(current_jid: str, stop, cache, read_ahead) -> None:
+def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
     """Best-effort CPU downloader, parallel to this GPU job: watch the shared
     jobs Dict for the oldest OTHER queued idc job and stage its series into the
     /dev/shm series cache. Scans every 2 s for the length of the run - a single
@@ -100,30 +100,66 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead) -> None:
             m = jobs_dict.get(k) or {}
             if m.get("state") != "queued":
                 continue
-            src = (m.get("source") or [{}])[0]
+            src = (m.get("source") or [{"kind": "upload"}])[0]
             if src.get("kind") == "idc" and src.get("crdc_series_uuid"):
-                cands.append((m.get("created", 0), src["crdc_series_uuid"]))
-        return min(cands)[1] if cands else None
+                cands.append((m.get("created", 0), "idc", src["crdc_series_uuid"], m["id"]))
+            else:
+                cands.append((m.get("created", 0), "upload", None, m["id"]))
+        return min(cands)[1:] if cands else None
 
     def work():
+        import shutil
         try:
             while not stop.is_set():
-                series = scan_once()
-                if series is None or cache.staging(series):
+                nxt = scan_once()
+                if nxt is None:
                     stop.wait(2.0)
                     continue
-                if not cache.has(series):
-                    t_f = time.time()
-                    if not cache.prefetch(series):
+                kind, series, njid = nxt
+                if kind == "idc":
+                    if cache.staging(series) or read_ahead.has(series):
                         stop.wait(2.0)
                         continue
-                    print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
-                          f"(parallel to {current_jid})", flush=True)
+                    if not cache.has(series):
+                        t_f = time.time()
+                        if not cache.prefetch(series):
+                            stop.wait(2.0)
+                            continue
+                        print(f"[prefetch] {series[:13]} staged in {time.time() - t_f:.1f}s "
+                              f"(parallel to {current_jid})", flush=True)
+                    t_r = time.time()
+                    if read_ahead.fill(series, cache.path(series)):
+                        print(f"[read-ahead] {series[:13]} read in {time.time() - t_r:.1f}s "
+                              f"(parallel to {current_jid})", flush=True)
+                    return                     # one-ahead only
+                # upload: bytes already sit on the jobs volume - copy the file to
+                # tmpfs under the lock (a reload racing save+commit could drop a
+                # result; and reading a stable local copy sidesteps any question
+                # of open handles across later reloads), then read it there.
+                if read_ahead.has(njid):
+                    stop.wait(2.0)
+                    continue
                 t_r = time.time()
-                if read_ahead.fill(series, cache.path(series)):
-                    print(f"[read-ahead] {series[:13]} read in {time.time() - t_r:.1f}s "
-                          f"(parallel to {current_jid})", flush=True)
-                return                         # one-ahead only
+                tmp = Path("/dev/shm") / f"preread_{njid}"
+                try:
+                    local = None
+                    with vol_lock:
+                        jobs_vol.reload()
+                        srcs = list((Path(JOBS_ROOT) / njid).glob("input_*"))
+                        if srcs:
+                            tmp.mkdir(exist_ok=True)
+                            local = tmp / srcs[0].name
+                            shutil.copy2(srcs[0], local)
+                    if local is None:
+                        stop.wait(2.0)         # upload not visible yet; retry
+                        continue
+                    if read_ahead.fill(njid, local):
+                        print(f"[read-ahead] upload {njid} read in {time.time() - t_r:.1f}s "
+                              f"(parallel to {current_jid})", flush=True)
+                        return                 # one-ahead only
+                    stop.wait(2.0)
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
         except Exception as e:
             print(f"[prefetch] failed: {e}", flush=True)
 
@@ -178,6 +214,7 @@ class Worker:
         self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), _fetch_idc_series,
                                         budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
         self.read_ahead = ReadAhead()
+        self._vol_lock = threading.Lock()    # scan-thread reload vs save+commit
         if not hasattr(self, "seg"):
             self._gpu_setup()
 
@@ -206,7 +243,7 @@ class Worker:
         _emit(jid, {"state": "running", "started": time.time()})
         prefetch_stop = threading.Event()
         _prefetch_next(jid, prefetch_stop, self.series_cache,
-                       self.read_ahead)   # CPU downloader + pre-reader
+                       self.read_ahead, self._vol_lock)   # CPU downloader + pre-reader
         try:
             if meta["task"] not in self._ensured:
                 # a Volume.commit scans the whole multi-GB weights tree - measured as
@@ -236,13 +273,22 @@ class Worker:
                     print(f"[read] {series[:13]} preread", flush=True)
                     input_path = preread
             else:
-                jobs_vol.reload()
-                input_path = next(jdir.glob("input_*"))
+                preread = self.read_ahead.pop(jid)
+                if preread is not None:
+                    rep2 = Reporter.of(on_progress, cancel=token)
+                    rep2.stage("read", "preread")
+                    print(f"[read] upload {jid} preread", flush=True)
+                    input_path = preread
+                else:
+                    with self._vol_lock:
+                        jobs_vol.reload()
+                    input_path = next(jdir.glob("input_*"))
             from nnseg.serve import RESULT_NAME, ResultCache
             s = self.seg.segment(input_path, meta["task"], progress=on_progress,
                                  cancel=token, **(meta.get("options") or {}))
-            s.save(jdir / RESULT_NAME)
-            jobs_vol.commit()
+            with self._vol_lock:
+                s.save(jdir / RESULT_NAME)
+                jobs_vol.commit()
             result = {"names": {int(k): v for k, v in s.schema.names.items()},
                       "volumes_ml": {k: round(float(v), 2)
                                      for k, v in s.volumes_ml().items()},
