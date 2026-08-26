@@ -114,6 +114,25 @@ class TestLayering(unittest.TestCase):
         for mod, line in _imports(_module_path("resample"), top_level_only=True):
             self.assertNotEqual(mod, "scipy", f"resample.py:{line} imports scipy at module level")
 
+    def test_importing_nnseg_is_torch_free(self):
+        """`import nnseg` and the front-end/describe surface (Segmenter, ModelCache,
+        TaskCatalog) must not pull torch - the serve front-end and describe-only callers
+        should not pay for a multi-GB CUDA torch. Torch loads lazily on first use of an
+        inference symbol (nnseg.segment). A transitive leak (e.g. an eager subpackage that
+        imports torch) is only caught at runtime, so use a fresh subprocess."""
+        import subprocess
+        import sys
+        code = (
+            "import sys, nnseg\n"
+            "assert 'torch' not in sys.modules, 'import nnseg pulled torch'\n"
+            "_ = (nnseg.Segmenter, nnseg.ModelCache, nnseg.TaskCatalog, nnseg.io)\n"
+            "assert 'torch' not in sys.modules, 'the front-end API surface pulled torch'\n"
+            "_ = nnseg.segment\n"
+            "assert 'torch' in sys.modules, 'lazy inference symbol failed to load torch'\n"
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+
 
 if __name__ == "__main__":
     unittest.main()

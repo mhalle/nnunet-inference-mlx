@@ -8,7 +8,11 @@ could be lifted out as its own package the day something outside wants it. The *
 layer** - ``io``, ``preprocess``, ``frame``, ``network``, ``pipeline``, ``cli`` - reads images
 through SimpleITK, drives nnU-Net's networks, and composes tasks from the toolkit's catalog.
 """
-from . import backends, errors, io
+# Eager imports are the torch-FREE surface: importing nnseg costs only these. The
+# inference path (torch) is loaded lazily on first access (see _LAZY / __getattr__
+# below), so `import nnseg` pulls no torch - a lean consumer (the serve front-end, a
+# describe-only caller) never pays for it. Enforced by tests/test_nnseg_layering.py.
+from . import errors, io
 from .job import Job
 from .progress import CancelToken, Progress
 from .errors import (Cancelled, InputError, ModelNotFound, NnsegError, ResourceError,
@@ -16,18 +20,49 @@ from .errors import (Cancelled, InputError, ModelNotFound, NnsegError, ResourceE
 from .frame import Frame
 from .grid import Grid
 from .mapping import Mapping
-from .network import TorchModel
-from .pipeline import segment
 from .result import Segmentation
 from .segmenter import Segmenter
 from .cache import ModelCache
 from .weights import WeightsStore
 from .tasks import TaskCatalog, TaskSpec
 from .reference import margins
-from .resample import resample_data
-from .restore import available_backends, resample_argmax, resample_paint, to_labels
-from .shuffleup import ShuffleUp3d, swap_transposed
 from .tables import AxisTable, build_tables
+
+# Torch-pulling exports, loaded on first ATTRIBUTE access (PEP 562). These live in the
+# modules that import torch at top level (network / pipeline / resample / restore /
+# shuffleup); keeping them lazy is what makes `import nnseg` torch-free.
+_LAZY = {
+    "segment": ("pipeline", "segment"),
+    "TorchModel": ("network", "TorchModel"),
+    "resample_data": ("resample", "resample_data"),
+    "available_backends": ("restore", "available_backends"),
+    "resample_argmax": ("restore", "resample_argmax"),
+    "resample_paint": ("restore", "resample_paint"),
+    "to_labels": ("restore", "to_labels"),
+    "ShuffleUp3d": ("shuffleup", "ShuffleUp3d"),
+    "swap_transposed": ("shuffleup", "swap_transposed"),
+}
+# The backends subpackage imports torch (each backend module does), so it's lazy too -
+# accessed as `nnseg.backends`, and pulled anyway by the inference path when it runs.
+_LAZY_SUBMODULES = ("backends",)
+
+
+def __getattr__(name: str):
+    import importlib
+    if name in _LAZY_SUBMODULES:
+        value = importlib.import_module(f".{name}", __name__)
+    else:
+        spec = _LAZY.get(name)
+        if spec is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        value = getattr(importlib.import_module(f".{spec[0]}", __name__), spec[1])
+    globals()[name] = value            # cache: __getattr__ won't fire again for it
+    return value
+
+
+def __dir__():
+    return sorted([*globals(), *_LAZY])
+
 
 __version__ = "0.1.0"
 __all__ = [
