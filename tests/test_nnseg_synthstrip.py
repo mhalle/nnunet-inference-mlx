@@ -18,8 +18,8 @@ def _img(arr, spacing, origin=(0., 0., 0.), direction=None):
 
 
 def test_module_imports_without_model():
-    # importing the engine must not require torch/the .pt (all lazy in functions)
-    assert callable(ss.segment) and callable(ss.conform) and callable(ss.restore_sdt_gpu)
+    # importing the engine must not require torch/surfa/the .pt (all lazy in functions)
+    assert callable(ss.segment) and callable(ss.restore_sdt_gpu) and callable(ss.restore_sdt_cpu)
 
 
 def test_weights_installed_is_the_cache_key_identity():
@@ -78,15 +78,6 @@ def test_restore_sdt_gpu_matches_cpu_reference():
         float(np.abs(gpu[interior] - cpu[interior]).max())
 
 
-def test_conform_produces_lia_multiple_of_64_grid():
-    """conform must return a grid that is a multiple of 64 per axis in [192,320]
-    and carry a valid geometry the restore can resample from."""
-    a = np.zeros((60, 80, 70), dtype=np.float32)
-    a[10:50, 20:60, 15:55] = 500.0                  # a foreground blob
-    im = _img(a, (2.0, 1.5, 1.8), origin=(5., -3., 2.))
-    conf, arr = ss.conform(im)
-    assert arr.shape == tuple(reversed(conf.GetSize()))     # (z,y,x) vs sitk (x,y,z)
-    for s in conf.GetSize():
-        assert 192 <= s <= 320 and s % 64 == 0, conf.GetSize()
-    assert np.allclose(conf.GetSpacing(), (1., 1., 1.))
-    assert 0.0 <= float(arr.min()) and float(arr.max()) <= 1.0
+# NOTE: conform is now SynthStrip's own surfa conform (the trained-input contract),
+# exercised end-to-end by the live Modal smoke - surfa's reorient crashes on some
+# local numpy builds, so it is not unit-tested here.

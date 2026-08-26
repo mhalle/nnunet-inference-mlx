@@ -120,8 +120,11 @@ fs_image = (
 synthstrip_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("curl")
-    .uv_pip_install("torch>=2.7", "numpy>=1.24", "scipy", "SimpleITK>=2.3", "obstore",
-                    "matplotlib")   # serve-core render_preview imports it (artifact overlap)
+    # numpy pinned <2: surfa's reorient breaks on numpy 2.x (stricter array
+    # assignment), and surfa declares no cap, so it would otherwise resolve to 2.x.
+    .uv_pip_install("torch>=2.7", "numpy>=1.24,<2", "scipy", "SimpleITK>=2.3", "obstore",
+                    "matplotlib",   # serve-core render_preview imports it (artifact overlap)
+                    "surfa")        # SynthStrip's own trained-input conform (not reimplemented)
     .run_commands(
         "mkdir -p /opt/synthstrip",
         "curl -sSL -o /opt/synthstrip/synthstrip.1.pt "

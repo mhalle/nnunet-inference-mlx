@@ -1,18 +1,25 @@
 """SynthStrip brain extraction (skull-strip) as an nnseg engine.
 
 SynthStrip is a contrast-agnostic learned brain-mask generator (a small 3D UNet,
-Hoopes et al. 2022) - a different algorithm family from nnU-Net and FastSurfer. It
-is deliberately the LIGHTEST engine: torch + numpy + scipy + SimpleITK (all
-already in nnseg's stack) + the vendored :mod:`._synthstrip_model` (~80 lines) +
-a 29 MB ``model_state_dict``. No surfa, no FreeSurfer, no FastSurferCNN.
+Hoopes et al. 2022) - a different algorithm family from nnU-Net and FastSurfer. A
+light engine: torch + numpy + scipy + SimpleITK + surfa + the vendored
+:mod:`._synthstrip_model` (~80 lines) + a 29 MB ``model_state_dict``. No FreeSurfer,
+no FastSurferCNN.
+
+**Conform uses surfa - the engine's OWN trained-input conform, not a reimplementation.**
+An earlier SimpleITK approximation under-segmented the inferior brain (cerebellum):
+`mri_synthstrip` feeds ``conformed.data`` to the net directly, so surfa's LIA array
+order IS the trained contract, and a different axis order degrades the mask. Lesson
+repeated from FastSurfer: use the engine's own conform. (surfa is pure-Python+numpy,
+no FreeSurfer binaries - still far leaner than the FastSurfer image.)
 
 Shape mirrors :mod:`nnseg.engines.fastsurfer` (current per-engine pattern; the
-Ecosystem/Engine re-architecture is a later holistic pass): conform in memory
-(SimpleITK, surfa-free), run the net -> a signed distance transform (SDT), restore
-the *graded* SDT to the input grid (physical-space ``grid_sample``, reusing the
-FastSurfer restore geometry), then threshold + largest-component -> a 1-label
-brain mask :class:`nnseg.result.Segmentation`. Proven torch-only in a spike
-(2026-08-26): correct 1326 ml mask, zero missing state_dict keys.
+Ecosystem/Engine re-architecture is a later holistic pass): surfa conform (1 mm,
+LIA, crop-to-bbox, pad-to-64, norm) -> run the net -> a signed distance transform
+(SDT) -> hand the conformed SDT back through a surfa-save/SimpleITK-read (so no
+manual axis conversion) -> restore the *graded* SDT to the input grid (physical-
+space ``grid_sample``, reusing the FastSurfer restore geometry) -> threshold +
+largest-component -> a 1-label brain mask :class:`nnseg.result.Segmentation`.
 """
 from __future__ import annotations
 
@@ -63,51 +70,6 @@ def _get_model(device: str):
     m = m.to(device)
     _MODELS[key] = m
     return m
-
-
-def conform(t1_img):
-    """SynthStrip's trained-input conform, surfa-free (SimpleITK): resample to
-    1 mm, reorient to LIA, crop to the nonzero bbox, pad/crop to a multiple of 64
-    per axis in [192, 320], and intensity-normalize (``-min``, ``/p99``, clip
-    [0,1]). Returns ``(conf_sitk, arr_zyx)`` - the SimpleITK image carries the
-    conformed geometry the restore resamples FROM; ``arr_zyx`` is the normalized
-    model input.
-
-    NOTE: an approximate replica of surfa's conform (spike-verified to a correct
-    mask volume); boundary parity against surfa is a follow-up before this is
-    trusted for clinical use, the same trained-input-contract caution as FastSurfer.
-    """
-    import SimpleITK as sitk
-
-    sp = t1_img.GetSpacing()
-    size = [int(round(t1_img.GetSize()[i] * sp[i])) for i in range(3)]
-    rs = sitk.ResampleImageFilter()
-    rs.SetOutputSpacing((1.0, 1.0, 1.0)); rs.SetSize(size)
-    rs.SetOutputOrigin(t1_img.GetOrigin()); rs.SetOutputDirection(t1_img.GetDirection())
-    rs.SetInterpolator(sitk.sitkLinear)
-    iso = sitk.DICOMOrient(rs.Execute(t1_img), "LIA")
-
-    a = sitk.GetArrayFromImage(iso)                       # (z, y, x)
-    nz = np.argwhere(a > float(a.min()))
-    lo, hi = nz.min(0), nz.max(0) + 1                     # (z, y, x)
-    crop = sitk.RegionOfInterest(iso, [int(hi[2]-lo[2]), int(hi[1]-lo[1]), int(hi[0]-lo[0])],
-                                 [int(lo[2]), int(lo[1]), int(lo[0])])   # sitk order (x,y,z)
-    csz = crop.GetSize()                                  # (x, y, z)
-    tgt = [int(np.clip(int(np.ceil(s / 64)) * 64, 192, 320)) for s in csz]
-    lower, upper, roi_lo, roi_sz = [], [], [], []
-    for i in range(3):
-        d = tgt[i] - csz[i]
-        if d >= 0:
-            lower.append(d // 2); upper.append(d - d // 2); roi_lo.append(0); roi_sz.append(csz[i])
-        else:
-            lower.append(0); upper.append(0); roi_lo.append((-d) // 2); roi_sz.append(tgt[i])
-    conf = sitk.ConstantPad(sitk.RegionOfInterest(crop, roi_sz, roi_lo), lower, upper, 0.0)
-
-    arr = sitk.GetArrayFromImage(conf).astype(np.float32)
-    arr = arr - float(arr.min())
-    p99 = float(np.percentile(arr, 99)) or 1.0
-    arr = np.clip(arr / p99, 0.0, 1.0)
-    return conf, arr
 
 
 def _resample_affine(source_ref, target_ref):
@@ -174,18 +136,38 @@ def restore_sdt_cpu(sdt_zyx, source_ref, target_ref, outside=100.0):
     return sitk.GetArrayFromImage(out)
 
 
-def _capture_sdt(t1_img, device: str, on_gpu: bool = True):
-    """Conform (SimpleITK) + run the cached model -> the SDT field in the
-    conformed frame. Keeps the SDT on the device when ``on_gpu`` (no transfer;
-    the restore resamples it there). Returns ``(sdt, conf_sitk)``."""
+def _capture_sdt(t1_img, device: str):
+    """SynthStrip's own (surfa) conform + the cached model -> the SDT field in the
+    conformed frame, handed back as a SimpleITK image so the restore needs no
+    manual surfa->SITK axis conversion (surfa writes it, SimpleITK reads it).
+    Mirrors ``mri_synthstrip`` exactly: conform 1 mm / LIA / crop-to-bbox / reshape
+    to a multiple of 64 in [192,320] / normalize; feed ``conformed.data`` to the
+    net. Returns ``(sdt_zyx, sdt_sitk)`` - the array (z,y,x) and its geometry."""
+    import os
+    import tempfile
+
+    import SimpleITK as sitk
+    import surfa as sf
     import torch
 
     model = _get_model(device)
-    conf, arr = conform(t1_img)
-    with torch.no_grad():
-        inp = torch.from_numpy(arr[None, None]).to(device)
-        sdt = model(inp).squeeze()                        # (Zs,Ys,Xs) on device
-    return (sdt if on_gpu else sdt.float().cpu().numpy()), conf
+    with tempfile.TemporaryDirectory() as td:
+        ti = os.path.join(td, "in.nii.gz")
+        sitk.WriteImage(t1_img, ti)                       # input (small) -> surfa's file reader
+        image = sf.load_volume(ti)
+        conformed = image.conform(voxsize=1.0, dtype="float32", method="nearest",
+                                  orientation="LIA").crop_to_bbox()
+        tgt = np.clip(np.ceil(np.array(conformed.shape[:3]) / 64).astype(int) * 64, 192, 320)
+        conformed = conformed.reshape(tgt)
+        conformed -= conformed.min()
+        conformed = (conformed / conformed.percentile(99)).clip(0, 1)
+        with torch.no_grad():
+            inp = torch.from_numpy(conformed.data[np.newaxis, np.newaxis]).to(device)
+            sdt = model(inp).squeeze().float().cpu().numpy()
+        so = os.path.join(td, "sdt.nii.gz")
+        conformed.new(sdt).save(so)                       # surfa writes correct geometry
+        sdt_sitk = sitk.ReadImage(so)                     # SimpleITK reads it back (z,y,x + geom)
+    return sitk.GetArrayFromImage(sdt_sitk).astype(np.float32), sdt_sitk
 
 
 def _fs_version() -> str:
@@ -220,15 +202,14 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", restore: str = "aut
     use_gpu = restore == "gpu" or (restore == "auto" and str(device).startswith("cuda"))
     timings: dict[str, float] = {}
     _t = time.perf_counter()
-    sdt, conf_orig = _capture_sdt(t1_img, device, on_gpu=use_gpu)
+    sdt_zyx, conf_orig = _capture_sdt(t1_img, device)     # surfa conform + net (1-channel SDT)
     timings["capture"] = time.perf_counter() - _t
 
     _t = time.perf_counter()
     if use_gpu:
-        sdt_native = restore_sdt_gpu(sdt, conf_orig, t1_img, device)
+        sdt_native = restore_sdt_gpu(sdt_zyx, conf_orig, t1_img, device)
     else:
-        arr = sdt if isinstance(sdt, np.ndarray) else sdt.float().cpu().numpy()
-        sdt_native = restore_sdt_cpu(arr, conf_orig, t1_img)
+        sdt_native = restore_sdt_cpu(sdt_zyx, conf_orig, t1_img)
     timings["restore"] = time.perf_counter() - _t
 
     from scipy import ndimage
