@@ -151,26 +151,36 @@ def _resample_affine(source_ref, target_ref):
     return A, t
 
 
-def restore_logits_gpu(logit_zyx, source_ref, target_ref, device="cuda"):
+def restore_logits_gpu(logits_in, source_ref, target_ref, device="cuda"):
     """GPU equivalent of :func:`restore_logits`: trilinear-resample the whole
     K-channel logit field from ``source_ref``'s grid onto ``target_ref``'s grid
     and argmax over classes, in one batched ``grid_sample`` on ``device`` instead
-    of 79 CPU SimpleITK resamples. Same physical-space mapping (so orientation/
-    spacing differences are handled) and the same half-pixel (voxel-center)
-    convention as SimpleITK (``align_corners=False``, zero padding outside).
+    of 79 CPU SimpleITK resamples. Uses the FULL physical-space affine (via
+    :func:`_resample_affine`, composing both grids' direction cosines), so
+    orientation, spacing AND oblique rotation are handled uniformly; same
+    half-pixel (voxel-center) convention as SimpleITK (``align_corners=False``,
+    zero padding outside).
 
-    Needs the full field resident on the device (~5 GB fp32 at 256^3 x 79); the
-    CPU :func:`restore_logits` is the memory-frugal fallback for limited hosts.
+    ``logits_in`` is either a torch tensor already ``(K, Zs, Ys, Xs)`` on a device
+    (the on-GPU path - no host<->device copy) or a numpy ``(Zs, Ys, Xs, K)`` field
+    (moved to ``device`` here). Needs the field resident on the device (~5 GB fp32
+    at 256^3 x 79); the CPU :func:`restore_logits` is the memory-frugal fallback.
     Returns a ``(Z, Y, X)`` int32 class-index volume (target array order)."""
     import torch
     import torch.nn.functional as F
 
-    Zs, Ys, Xs, K = logit_zyx.shape
+    dev = torch.device(device)
+    if isinstance(logits_in, torch.Tensor):              # already (K,Zs,Ys,Xs) on device
+        K, Zs, Ys, Xs = (int(s) for s in logits_in.shape)
+        logits = logits_in.to(dev).float()[None]         # (1,K,Zs,Ys,Xs) fp32
+    else:                                                # numpy (Zs,Ys,Xs,K)
+        Zs, Ys, Xs, K = logits_in.shape
+        logits = (torch.from_numpy(np.ascontiguousarray(logits_in))
+                  .permute(3, 0, 1, 2).contiguous()[None].to(dev, torch.float32))
     tgt = target_ref.GetSize()                            # (Xt, Yt, Zt)
     Xt, Yt, Zt = int(tgt[0]), int(tgt[1]), int(tgt[2])
     A, t = _resample_affine(source_ref, target_ref)
 
-    dev = torch.device(device)
     # target voxel indices (x,y,z) for every output voxel, array order (z,y,x)
     zz, yy, xx = torch.meshgrid(torch.arange(Zt), torch.arange(Yt), torch.arange(Xt),
                                 indexing="ij")
@@ -182,8 +192,6 @@ def restore_logits_gpu(logit_zyx, source_ref, target_ref, device="cuda"):
     N = torch.as_tensor([Xs, Ys, Zs], device=dev, dtype=torch.float64)
     grid = ((src + 0.5) * 2.0 / N - 1.0).to(torch.float32)[None]        # (1,Zt,Yt,Xt,3)
 
-    logits = (torch.from_numpy(np.ascontiguousarray(logit_zyx))         # (Zs,Ys,Xs,K)
-              .permute(3, 0, 1, 2).contiguous()[None].to(dev))          # (1,K,Zs,Ys,Xs)
     out = F.grid_sample(logits, grid, mode="bilinear",
                         padding_mode="zeros", align_corners=False)      # (1,K,Zt,Yt,Xt)
     idx = out.argmax(dim=1)[0].to(torch.int32).cpu().numpy()            # (Zt,Yt,Xt)
@@ -229,14 +237,22 @@ def _get_runner(device: str, batch_size: int):
     return runner
 
 
-def _capture_logits(t1_sitk, device: str, batch_size: int = 8):
+def _capture_logits(t1_sitk, device: str, batch_size: int = 8, on_gpu: bool = True):
     """Segment an in-memory SimpleITK image with a CACHED FastSurfer model,
     capturing the pre-argmax logit field in the conformed-orig frame. Drives
     conform + get_prediction directly (no ``rp.main``, no SubjectList): the input
     goes through nibabel in memory, conform runs on it, and NOTHING is written -
     the conformed orig, the segfile, brainmask/aseg/CC that ``main`` would emit
-    are all skipped (we only need the logits). Returns
-    (logit_zyx, conf_orig_sitk, fs_labels_zyx, class_labels)."""
+    are all skipped (we only need the logits).
+
+    We conform to LIA (the default), so the LIA inference frame IS the conformed
+    frame and ``n2l.inverse`` is the identity - the orientation change is deferred
+    into the restore's physical-space resample. When ``on_gpu`` and that reorder
+    is identity, the K-channel field stays on the GPU (returned as a torch tensor
+    ``(K, Zs, Ys, Xs)``) - no host<->device copy, no per-channel reorder. The
+    fallback (``on_gpu=False`` or a non-identity reorder) returns numpy
+    ``(Zs, Ys, Xs, K)`` as before. Returns
+    (logits, conf_orig_sitk, fs_labels_zyx, class_labels)."""
     import torch
     from FastSurferCNN.data_loader.conform import Reorientation, conform, is_conform
     import FastSurferCNN.data_loader.data_utils as du
@@ -263,24 +279,31 @@ def _capture_logits(t1_sitk, device: str, batch_size: int = 8):
         pred_prob = model.run(pred_prob, "image", orig_in_lia,
                               n2l.reorder_axes(zoom), out=pred_prob)
 
-    inv = n2l.inverse                                 # exact discrete reorder LIA->conformed
-    pp = pred_prob.float().cpu().numpy()              # (X, Y, Z, K) nibabel order
-    conf0 = np.asarray(inv(pp[..., 0], order=1))
-    logit_conf = np.empty(conf0.shape + (pp.shape[3],), np.float32)
-    logit_conf[..., 0] = conf0
-    for k in range(1, pp.shape[3]):
-        logit_conf[..., k] = np.asarray(inv(pp[..., k], order=1))
-    pred_classes = torch.argmax(pred_prob, 3)
-    del pred_prob
-    pred_classes = inv(pred_classes, order=0)
-    pred_classes = du.map_label2aparc_aseg(pred_classes, r.labels)
-    fs_labels = du.split_cortex_labels(pred_classes.cpu().numpy())
+    inv = n2l.inverse                                 # LIA -> conformed-orig frame
+    identity = inv.is_identity()                      # true when conformed to LIA (default)
 
-    conf_orig = nibabel_to_sitk(orig)                 # conformed geometry, no file round-trip
-    logit_zyx = np.ascontiguousarray(
-        np.transpose(logit_conf, (2, 1, 0, 3)))       # (X,Y,Z,K) -> (Z,Y,X,K)
+    # FastSurfer's own labels, for the self-check (single channel, cheap to move)
+    pred_classes = inv(torch.argmax(pred_prob, 3), order=0)
+    pred_classes = du.map_label2aparc_aseg(pred_classes, r.labels)
+    fs_labels = du.split_cortex_labels(pred_classes.cpu().numpy())      # (X,Y,Z)
     fs_labels_zyx = np.ascontiguousarray(np.transpose(fs_labels, (2, 1, 0)))
-    return logit_zyx, conf_orig, fs_labels_zyx, r.labels
+    conf_orig = nibabel_to_sitk(orig)                 # conformed geometry, no file round-trip
+
+    if on_gpu and identity:
+        # keep the field on the device; (X,Y,Z,K) -> (K,Z,Y,X) for the resampler.
+        # The orientation change is left to the restore's affine (no reorder here).
+        logits = pred_prob.permute(3, 2, 1, 0).contiguous()            # (K,Zs,Ys,Xs) on device
+    else:
+        pp = pred_prob.float().cpu().numpy()          # (X, Y, Z, K) nibabel order
+        if identity:
+            logit_conf = pp
+        else:                                         # generic reorder (rare: non-LIA conform)
+            logit_conf = np.empty(inv(pp[..., 0], order=1).shape + (pp.shape[3],), np.float32)
+            for k in range(pp.shape[3]):
+                logit_conf[..., k] = np.asarray(inv(pp[..., k], order=1))
+        logits = np.ascontiguousarray(np.transpose(logit_conf, (2, 1, 0, 3)))   # (Z,Y,X,K)
+    del pred_prob
+    return logits, conf_orig, fs_labels_zyx, r.labels
 
 
 def _fs_version() -> str:
@@ -329,10 +352,11 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
     else:
         from .. import io
         t1_img = io.read_image(str(t1_input))         # path: geometry-correct read
+    use_gpu = restore == "gpu" or (restore == "auto" and str(device).startswith("cuda"))
     timings: dict[str, float] = {}
     _t = time.perf_counter()
-    logit_zyx, conf_orig, fs_labels_zyx, class_labels = _capture_logits(
-        t1_img, device, batch_size)
+    logits, conf_orig, fs_labels_zyx, class_labels = _capture_logits(
+        t1_img, device, batch_size, on_gpu=use_gpu)
     timings["capture"] = time.perf_counter() - _t     # conform + VINN inference (model cached)
 
     def to_fs(idx_zyx):
@@ -340,8 +364,13 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
                                     class_labels)
         return du.split_cortex_labels(m.cpu().numpy()).astype(np.int32)
 
+    def _source_argmax(lg):                           # argmax over classes -> (Zs,Ys,Xs)
+        if isinstance(lg, torch.Tensor):              # (K,Zs,Ys,Xs) on device
+            return lg.argmax(dim=0).to(torch.int32).cpu().numpy()
+        return np.argmax(lg, axis=3).astype(np.int32)  # (Zs,Ys,Xs,K) numpy
+
     if self_check:                                    # argmax at conformed == FastSurfer's labels
-        my = to_fs(np.argmax(logit_zyx, axis=3))
+        my = to_fs(_source_argmax(logits))
         agree = float((my == fs_labels_zyx).mean())
         if agree < 0.999:
             raise RuntimeError(f"FastSurfer logit self-check failed: {agree:.4%} "
@@ -354,24 +383,24 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
         hi = _np.array(im.TransformIndexToPhysicalPoint((sz[0]-1, sz[1]-1, sz[2]-1)))
         return _np.minimum(lo, hi), _np.maximum(lo, hi)
     clo, chi = _extent(conf_orig); tlo, thi = _extent(t1_img)
-    print(f"[fastsurfer] logit_zyx={logit_zyx.shape} conf={conf_orig.GetSize()} "
-          f"t1={t1_img.GetSize()} conf_ext={clo.round(1)}..{chi.round(1)} "
+    print(f"[fastsurfer] logits={tuple(logits.shape)} conf={conf_orig.GetSize()} "
+          f"t1={t1_img.GetSize()} restore={'gpu' if use_gpu else 'cpu'} "
+          f"conf_ext={clo.round(1)}..{chi.round(1)} "
           f"t1_ext={tlo.round(1)}..{thi.round(1)}", flush=True)
 
-    use_gpu = restore == "gpu" or (restore == "auto" and str(device).startswith("cuda"))
     if logit_grade:
         _t = time.perf_counter()
         if use_gpu:
-            idx_native = restore_logits_gpu(logit_zyx, conf_orig, t1_img, device)
+            idx_native = restore_logits_gpu(logits, conf_orig, t1_img, device)
         else:
-            idx_native = restore_logits(logit_zyx, conf_orig, t1_img)
+            idx_native = restore_logits(logits, conf_orig, t1_img)
         timings["restore"] = time.perf_counter() - _t   # physical-space resample + argmax
         labels_arr = to_fs(idx_native)                # (Z,Y,X) FreeSurfer ids on input grid
         nfg = int((labels_arr > 0).sum())
         print(f"[fastsurfer] restored foreground voxels={nfg}/{labels_arr.size}", flush=True)
         if nfg == 0:
             raise RuntimeError(
-                f"logit-grade restore is empty: logit_zyx={logit_zyx.shape}, "
+                f"logit-grade restore is empty: logits={tuple(logits.shape)}, "
                 f"conf={conf_orig.GetSize()} ext {clo.round(1)}..{chi.round(1)}, "
                 f"t1={t1_img.GetSize()} ext {tlo.round(1)}..{thi.round(1)}; "
                 "conf/t1 physical extents likely do not overlap")

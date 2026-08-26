@@ -107,6 +107,49 @@ def test_sitk_to_nibabel_roundtrip_preserves_geometry():
     assert np.allclose(ras_sitk, ras_nib, atol=1e-6), (ras_sitk, ras_nib)
 
 
+def test_restore_gpu_matches_cpu_reference():
+    """The GPU restore (grid_sample) must reproduce the SimpleITK CPU restore's
+    argmax labels: same physical-space mapping and half-pixel (voxel-center)
+    convention. Run on the CPU torch device so the geometry math is verified
+    without a GPU. A flipped direction + anisotropic spacing + offset origin +
+    upsampling exercises _resample_affine (the silent-bug-prone part)."""
+    pytest.importorskip("torch")
+    Z = Y = X = 16
+    zz, yy, xx = np.meshgrid(np.arange(Z), np.arange(Y), np.arange(X), indexing="ij")
+    # smooth per-class linear fields -> well-defined argmax planes, not tie noise
+    feats = [xx, yy, zz, xx + yy, (X - 1 - xx)]
+    logit = np.stack([f.astype(np.float32) for f in feats], axis=-1)     # (Z,Y,X,K)
+    flip = (-1., 0., 0., 0., -1., 0., 0., 0., 1.)
+    source = _img(np.zeros((Z, Y, X)), (1.5, 1.25, 1.0), origin=(10., -20., 5.))
+    source.SetDirection(flip)
+    target = _img(np.zeros((Z * 2, Y * 2, X * 2)), (0.75, 0.6, 0.5), origin=(8., -18., 6.))
+    target.SetDirection(flip)
+
+    cpu = fs.restore_logits(logit, source, target)
+    gpu = fs.restore_logits_gpu(logit, source, target, device="cpu")
+    assert cpu.shape == gpu.shape == (Z * 2, Y * 2, X * 2)
+    interior = tuple(slice(3, -3) for _ in range(3))     # edges differ by padding only
+    agree = float((cpu[interior] == gpu[interior]).mean())
+    assert agree > 0.99, agree
+
+
+def test_restore_gpu_tensor_input_matches_numpy_input():
+    """The on-GPU handoff passes a (K,Zs,Ys,Xs) torch tensor instead of the numpy
+    (Zs,Ys,Xs,K) field; both must yield identical labels. Guards the permute
+    layout used when the field is kept resident on the device."""
+    torch = pytest.importorskip("torch")
+    Z = Y = X = 12
+    zz, yy, xx = np.meshgrid(np.arange(Z), np.arange(Y), np.arange(X), indexing="ij")
+    logit = np.stack([xx, yy, zz, xx + yy], axis=-1).astype(np.float32)   # (Z,Y,X,K)
+    source = _img(np.zeros((Z, Y, X)), (1.0, 1.25, 1.5), origin=(3., -4., 5.))
+    target = _img(np.zeros((Z * 2, Y * 2, X * 2)), (0.5, 0.625, 0.75), origin=(3., -4., 5.))
+
+    from_numpy = fs.restore_logits_gpu(logit, source, target, device="cpu")
+    tens = torch.from_numpy(logit).permute(3, 0, 1, 2).contiguous()       # (K,Z,Y,X)
+    from_tensor = fs.restore_logits_gpu(tens, source, target, device="cpu")
+    assert np.array_equal(from_numpy, from_tensor)
+
+
 def test_sitk_nibabel_sitk_roundtrip_is_geometry_exact():
     """sitk -> nibabel -> sitk must recover size/spacing/origin/direction/data
     exactly. This is the bridge that recovers the conformed-orig geometry for the
