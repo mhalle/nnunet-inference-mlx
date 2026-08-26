@@ -133,6 +133,11 @@ class Segmenter:
                 return {**info, "folds_default": list(self.policy["folds"]),
                         "hint": "structures are read from the checkpoint once "
                                 "installed; prepare() or first use installs it"}
+            if info is not None and info.get("engine"):
+                # an engine (e.g. FastSurfer) has no nnU-Net TaskSpec, so
+                # _resolve_spec would raise; its describe IS its info - and it
+                # carries weights_installed, which the result-cache key needs.
+                return {**info, "folds_default": list(self.policy["folds"])}
         spec = _resolve_spec(task, self.catalog)
         d = {"name": spec.name, "source": spec.source, "modality": spec.modality,
              "shape": spec.shape, "n_structures": len(spec.label_map),

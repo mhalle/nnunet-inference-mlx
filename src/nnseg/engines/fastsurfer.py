@@ -27,6 +27,23 @@ import numpy as np
 
 _LUT_PATH = Path(__file__).resolve().parent.parent / "data" / "fastsurfer_lut.json"
 
+WEIGHTS_ID = "fastsurfer"
+WEIGHTS_VERSION = "vinn-v2"
+
+
+def weights_installed() -> list[dict]:
+    """The engine's weights identity for the result-cache key.
+
+    FastSurfer bakes its checkpoints into the worker image (not nnseg's weights
+    volume), so this is a fixed version string, not read from an install
+    sidecar. It is the ONE source of truth: the API-side describe
+    (:meth:`ecosystems.FastSurferEcosystem.info`) and the worker-side re-key
+    (``modal_app._FastSurferShim``) must both return this, or the key the worker
+    stores a finished result under and the key a plain GET computes diverge -
+    and every bare read then 404s a result that is actually cached. (Bug found
+    2026-08-26: worker keyed ``fastsurfer=vinn-v2``, API keyed ``unknown``.)"""
+    return [{"id": WEIGHTS_ID, "version": WEIGHTS_VERSION}]
+
 
 def load_lut() -> dict[int, dict]:
     """FastSurfer output labels -> {name, color}. The segment table for the
@@ -228,9 +245,28 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
             raise RuntimeError(f"FastSurfer logit self-check failed: {agree:.4%} "
                                "of conformed voxels match FastSurfer's own labels")
 
+    def _extent(im):
+        import numpy as _np
+        lo = _np.array(im.TransformIndexToPhysicalPoint((0, 0, 0)))
+        sz = im.GetSize()
+        hi = _np.array(im.TransformIndexToPhysicalPoint((sz[0]-1, sz[1]-1, sz[2]-1)))
+        return _np.minimum(lo, hi), _np.maximum(lo, hi)
+    clo, chi = _extent(conf_orig); tlo, thi = _extent(t1_img)
+    print(f"[fastsurfer] logit_zyx={logit_zyx.shape} conf={conf_orig.GetSize()} "
+          f"t1={t1_img.GetSize()} conf_ext={clo.round(1)}..{chi.round(1)} "
+          f"t1_ext={tlo.round(1)}..{thi.round(1)}", flush=True)
+
     if logit_grade:
         idx_native = restore_logits(logit_zyx, conf_orig, t1_img)
         labels_arr = to_fs(idx_native)                # (Z,Y,X) FreeSurfer ids on input grid
+        nfg = int((labels_arr > 0).sum())
+        print(f"[fastsurfer] restored foreground voxels={nfg}/{labels_arr.size}", flush=True)
+        if nfg == 0:
+            raise RuntimeError(
+                f"logit-grade restore is empty: logit_zyx={logit_zyx.shape}, "
+                f"conf={conf_orig.GetSize()} ext {clo.round(1)}..{chi.round(1)}, "
+                f"t1={t1_img.GetSize()} ext {tlo.round(1)}..{thi.round(1)}; "
+                "conf/t1 physical extents likely do not overlap")
     else:
         conf_seg = sitk.GetImageFromArray(fs_labels_zyx.astype(np.uint16))
         conf_seg.CopyInformation(conf_orig)

@@ -308,8 +308,12 @@ class FastSurferEcosystem(ModelEcosystem):
             "FastSurfer-enabled worker via nnseg.engines.fastsurfer, not a TaskSpec")
 
     def info(self, task: str, root) -> dict:
+        # weights_installed is the result-cache key's model component; it must
+        # match the worker's re-key (see engines.fastsurfer.weights_installed).
+        from .engines.fastsurfer import weights_installed
         return {"ecosystem": "fastsurfer", "engine": True, "modality": "MR (T1)",
-                "structures": "~95 FreeSurfer aparc+aseg (DKTatlas)"}
+                "structures": "~95 FreeSurfer aparc+aseg (DKTatlas)",
+                "weights_installed": weights_installed()}
 
 
 def registry(ecosystems=None) -> dict:

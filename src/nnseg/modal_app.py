@@ -616,7 +616,8 @@ class _FastSurferShim:
     """A Segmenter-shaped stand-in so publish_completion's re-key
     (weights_versions_of -> describe) has a stable FastSurfer version."""
     def describe(self, task):
-        return {"weights_installed": [{"id": "fastsurfer", "version": "vinn-v2"}]}
+        from nnseg.engines.fastsurfer import weights_installed
+        return {"weights_installed": weights_installed()}
 
     def resolve_task(self, t):
         return t
