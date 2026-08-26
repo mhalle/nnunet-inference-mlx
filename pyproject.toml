@@ -47,6 +47,12 @@ torch = ["torch>=2.7", "nnunetv2", "scipy", "scikit-image", "numpy>=2"]
 # torch extra's numpy>=2. Declared conflicting below so uv forks them into ONE universal lock;
 # materialize this engine on its own: `UV_PROJECT_ENVIRONMENT=.venvs/synthstrip uv sync --extra synthstrip`.
 synthstrip = ["torch>=2.7", "surfa", "numpy<2", "scipy"]
+# NOTE: a `fastsurfer` git-source extra was tried and does NOT work - FastSurfer's own
+# pyproject uses `[tool.setuptools] packages = ['FastSurferCNN', ...]`, an explicit list that
+# omits subpackages, so `pip install git+...` ships an INCOMPLETE FastSurferCNN (no `.utils`,
+# `.data_loader`). Installs but ImportErrors on use. So FastSurfer stays the git-clone + sys.path
+# engine (its Modal image); the extras mechanism fits engines with complete packaging
+# (SynthStrip via PyPI). A fork fixing FastSurfer's `packages = find` would enable an extra.
 
 [build-system]
 requires = ["hatchling"]
