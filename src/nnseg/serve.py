@@ -1409,18 +1409,26 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         canonical = canon_task(task)
         if canonical is None:
             raise HTTPException(404, f"unknown task {task!r}")
+        # canon_task drops @version by design (all wire forms converge to ONE
+        # cache key). For prepare the version IS the request, so pass the
+        # requested form through - dropping it silently installed the default
+        # and answered 202, the "silent wrong version" bug this grammar exists
+        # to prevent (found by the live integration pass).
+        requested = task if "@" in task else canonical
         task = canonical
         if not executor.accepting:
             raise HTTPException(429, "queue is full, retry later",
                                 headers={"Retry-After": "30"})
         jid, jdir = executor.new_job_dir()
         try:
-            executor.submit_prepare(jid, jdir, task)
+            executor.submit_prepare(jid, jdir, requested)
         except QueueFull as e:
             import shutil
             shutil.rmtree(jdir, ignore_errors=True)
             raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
-        return {"id": jid, "kind": "prepare", "task": task}
+        return {"id": jid, "kind": "prepare", "task": task,
+                **({"version": requested.rpartition("@")[2]}
+                   if requested != task else {})}
 
     @app.get("/v1/sources")
     def list_sources():

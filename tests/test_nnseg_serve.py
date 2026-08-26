@@ -2456,3 +2456,40 @@ def test_prefer_wait_never_nan():
             "getlist": lambda self, k, _t=tok: [_t]})())
         w = _prefer_wait_raw(req, 110.0)
         assert w is None or (w == w and 0.0 <= w <= 110.0), (tok, w)
+
+
+def test_prepare_preserves_the_version_pin(tmp_path):
+    """Live integration pass: POST /v1/tasks/<eco:name@version>/prepare must
+    honor the pin. canon_task drops @version by design (wire forms converge to
+    one cache key), which silently installed the DEFAULT version and answered
+    202 - the 'silent wrong version' bug the grammar exists to prevent."""
+    seen = []
+
+    class PinSeg(FakeSegmenter):
+        def resolve_task(self, t):
+            if t.split("@")[0] not in ("total_fast", "ts:total_fast"):
+                raise LookupError(t)
+            return "ts:total_fast"
+
+        def prepare(self, task, progress=None):
+            seen.append(task)
+            return {"task": task}
+
+    ex = LocalExecutor(PinSeg(), workdir=tmp_path)
+    client = TestClient(create_app(ex))
+    try:
+        r = client.post("/v1/tasks/ts:total_fast@v9.9.9/prepare")
+        assert r.status_code == 202 and r.json()["version"] == "v9.9.9"
+        t0 = time.time()
+        while not seen and time.time() - t0 < 5:
+            time.sleep(0.02)
+        assert seen == ["ts:total_fast@v9.9.9"], seen
+        seen.clear()
+        r = client.post("/v1/tasks/total_fast/prepare")   # unpinned unchanged
+        assert "version" not in r.json()
+        t0 = time.time()
+        while not seen and time.time() - t0 < 5:
+            time.sleep(0.02)
+        assert seen == ["ts:total_fast"]
+    finally:
+        ex.close()
