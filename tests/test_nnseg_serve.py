@@ -127,6 +127,22 @@ def test_health_and_tasks(tmp_path):
     assert client.get("/v1/tasks/nope").status_code == 404
 
 
+def test_version_self_report(tmp_path):
+    _, _, client = make(tmp_path)
+    r = client.get("/v1/version")
+    assert r.status_code == 200
+    v = r.json()
+    assert v["name"] == "nnseg"
+    assert v["contract"]                              # a contract version is reported
+    assert v.get("version") and v["version"] != "unknown"   # nnseg __version__
+    assert v.get("started_at")
+    # `packages` reports installed DEPENDENCIES (nnseg itself is mounted/source, no dist
+    # metadata) - torch is always installed in the test env.
+    assert v["packages"].get("torch", {}).get("version")
+    # weights map is present (empty with the FakeSegmenter, which has no catalog)
+    assert isinstance(v["weights"], dict)
+
+
 # -- queue semantics ---------------------------------------------------------
 
 def test_fifo_order_and_positions(tmp_path):

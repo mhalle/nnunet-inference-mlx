@@ -5,6 +5,7 @@ the medseg workspace): a 3D Slicer panel, a CLI on another machine, a notebook. 
 contract is deliberately small:
 
     GET    /v1/health              who am I - version, device, task count
+    GET    /v1/version             what's deployed - contract, package + weights versions
     GET    /v1/tasks               task names
     GET    /v1/tasks/{task}        describe: structures, modality, weights
     POST   /v1/jobs                task + input (+ options JSON) -> {id}; the input is a
@@ -1161,6 +1162,31 @@ def _version() -> str:
         return "unknown"
 
 
+CONTRACT_VERSION = "1"          # the /v1 wire contract; bump only on a breaking change
+
+
+def _pkg_info(name: str) -> dict | None:
+    """Best-effort ``{version, commit?}`` for an installed distribution. The commit
+    (from a VCS install's ``direct_url.json``) is what actually pins an engine
+    package's rev - the version string alone doesn't. Returns None if not installed
+    (engine packages live only in their own images)."""
+    import importlib.metadata as im
+    try:
+        info = {"version": im.version(name)}
+    except Exception:
+        return None
+    try:
+        import json
+        raw = im.distribution(name).read_text("direct_url.json")
+        commit = ((json.loads(raw).get("vcs_info") or {}).get("commit_id")
+                  if raw else None)
+        if commit:
+            info["commit"] = commit
+    except Exception:
+        pass
+    return info
+
+
 def _progress_headers(progress: dict | None, extra: dict | None = None) -> dict:
     """202 progress as headers, so HEAD probes and header-only clients see how
     far along a flight is (a HEAD response cannot carry a body)."""
@@ -1374,6 +1400,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             raise HTTPException(401, "this server requires a bearer token for "
                                      "anything beyond cached reads")
 
+    import datetime as _dt
+    _started_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
     @app.get("/v1/health")
     def health():
         policy = getattr(seg, "policy", {})
@@ -1383,6 +1412,35 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 "n_tasks": len(seg.tasks()), "accepting": executor.accepting,
                 "sources": ["upload"] + [k for k, v in sources.items()
                                          if _source_enabled(v)]}
+
+    @app.get("/v1/version")
+    def version():
+        """Self-report - what this deployment is running. Anonymous, no external
+        calls: the wire contract version, the nnseg version, when this instance
+        started, the installed package versions (with git commit for the engine
+        packages, which is what pins their rev), and the weights identity per task.
+        For clients (compat), operators (is it current?), and debugging (which rev
+        produced this seg?)."""
+        # nnseg itself is reported by the top-level "version" (its __version__): it's
+        # mounted/source-on-path in the deployed images and CI, so it has no dist
+        # metadata to read here. `packages` reports the installed DEPENDENCIES.
+        pkgs = {}
+        for name in ("nnunetv2", "torch", "fastsurfer-lean", "synthstrip-torch", "surfa"):
+            info = _pkg_info(name)
+            if info is not None:
+                pkgs[name] = info
+        weights: dict = {}
+        cat = getattr(seg, "catalog", None)
+        if hasattr(cat, "info"):
+            for t in seg.tasks():
+                try:
+                    wi = dict(cat.info(t)).get("weights_installed")
+                    if wi:
+                        weights[t] = wi
+                except Exception:
+                    pass
+        return {"name": "nnseg", "contract": CONTRACT_VERSION, "version": _version(),
+                "started_at": _started_at, "packages": pkgs, "weights": weights}
 
     @app.get("/v1/tasks")
     def tasks():
