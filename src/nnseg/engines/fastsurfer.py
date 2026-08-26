@@ -133,6 +133,63 @@ def restore_logits(logit_zyx, source_ref, target_ref):
     return idx
 
 
+def _resample_affine(source_ref, target_ref):
+    """The 3x3 matrix A and offset t that map a TARGET voxel index (x,y,z) to the
+    continuous SOURCE voxel index (x,y,z), composing SimpleITK's physical-space
+    transforms of both grids (identity transform between them, like
+    ``restore_logits``). physical = origin + direction @ (spacing * index); the
+    source direction is orthonormal so its inverse is its transpose."""
+    O_s = np.asarray(source_ref.GetOrigin(), dtype=np.float64)
+    O_t = np.asarray(target_ref.GetOrigin(), dtype=np.float64)
+    D_s = np.asarray(source_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
+    D_t = np.asarray(target_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
+    S_s = np.asarray(source_ref.GetSpacing(), dtype=np.float64)
+    S_t = np.asarray(target_ref.GetSpacing(), dtype=np.float64)
+    inv_s = np.diag(1.0 / S_s) @ D_s.T
+    A = inv_s @ D_t @ np.diag(S_t)
+    t = inv_s @ (O_t - O_s)
+    return A, t
+
+
+def restore_logits_gpu(logit_zyx, source_ref, target_ref, device="cuda"):
+    """GPU equivalent of :func:`restore_logits`: trilinear-resample the whole
+    K-channel logit field from ``source_ref``'s grid onto ``target_ref``'s grid
+    and argmax over classes, in one batched ``grid_sample`` on ``device`` instead
+    of 79 CPU SimpleITK resamples. Same physical-space mapping (so orientation/
+    spacing differences are handled) and the same half-pixel (voxel-center)
+    convention as SimpleITK (``align_corners=False``, zero padding outside).
+
+    Needs the full field resident on the device (~5 GB fp32 at 256^3 x 79); the
+    CPU :func:`restore_logits` is the memory-frugal fallback for limited hosts.
+    Returns a ``(Z, Y, X)`` int32 class-index volume (target array order)."""
+    import torch
+    import torch.nn.functional as F
+
+    Zs, Ys, Xs, K = logit_zyx.shape
+    tgt = target_ref.GetSize()                            # (Xt, Yt, Zt)
+    Xt, Yt, Zt = int(tgt[0]), int(tgt[1]), int(tgt[2])
+    A, t = _resample_affine(source_ref, target_ref)
+
+    dev = torch.device(device)
+    # target voxel indices (x,y,z) for every output voxel, array order (z,y,x)
+    zz, yy, xx = torch.meshgrid(torch.arange(Zt), torch.arange(Yt), torch.arange(Xt),
+                                indexing="ij")
+    idx_t = torch.stack([xx, yy, zz], dim=-1).to(dev, torch.float64)   # (Zt,Yt,Xt,3)
+    A_t = torch.as_tensor(A, device=dev, dtype=torch.float64)
+    off = torch.as_tensor(t, device=dev, dtype=torch.float64)
+    src = idx_t @ A_t.T + off                             # continuous source index (x,y,z)
+    # -> normalized [-1,1], voxel-center convention (align_corners=False)
+    N = torch.as_tensor([Xs, Ys, Zs], device=dev, dtype=torch.float64)
+    grid = ((src + 0.5) * 2.0 / N - 1.0).to(torch.float32)[None]        # (1,Zt,Yt,Xt,3)
+
+    logits = (torch.from_numpy(np.ascontiguousarray(logit_zyx))         # (Zs,Ys,Xs,K)
+              .permute(3, 0, 1, 2).contiguous()[None].to(dev))          # (1,K,Zs,Ys,Xs)
+    out = F.grid_sample(logits, grid, mode="bilinear",
+                        padding_mode="zeros", align_corners=False)      # (1,K,Zt,Yt,Xt)
+    idx = out.argmax(dim=1)[0].to(torch.int32).cpu().numpy()            # (Zt,Yt,Xt)
+    return idx
+
+
 _RUNNERS: dict = {}          # (device, batch_size) -> RunModelOnData, cached across jobs
 
 
@@ -235,7 +292,7 @@ def _fs_version() -> str:
 
 
 def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8,
-            logit_grade: bool = True, self_check: bool = True):
+            logit_grade: bool = True, self_check: bool = True, restore: str = "auto"):
     """Segment a T1 with FastSurfer and return an :class:`nnseg.result.Segmentation`
     on the input's grid.
 
@@ -250,6 +307,12 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
     nearest-neighbor resample of FastSurfer's own labelmap. ``self_check``
     verifies (loudly) that argmax at the conformed grid reproduces FastSurfer's
     own labels before trusting the restore.
+
+    ``restore`` selects the logit-restore backend: ``"gpu"`` (batched
+    ``grid_sample``, fast, needs the whole field on the device), ``"cpu"``
+    (per-channel SimpleITK, slow but memory-frugal - for limited local hosts), or
+    ``"auto"`` (GPU on a CUDA device, CPU otherwise). The two are numerically
+    equivalent (same physical-space mapping and half-pixel convention).
     """
     import SimpleITK as sitk
     import FastSurferCNN.data_loader.data_utils as du
@@ -295,10 +358,14 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
           f"t1={t1_img.GetSize()} conf_ext={clo.round(1)}..{chi.round(1)} "
           f"t1_ext={tlo.round(1)}..{thi.round(1)}", flush=True)
 
+    use_gpu = restore == "gpu" or (restore == "auto" and str(device).startswith("cuda"))
     if logit_grade:
         _t = time.perf_counter()
-        idx_native = restore_logits(logit_zyx, conf_orig, t1_img)
-        timings["restore"] = time.perf_counter() - _t   # per-channel physical-space resample + argmax
+        if use_gpu:
+            idx_native = restore_logits_gpu(logit_zyx, conf_orig, t1_img, device)
+        else:
+            idx_native = restore_logits(logit_zyx, conf_orig, t1_img)
+        timings["restore"] = time.perf_counter() - _t   # physical-space resample + argmax
         labels_arr = to_fs(idx_native)                # (Z,Y,X) FreeSurfer ids on input grid
         nfg = int((labels_arr > 0).sum())
         print(f"[fastsurfer] restored foreground voxels={nfg}/{labels_arr.size}", flush=True)
@@ -326,7 +393,8 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
                 origin=tuple(float(o) for o in reversed(t1_img.GetOrigin())))
     prov = {"engine": "fastsurfer", "fastsurfer_version": _fs_version(),
             "network": "FastSurferVINN (2.5D view aggregation)",
-            "restore": "logit-grade (physical-space)" if logit_grade else "label-nn",
+            "restore": (f"logit-grade (physical-space, {'gpu' if use_gpu else 'cpu'})"
+                        if logit_grade else "label-nn"),
             "self_check": "reproduces FastSurfer labels at conformed grid" if self_check else "skipped",
             "device": device}
     seg = Segmentation(labels=out_img, schema=LabelSchema(names=names),
