@@ -1,0 +1,626 @@
+{
+ "2": {
+  "name": "Left-Cerebral-White-Matter",
+  "color": [
+   245,
+   245,
+   245
+  ]
+ },
+ "4": {
+  "name": "Left-Lateral-Ventricle",
+  "color": [
+   120,
+   18,
+   134
+  ]
+ },
+ "5": {
+  "name": "Left-Inf-Lat-Vent",
+  "color": [
+   196,
+   58,
+   250
+  ]
+ },
+ "7": {
+  "name": "Left-Cerebellum-White-Matter",
+  "color": [
+   220,
+   248,
+   164
+  ]
+ },
+ "8": {
+  "name": "Left-Cerebellum-Cortex",
+  "color": [
+   230,
+   148,
+   34
+  ]
+ },
+ "10": {
+  "name": "Left-Thalamus",
+  "color": [
+   0,
+   118,
+   14
+  ]
+ },
+ "11": {
+  "name": "Left-Caudate",
+  "color": [
+   122,
+   186,
+   220
+  ]
+ },
+ "12": {
+  "name": "Left-Putamen",
+  "color": [
+   236,
+   13,
+   176
+  ]
+ },
+ "13": {
+  "name": "Left-Pallidum",
+  "color": [
+   12,
+   48,
+   255
+  ]
+ },
+ "14": {
+  "name": "3rd-Ventricle",
+  "color": [
+   204,
+   182,
+   142
+  ]
+ },
+ "15": {
+  "name": "4th-Ventricle",
+  "color": [
+   42,
+   204,
+   164
+  ]
+ },
+ "16": {
+  "name": "Brain-Stem",
+  "color": [
+   119,
+   159,
+   176
+  ]
+ },
+ "17": {
+  "name": "Left-Hippocampus",
+  "color": [
+   220,
+   216,
+   20
+  ]
+ },
+ "18": {
+  "name": "Left-Amygdala",
+  "color": [
+   103,
+   255,
+   255
+  ]
+ },
+ "24": {
+  "name": "CSF",
+  "color": [
+   60,
+   60,
+   60
+  ]
+ },
+ "26": {
+  "name": "Left-Accumbens-area",
+  "color": [
+   255,
+   165,
+   0
+  ]
+ },
+ "28": {
+  "name": "Left-VentralDC",
+  "color": [
+   165,
+   42,
+   42
+  ]
+ },
+ "31": {
+  "name": "Left-choroid-plexus",
+  "color": [
+   0,
+   200,
+   200
+  ]
+ },
+ "41": {
+  "name": "Right-Cerebral-White-Matter",
+  "color": [
+   245,
+   245,
+   245
+  ]
+ },
+ "43": {
+  "name": "Right-Lateral-Ventricle",
+  "color": [
+   120,
+   18,
+   134
+  ]
+ },
+ "44": {
+  "name": "Right-Inf-Lat-Vent",
+  "color": [
+   196,
+   58,
+   250
+  ]
+ },
+ "46": {
+  "name": "Right-Cerebellum-White-Matter",
+  "color": [
+   220,
+   248,
+   164
+  ]
+ },
+ "47": {
+  "name": "Right-Cerebellum-Cortex",
+  "color": [
+   230,
+   148,
+   34
+  ]
+ },
+ "49": {
+  "name": "Right-Thalamus",
+  "color": [
+   0,
+   118,
+   14
+  ]
+ },
+ "50": {
+  "name": "Right-Caudate",
+  "color": [
+   122,
+   186,
+   220
+  ]
+ },
+ "51": {
+  "name": "Right-Putamen",
+  "color": [
+   236,
+   13,
+   176
+  ]
+ },
+ "52": {
+  "name": "Right-Pallidum",
+  "color": [
+   13,
+   48,
+   255
+  ]
+ },
+ "53": {
+  "name": "Right-Hippocampus",
+  "color": [
+   220,
+   216,
+   20
+  ]
+ },
+ "54": {
+  "name": "Right-Amygdala",
+  "color": [
+   103,
+   255,
+   255
+  ]
+ },
+ "58": {
+  "name": "Right-Accumbens-area",
+  "color": [
+   255,
+   165,
+   0
+  ]
+ },
+ "60": {
+  "name": "Right-VentralDC",
+  "color": [
+   165,
+   42,
+   42
+  ]
+ },
+ "63": {
+  "name": "Right-choroid-plexus",
+  "color": [
+   0,
+   200,
+   221
+  ]
+ },
+ "77": {
+  "name": "WM-hypointensities",
+  "color": [
+   200,
+   70,
+   255
+  ]
+ },
+ "1002": {
+  "name": "ctx-lh-caudalanteriorcingulate",
+  "color": [
+   125,
+   100,
+   160
+  ]
+ },
+ "1003": {
+  "name": "ctx-lh-caudalmiddlefrontal",
+  "color": [
+   100,
+   25,
+   0
+  ]
+ },
+ "1005": {
+  "name": "ctx-lh-cuneus",
+  "color": [
+   220,
+   20,
+   100
+  ]
+ },
+ "1006": {
+  "name": "ctx-lh-entorhinal",
+  "color": [
+   220,
+   20,
+   10
+  ]
+ },
+ "1007": {
+  "name": "ctx-lh-fusiform",
+  "color": [
+   180,
+   220,
+   140
+  ]
+ },
+ "1008": {
+  "name": "ctx-lh-inferiorparietal",
+  "color": [
+   220,
+   60,
+   220
+  ]
+ },
+ "1009": {
+  "name": "ctx-lh-inferiortemporal",
+  "color": [
+   180,
+   40,
+   120
+  ]
+ },
+ "1010": {
+  "name": "ctx-lh-isthmuscingulate",
+  "color": [
+   140,
+   20,
+   140
+  ]
+ },
+ "1011": {
+  "name": "ctx-lh-lateraloccipital",
+  "color": [
+   20,
+   30,
+   140
+  ]
+ },
+ "1012": {
+  "name": "ctx-lh-lateralorbitofrontal",
+  "color": [
+   35,
+   75,
+   50
+  ]
+ },
+ "1013": {
+  "name": "ctx-lh-lingual",
+  "color": [
+   225,
+   140,
+   140
+  ]
+ },
+ "1014": {
+  "name": "ctx-lh-medialorbitofrontal",
+  "color": [
+   200,
+   35,
+   75
+  ]
+ },
+ "1015": {
+  "name": "ctx-lh-middletemporal",
+  "color": [
+   160,
+   100,
+   50
+  ]
+ },
+ "1016": {
+  "name": "ctx-lh-parahippocampal",
+  "color": [
+   20,
+   220,
+   60
+  ]
+ },
+ "1017": {
+  "name": "ctx-lh-paracentral",
+  "color": [
+   60,
+   220,
+   60
+  ]
+ },
+ "1018": {
+  "name": "ctx-lh-parsopercularis",
+  "color": [
+   220,
+   180,
+   140
+  ]
+ },
+ "1019": {
+  "name": "ctx-lh-parsorbitalis",
+  "color": [
+   20,
+   100,
+   50
+  ]
+ },
+ "1020": {
+  "name": "ctx-lh-parstriangularis",
+  "color": [
+   220,
+   60,
+   20
+  ]
+ },
+ "1021": {
+  "name": "ctx-lh-pericalcarine",
+  "color": [
+   120,
+   100,
+   60
+  ]
+ },
+ "1022": {
+  "name": "ctx-lh-postcentral",
+  "color": [
+   220,
+   20,
+   20
+  ]
+ },
+ "1023": {
+  "name": "ctx-lh-posteriorcingulate",
+  "color": [
+   220,
+   180,
+   220
+  ]
+ },
+ "1024": {
+  "name": "ctx-lh-precentral",
+  "color": [
+   60,
+   20,
+   220
+  ]
+ },
+ "1025": {
+  "name": "ctx-lh-precuneus",
+  "color": [
+   160,
+   140,
+   180
+  ]
+ },
+ "1026": {
+  "name": "ctx-lh-rostralanteriorcingulate",
+  "color": [
+   80,
+   20,
+   140
+  ]
+ },
+ "1027": {
+  "name": "ctx-lh-rostralmiddlefrontal",
+  "color": [
+   75,
+   50,
+   125
+  ]
+ },
+ "1028": {
+  "name": "ctx-lh-superiorfrontal",
+  "color": [
+   20,
+   220,
+   160
+  ]
+ },
+ "1029": {
+  "name": "ctx-lh-superiorparietal",
+  "color": [
+   20,
+   180,
+   140
+  ]
+ },
+ "1030": {
+  "name": "ctx-lh-superiortemporal",
+  "color": [
+   140,
+   220,
+   220
+  ]
+ },
+ "1031": {
+  "name": "ctx-lh-supramarginal",
+  "color": [
+   80,
+   160,
+   20
+  ]
+ },
+ "1034": {
+  "name": "ctx-lh-transversetemporal",
+  "color": [
+   150,
+   150,
+   200
+  ]
+ },
+ "1035": {
+  "name": "ctx-lh-insula",
+  "color": [
+   255,
+   192,
+   32
+  ]
+ },
+ "2002": {
+  "name": "ctx-rh-caudalanteriorcingulate",
+  "color": [
+   125,
+   100,
+   160
+  ]
+ },
+ "2005": {
+  "name": "ctx-rh-cuneus",
+  "color": [
+   220,
+   20,
+   100
+  ]
+ },
+ "2010": {
+  "name": "ctx-rh-isthmuscingulate",
+  "color": [
+   140,
+   20,
+   140
+  ]
+ },
+ "2012": {
+  "name": "ctx-rh-lateralorbitofrontal",
+  "color": [
+   35,
+   75,
+   50
+  ]
+ },
+ "2013": {
+  "name": "ctx-rh-lingual",
+  "color": [
+   225,
+   140,
+   140
+  ]
+ },
+ "2014": {
+  "name": "ctx-rh-medialorbitofrontal",
+  "color": [
+   200,
+   35,
+   75
+  ]
+ },
+ "2016": {
+  "name": "ctx-rh-parahippocampal",
+  "color": [
+   20,
+   220,
+   60
+  ]
+ },
+ "2017": {
+  "name": "ctx-rh-paracentral",
+  "color": [
+   60,
+   220,
+   60
+  ]
+ },
+ "2021": {
+  "name": "ctx-rh-pericalcarine",
+  "color": [
+   120,
+   100,
+   60
+  ]
+ },
+ "2022": {
+  "name": "ctx-rh-postcentral",
+  "color": [
+   220,
+   20,
+   20
+  ]
+ },
+ "2023": {
+  "name": "ctx-rh-posteriorcingulate",
+  "color": [
+   220,
+   180,
+   220
+  ]
+ },
+ "2024": {
+  "name": "ctx-rh-precentral",
+  "color": [
+   60,
+   20,
+   220
+  ]
+ },
+ "2025": {
+  "name": "ctx-rh-precuneus",
+  "color": [
+   160,
+   140,
+   180
+  ]
+ },
+ "2028": {
+  "name": "ctx-rh-superiorfrontal",
+  "color": [
+   20,
+   220,
+   160
+  ]
+ }
+}
