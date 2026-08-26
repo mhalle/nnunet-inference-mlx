@@ -232,8 +232,8 @@ class TCIASource(DataSource):
 def openneuro_source() -> UrlTemplateSource:
     """OpenNeuro (CC0 neuroimaging, BIDS layout) straight off its public S3
     bucket over HTTPS - the data-only case: identifiers are
-    ``ds<number>/<path-to-file>`` (slashed, so cache keys hash; reachable via
-    the jobs API, not the single-segment path surface)."""
+    ``ds<number>/<path-to-file>`` (slashed, so cache keys hash; the path
+    surface's greedy routes carry the slashes in ordinary URLs)."""
     return UrlTemplateSource(
         "openneuro",
         r"(?!.*(?:^|/)\.\.(?:/|$))ds[0-9]{6}/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}",
@@ -564,8 +564,8 @@ def registry(sources=None) -> dict:
         if not s.id_pattern:
             raise ValueError(f"source {s.prefix!r} declares no id_pattern")
         # identifiers may contain slashes (DOIs, org/name ids): the series
-        # cache hashes filesystem-unsafe keys, so no pattern restriction is
-        # needed here. Slashed identifiers are reachable through the jobs API;
-        # only the single-segment path surface cannot address them.
+        # cache hashes filesystem-unsafe keys, and the path surface's greedy
+        # routes ({ident:path}, parsed right-to-left in serve._mount_source)
+        # address them in ordinary URLs - so no pattern restriction is needed.
         out[s.prefix] = s
     return out
