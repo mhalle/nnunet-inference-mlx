@@ -87,53 +87,54 @@ _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP"
                   # loops on AttributeError (hit live 2026-08-25).
                   "NNSEG_PUBLIC", "NNSEG_FASTSURFER", "NNSEG_SYNTHSTRIP")
 
+# Base image (the ASGI api container + the nnU-Net GPU Worker). uv-NATIVE: the nnU-Net
+# worker's deps come from pyproject extras - `torch` (torch/nnunetv2/scipy/scikit-image),
+# `serve` (fastapi/uvicorn/python-multipart/matplotlib), `idc` (obstore), `cuda` (triton,
+# the CUDA restore backend). nnunetv2 resolves from PyPI via --no-sources-package (the
+# local ../upstream/nnUNet path source is dev-only and absent in the build). apt git: uv
+# sync resolves the whole project's lock, which touches the engine git sources.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("torch>=2.7", "numpy>=1.24", "triton", "nnunetv2>=2.5",
-                    "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart",
-                    "matplotlib")
+    .apt_install("git")
+    .uv_sync(extras=["torch", "serve", "idc", "cuda"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
 
-# FastSurfer engine image (built only when the deployment enables it): the
-# uv-only FastSurfer stack + obstore (source fetch) + the mounted nnseg pkg
-# (serve-core for cache/publish). Its own torch/monai pins never meet nnseg's -
-# separate image = separate interpreter (docs: "one server per environment").
+# FastSurfer engine image (built only when the deployment enables it). uv-NATIVE:
+# `uv_sync` installs the project's deps for the `fastsurfer` + `idc` extras straight
+# from pyproject (`--no-install-project`, so nnseg stays mounted, not installed) -
+# the fastsurfer-lean git source + rev live ONLY in [tool.uv.sources], not here.
+# `fastsurfer` pulls fastsurfer-lean (CNN inference deps incl. matplotlib, no
+# monai/meshpy/torchio); `idc` pulls obstore (source fetch); core deps (SimpleITK
+# etc.) come with the sync. frozen=False: this repo gitignores uv.lock (pyproject is
+# the source of truth), so resolve at build.
 fs_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")                       # uv needs git to install the git+ dep below
-    # Install FastSurfer's parcellation CNN from our slimmed fork fastsurfer-lean
-    # (proper pip package, FastSurferCNN importable) instead of the old git-clone +
-    # requirements.txt + sys.path hack. It pulls only the CNN inference deps
-    # (torch/torchvision/nibabel/scipy/scikit-image/matplotlib/...) - no
-    # monai/meshpy/torchio/lapy. SimpleITK + obstore are nnseg's (mounted, not installed).
-    .uv_pip_install(
-        "fastsurfer-lean @ git+https://github.com/mhalle/fastsurfer-lean.git"
-        "@041062008b1276b2fb21c886d6943f7bfc3bba6e",
-        "SimpleITK>=2.3", "obstore",
-    )
+    .apt_install("git")                       # uv needs git for the git source in pyproject
+    # --no-sources-package nnunetv2: uv sync resolves the WHOLE project (every extra, to build
+    # the lock) before installing the selected ones, so it would hit the local nnunetv2 path
+    # source (file:///upstream/nnUNet, absent in the build) even though fastsurfer/idc don't
+    # install nnunetv2. Ignoring just that one source resolves it from PyPI; the fastsurfer-lean
+    # git source stays active.
+    .uv_sync(extras=["fastsurfer", "idc"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
 
-# SynthStrip engine image (built only when enabled): installs our standalone
-# `synthstrip-torch` package from git (like fastsurfer-lean), which brings the model +
-# surfa trained-conform + its deps (torch/numpy<2/surfa/SimpleITK). scipy is nnseg's
-# (mask cleanup), obstore the source fetch, matplotlib the serve-core preview. The 29 MB
-# weights are fetched at BUILD (baked into the default cache) so there is no cold-start
-# download. numpy<2 comes from synthstrip-torch (surfa's reorient breaks on numpy 2.x).
+# SynthStrip engine image (built only when enabled). uv-NATIVE, same shape as fs_image:
+# `synthstrip` brings synthstrip-torch (from its git source in pyproject) + scipy (nnseg
+# mask cleanup); `idc` brings obstore (fetch); `preview` brings matplotlib (serve-core
+# preview - synthstrip-torch doesn't carry it, it's a serve-tier concern). numpy<2 comes
+# from synthstrip-torch (surfa's reorient breaks on numpy 2.x). Weights fetch from MGH at
+# first use (cached warm), like FastSurfer's checkpoints.
 synthstrip_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")                       # uv needs git to install the git+ dep below
-    .uv_pip_install(
-        "synthstrip-torch @ git+https://github.com/mhalle/synthstrip-torch.git"
-        "@1b871fb1f98fbe60ed1efe87de34a8703a106b44",
-        "scipy", "obstore",
-        "matplotlib",   # serve-core render_preview imports it (artifact overlap)
-    )
-    # Bake the weights into the package's default cache so first request isn't a download.
-    .run_commands("python -c 'import synthstrip_torch; synthstrip_torch.fetch_weights()'")
+    .apt_install("git")                       # uv needs git for the git source in pyproject
+    .uv_sync(extras=["synthstrip", "idc", "preview"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )

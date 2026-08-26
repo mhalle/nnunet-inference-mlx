@@ -45,6 +45,15 @@ idc = ["obstore"]
 modal = ["modal"]
 # Multi-label connected-component cleanup (segment --remove-small-components-mm3).
 postprocessing = ["connected-components-3d"]
+# The artifact-preview renderer. Every serve WORKER renders previews in the artifact
+# overlap (serve-core render_preview imports matplotlib), so a worker image whose engine
+# extra doesn't already bring matplotlib includes this. Kept out of an engine's own deps
+# because it's a serve-tier concern, not the engine's.
+preview = ["matplotlib"]
+# CUDA-only acceleration for the nnU-Net worker: the Triton restore backend (picked
+# automatically on CUDA). No macOS/Linux-CPU wheels, so it is opt-in - only the GPU base
+# image syncs it. nnseg falls back to the numpy/torch restore without it.
+cuda = ["triton"]
 test = ["pytest", "pydicom", "fastapi", "httpx", "python-multipart"]
 # The torch path (nnseg): torch >= 2.7 for torch.mps.compile_shader; nnunetv2 for the network
 # architecture, weights and sliding-window slicers (stock APIs only - the GPU resampler now
