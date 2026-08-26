@@ -35,6 +35,30 @@ def load_lut() -> dict[int, dict]:
     return {int(k): v for k, v in raw.items()}
 
 
+def sitk_to_nibabel(img):
+    """A SimpleITK image -> an in-memory nibabel Nifti1Image, so FastSurfer's
+    ``conform`` (which is nibabel-coupled, and which we deliberately do not
+    reimplement) can consume SimpleITK-decoded data without a file round-trip.
+
+    The one geometry conversion on the way in: SimpleITK is LPS with array order
+    (z, y, x); nibabel is RAS with array order (i, j, k) = (x, y, z). So the
+    data is transposed to (x, y, z) and the affine is built from the direction/
+    spacing/origin with the first two axes negated (LPS -> RAS). Round-trip
+    tested."""
+    import nibabel as nib
+    import SimpleITK as sitk
+
+    arr = sitk.GetArrayFromImage(img)                       # (z, y, x)
+    data = np.ascontiguousarray(np.transpose(arr, (2, 1, 0)))   # (x, y, z)
+    sp = np.asarray(img.GetSpacing(), dtype=np.float64)     # (sx, sy, sz)
+    D = np.asarray(img.GetDirection(), dtype=np.float64).reshape(3, 3)
+    aff = np.eye(4)
+    aff[:3, :3] = D * sp[np.newaxis, :]                     # columns scaled by spacing (LPS)
+    aff[:3, 3] = np.asarray(img.GetOrigin(), dtype=np.float64)
+    aff = np.diag([-1.0, -1.0, 1.0, 1.0]) @ aff             # LPS -> RAS
+    return nib.Nifti1Image(data, aff)
+
+
 def restore_logits(logit_zyx, source_ref, target_ref):
     """Resample a per-class logit field from ``source_ref``'s grid onto
     ``target_ref``'s grid (SimpleITK physical space, so any orientation/spacing
@@ -70,17 +94,35 @@ def restore_logits(logit_zyx, source_ref, target_ref):
     return idx
 
 
-def _capture_logits(t1_path: str, out_dir: str, device: str):
-    """Run FastSurfer seg-only, capturing the pre-argmax logit field in the
-    conformed-orig frame. Returns (logit_zyx, conf_orig_sitk, fs_labels_zyx,
-    class_labels, provenance). FastSurfer is imported here and nowhere else."""
+def _capture_logits(t1_sitk, out_dir: str, device: str):
+    """Run FastSurfer seg-only on an in-memory SimpleITK image, capturing the
+    pre-argmax logit field in the conformed-orig frame. The input reaches
+    FastSurfer through nibabel in memory (no file decode): ``du.load_image`` -
+    FastSurfer's one file-read seam - is patched to return the SimpleITK image
+    converted to nibabel, so FastSurfer's own ``conform`` runs on it directly.
+    Returns (logit_zyx, conf_orig_sitk, fs_labels_zyx, class_labels).
+    FastSurfer is imported here and nowhere else."""
     import os
 
+    import nibabel as nib
     import SimpleITK as sitk
     import torch
     from FastSurferCNN import run_prediction as rp
     from FastSurferCNN.data_loader.conform import Reorientation
     import FastSurferCNN.data_loader.data_utils as du
+
+    nib_img = sitk_to_nibabel(t1_sitk)                # the SITK -> nibabel bridge
+    orig_load_image = du.load_image
+
+    def load_image_from_memory(file, name="image", **kw):
+        return nib_img, np.asanyarray(nib_img.dataobj)
+
+    du.load_image = load_image_from_memory
+    # a tiny valid placeholder so SubjectList's existence check passes; its
+    # content is never read (load_image is patched to the in-memory image)
+    ph = Path(out_dir) / "placeholder.nii.gz"
+    ph.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(np.zeros((2, 2, 2), np.uint8), np.eye(4)), str(ph))
 
     cap: dict = {}
 
@@ -116,11 +158,14 @@ def _capture_logits(t1_path: str, out_dir: str, device: str):
     conf_path = f"{out_dir}/spike/mri/orig.nii.gz"
     parser = rp.make_parser()
     args = parser.parse_args([
-        "--t1", t1_path, "--sid", "spike", "--sd", out_dir,
+        "--t1", str(ph), "--sid", "spike", "--sd", out_dir,
         "--asegdkt_segfile", f"{out_dir}/spike/mri/aparc.DKTatlas+aseg.deep.nii.gz",
         "--conformed_name", conf_path, "--device", device,
         "--batch_size", "8", "--viewagg_device", "auto"])
-    rc = rp.main(**vars(args))
+    try:
+        rc = rp.main(**vars(args))
+    finally:
+        du.load_image = orig_load_image               # never leave the patch installed
     if "logit_conf" not in cap:
         raise RuntimeError(f"FastSurfer produced no logit field (rc={rc})")
 
@@ -139,10 +184,15 @@ def _fs_version() -> str:
         return "unknown"
 
 
-def segment(t1_path, *, out_dir, device: str = "cuda",
+def segment(t1_input, *, out_dir, device: str = "cuda",
             logit_grade: bool = True, self_check: bool = True):
     """Segment a T1 with FastSurfer and return an :class:`nnseg.result.Segmentation`
     on the input's grid.
+
+    ``t1_input`` is a SimpleITK image (the memory-in path - what nnseg's reader
+    / read-ahead produces) or a path (read with nnseg's ``io.read_image`` so its
+    IPP/affine geometry fixes apply). Either way the data reaches FastSurfer
+    through nibabel in memory; no temp NIfTI of the volume is written.
 
     ``logit_grade`` restores the captured logit field to the input grid and
     argmaxes after (sub-voxel boundaries); ``False`` falls back to a
@@ -158,9 +208,13 @@ def segment(t1_path, *, out_dir, device: str = "cuda",
     from ..result import Segmentation
     from ..values import LabelSchema
 
-    t1_img = sitk.ReadImage(str(t1_path))             # target grid = the acquisition
+    if isinstance(t1_input, sitk.Image):
+        t1_img = t1_input                             # memory-in (read-ahead / caller)
+    else:
+        from .. import io
+        t1_img = io.read_image(str(t1_input))         # path: geometry-correct read
     logit_zyx, conf_orig, fs_labels_zyx, class_labels = _capture_logits(
-        str(t1_path), str(out_dir), device)
+        t1_img, str(out_dir), device)
 
     def to_fs(idx_zyx):
         m = du.map_label2aparc_aseg(torch.from_numpy(idx_zyx.astype(np.int64)),

@@ -82,3 +82,26 @@ def test_restore_logits_beats_label_nn_on_a_slanted_boundary():
     nn_err = float((nn[c] != truth[c]).mean())
     assert lg_err < nn_err, (lg_err, nn_err)        # logit-grade closer to truth
     assert lg_err < 0.005                            # near-exact on a linear field
+
+
+def test_sitk_to_nibabel_roundtrip_preserves_geometry():
+    """The SITK->nibabel bridge must preserve geometry: a marked voxel's RAS
+    physical location and value must survive the conversion (LPS->RAS,
+    zyx->xyz). A wrong axis/sign here is the silent-mirror class of bug."""
+    nib = pytest.importorskip("nibabel")
+    # a non-trivial axis-aligned geometry (anisotropic, flipped, offset)
+    arr = np.zeros((6, 8, 10), dtype=np.float32)      # sitk (z,y,x)
+    arr[1, 2, 3] = 7.0                                # a marked voxel, sitk index (x=3,y=2,z=1)
+    im = sitk.GetImageFromArray(arr)
+    im.SetSpacing((1.0, 1.5, 2.0)); im.SetOrigin((10.0, -20.0, 5.0))
+    im.SetDirection((-1., 0., 0., 0., -1., 0., 0., 0., 1.))   # LPS-ish flip
+
+    nb = fs.sitk_to_nibabel(im)
+    data = np.asanyarray(nb.dataobj)
+    # value at nibabel index (i=3, j=2, k=1) == the marked voxel
+    assert data[3, 2, 1] == 7.0
+    # physical location must match: sitk physical point (RAS) of that voxel
+    px, py, pz = im.TransformIndexToPhysicalPoint((3, 2, 1))    # LPS
+    ras_sitk = np.array([-px, -py, pz])                          # LPS -> RAS
+    ras_nib = (nb.affine @ np.array([3, 2, 1, 1.0]))[:3]
+    assert np.allclose(ras_sitk, ras_nib, atol=1e-6), (ras_sitk, ras_nib)

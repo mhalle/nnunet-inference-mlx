@@ -667,6 +667,8 @@ if FASTSURFER:
             from nnseg.engines import fastsurfer
             out = Path("/dev/shm") / f"fs_{meta['id']}"
             out.mkdir(parents=True, exist_ok=True)
+            # input_path is a SimpleITK image when read-ahead pre-read it
+            # (memory-in, decode-once) or a path otherwise; segment() takes both
             return fastsurfer.segment(input_path, out_dir=str(out), device="cuda")
 
         @modal.method()
