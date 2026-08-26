@@ -105,3 +105,21 @@ def test_sitk_to_nibabel_roundtrip_preserves_geometry():
     ras_sitk = np.array([-px, -py, pz])                          # LPS -> RAS
     ras_nib = (nb.affine @ np.array([3, 2, 1, 1.0]))[:3]
     assert np.allclose(ras_sitk, ras_nib, atol=1e-6), (ras_sitk, ras_nib)
+
+
+def test_sitk_nibabel_sitk_roundtrip_is_geometry_exact():
+    """sitk -> nibabel -> sitk must recover size/spacing/origin/direction/data
+    exactly. This is the bridge that recovers the conformed-orig geometry for the
+    logit restore without a file round-trip; a silent error here misplaces every
+    boundary."""
+    arr = np.arange(6 * 8 * 10, dtype=np.float32).reshape(6, 8, 10)   # sitk (z,y,x)
+    im = sitk.GetImageFromArray(arr)
+    im.SetSpacing((1.0, 1.5, 2.0)); im.SetOrigin((10.0, -20.0, 5.0))
+    im.SetDirection((-1., 0., 0., 0., -1., 0., 0., 0., 1.))
+
+    back = fs.nibabel_to_sitk(fs.sitk_to_nibabel(im))
+    assert back.GetSize() == im.GetSize()
+    assert np.allclose(back.GetSpacing(), im.GetSpacing(), atol=1e-9)
+    assert np.allclose(back.GetOrigin(), im.GetOrigin(), atol=1e-6)
+    assert np.allclose(back.GetDirection(), im.GetDirection(), atol=1e-9)
+    assert np.array_equal(sitk.GetArrayFromImage(back), arr)

@@ -76,6 +76,28 @@ def sitk_to_nibabel(img):
     return nib.Nifti1Image(data, aff)
 
 
+def nibabel_to_sitk(nb):
+    """The inverse of :func:`sitk_to_nibabel`: an in-memory nibabel image back to
+    a SimpleITK image. Used to recover the conformed-orig geometry from the
+    conformed nibabel image FastSurfer produces, so the logit restore's source
+    grid needs no file round-trip. Assumes an orthogonal affine (direction *
+    spacing, no shear) - true for FastSurfer's conformed output and for medical
+    acquisitions. Round-trip tested against sitk_to_nibabel."""
+    import SimpleITK as sitk
+
+    data = np.asanyarray(nb.dataobj)                        # (x, y, z)
+    arr = np.ascontiguousarray(np.transpose(data, (2, 1, 0)))   # (z, y, x) for sitk
+    aff = np.diag([-1.0, -1.0, 1.0, 1.0]) @ np.asarray(nb.affine, dtype=np.float64)  # RAS -> LPS
+    M = aff[:3, :3]
+    sp = np.linalg.norm(M, axis=0)                          # column norms = spacing
+    D = M / sp[np.newaxis, :]                               # unit columns = direction cosines
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing(tuple(float(s) for s in sp))
+    img.SetOrigin(tuple(float(o) for o in aff[:3, 3]))
+    img.SetDirection(tuple(float(d) for d in D.flatten()))
+    return img
+
+
 def restore_logits(logit_zyx, source_ref, target_ref):
     """Resample a per-class logit field from ``source_ref``'s grid onto
     ``target_ref``'s grid (SimpleITK physical space, so any orientation/spacing
@@ -111,86 +133,97 @@ def restore_logits(logit_zyx, source_ref, target_ref):
     return idx
 
 
-def _capture_logits(t1_sitk, out_dir: str, device: str):
-    """Run FastSurfer seg-only on an in-memory SimpleITK image, capturing the
-    pre-argmax logit field in the conformed-orig frame. The input reaches
-    FastSurfer through nibabel in memory (no file decode): ``du.load_image`` -
-    FastSurfer's one file-read seam - is patched to return the SimpleITK image
-    converted to nibabel, so FastSurfer's own ``conform`` runs on it directly.
-    Returns (logit_zyx, conf_orig_sitk, fs_labels_zyx, class_labels).
-    FastSurfer is imported here and nowhere else."""
-    import os
+_RUNNERS: dict = {}          # (device, batch_size) -> RunModelOnData, cached across jobs
 
-    import nibabel as nib
-    import SimpleITK as sitk
-    import torch
+
+def _get_runner(device: str, batch_size: int):
+    """A FastSurfer ``RunModelOnData`` (the three view models + LUT), built ONCE
+    per (device, batch_size) and reused across jobs. This is the expensive,
+    input-independent setup - checkpoint load, arch build, device upload - so
+    caching it turns per-job model reload (dominant in the warm case) into a
+    one-time cost. Defaults (checkpoint/config/LUT paths, conform knobs) are
+    taken from FastSurfer's own argument parser so we track upstream, not a
+    hardcoded copy. FastSurfer is imported here and nowhere else."""
+    key = (device, int(batch_size))
+    runner = _RUNNERS.get(key)
+    if runner is not None:
+        return runner
     from FastSurferCNN import run_prediction as rp
-    from FastSurferCNN.data_loader.conform import Reorientation
+    from FastSurferCNN.utils.checkpoint import (
+        get_checkpoints, get_config_file, load_checkpoint_config_defaults)
+
+    args = rp.make_parser().parse_args(
+        ["--t1", "x", "--sd", "x", "--device", device,
+         "--batch_size", str(int(batch_size)), "--viewagg_device", "auto"])
+    cfg_file = get_config_file("FastSurferCNN")
+    get_checkpoints(args.ckpt_ax, args.ckpt_cor, args.ckpt_sag,   # no-op once downloaded
+                    urls=load_checkpoint_config_defaults("url", filename=cfg_file))
+    # Mirror main()'s constructor EXACTLY, every knob from the parsed args - the
+    # init defaults are NOT the CLI defaults (e.g. image_size init=True but CLI
+    # "auto"), and a wrong conform knob yields a degenerate segmentation.
+    runner = rp.RunModelOnData(
+        lut=args.lut, ckpt_ax=args.ckpt_ax, ckpt_sag=args.ckpt_sag,
+        ckpt_cor=args.ckpt_cor, cfg_ax=args.cfg_ax, cfg_sag=args.cfg_sag,
+        cfg_cor=args.cfg_cor, device=args.device, viewagg_device=args.viewagg_device,
+        threads=args.threads, batch_size=args.batch_size, vox_size=args.vox_size,
+        orientation=args.orientation, image_size=args.image_size,
+        async_io=args.async_io, conform_to_1mm_threshold=args.conform_to_1mm_threshold)
+    _RUNNERS[key] = runner
+    return runner
+
+
+def _capture_logits(t1_sitk, device: str, batch_size: int = 8):
+    """Segment an in-memory SimpleITK image with a CACHED FastSurfer model,
+    capturing the pre-argmax logit field in the conformed-orig frame. Drives
+    conform + get_prediction directly (no ``rp.main``, no SubjectList): the input
+    goes through nibabel in memory, conform runs on it, and NOTHING is written -
+    the conformed orig, the segfile, brainmask/aseg/CC that ``main`` would emit
+    are all skipped (we only need the logits). Returns
+    (logit_zyx, conf_orig_sitk, fs_labels_zyx, class_labels)."""
+    import torch
+    from FastSurferCNN.data_loader.conform import Reorientation, conform, is_conform
     import FastSurferCNN.data_loader.data_utils as du
 
-    nib_img = sitk_to_nibabel(t1_sitk)                # the SITK -> nibabel bridge
-    orig_load_image = du.load_image
+    r = _get_runner(device, batch_size)
+    orig = sitk_to_nibabel(t1_sitk)                   # the SITK -> nibabel bridge
+    orig_data = np.asanyarray(orig.dataobj)
+    # conform in memory, no file writes (conform_and_save_orig minus the IO);
+    # reuse FastSurfer's own conform kwargs so we match its trained-input contract
+    ck = r._RunModelOnData__conform_kwargs()          # name-mangled: FastSurfer's exact knobs
+    if not is_conform(orig, **r._RunModelOnData__conform_kwargs(verbose=False)):
+        orig = conform(orig, **ck)
+        orig_data = np.asanyarray(orig.dataobj)
 
-    def load_image_from_memory(file, name="image", **kw):
-        return nib_img, np.asanyarray(nib_img.dataobj)
+    zoom = np.asarray(orig.header.get_zooms())
+    n2l = Reorientation.from_target_orientation(
+        orig.affine, "soft LIA", orig_data.shape, zoom)
+    orig_in_lia = n2l(orig_data, order=1)
+    shape = orig_in_lia.shape + (r.get_num_classes(),)
+    pred_prob = torch.zeros(shape, device=r.viewagg_device,
+                            dtype=torch.float16, requires_grad=False)
+    for plane, model in r.models.items():
+        r.set_model(plane)
+        pred_prob = model.run(pred_prob, "image", orig_in_lia,
+                              n2l.reorder_axes(zoom), out=pred_prob)
 
-    du.load_image = load_image_from_memory
-    # a tiny valid placeholder so SubjectList's existence check passes; its
-    # content is never read (load_image is patched to the in-memory image)
-    ph = Path(out_dir) / "placeholder.nii.gz"
-    ph.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(np.zeros((2, 2, 2), np.uint8), np.eye(4)), str(ph))
+    inv = n2l.inverse                                 # exact discrete reorder LIA->conformed
+    pp = pred_prob.float().cpu().numpy()              # (X, Y, Z, K) nibabel order
+    conf0 = np.asarray(inv(pp[..., 0], order=1))
+    logit_conf = np.empty(conf0.shape + (pp.shape[3],), np.float32)
+    logit_conf[..., 0] = conf0
+    for k in range(1, pp.shape[3]):
+        logit_conf[..., k] = np.asarray(inv(pp[..., k], order=1))
+    pred_classes = torch.argmax(pred_prob, 3)
+    del pred_prob
+    pred_classes = inv(pred_classes, order=0)
+    pred_classes = du.map_label2aparc_aseg(pred_classes, r.labels)
+    fs_labels = du.split_cortex_labels(pred_classes.cpu().numpy())
 
-    cap: dict = {}
-
-    def capturing_get_prediction(self, image_name, orig_data, zoom, affine):
-        _zoom = np.asarray(zoom)
-        n2l = Reorientation.from_target_orientation(
-            affine, "soft LIA", orig_data.shape, _zoom)
-        orig_in_lia = n2l(orig_data, order=1)
-        shape = orig_in_lia.shape + (self.get_num_classes(),)
-        pred_prob = torch.zeros(shape, device=self.viewagg_device,
-                                dtype=torch.float16, requires_grad=False)
-        for plane, model in self.models.items():
-            self.set_model(plane)
-            pred_prob = model.run(pred_prob, image_name, orig_in_lia,
-                                  n2l.reorder_axes(_zoom), out=pred_prob)
-        inv = n2l.inverse                             # exact discrete reorder LIA->conformed
-        pp = pred_prob.float().cpu().numpy()          # (X, Y, Z, K) nibabel order
-        conf0 = np.asarray(inv(pp[..., 0], order=1))
-        logit_conf = np.empty(conf0.shape + (pp.shape[3],), np.float32)
-        logit_conf[..., 0] = conf0
-        for k in range(1, pp.shape[3]):
-            logit_conf[..., k] = np.asarray(inv(pp[..., k], order=1))
-        cap["logit_conf"] = logit_conf
-        cap["labels"] = self.labels
-        pred_classes = torch.argmax(pred_prob, 3)
-        del pred_prob
-        pred_classes = n2l.inverse(pred_classes, order=0)
-        pred_classes = du.map_label2aparc_aseg(pred_classes, self.labels)
-        cap["fs_labels"] = du.split_cortex_labels(pred_classes.cpu().numpy())
-        return cap["fs_labels"]
-
-    rp.RunModelOnData.get_prediction = capturing_get_prediction
-    conf_path = f"{out_dir}/spike/mri/orig.nii.gz"
-    parser = rp.make_parser()
-    args = parser.parse_args([
-        "--t1", str(ph), "--sid", "spike", "--sd", out_dir,
-        "--asegdkt_segfile", f"{out_dir}/spike/mri/aparc.DKTatlas+aseg.deep.nii.gz",
-        "--conformed_name", conf_path, "--device", device,
-        "--batch_size", "8", "--viewagg_device", "auto"])
-    try:
-        rc = rp.main(**vars(args))
-    finally:
-        du.load_image = orig_load_image               # never leave the patch installed
-    if "logit_conf" not in cap:
-        raise RuntimeError(f"FastSurfer produced no logit field (rc={rc})")
-
-    conf_orig = sitk.ReadImage(conf_path)             # correct geometry, (z,y,x)
+    conf_orig = nibabel_to_sitk(orig)                 # conformed geometry, no file round-trip
     logit_zyx = np.ascontiguousarray(
-        np.transpose(cap["logit_conf"], (2, 1, 0, 3)))  # (X,Y,Z,K) -> (Z,Y,X,K)
-    fs_labels_zyx = np.ascontiguousarray(np.transpose(cap["fs_labels"], (2, 1, 0)))
-    return logit_zyx, conf_orig, fs_labels_zyx, cap["labels"]
+        np.transpose(logit_conf, (2, 1, 0, 3)))       # (X,Y,Z,K) -> (Z,Y,X,K)
+    fs_labels_zyx = np.ascontiguousarray(np.transpose(fs_labels, (2, 1, 0)))
+    return logit_zyx, conf_orig, fs_labels_zyx, r.labels
 
 
 def _fs_version() -> str:
@@ -201,7 +234,7 @@ def _fs_version() -> str:
         return "unknown"
 
 
-def segment(t1_input, *, out_dir, device: str = "cuda",
+def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8,
             logit_grade: bool = True, self_check: bool = True):
     """Segment a T1 with FastSurfer and return an :class:`nnseg.result.Segmentation`
     on the input's grid.
@@ -209,7 +242,8 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
     ``t1_input`` is a SimpleITK image (the memory-in path - what nnseg's reader
     / read-ahead produces) or a path (read with nnseg's ``io.read_image`` so its
     IPP/affine geometry fixes apply). Either way the data reaches FastSurfer
-    through nibabel in memory; no temp NIfTI of the volume is written.
+    through nibabel in memory; nothing is written to disk (``out_dir`` is accepted
+    for call-site compatibility and unused - the engine writes no temp files).
 
     ``logit_grade`` restores the captured logit field to the input grid and
     argmaxes after (sub-voxel boundaries); ``False`` falls back to a
@@ -235,8 +269,8 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
     timings: dict[str, float] = {}
     _t = time.perf_counter()
     logit_zyx, conf_orig, fs_labels_zyx, class_labels = _capture_logits(
-        t1_img, str(out_dir), device)
-    timings["capture"] = time.perf_counter() - _t     # conform + VINN inference + model load
+        t1_img, device, batch_size)
+    timings["capture"] = time.perf_counter() - _t     # conform + VINN inference (model cached)
 
     def to_fs(idx_zyx):
         m = du.map_label2aparc_aseg(torch.from_numpy(idx_zyx.astype(np.int64)),

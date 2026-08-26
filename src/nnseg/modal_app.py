@@ -492,8 +492,11 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
         _emit(jid, {"state": "cancelled", "finished": time.time()})
         _clear_own_artifacts_marker(jid, meta)
     except Exception as e:               # noqa: BLE001 - reported to the client
+        import traceback
+        tb = traceback.format_exc()
+        print(tb, flush=True)                          # worker log for diagnosis
         _emit(jid, {"state": "failed", "finished": time.time(),
-                    "error": f"{type(e).__name__}: {e}"})
+                    "error": f"{type(e).__name__}: {e}\n--- traceback ---\n{tb[-1600:]}"})
         _clear_own_artifacts_marker(jid, meta)   # a put that failed after
     finally:                                     # set_pending must not 202
         if pinned_key is not None:               # until the sweep
@@ -667,11 +670,10 @@ if FASTSURFER:
 
         def _compute(self, input_path, meta, on_progress, token):
             from nnseg.engines import fastsurfer
-            out = Path("/dev/shm") / f"fs_{meta['id']}"
-            out.mkdir(parents=True, exist_ok=True)
             # input_path is a SimpleITK image when read-ahead pre-read it
             # (memory-in, decode-once) or a path otherwise; segment() takes both
-            return fastsurfer.segment(input_path, out_dir=str(out), device="cuda")
+            # and writes no temp files (model is cached across jobs on this worker).
+            return fastsurfer.segment(input_path, device="cuda")
 
         @modal.method()
         def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
