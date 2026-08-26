@@ -39,7 +39,14 @@ test = ["pytest", "pydicom", "fastapi", "httpx", "python-multipart"]
 # architecture, weights and sliding-window slicers (stock APIs only - the GPU resampler now
 # lives in nnseg.resample, so no fork is pinned); scipy builds the resampler's exact operators;
 # scikit-image is test-only reference. SimpleITK is already a core dependency and does the IO.
-torch = ["torch>=2.7", "nnunetv2", "scipy", "scikit-image"]
+# numpy>=2 anchors the "numpy-2 world" (the GPU/nnU-Net path, tested on 2.x) so it forks
+# cleanly from the synthstrip engine's numpy<2 - see [tool.uv] conflicts below.
+torch = ["torch>=2.7", "nnunetv2", "scipy", "scikit-image", "numpy>=2"]
+# The SynthStrip engine (nnseg.engines.synthstrip): its OWN environment. surfa is SynthStrip's
+# trained-input conform, and surfa's reorient needs numpy<2 - genuinely incompatible with the
+# torch extra's numpy>=2. Declared conflicting below so uv forks them into ONE universal lock;
+# materialize this engine on its own: `UV_PROJECT_ENVIRONMENT=.venvs/synthstrip uv sync --extra synthstrip`.
+synthstrip = ["torch>=2.7", "surfa", "numpy<2", "scipy"]
 
 [build-system]
 requires = ["hatchling"]
@@ -50,6 +57,19 @@ packages = ["src/nnunet_inference_mlx", "src/nnseg"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
+
+[tool.uv]
+# Engines own their environments (docs: "one environment per engine"). An engine whose
+# deps genuinely conflict with the core (here: synthstrip's numpy<2 vs the torch path's
+# numpy>=2) is declared here so uv resolves them in separate forks of ONE universal lock -
+# the same declaration then drives per-engine venvs locally and per-engine images on Modal.
+# A future engine with its own incompatible pins adds an extra + one entry here.
+conflicts = [
+    [
+      { extra = "torch" },
+      { extra = "synthstrip" },
+    ],
+]
 
 [tool.uv.sources]
 # Local convenience, not a pin: nnseg uses only stock nnunetv2 APIs, so a released nnunetv2
