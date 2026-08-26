@@ -102,12 +102,16 @@ image = (
 # separate image = separate interpreter (docs: "one server per environment").
 fs_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .run_commands(
-        "git clone --depth 1 https://github.com/Deep-MI/FastSurfer.git /opt/FastSurfer",
-        "pip install --no-cache-dir uv",
-        "cd /opt/FastSurfer && uv pip install --system -r requirements.txt",
-        "uv pip install --system obstore",
+    .apt_install("git")                       # uv needs git to install the git+ dep below
+    # Install FastSurfer's parcellation CNN from our slimmed fork fastsurfer-lean
+    # (proper pip package, FastSurferCNN importable) instead of the old git-clone +
+    # requirements.txt + sys.path hack. It pulls only the CNN inference deps
+    # (torch/torchvision/nibabel/scipy/scikit-image/matplotlib/...) - no
+    # monai/meshpy/torchio/lapy. SimpleITK + obstore are nnseg's (mounted, not installed).
+    .uv_pip_install(
+        "fastsurfer-lean @ git+https://github.com/mhalle/fastsurfer-lean.git"
+        "@041062008b1276b2fb21c886d6943f7bfc3bba6e",
+        "SimpleITK>=2.3", "obstore",
     )
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
@@ -672,11 +676,11 @@ if FASTSURFER:
 
         @modal.enter()
         def setup(self):
-            import sys
             _pkg_dir()                              # nnseg on the path
-            sys.path.insert(0, "/opt/FastSurfer")   # FastSurferCNN importable
+            # FastSurferCNN is now a pip-installed package (fastsurfer-lean) - no
+            # /opt/FastSurfer clone, no sys.path/FASTSURFER_HOME. Checkpoints still
+            # self-download at first run relative to the installed package.
             os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            os.environ["FASTSURFER_HOME"] = "/opt/FastSurfer"
             from nnseg.serve import ReadAhead, SeriesCache
             from nnseg.sources import registry
             self._sources = registry(None)

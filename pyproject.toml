@@ -86,7 +86,7 @@ conflicts = [
 nnunetv2 = { path = "../upstream/nnUNet", editable = true }
 # fastsurfer-lean = our slimmed FastSurfer fork (parcellation CNN only, packaging fixed).
 # Pinned to the slim branch's rev; import namespace stays FastSurferCNN.
-fastsurfer-lean = { git = "https://github.com/mhalle/fastsurfer-lean.git", rev = "1f675598ed51b48e0edc2c52053f83b21accd814" }
+fastsurfer-lean = { git = "https://github.com/mhalle/fastsurfer-lean.git", rev = "041062008b1276b2fb21c886d6943f7bfc3bba6e" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
