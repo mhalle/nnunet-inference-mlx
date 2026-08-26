@@ -28,8 +28,9 @@ tell the difference:
 
 Deploy-time configuration is by environment variable because Modal resolves
 decorators at import: NNSEG_GPU (default L40S - wins `total` outright; A10 is the
-economical fast-mode choice), NNSEG_APP_NAME, NNSEG_SCALEDOWN (seconds, default 600;
-Modal caps warmth at 20 min - longer means min_containers money), NNSEG_PROXY_AUTH,
+economical fast-mode choice), NNSEG_APP_NAME, NNSEG_SCALEDOWN (seconds, default 120 -
+conservative: a forgotten/left-up deploy idles at most ~2 min of GPU (~$0.07 on L40S)
+before scaling down; raise it to keep a busy server warmer), NNSEG_PROXY_AUTH,
 NNSEG_SNAPSHOT (memory snapshots, default ON - measured 2026-08-24: cold spawn->start
 10-14 s -> 6.4-6.7 s, one 35 s snapshot-creation run per deploy).
 
@@ -48,7 +49,7 @@ import modal
 APP_NAME = os.environ.get("NNSEG_APP_NAME", "nnseg-serve")
 GPU = os.environ.get("NNSEG_GPU", "L40S")
 PROXY_AUTH = os.environ.get("NNSEG_PROXY_AUTH", "1") not in ("0", "false", "no")
-SCALEDOWN = int(os.environ.get("NNSEG_SCALEDOWN", "600"))
+SCALEDOWN = int(os.environ.get("NNSEG_SCALEDOWN", "120"))
 GPU_SNAPSHOT = os.environ.get("NNSEG_GPU_SNAPSHOT", "0") not in ("0", "false", "no", "")
 SNAPSHOT = (os.environ.get("NNSEG_SNAPSHOT", "1") not in ("0", "false", "no")) or GPU_SNAPSHOT
 WARM_TASK = os.environ.get("NNSEG_WARM_TASK", "total_fast")
