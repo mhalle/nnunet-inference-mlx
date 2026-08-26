@@ -120,6 +120,21 @@ fs_image = (
     # git source stays active.
     .uv_sync(extras=["fastsurfer", "idc"], frozen=False,
              extra_options="--no-sources-package nnunetv2")
+    # Bake the ~67 MB VINN checkpoints into the image at BUILD (via FastSurfer's own
+    # get_checkpoints, to the package-default paths) so cold containers never re-download
+    # them from Zenodo/b2share - a reliability win (no runtime dependency on those hosts)
+    # and it removes that slice from every cold start. At runtime get_checkpoints is then
+    # a no-op. Placed before the nnseg mount so an nnseg edit doesn't bust this cache layer.
+    .run_commands(
+        "python -c \""
+        "from FastSurferCNN import run_prediction as rp;"
+        "from FastSurferCNN.utils.checkpoint import get_checkpoints,get_config_file,"
+        "load_checkpoint_config_defaults as L;"
+        "a=rp.make_parser().parse_args(['--t1','x','--sd','x']);"
+        "get_checkpoints(a.ckpt_ax,a.ckpt_cor,a.ckpt_sag,"
+        "urls=L('url',filename=get_config_file('FastSurferCNN')))"
+        "\""
+    )
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -135,6 +150,9 @@ synthstrip_image = (
     .apt_install("git")                       # uv needs git for the git source in pyproject
     .uv_sync(extras=["synthstrip", "idc", "preview"], frozen=False,
              extra_options="--no-sources-package nnunetv2")
+    # Bake the 29 MB weights into the image at BUILD (to synthstrip-torch's default cache)
+    # so cold containers don't re-download from MGH. Same rationale as FastSurfer above.
+    .run_commands("python -c 'import synthstrip_torch; synthstrip_torch.fetch_weights()'")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -669,11 +687,26 @@ class _SynthStripShim:
 if FASTSURFER:
     @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=fs_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol})
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class FastSurferWorker:
         """The FastSurfer engine worker: same _execute_job scheduler as Worker,
         different image + compute. Reuses nnseg serve-core (fetch/stage/cache/
         publish/artifacts) mounted into the FastSurfer image."""
+
+        @modal.enter(snap=SNAPSHOT)
+        def preload(self):
+            """Heavy imports paid once per deploy, before the memory snapshot; later
+            cold containers restore from it (the same win the base Worker gets). Classic
+            snapshot => imports only, no CUDA. With NNSEG_GPU_SNAPSHOT the model is built
+            onto the GPU here so a restored container starts model-ready."""
+            _pkg_dir()
+            import torch  # noqa: F401
+            import FastSurferCNN.run_prediction  # noqa: F401 - the CNN import graph
+            import nnseg  # noqa: F401
+            if GPU_SNAPSHOT:
+                from nnseg.engines import fastsurfer
+                fastsurfer._get_runner("cuda", 8)
 
         @modal.enter()
         def setup(self):
@@ -722,10 +755,22 @@ if FASTSURFER:
 if SYNTHSTRIP:
     @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=synthstrip_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol})
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class SynthStripWorker:
-        """The SynthStrip engine worker: same _execute_job scheduler as Worker,
-        a slim image + the vendored SynthStrip net. Reuses nnseg serve-core."""
+        """The SynthStrip engine worker: same _execute_job scheduler as Worker, a slim
+        image + the standalone synthstrip-torch package. Reuses nnseg serve-core."""
+
+        @modal.enter(snap=SNAPSHOT)
+        def preload(self):
+            """Heavy imports before the memory snapshot (see FastSurferWorker.preload)."""
+            _pkg_dir()
+            import torch  # noqa: F401
+            import synthstrip_torch  # noqa: F401 - model class + torch
+            import nnseg  # noqa: F401
+            if GPU_SNAPSHOT:
+                from nnseg.engines import synthstrip
+                synthstrip._get_model("cuda")
 
         @modal.enter()
         def setup(self):
