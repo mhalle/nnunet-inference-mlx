@@ -6,7 +6,6 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "mlx>=0.25",
     "numpy",
     "tqdm",
     "typer>=0.12",
@@ -14,6 +13,12 @@ dependencies = [
     # part of segmenting, which is what the package is for. `uv run` installs it.
     "SimpleITK",
 ]
+# NOTE: mlx is NOT a core dependency (moved to the `mlx` extra below, 2026-08-26).
+# The product is torch/MPS-first (nnseg); MLX is the oracle-only path. Keeping mlx
+# in core made the whole package uninstallable where mlx has no wheels (Linux/CUDA/
+# Modal) - CI had to avoid `uv sync` and hand-list deps for exactly this reason, and
+# the per-engine images mount the package + hand-list rather than `pip install nnseg[...]`.
+# With mlx optional, core installs anywhere and uv-native `uv sync --extra <x>` works.
 
 [project.scripts]
 nnmlx = "nnunet_inference_mlx.cli:app"
@@ -24,6 +29,12 @@ totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
 nnseg = "nnseg.cli:main"
 
 [project.optional-dependencies]
+# The MLX oracle path (the `nnunet_inference_mlx` package + the nnmlx / TotalSegmentator /
+# totalseg-mlx scripts). Apple-Silicon only - mlx has no Linux/CUDA wheels, which is why it
+# is an extra, not a core dep: `nnseg` (the torch product) never imports it (enforced by
+# tests/test_nnseg_layering.py), so core stays installable everywhere. Run the oracle with
+# `uv sync --extra mlx` (or `pip install nnunet-inference-mlx[mlx]`).
+mlx = ["mlx>=0.25"]
 # Remote weight download (store.download / download_archive).
 remote = ["httpx"]
 # The REST job server (nnseg serve).
