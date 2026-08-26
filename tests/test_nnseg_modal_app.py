@@ -162,6 +162,14 @@ def test_spawn_worker_rejects_fastsurfer_when_disabled(monkeypatch):
         modal_app._spawn_worker("fastsurfer:brain", "j1")
 
 
+def test_spawn_worker_rejects_synthstrip_when_disabled(monkeypatch):
+    """Same dispatch guard for the synthstrip: engine."""
+    from nnseg import modal_app
+    monkeypatch.setattr(modal_app, "SYNTHSTRIP", False)
+    with pytest.raises(RuntimeError, match="synthstrip engine is not enabled"):
+        modal_app._spawn_worker("synthstrip:mask", "j1")
+
+
 def test_execute_job_and_hooks_exist():
     """The engine seam: a shared _execute_job + per-worker _ensure/_compute
     hooks (so adding an engine is a compute, not a run_job copy)."""

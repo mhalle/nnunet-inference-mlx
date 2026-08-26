@@ -190,3 +190,18 @@ def test_fastsurfer_ecosystem_lists_but_refuses_spec(tmp_path):
     assert cat.info("fastsurfer:brain")["engine"] is True
     with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
         cat.get("fastsurfer:brain")
+
+
+def test_synthstrip_ecosystem_lists_but_refuses_spec(tmp_path):
+    """SynthStrip is an engine too: resolves/lists/describes with weights_installed
+    for the cache key, but spec() refuses (no TaskSpec)."""
+    from nnseg.ecosystems import EcosystemCatalog, SynthStripEcosystem
+    from nnseg.errors import UnsupportedModel
+    cat = EcosystemCatalog([SynthStripEcosystem()], root=tmp_path)
+    assert cat.resolve("synthstrip:mask")[2] == "synthstrip:mask"
+    assert cat.resolve("mask")[2] == "synthstrip:mask"
+    info = cat.info("synthstrip:mask")
+    assert info["engine"] is True
+    assert info["weights_installed"] == [{"id": "synthstrip", "version": "v1"}]
+    with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
+        cat.get("synthstrip:mask")

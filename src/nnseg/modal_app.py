@@ -62,6 +62,7 @@ RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 FASTSURFER = os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", "")
+SYNTHSTRIP = os.environ.get("NNSEG_SYNTHSTRIP", "0") not in ("0", "false", "no", "")
 
 
 def _pkg_dir() -> Path:
@@ -84,7 +85,7 @@ _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP"
                   # forwarded, its PUBLIC is False, the attribute never
                   # exists, and every request 303s while the runner crash-
                   # loops on AttributeError (hit live 2026-08-25).
-                  "NNSEG_PUBLIC", "NNSEG_FASTSURFER")
+                  "NNSEG_PUBLIC", "NNSEG_FASTSURFER", "NNSEG_SYNTHSTRIP")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -107,6 +108,24 @@ fs_image = (
         "pip install --no-cache-dir uv",
         "cd /opt/FastSurfer && uv pip install --system -r requirements.txt",
         "uv pip install --system obstore",
+    )
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+)
+
+# SynthStrip engine image (built only when enabled): the LIGHTEST engine - its
+# deps (torch/numpy/scipy/SimpleITK) are the same as nnseg's, and the model is
+# vendored in nnseg.engines._synthstrip_model, so the image is just those deps +
+# obstore (source fetch) + the baked 29 MB weights + the mounted nnseg pkg.
+synthstrip_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("curl")
+    .uv_pip_install("torch>=2.7", "numpy>=1.24", "scipy", "SimpleITK>=2.3", "obstore",
+                    "matplotlib")   # serve-core render_preview imports it (artifact overlap)
+    .run_commands(
+        "mkdir -p /opt/synthstrip",
+        "curl -sSL -o /opt/synthstrip/synthstrip.1.pt "
+        "https://ftp.nmr.mgh.harvard.edu/pub/dist/freesurfer/synthstrip/models/synthstrip.1.pt",
     )
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
@@ -628,6 +647,17 @@ class _FastSurferShim:
         return t
 
 
+class _SynthStripShim:
+    """Segmenter-shaped stand-in giving publish_completion's re-key a stable
+    SynthStrip weights version (same role as _FastSurferShim)."""
+    def describe(self, task):
+        from nnseg.engines.synthstrip import weights_installed
+        return {"weights_installed": weights_installed()}
+
+    def resolve_task(self, t):
+        return t
+
+
 if FASTSURFER:
     @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=fs_image,
@@ -681,14 +711,68 @@ if FASTSURFER:
             _execute_job(self, jid, source_tokens)
 
 
+if SYNTHSTRIP:
+    @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
+             max_containers=MAX_CONTAINERS, image=synthstrip_image,
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol})
+    class SynthStripWorker:
+        """The SynthStrip engine worker: same _execute_job scheduler as Worker,
+        a slim image + the vendored SynthStrip net. Reuses nnseg serve-core."""
+
+        @modal.enter()
+        def setup(self):
+            _pkg_dir()                              # nnseg on the path
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            from nnseg.serve import ReadAhead, SeriesCache
+            from nnseg.sources import registry
+            self._sources = registry(None)
+
+            def fetch_source(key, entry, credentials=None):
+                prefix, ident = key.split(":", 1)
+                if credentials is not None:
+                    return self._sources[prefix].fetch(ident, entry, credentials=credentials)
+                return self._sources[prefix].fetch(ident, entry)
+
+            self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
+                                            budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
+            self.read_ahead = ReadAhead()
+            self._vol_lock = threading.Lock()
+            self._ensured = set()
+            self.seg = _SynthStripShim()
+
+        _artifact_worker = Worker._artifact_worker   # identical overlap logic
+
+        def _prepare(self, task: str) -> dict:
+            return {"engine": "synthstrip", "task": task, "note": "weights baked in image"}
+
+        def _ensure(self, task: str) -> None:
+            return None                              # weights are in the image
+
+        def _compute(self, input_path, meta, on_progress, token):
+            from nnseg.engines import synthstrip
+            # input_path is a SimpleITK image (read-ahead memory-in) or a path;
+            # segment() takes both and writes no temp files (model cached per worker).
+            return synthstrip.segment(input_path, device="cuda")
+
+        @modal.method()
+        def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
+            _execute_job(self, jid, source_tokens)
+
+
 def _spawn_worker(task: str, jid: str, source_tokens=None):
-    """Dispatch to the engine that owns this task. fastsurfer:* -> the FastSurfer
-    worker (if the deployment enabled it); everything else -> the nnU-Net Worker."""
+    """Dispatch to the engine that owns this task. ``fastsurfer:*`` and
+    ``synthstrip:*`` -> their engine workers (if enabled); everything else -> the
+    nnU-Net Worker."""
     if str(task).startswith("fastsurfer:"):
         if not FASTSURFER:
             raise RuntimeError("the fastsurfer engine is not enabled on this "
                                "deployment (set NNSEG_FASTSURFER=1 at deploy)")
         return FastSurferWorker().run_job.spawn(jid, source_tokens=source_tokens)
+    if str(task).startswith("synthstrip:"):
+        if not SYNTHSTRIP:
+            raise RuntimeError("the synthstrip engine is not enabled on this "
+                               "deployment (set NNSEG_SYNTHSTRIP=1 at deploy)")
+        return SynthStripWorker().run_job.spawn(jid, source_tokens=source_tokens)
     return Worker().run_job.spawn(jid, source_tokens=source_tokens)
 
 

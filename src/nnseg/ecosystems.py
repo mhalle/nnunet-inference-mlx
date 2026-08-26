@@ -329,11 +329,46 @@ def registry(ecosystems=None) -> dict:
     return out
 
 
+class SynthStripEcosystem(ModelEcosystem):
+    """SynthStrip brain extraction (skull-strip) as an ENGINE - a contrast-agnostic
+    learned brain-mask UNet, not nnU-Net. Appears in the catalog so
+    ``synthstrip:mask`` resolves/lists/describes; runs on a SynthStrip-enabled
+    worker via :mod:`nnseg.engines.synthstrip`, not the nnU-Net pipeline."""
+
+    name = "synthstrip"
+    description = "SynthStrip brain extraction / skull-strip (engine)"
+
+    def tasks(self) -> list:
+        return ["mask"]
+
+    def materialized(self, task: str, root) -> bool:
+        return True                      # weights are baked into the worker image
+
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        return None
+
+    def spec(self, task: str, root):
+        from .errors import UnsupportedModel
+        raise UnsupportedModel(
+            "synthstrip is an engine, not an nnU-Net task; it runs on a "
+            "SynthStrip-enabled worker via nnseg.engines.synthstrip, not a TaskSpec")
+
+    def info(self, task: str, root) -> dict:
+        # weights_installed is the result-cache key's model component; it must
+        # match the worker's re-key (see engines.synthstrip.weights_installed).
+        from .engines.synthstrip import weights_installed
+        return {"ecosystem": "synthstrip", "engine": True, "modality": "MR (any contrast)",
+                "structures": "brain mask (1 label)",
+                "weights_installed": weights_installed()}
+
+
 def default_ecosystems() -> list:
     import os
     ecos = [TSEcosystem(), MooseEcosystem()]
     if os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", ""):
         ecos.append(FastSurferEcosystem())
+    if os.environ.get("NNSEG_SYNTHSTRIP", "0") not in ("0", "false", "no", ""):
+        ecos.append(SynthStripEcosystem())
     return ecos
 
 
