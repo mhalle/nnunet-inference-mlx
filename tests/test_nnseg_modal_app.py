@@ -151,3 +151,21 @@ def test_fresh_weights_versions_reloads_once(monkeypatch):
     type(ex)._wv_cache = {}
     ex._fresh_weights_versions("t")
     assert Vol.n == 2                       # window elapsed: one more
+
+
+def test_spawn_worker_rejects_fastsurfer_when_disabled(monkeypatch):
+    """Dispatch: a fastsurfer: task on a deployment without the engine enabled
+    fails loudly rather than routing to a nonexistent worker."""
+    from nnseg import modal_app
+    monkeypatch.setattr(modal_app, "FASTSURFER", False)
+    with pytest.raises(RuntimeError, match="fastsurfer engine is not enabled"):
+        modal_app._spawn_worker("fastsurfer:brain", "j1")
+
+
+def test_execute_job_and_hooks_exist():
+    """The engine seam: a shared _execute_job + per-worker _ensure/_compute
+    hooks (so adding an engine is a compute, not a run_job copy)."""
+    from nnseg import modal_app
+    assert callable(modal_app._execute_job) and callable(modal_app._spawn_worker)
+    for h in ("_ensure", "_compute", "_prepare"):
+        assert callable(getattr(modal_app.Worker, h))

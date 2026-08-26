@@ -60,6 +60,7 @@ ARTIFACTS = set(filter(None, os.environ.get("NNSEG_ARTIFACTS",
 RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
+FASTSURFER = os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", "")
 
 
 def _pkg_dir() -> Path:
@@ -82,13 +83,30 @@ _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP"
                   # forwarded, its PUBLIC is False, the attribute never
                   # exists, and every request 303s while the runner crash-
                   # loops on AttributeError (hit live 2026-08-25).
-                  "NNSEG_PUBLIC")
+                  "NNSEG_PUBLIC", "NNSEG_FASTSURFER")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("torch>=2.7", "numpy>=1.24", "triton", "nnunetv2>=2.5",
                     "SimpleITK>=2.3", "obstore", "fastapi", "python-multipart",
                     "matplotlib")
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+)
+
+# FastSurfer engine image (built only when the deployment enables it): the
+# uv-only FastSurfer stack + obstore (source fetch) + the mounted nnseg pkg
+# (serve-core for cache/publish). Its own torch/monai pins never meet nnseg's -
+# separate image = separate interpreter (docs: "one server per environment").
+fs_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .run_commands(
+        "git clone --depth 1 https://github.com/Deep-MI/FastSurfer.git /opt/FastSurfer",
+        "pip install --no-cache-dir uv",
+        "cd /opt/FastSurfer && uv pip install --system -r requirements.txt",
+        "uv pip install --system obstore",
+    )
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -336,6 +354,156 @@ def _emit(jid: str, update: dict) -> None:
 _cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
 
 
+def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
+    """The engine-agnostic job body shared by every worker: fetch/stage/
+    read, then ctx._ensure + ctx._compute (the engine), then save +
+    publish_completion + artifact overlap. Only _ensure/_compute/_prepare
+    differ per engine; everything else - queue, cache, markers, prefetch,
+    single-flight, cancel - is identical."""
+    from dataclasses import asdict
+
+    from nnseg.errors import Cancelled
+    from nnseg.progress import CancelToken, Reporter
+    meta = jobs_dict.get(jid)
+    if meta is None or meta.get("state") == "cancelled":
+        return
+    jdir = Path(JOBS_ROOT) / jid
+    last = {"t": 0.0}
+
+    def on_progress(p):
+        now = time.time()
+        if now - last["t"] >= 0.25 or p.stage in ("restore", "finalize"):
+            last["t"] = now
+            if jobs_dict.contains(f"cancel:{jid}") if hasattr(jobs_dict, "contains")                         else jobs_dict.get(f"cancel:{jid}") is not None:
+                token.cancel()         # cooperative: honored at the next check
+            _emit(jid, {"progress": asdict(p)})
+
+    token = CancelToken()
+    started = time.time()
+    pinned_key = None
+    _emit(jid, {"state": "running", "started": started})
+    prefetch_stop = threading.Event()
+    _prefetch_next(jid, prefetch_stop, ctx.series_cache,
+                   ctx.read_ahead, ctx._vol_lock)   # CPU downloader + pre-reader
+    try:
+        if meta.get("kind") == "prepare":
+            rep = Reporter.of(on_progress, cancel=token)
+            rep.stage("weights", meta["task"])
+            result = ctx._prepare(meta["task"])
+            _emit(jid, {"state": "done", "finished": time.time(), "result": result})
+            return
+        ctx._ensure(meta["task"])   # per-container weights provisioning (engine's own)
+        src = (meta.get("source") or [{"kind": "upload"}])[0]
+        kind = src.get("kind", "upload")
+        if kind != "upload":
+            rep = Reporter.of(on_progress, cancel=token)
+            ident = src.get("id") or src.get("crdc_series_uuid")
+            key = f"{kind}:{ident}"
+            ctx.series_cache.pin(key)
+            pinned_key = key
+            if ctx.series_cache.has(key):
+                how = "cached"
+            elif ctx.series_cache.staging(key):
+                how = "prefetched"
+            else:
+                how = "inline"
+            rep.stage("fetch", ident[:13] if how == "inline" else how)
+            t_f = time.time()
+            input_path = ctx.series_cache.get_or_fetch(
+                key, check=rep.check,
+                credentials=(source_tokens or {}).get(kind))
+            print(f"[fetch] {ident[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
+            rep.check()
+            preread = ctx.read_ahead.pop(key)
+            if preread is not None:
+                rep.stage("read", "preread")
+                print(f"[read] {ident[:13]} preread", flush=True)
+                input_path = preread
+        else:
+            preread = ctx.read_ahead.pop(jid)
+            if preread is not None:
+                rep2 = Reporter.of(on_progress, cancel=token)
+                rep2.stage("read", "preread")
+                print(f"[read] upload {jid} preread", flush=True)
+                input_path = preread
+            else:
+                with ctx._vol_lock:
+                    jobs_vol.reload()
+                input_path = next(jdir.glob("input_*"))
+        from nnseg.serve import RESULT_NAME, ResultCache
+        s = ctx._compute(input_path, meta, on_progress, token)
+        with ctx._vol_lock:
+            s.save(jdir / RESULT_NAME)
+            jobs_vol.commit()
+        result = {"names": {int(k): v for k, v in s.schema.names.items()},
+                  "volumes_ml": {k: round(float(v), 2)
+                                 for k, v in s.volumes_ml().items()},
+                  "provenance": s.provenance}
+        # The publication order (re-key, pair load, pending marker,
+        # cache put, done, overlap start) lives in one place -
+        # nnseg.serve.publish_completion; this side supplies the Dict
+        # markers, the volume commit, and _emit. The marker landing
+        # before the put also closes the last C8-class window here:
+        # the entry becomes visible at commit, and the marker must
+        # never trail it.
+        from nnseg.serve import publish_completion
+
+        def _migrate(old_key: str, new_key: str) -> None:
+            _release_inflight(old_key, jid)
+            _install_inflight(new_key, jid)
+            meta["cache_key"] = new_key
+            _emit(jid, {"cache_key": new_key})
+
+        def _set_pending(key: str) -> None:
+            _set_pending_marker(key, jid)
+
+        def _clear_pending(key: str) -> None:
+            _clear_pending_marker(key, jid)
+
+        def _put(key: str) -> None:
+            ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
+                key, jdir / RESULT_NAME, result,
+                {"identity": meta.get("input_identity"), "task": meta["task"],
+                 "options": meta.get("options"), "job": jid,
+                 "computed": started})
+            cache_vol.commit()
+
+        def _mark_done() -> None:
+            _emit(jid, {"state": "done", "finished": time.time(),
+                        "result": result})
+
+        def _start(pair, key: str) -> None:
+            threading.Thread(target=ctx._artifact_worker,
+                             args=(pair, key, jid, meta["task"]),
+                             name="nnseg-artifacts", daemon=True).start()
+
+        meta["cache_key"], _ = publish_completion(
+            segmenter=ctx.seg, task=meta["task"],
+            identity=tuple(meta.get("input_identity") or ()),
+            options=meta.get("options") or {},
+            cache_key=meta.get("cache_key"),
+            labels_path=jdir / RESULT_NAME, input_image=input_path,
+            artifacts=ARTIFACTS, cache_enabled=True,
+            migrate_key=_migrate, set_pending=_set_pending,
+            clear_pending=_clear_pending, put=_put,
+            mark_done=_mark_done, start_worker=_start)
+    except Cancelled:
+        _emit(jid, {"state": "cancelled", "finished": time.time()})
+        _clear_own_artifacts_marker(jid, meta)
+    except Exception as e:               # noqa: BLE001 - reported to the client
+        _emit(jid, {"state": "failed", "finished": time.time(),
+                    "error": f"{type(e).__name__}: {e}"})
+        _clear_own_artifacts_marker(jid, meta)   # a put that failed after
+    finally:                                     # set_pending must not 202
+        if pinned_key is not None:               # until the sweep
+            ctx.series_cache.unpin(pinned_key)
+        prefetch_stop.set()            # end the scan loop with the run
+        with ctx._vol_lock:
+            _bound_jobs_store(jid)
+        if meta.get("cache_key"):
+            _release_inflight(meta["cache_key"], jid)
+
+
 @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
          max_containers=MAX_CONTAINERS,
          volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
@@ -419,160 +587,102 @@ class Worker:
                          statistics_out=Path("/dev/shm") / f"stats_{jid}.json",
                          place=_place, finish=_finish)
 
+    # -- engine hooks (nnU-Net); _execute_job calls these ------------------
+    def _prepare(self, task: str) -> dict:
+        r = self.seg.prepare(task)
+        weights_vol.commit()
+        self._ensured.add(task)
+        return r
+
+    def _ensure(self, task: str) -> None:
+        if task not in self._ensured:
+            # Volume.commit scans the whole multi-GB weights tree, so ensure+
+            # commit once per container, not per job. seg.prepare is catalog-
+            # aware: ts, moose, native all install through it.
+            self.seg.prepare(task)
+            weights_vol.commit()
+            self._ensured.add(task)
+
+    def _compute(self, input_path, meta, on_progress, token):
+        return self.seg.segment(input_path, meta["task"], progress=on_progress,
+                                cancel=token, **(meta.get("options") or {}))
+
     @modal.method()
     def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
-        from dataclasses import asdict
+        _execute_job(self, jid, source_tokens)
 
-        from nnseg.errors import Cancelled
-        from nnseg.progress import CancelToken, Reporter
-        meta = jobs_dict.get(jid)
-        if meta is None or meta.get("state") == "cancelled":
-            return
-        jdir = Path(JOBS_ROOT) / jid
-        last = {"t": 0.0}
 
-        def on_progress(p):
-            now = time.time()
-            if now - last["t"] >= 0.25 or p.stage in ("restore", "finalize"):
-                last["t"] = now
-                if jobs_dict.contains(f"cancel:{jid}") if hasattr(jobs_dict, "contains")                         else jobs_dict.get(f"cancel:{jid}") is not None:
-                    token.cancel()         # cooperative: honored at the next check
-                _emit(jid, {"progress": asdict(p)})
+class _FastSurferShim:
+    """A Segmenter-shaped stand-in so publish_completion's re-key
+    (weights_versions_of -> describe) has a stable FastSurfer version."""
+    def describe(self, task):
+        return {"weights_installed": [{"id": "fastsurfer", "version": "vinn-v2"}]}
 
-        token = CancelToken()
-        started = time.time()
-        pinned_key = None
-        _emit(jid, {"state": "running", "started": started})
-        prefetch_stop = threading.Event()
-        _prefetch_next(jid, prefetch_stop, self.series_cache,
-                       self.read_ahead, self._vol_lock)   # CPU downloader + pre-reader
-        try:
-            if meta.get("kind") == "prepare":
-                rep = Reporter.of(on_progress, cancel=token)
-                rep.stage("weights", meta["task"])
-                result = self.seg.prepare(meta["task"])
-                weights_vol.commit()
-                self._ensured.add(meta["task"])
-                _emit(jid, {"state": "done", "finished": time.time(), "result": result})
-                return
-            if meta["task"] not in self._ensured:
-                # a Volume.commit scans the whole multi-GB weights tree - measured as
-                # a suspect in the 41.8 s warm gap - so ensure+commit once per
-                # container, not once per job. seg.prepare is catalog-aware:
-                # ts, moose, and native tasks all install through it.
-                self.seg.prepare(meta["task"])
-                weights_vol.commit()
-                self._ensured.add(meta["task"])
-            src = (meta.get("source") or [{"kind": "upload"}])[0]
-            kind = src.get("kind", "upload")
-            if kind != "upload":
-                rep = Reporter.of(on_progress, cancel=token)
-                ident = src.get("id") or src.get("crdc_series_uuid")
-                key = f"{kind}:{ident}"
-                self.series_cache.pin(key)
-                pinned_key = key
-                if self.series_cache.has(key):
-                    how = "cached"
-                elif self.series_cache.staging(key):
-                    how = "prefetched"
-                else:
-                    how = "inline"
-                rep.stage("fetch", ident[:13] if how == "inline" else how)
-                t_f = time.time()
-                input_path = self.series_cache.get_or_fetch(
-                    key, check=rep.check,
-                    credentials=(source_tokens or {}).get(kind))
-                print(f"[fetch] {ident[:13]} {how} {time.time() - t_f:.1f}s", flush=True)
-                rep.check()
-                preread = self.read_ahead.pop(key)
-                if preread is not None:
-                    rep.stage("read", "preread")
-                    print(f"[read] {ident[:13]} preread", flush=True)
-                    input_path = preread
-            else:
-                preread = self.read_ahead.pop(jid)
-                if preread is not None:
-                    rep2 = Reporter.of(on_progress, cancel=token)
-                    rep2.stage("read", "preread")
-                    print(f"[read] upload {jid} preread", flush=True)
-                    input_path = preread
-                else:
-                    with self._vol_lock:
-                        jobs_vol.reload()
-                    input_path = next(jdir.glob("input_*"))
-            from nnseg.serve import RESULT_NAME, ResultCache
-            s = self.seg.segment(input_path, meta["task"], progress=on_progress,
-                                 cancel=token, **(meta.get("options") or {}))
-            with self._vol_lock:
-                s.save(jdir / RESULT_NAME)
-                jobs_vol.commit()
-            result = {"names": {int(k): v for k, v in s.schema.names.items()},
-                      "volumes_ml": {k: round(float(v), 2)
-                                     for k, v in s.volumes_ml().items()},
-                      "provenance": s.provenance}
-            # The publication order (re-key, pair load, pending marker,
-            # cache put, done, overlap start) lives in one place -
-            # nnseg.serve.publish_completion; this side supplies the Dict
-            # markers, the volume commit, and _emit. The marker landing
-            # before the put also closes the last C8-class window here:
-            # the entry becomes visible at commit, and the marker must
-            # never trail it.
-            from nnseg.serve import publish_completion
+    def resolve_task(self, t):
+        return t
 
-            def _migrate(old_key: str, new_key: str) -> None:
-                _release_inflight(old_key, jid)
-                _install_inflight(new_key, jid)
-                meta["cache_key"] = new_key
-                _emit(jid, {"cache_key": new_key})
 
-            def _set_pending(key: str) -> None:
-                _set_pending_marker(key, jid)
+if FASTSURFER:
+    @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
+             max_containers=MAX_CONTAINERS, image=fs_image,
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol})
+    class FastSurferWorker:
+        """The FastSurfer engine worker: same _execute_job scheduler as Worker,
+        different image + compute. Reuses nnseg serve-core (fetch/stage/cache/
+        publish/artifacts) mounted into the FastSurfer image."""
 
-            def _clear_pending(key: str) -> None:
-                _clear_pending_marker(key, jid)
+        @modal.enter()
+        def setup(self):
+            import sys
+            _pkg_dir()                              # nnseg on the path
+            sys.path.insert(0, "/opt/FastSurfer")   # FastSurferCNN importable
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            os.environ["FASTSURFER_HOME"] = "/opt/FastSurfer"
+            from nnseg.serve import ReadAhead, SeriesCache
+            from nnseg.sources import registry
+            self._sources = registry(None)
 
-            def _put(key: str) -> None:
-                ResultCache(CACHE_ROOT, keep=RESULTS_KEEP).put(
-                    key, jdir / RESULT_NAME, result,
-                    {"identity": meta.get("input_identity"), "task": meta["task"],
-                     "options": meta.get("options"), "job": jid,
-                     "computed": started})
-                cache_vol.commit()
+            def fetch_source(key, entry, credentials=None):
+                prefix, ident = key.split(":", 1)
+                if credentials is not None:
+                    return self._sources[prefix].fetch(ident, entry, credentials=credentials)
+                return self._sources[prefix].fetch(ident, entry)
 
-            def _mark_done() -> None:
-                _emit(jid, {"state": "done", "finished": time.time(),
-                            "result": result})
+            self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
+                                            budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
+            self.read_ahead = ReadAhead()
+            self._vol_lock = threading.Lock()
+            self._ensured = set()
+            self.seg = _FastSurferShim()
 
-            def _start(pair, key: str) -> None:
-                threading.Thread(target=self._artifact_worker,
-                                 args=(pair, key, jid, meta["task"]),
-                                 name="nnseg-artifacts", daemon=True).start()
+        _artifact_worker = Worker._artifact_worker   # identical overlap logic
 
-            meta["cache_key"], _ = publish_completion(
-                segmenter=self.seg, task=meta["task"],
-                identity=tuple(meta.get("input_identity") or ()),
-                options=meta.get("options") or {},
-                cache_key=meta.get("cache_key"),
-                labels_path=jdir / RESULT_NAME, input_image=input_path,
-                artifacts=ARTIFACTS, cache_enabled=True,
-                migrate_key=_migrate, set_pending=_set_pending,
-                clear_pending=_clear_pending, put=_put,
-                mark_done=_mark_done, start_worker=_start)
-        except Cancelled:
-            _emit(jid, {"state": "cancelled", "finished": time.time()})
-            _clear_own_artifacts_marker(jid, meta)
-        except Exception as e:               # noqa: BLE001 - reported to the client
-            _emit(jid, {"state": "failed", "finished": time.time(),
-                        "error": f"{type(e).__name__}: {e}"})
-            _clear_own_artifacts_marker(jid, meta)   # a put that failed after
-        finally:                                     # set_pending must not 202
-            if pinned_key is not None:               # until the sweep
-                self.series_cache.unpin(pinned_key)
-            prefetch_stop.set()            # end the scan loop with the run
-            with self._vol_lock:
-                _bound_jobs_store(jid)
-            if meta.get("cache_key"):
-                _release_inflight(meta["cache_key"], jid)
+        def _prepare(self, task: str) -> dict:
+            return {"engine": "fastsurfer", "task": task, "note": "checkpoints self-provision"}
+
+        def _ensure(self, task: str) -> None:
+            return None                              # FastSurfer downloads on first run
+
+        def _compute(self, input_path, meta, on_progress, token):
+            from nnseg.engines import fastsurfer
+            out = Path("/dev/shm") / f"fs_{meta['id']}"
+            out.mkdir(parents=True, exist_ok=True)
+            return fastsurfer.segment(input_path, out_dir=str(out), device="cuda")
+
+        @modal.method()
+        def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
+            _execute_job(self, jid, source_tokens)
+
+
+def _spawn_worker(task: str, jid: str, source_tokens=None):
+    """Dispatch to the engine that owns this task. fastsurfer:* -> the FastSurfer
+    worker (if the deployment enabled it); everything else -> the nnU-Net Worker."""
+    if str(task).startswith("fastsurfer:"):
+        if not FASTSURFER:
+            raise RuntimeError("the fastsurfer engine is not enabled on this "
+                               "deployment (set NNSEG_FASTSURFER=1 at deploy)")
+        return FastSurferWorker().run_job.spawn(jid, source_tokens=source_tokens)
+    return Worker().run_job.spawn(jid, source_tokens=source_tokens)
 
 
 class ModalExecutor:
@@ -593,7 +703,7 @@ class ModalExecutor:
         meta = {"id": jid, "task": task, "options": {}, "kind": "prepare",
                 "state": "queued", "created": time.time(), "source": []}
         jobs_dict[jid] = meta
-        Worker().run_job.spawn(jid)
+        _spawn_worker(task, jid)
         return meta
 
     def artifact_state(self, key: str) -> str:
@@ -685,7 +795,7 @@ class ModalExecutor:
         jobs_dict[jid] = meta
         if key:
             jobs_dict[f"inflight:{key}"] = jid
-        call = Worker().run_job.spawn(jid, source_tokens=source_tokens)
+        call = _spawn_worker(task, jid, source_tokens)
         _emit(jid, {"call_id": call.object_id})   # merge, never clobber worker emits
         return meta
 

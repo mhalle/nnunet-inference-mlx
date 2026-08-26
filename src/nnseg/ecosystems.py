@@ -282,6 +282,36 @@ def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None,
         shutil.rmtree(staging, ignore_errors=True)
 
 
+class FastSurferEcosystem(ModelEcosystem):
+    """FastSurfer whole-brain parcellation as an ENGINE (2.5D view-aggregation,
+    not nnU-Net). It appears in the catalog so ``fastsurfer:brain`` resolves,
+    lists and describes; it self-provisions its checkpoints at run time, and
+    ``spec()`` refuses because there is no TaskSpec - the FastSurfer worker runs
+    it through :mod:`nnseg.engines.fastsurfer`, not the nnU-Net pipeline."""
+
+    name = "fastsurfer"
+    description = "FastSurfer whole-brain parcellation (engine)"
+
+    def tasks(self) -> list:
+        return ["brain"]
+
+    def materialized(self, task: str, root) -> bool:
+        return True                      # checkpoints self-download on first run
+
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        return None
+
+    def spec(self, task: str, root):
+        from .errors import UnsupportedModel
+        raise UnsupportedModel(
+            "fastsurfer is an engine, not an nnU-Net task; it runs on a "
+            "FastSurfer-enabled worker via nnseg.engines.fastsurfer, not a TaskSpec")
+
+    def info(self, task: str, root) -> dict:
+        return {"ecosystem": "fastsurfer", "engine": True, "modality": "MR (T1)",
+                "structures": "~95 FreeSurfer aparc+aseg (DKTatlas)"}
+
+
 def registry(ecosystems=None) -> dict:
     """Normalize a list of ecosystems into ``{name: ecosystem}``. Duplicate
     ecosystem names are rejected; duplicate *task* names across ecosystems are
@@ -296,7 +326,11 @@ def registry(ecosystems=None) -> dict:
 
 
 def default_ecosystems() -> list:
-    return [TSEcosystem(), MooseEcosystem()]
+    import os
+    ecos = [TSEcosystem(), MooseEcosystem()]
+    if os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", ""):
+        ecos.append(FastSurferEcosystem())
+    return ecos
 
 
 class EcosystemCatalog:

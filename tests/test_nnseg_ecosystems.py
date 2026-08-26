@@ -177,3 +177,16 @@ def test_moose_extract_is_atomic_and_digest_checked(tmp_path):
     assert (dest / "Dataset001" / "dataset.json").exists()
     assert (dest / "Dataset001" / "fold_0" / "checkpoint.pth").exists()
     assert not list(dest.glob(".unzip-*"))     # staging cleaned
+
+
+def test_fastsurfer_ecosystem_lists_but_refuses_spec(tmp_path):
+    """FastSurfer is an engine: it resolves/lists/describes, but spec() refuses
+    (no TaskSpec - it runs on a FastSurfer worker, not the nnU-Net pipeline)."""
+    from nnseg.ecosystems import EcosystemCatalog, FastSurferEcosystem
+    from nnseg.errors import UnsupportedModel
+    cat = EcosystemCatalog([FastSurferEcosystem()], root=tmp_path)
+    assert cat.resolve("fastsurfer:brain")[2] == "fastsurfer:brain"
+    assert cat.resolve("brain")[2] == "fastsurfer:brain"
+    assert cat.info("fastsurfer:brain")["engine"] is True
+    with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
+        cat.get("fastsurfer:brain")
