@@ -225,13 +225,18 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
     from ..result import Segmentation
     from ..values import LabelSchema
 
+    import time
+
     if isinstance(t1_input, sitk.Image):
         t1_img = t1_input                             # memory-in (read-ahead / caller)
     else:
         from .. import io
         t1_img = io.read_image(str(t1_input))         # path: geometry-correct read
+    timings: dict[str, float] = {}
+    _t = time.perf_counter()
     logit_zyx, conf_orig, fs_labels_zyx, class_labels = _capture_logits(
         t1_img, str(out_dir), device)
+    timings["capture"] = time.perf_counter() - _t     # conform + VINN inference + model load
 
     def to_fs(idx_zyx):
         m = du.map_label2aparc_aseg(torch.from_numpy(idx_zyx.astype(np.int64)),
@@ -257,7 +262,9 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
           f"t1_ext={tlo.round(1)}..{thi.round(1)}", flush=True)
 
     if logit_grade:
+        _t = time.perf_counter()
         idx_native = restore_logits(logit_zyx, conf_orig, t1_img)
+        timings["restore"] = time.perf_counter() - _t   # per-channel physical-space resample + argmax
         labels_arr = to_fs(idx_native)                # (Z,Y,X) FreeSurfer ids on input grid
         nfg = int((labels_arr > 0).sum())
         print(f"[fastsurfer] restored foreground voxels={nfg}/{labels_arr.size}", flush=True)
@@ -289,5 +296,5 @@ def segment(t1_input, *, out_dir, device: str = "cuda",
             "self_check": "reproduces FastSurfer labels at conformed grid" if self_check else "skipped",
             "device": device}
     seg = Segmentation(labels=out_img, schema=LabelSchema(names=names),
-                       grid=grid, spec=None, timings={}, provenance=prov)
+                       grid=grid, spec=None, timings=timings, provenance=prov)
     return seg
