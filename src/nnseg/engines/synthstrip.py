@@ -1,25 +1,18 @@
 """SynthStrip brain extraction (skull-strip) as an nnseg engine.
 
 SynthStrip is a contrast-agnostic learned brain-mask generator (a small 3D UNet,
-Hoopes et al. 2022) - a different algorithm family from nnU-Net and FastSurfer. A
-light engine: torch + numpy + scipy + SimpleITK + surfa + the vendored
-:mod:`._synthstrip_model` (~80 lines) + a 29 MB ``model_state_dict``. No FreeSurfer,
-no FastSurferCNN.
+Hoopes et al. 2022) - a different algorithm family from nnU-Net and FastSurfer.
 
-**Conform uses surfa - the engine's OWN trained-input conform, not a reimplementation.**
-An earlier SimpleITK approximation under-segmented the inferior brain (cerebellum):
-`mri_synthstrip` feeds ``conformed.data`` to the net directly, so surfa's LIA array
-order IS the trained contract, and a different axis order degrades the mask. Lesson
-repeated from FastSurfer: use the engine's own conform. (surfa is pure-Python+numpy,
-no FreeSurfer binaries - still far leaner than the FastSurfer image.)
+**The model + conform now live in the standalone ``synthstrip-torch`` package**
+(mirroring how FastSurfer's CNN lives in ``fastsurfer-lean``): it owns the surfa
+trained-conform and the net, and returns the signed distance transform (SDT). This
+module is the thin nnseg ADAPTER: it keeps the restore geometry (physical-space
+``grid_sample``, shared with FastSurfer), the mask cleanup, and the wrapping into an
+nnseg :class:`~nnseg.result.Segmentation`, plus the result-cache weights identity.
 
-Shape mirrors :mod:`nnseg.engines.fastsurfer` (current per-engine pattern; the
-Ecosystem/Engine re-architecture is a later holistic pass): surfa conform (1 mm,
-LIA, crop-to-bbox, pad-to-64, norm) -> run the net -> a signed distance transform
-(SDT) -> hand the conformed SDT back through a surfa-save/SimpleITK-read (so no
-manual axis conversion) -> restore the *graded* SDT to the input grid (physical-
-space ``grid_sample``, reusing the FastSurfer restore geometry) -> threshold +
-largest-component -> a 1-label brain mask :class:`nnseg.result.Segmentation`.
+Flow: ``synthstrip_torch.predict_sdt`` (surfa conform 1 mm/LIA + net -> conformed
+SDT handed back as a SimpleITK image) -> restore the *graded* SDT to the input grid
+-> threshold at ``border`` mm + largest filled component -> a 1-label brain mask.
 """
 from __future__ import annotations
 
@@ -29,9 +22,6 @@ import numpy as np
 
 WEIGHTS_ID = "synthstrip"
 WEIGHTS_VERSION = "v1"                       # synthstrip.1.pt (MGH, 2022-04-28)
-MODEL_URL = ("https://ftp.nmr.mgh.harvard.edu/pub/dist/freesurfer/synthstrip/"
-             "models/synthstrip.1.pt")
-DEFAULT_MODEL_PATH = "/opt/synthstrip/synthstrip.1.pt"   # baked into the worker image
 BRAIN_LABEL = 1
 
 
@@ -42,34 +32,14 @@ def weights_installed() -> list[dict]:
     return [{"id": WEIGHTS_ID, "version": WEIGHTS_VERSION}]
 
 
-_MODELS: dict = {}                           # device -> StripModel, cached across jobs
-
-
 def _get_model(device: str):
-    """Build StripModel and load the bundled weights ONCE per device (the model
-    is input-independent). Weights path: ``NNSEG_SYNTHSTRIP_MODEL`` or the baked
-    default; loaded with ``weights_only=True`` (no pickle execution)."""
-    import torch
+    """The cached SynthStrip net for ``device`` (built + weights loaded once per
+    device by ``synthstrip_torch``). ``NNSEG_SYNTHSTRIP_MODEL`` overrides the
+    weights path; otherwise the package fetches + caches ``synthstrip.1.pt``."""
+    import synthstrip_torch
 
-    key = str(device)
-    m = _MODELS.get(key)
-    if m is not None:
-        return m
-    from ._synthstrip_model import StripModel
-
-    path = os.environ.get("NNSEG_SYNTHSTRIP_MODEL", DEFAULT_MODEL_PATH)
-    if not os.path.exists(path):
-        raise RuntimeError(
-            f"SynthStrip weights not found at {path!r}; bake {MODEL_URL} into the "
-            "image or set NNSEG_SYNTHSTRIP_MODEL to its path")
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    sd = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    m = StripModel()
-    m.load_state_dict(sd)
-    m.eval()
-    m = m.to(device)
-    _MODELS[key] = m
-    return m
+    return synthstrip_torch.load_model(
+        path=os.environ.get("NNSEG_SYNTHSTRIP_MODEL"), device=device)
 
 
 def _resample_affine(source_ref, target_ref):
@@ -137,41 +107,12 @@ def restore_sdt_cpu(sdt_zyx, source_ref, target_ref, outside=100.0):
 
 
 def _capture_sdt(t1_img, device: str):
-    """SynthStrip's own (surfa) conform + the cached model -> the SDT field in the
-    conformed frame, handed back as a SimpleITK image so the restore needs no
-    manual surfa->SITK axis conversion (surfa writes it, SimpleITK reads it).
-    Mirrors ``mri_synthstrip`` exactly: conform 1 mm / LIA / crop-to-bbox / reshape
-    to a multiple of 64 in [192,320] / normalize; feed ``conformed.data`` to the
-    net. Returns ``(sdt_zyx, sdt_sitk)`` - the array (z,y,x) and its geometry."""
-    import os
-    import tempfile
+    """SynthStrip's conform + net via ``synthstrip_torch`` -> ``(sdt_zyx, sdt_sitk)``:
+    the SDT array ``(z,y,x)`` and its geometry as a SimpleITK image (so the restore
+    needs no manual axis conversion)."""
+    import synthstrip_torch
 
-    import SimpleITK as sitk
-    import surfa as sf
-    import torch
-
-    model = _get_model(device)
-    with tempfile.TemporaryDirectory() as td:
-        ti = os.path.join(td, "in.nii.gz")
-        sitk.WriteImage(t1_img, ti)                       # input (small) -> surfa's file reader
-        image = sf.load_volume(ti)
-        conformed = image.conform(voxsize=1.0, dtype="float32", method="nearest",
-                                  orientation="LIA").crop_to_bbox()
-        tgt = np.clip(np.ceil(np.array(conformed.shape[:3]) / 64).astype(int) * 64, 192, 320)
-        conformed = conformed.reshape(tgt)
-        conformed -= conformed.min()
-        conformed = (conformed / conformed.percentile(99)).clip(0, 1)
-        with torch.no_grad():
-            inp = torch.from_numpy(conformed.data[np.newaxis, np.newaxis]).to(device)
-            sdt = model(inp).squeeze().float().cpu().numpy()
-        so = os.path.join(td, "sdt.nii.gz")
-        conformed.new(sdt).save(so)                       # surfa writes correct geometry
-        sdt_sitk = sitk.ReadImage(so)                     # SimpleITK reads it back (z,y,x + geom)
-    return sitk.GetArrayFromImage(sdt_sitk).astype(np.float32), sdt_sitk
-
-
-def _fs_version() -> str:
-    return WEIGHTS_VERSION
+    return synthstrip_torch.predict_sdt(t1_img, model=_get_model(device), device=device)
 
 
 def segment(t1_input, *, out_dir=None, device: str = "cuda", restore: str = "auto",

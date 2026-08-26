@@ -117,23 +117,23 @@ fs_image = (
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
 
-# SynthStrip engine image (built only when enabled): the LIGHTEST engine - its
-# deps (torch/numpy/scipy/SimpleITK) are the same as nnseg's, and the model is
-# vendored in nnseg.engines._synthstrip_model, so the image is just those deps +
-# obstore (source fetch) + the baked 29 MB weights + the mounted nnseg pkg.
+# SynthStrip engine image (built only when enabled): installs our standalone
+# `synthstrip-torch` package from git (like fastsurfer-lean), which brings the model +
+# surfa trained-conform + its deps (torch/numpy<2/surfa/SimpleITK). scipy is nnseg's
+# (mask cleanup), obstore the source fetch, matplotlib the serve-core preview. The 29 MB
+# weights are fetched at BUILD (baked into the default cache) so there is no cold-start
+# download. numpy<2 comes from synthstrip-torch (surfa's reorient breaks on numpy 2.x).
 synthstrip_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("curl")
-    # numpy pinned <2: surfa's reorient breaks on numpy 2.x (stricter array
-    # assignment), and surfa declares no cap, so it would otherwise resolve to 2.x.
-    .uv_pip_install("torch>=2.7", "numpy>=1.24,<2", "scipy", "SimpleITK>=2.3", "obstore",
-                    "matplotlib",   # serve-core render_preview imports it (artifact overlap)
-                    "surfa")        # SynthStrip's own trained-input conform (not reimplemented)
-    .run_commands(
-        "mkdir -p /opt/synthstrip",
-        "curl -sSL -o /opt/synthstrip/synthstrip.1.pt "
-        "https://ftp.nmr.mgh.harvard.edu/pub/dist/freesurfer/synthstrip/models/synthstrip.1.pt",
+    .apt_install("git")                       # uv needs git to install the git+ dep below
+    .uv_pip_install(
+        "synthstrip-torch @ git+https://github.com/mhalle/synthstrip-torch.git"
+        "@1b871fb1f98fbe60ed1efe87de34a8703a106b44",
+        "scipy", "obstore",
+        "matplotlib",   # serve-core render_preview imports it (artifact overlap)
     )
+    # Bake the weights into the package's default cache so first request isn't a download.
+    .run_commands("python -c 'import synthstrip_torch; synthstrip_torch.fetch_weights()'")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )

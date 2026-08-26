@@ -1,6 +1,7 @@
-"""SynthStrip engine: geometry (SDT restore), conform shape, the vendored model,
-and the weights identity - all with synthetic data, no real weights or GPU. The
-model-dependent compute is validated by the live Modal smoke."""
+"""SynthStrip engine: geometry (SDT restore) and the weights identity - synthetic
+data, no real weights or GPU. The model itself lives in the standalone synthstrip-torch
+package (its arch test skips where that isn't installed); model-dependent compute is
+validated by the live Modal smoke."""
 import numpy as np
 import pytest
 
@@ -28,8 +29,11 @@ def test_weights_installed_is_the_cache_key_identity():
 
 
 def test_stripmodel_state_dict_roundtrips_and_forward_is_one_channel():
+    # The model now lives in the standalone synthstrip-torch package (installed only in
+    # the synthstrip engine env); skip where it isn't present (e.g. CI's mlx-free scope).
     torch = pytest.importorskip("torch")
-    from nnseg.engines._synthstrip_model import StripModel
+    pytest.importorskip("synthstrip_torch")
+    from synthstrip_torch.model import StripModel
     m = StripModel()
     m2 = StripModel()
     missing, unexpected = m2.load_state_dict(m.state_dict(), strict=True)

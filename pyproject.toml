@@ -53,11 +53,13 @@ test = ["pytest", "pydicom", "fastapi", "httpx", "python-multipart"]
 # numpy>=2 anchors the "numpy-2 world" (the GPU/nnU-Net path, tested on 2.x) so it forks
 # cleanly from the synthstrip engine's numpy<2 - see [tool.uv] conflicts below.
 torch = ["torch>=2.7", "nnunetv2", "scipy", "scikit-image", "numpy>=2"]
-# The SynthStrip engine (nnseg.engines.synthstrip): its OWN environment. surfa is SynthStrip's
-# trained-input conform, and surfa's reorient needs numpy<2 - genuinely incompatible with the
-# torch extra's numpy>=2. Declared conflicting below so uv forks them into ONE universal lock;
-# materialize this engine on its own: `UV_PROJECT_ENVIRONMENT=.venvs/synthstrip uv sync --extra synthstrip`.
-synthstrip = ["torch>=2.7", "surfa", "numpy<2", "scipy"]
+# The SynthStrip engine: the model + conform live in the standalone `synthstrip-torch`
+# package (like fastsurfer-lean; git rev in [tool.uv.sources]), which brings torch + surfa +
+# numpy<2 + SimpleITK. scipy is nnseg's (the post-restore mask cleanup). surfa's reorient
+# needs numpy<2 - genuinely incompatible with the torch extra's numpy>=2, so this extra is
+# declared conflicting below and uv forks them into ONE universal lock; materialize this engine
+# on its own: `UV_PROJECT_ENVIRONMENT=.venvs/synthstrip uv sync --extra synthstrip`.
+synthstrip = ["synthstrip-torch", "scipy"]
 # The FastSurfer engine, installed pip-style from our slimmed fork `fastsurfer-lean`
 # (mhalle/fastsurfer-lean - FastSurfer's parcellation CNN only, packaging fixed so
 # FastSurferCNN's subpackages ship; git rev in [tool.uv.sources]). This replaces the
@@ -98,6 +100,9 @@ nnunetv2 = { path = "../upstream/nnUNet", editable = true }
 # fastsurfer-lean = our slimmed FastSurfer fork (parcellation CNN only, packaging fixed).
 # Pinned to the slim branch's rev; import namespace stays FastSurferCNN.
 fastsurfer-lean = { git = "https://github.com/mhalle/fastsurfer-lean.git", rev = "041062008b1276b2fb21c886d6943f7bfc3bba6e" }
+# synthstrip-torch = our standalone SynthStrip inference package (StripModel + surfa conform
+# + SDT; weights fetched from MGH at runtime). Import namespace: synthstrip_torch.
+synthstrip-torch = { git = "https://github.com/mhalle/synthstrip-torch.git", rev = "1b871fb1f98fbe60ed1efe87de34a8703a106b44" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
