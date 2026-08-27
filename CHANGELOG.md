@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+- **Named inputs, typed parameters, introspection (nnseg).** A task now publishes
+  what it takes: `describe()` carries `inputs` (roles), `parameters` grouped by
+  owner (the algorithm's knobs vs ours, as real JSON Schema), and `behavior` -
+  read-only facts about what an engine does that a caller cannot change. Sources
+  bind to roles **by name, never by position**: MONAI's BraTS bundle orders its
+  channels T1c-first while nnU-Net's own convention puts FLAIR there, so a
+  positional wire would silently mis-serve one of them. New `nnseg.schemas`
+  generates the published schema and enforces it from one declaration; pydantic
+  becomes a core dependency but stops at the wire. Options outside a task's
+  schema are now refused at submit, which means `device`/`dtype`/`weights`/
+  `batch_size`/`accumulate` are no longer settable remotely - deployment policy,
+  not per-request knobs.
+
+- **A content-addressed input store (nnseg).** Upload once, refer by digest
+  thereafter: `GET/PUT /v1/inputs/{digest}`, `POST /v1/inputs` for a DICOM series
+  (parts or a zip) as one tree, and a `{"kind":"input","sha256":...}` source. The
+  server does the addressing - a declared digest is checked, never trusted. A
+  blob's key is exactly the pre-existing upload identity, so no cached result
+  moved. A tree's key is rooted in the sorted digests of its members, so it
+  survives arrival order, filenames and zip metadata.
+
+- **Results carry their content digest.** A finished job publishes `outputs`; the
+  ETag is that digest and `If-None-Match` is honored (304), so a client stops
+  re-downloading label volumes it already holds. `POST /v1/inputs?from_job=<id>`
+  promotes a result into the input store, so one job's output can be another's
+  input without the bytes routing through the client.
+
+- **MONAI bundles can be multi-channel.** The engine takes a role->image mapping,
+  orders channels by the bundle's own `channel_def`, and refuses inputs that do
+  not share a grid - nnseg does not register images, and says so in the task's
+  `behavior.alignment`. `brats_mri_segmentation` is curated as the first
+  multi-input task. A region head (overlapping output channels, no `background`
+  entry) is no longer read as a labelmap on either side.
+
+- **Fixed: engine workers published results under a key nobody computes.** Every
+  MONAI job recomputed forever - the worker's describe shim reported "unknown"
+  weights for an engine whose identity is per task, so `publish_completion`
+  re-keyed the result onto a key the API never computes. Its docstring already
+  claimed the two "cannot drift"; there is now a test that checks it.
+
+- **Modal:** a new `nnseg-inputs` Volume for the input store, mounted on the API
+  function and every worker; the `jobs` volume is now `scratch`.
+
 - **Engine / Ecosystem split (nnseg).** The two ideas that one class used to carry
   are now separate: an **ecosystem** is the user-facing *catalog* (`ts`, `moose`,
   `custom`, `fastsurfer`, `synthstrip`, keeping the `eco:task@version` grammar) and

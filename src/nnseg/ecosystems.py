@@ -23,7 +23,9 @@ The nnU-Net catalogs:
 - ``custom`` - local model folders the operator registers explicitly.
 
 Engine catalogs (present only where their engine is enabled, so the catalog can
-never list a task no worker can run): ``fastsurfer``, ``synthstrip``.
+never list a task no worker can run): ``fastsurfer``, ``synthstrip``,
+``voxtell`` (free-text prompts), ``monai`` (the model-zoo bundles - the first
+catalog of many tasks on a NEW engine, and the first with multi-input models).
 
 An :class:`EcosystemCatalog` federates a registry of ecosystems behind the
 same interface :class:`nnseg.tasks.TaskCatalog` exposes, so ``Segmenter`` and

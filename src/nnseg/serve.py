@@ -9,7 +9,9 @@ contract is deliberately small:
     GET    /v1/tasks               task names
     GET    /v1/tasks/{task}        describe: structures, modality, weights
     POST   /v1/jobs                task + input (+ options JSON) -> {id}; the input is a
-                                   one-element `source` list - {"kind": "upload"} (the
+                                   `source` list - one entry for most tasks, one
+                                   PER DECLARED ROLE for a multi-input model,
+                                   each {"kind": "upload"} (the
                                    default; multipart part "file") or {"kind": "idc",
                                    "crdc_series_uuid": ...} (the server fetches from
                                    the public IDC buckets; needs the idc extra). A bare
@@ -539,10 +541,17 @@ class ReadAhead:
 
 
 class ResultCache:
-    """Content-keyed store of finished results: <root>/<key>/labels.seg.nrrd +
+    """REQUEST-keyed store of finished results: <root>/<key>/labels.seg.nrrd +
     result.json + meta.json (the readable key components - a cache you can ls).
     LRU by directory mtime, count-bounded; results are ~MBs so the bound is
-    generous by default."""
+    generous by default.
+
+    The key is :func:`result_key` - a digest of the REQUEST (identity x task x
+    options x weights x version), not of the bytes. That distinction matters now
+    that content addressing exists next door: :mod:`nnseg.content` keys on what
+    the bytes ARE, this keys on what was asked for. A finished job publishes the
+    content digest of its output in ``outputs``, which is what an ETag and a
+    chained input refer to."""
 
     def __init__(self, root, *, keep: int = 500):
         self.root = Path(root).expanduser()

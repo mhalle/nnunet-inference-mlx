@@ -91,7 +91,7 @@ Each Modal image installs **only the extras its role needs**, via
 
 Consequences to respect:
 - **A dependency in `[project] dependencies` (core) weighs down *every* image.** Keep core
-  minimal (`numpy, tqdm, typer, SimpleITK`). This is why **mlx is an extra, not core** — the
+  minimal (`numpy, tqdm, typer, SimpleITK, pydantic`). This is why **mlx is an extra, not core** — the
   torch product installs mlx-free everywhere.
 - **A dependency in an extra weighs down every image that installs that extra.** Put a dep in
   the *narrowest* extra that needs it (e.g. `triton` is in `cuda`, not `torch`; `matplotlib`
@@ -112,6 +112,47 @@ Consequences to respect:
 - `--no-install-project` (implicit in Modal's `uv_sync`) — nnseg is **mounted**
   (`add_local_dir` + the `_pkg_dir()` `sys.path` shim), not installed, so a code edit does not
   rebuild the dependency layer.
+
+## When core does grow — the pydantic precedent (2026-08-27)
+
+Core gained one dependency since this document was written, and the reasoning is
+the standard to hold the next one to.
+
+`nnseg.schemas` declares each task's parameters as pydantic models, and one
+declaration then produces three things: the JSON Schema `describe()` publishes,
+the validation `POST /v1/jobs` enforces, and (through FastAPI response models)
+the OpenAPI document. The alternative — a hand-written schema dict beside a
+hand-written validator — is the same failure shape as a hand-maintained label
+list: two copies of one truth that drift, and the drift is silent.
+
+It was **measured before it was accepted**, not argued:
+
+| | import | on disk |
+|---|---|---|
+| pydantic + pydantic-core | 27 ms | 7.8 MB |
+| SimpleITK *(already core)* | 58 ms | 183 MB |
+| numpy *(already core)* | 29 ms | — |
+
+A twenty-third the size of a dependency core already requires, importing faster
+than numpy, and **already present wherever the `serve` extra is installed**,
+because FastAPI depends on it. So the marginal cost is confined to the engine
+images, which carry torch.
+
+Two conditions came with it, and both still hold:
+
+1. **It stops at the wire.** `schemas.py` and `serve.py` only. It must not reach
+   the value types (`Segmentation`, `Grid`, `LabelSchema`) or the kernel layer —
+   those are frozen dataclasses on a hot path with no untrusted input, where
+   validation is a cost with no reader. `tests/test_nnseg_layering.py` keeps the
+   kernel torch+numpy-only, which also keeps pydantic out of it.
+2. **It does not join the eager import path.** `import nnseg` still pulls neither
+   torch nor pydantic (`test_importing_nnseg_is_torch_free` checks the first;
+   the registry is imported lazily, which keeps the second).
+
+The honest cost recorded for later: pydantic's v1→v2 migration was disruptive,
+and this makes the project structurally exposed to their next major. `serve`
+already bound us to pydantic v2 through FastAPI, so making it core widened the
+blast radius without adding a new exposure — but it did widen it.
 
 ## Rule 6 — engine dependencies are self-describing
 
