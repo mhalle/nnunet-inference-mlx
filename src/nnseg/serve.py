@@ -666,6 +666,27 @@ class QueueFull(NnsegError):
     """The pending queue is at its bound; the caller should retry later."""
 
 
+def _local_scratch():
+    """A container-LOCAL staging directory, deliberately not on any volume.
+
+    Ingest hashes what it receives and then adopts the file into the content
+    store. Staging that on a snapshot-consistent volume means a concurrent reload
+    can truncate the very bytes being hashed - and guarding against it with the
+    volume lock is worse than the disease on an async route: the lock would be
+    held across an await on the NETWORK, so a second upload blocks the event loop
+    acquiring it while the first waits to be resumed to release it. Neither
+    request can finish.
+
+    Staging locally removes the hazard instead of serializing around it. Nothing
+    here needs to be visible to another container: only the adopt into the
+    content store does, and that has its own lock and no awaits inside it.
+    """
+    import tempfile
+    shm = Path("/dev/shm")
+    return tempfile.mkdtemp(prefix="nnseg-ingest-",
+                            dir=str(shm) if shm.is_dir() else None)
+
+
 def _write_guard(executor):
     """The guard a write into the job directory must hold.
 
@@ -1717,7 +1738,14 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     @app.get("/v1/inputs/{digest}")
     def input_status(digest: str, request: Request):
         """Whether this server already holds that content - the call a client
-        makes before deciding whether an upload is needed at all."""
+        makes before deciding whether an upload is needed at all.
+
+        Authenticated: a 200 here confirms that somebody uploaded exactly these
+        bytes, which is a fact about another caller's data even though it hands
+        none of it back. Anonymous has no legitimate use for it - it can neither
+        compute nor store - so it does not get to ask.
+        """
+        require_auth(request)
         store = _store_or_404()
         if not is_digest(digest):
             raise HTTPException(422, {
@@ -1759,13 +1787,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                            "to /v1/inputs; this route takes single blobs, whose "
                            "digest a client can compute before sending"})
         import tempfile
-        jid, jdir = executor.new_job_dir()  # a scratch dir on the right filesystem
+        work = _local_scratch()
         try:
-            fd, tmp = tempfile.mkstemp(dir=jdir)
+            fd, tmp = tempfile.mkstemp(dir=work)
             os.close(fd)
             tmp = Path(tmp)
             h = hashlib.sha256()
-            with _write_guard(executor), open(tmp, "wb") as f:
+            with open(tmp, "wb") as f:
                 async for chunk in request.stream():
                     h.update(chunk)
                     f.write(chunk)
@@ -1790,8 +1818,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             return {"digest": actual, "stored": True, "stored_as": Path(name).name,
                     "bytes": tmp.stat().st_size}
         finally:
-            import shutil
-            shutil.rmtree(jdir, ignore_errors=True)
+            _discard(work)
 
     @app.post("/v1/inputs")
     async def post_input(request: Request, kind: str | None = None,
@@ -1852,14 +1879,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if kind not in (None, "tree", "blob"):
             raise HTTPException(422, {"code": "bad_kind",
                                       "message": "kind must be 'tree' or 'blob'"})
-        import shutil
-        jid, work = executor.new_job_dir()
+        work = Path(_local_scratch())
         try:
             staged = work / "in"
             staged.mkdir()
             for i, up in enumerate(uploads):
                 name = Path(getattr(up, "filename", None) or f"part{i}").name
-                with _write_guard(executor), open(staged / f"{i}_{name}", "wb") as f:
+                with open(staged / f"{i}_{name}", "wb") as f:
                     while chunk := await up.read(1 << 20):
                         f.write(chunk)
             files = sorted(staged.iterdir())
@@ -1875,8 +1901,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             if len(files) == 1 and kind != "blob" and _is_zip(files[0]):
                 unpacked = work / "unpacked"
                 try:
-                    with _write_guard(executor):
-                        files = sorted(content.extract_zip(files[0], unpacked))
+                    files = sorted(content.extract_zip(files[0], unpacked))
                 except content.ArchiveError as e:
                     raise HTTPException(422, {"code": "bad_archive",
                                               "message": str(e)}) from e
@@ -1916,7 +1941,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                       "declared": e.expected, "actual": e.actual,
                                       "message": str(e)}) from e
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            _discard(work)
 
     @app.get("/v1/health")
     def health():

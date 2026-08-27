@@ -336,10 +336,16 @@ def extract_zip(archive, dest, *, max_members: int = MAX_MEMBERS,
                 if total > max_bytes:
                     raise ArchiveError(
                         f"the archive expands past the {max_bytes} byte limit")
-                # Two members can flatten onto one name (a/IM1 and b/IM1). Keep
-                # both: dropping one would silently change what the tree IS.
+                # Two members can flatten onto one name (a/IM1 and b/IM1), and
+                # both must survive: dropping one would silently change what the
+                # tree IS. Index every member unconditionally rather than only
+                # the collisions - a synthesized "2_IM1.dcm" would otherwise
+                # collide with a real member of that name and overwrite it,
+                # which is the same silent loss by a longer route. These names
+                # are staging only; the store renames members by their own
+                # digest.
                 seen[name] = seen.get(name, 0) + 1
-                out = dest / (name if seen[name] == 1 else f"{seen[name]}_{name}")
+                out = dest / f"{len(written)}_{name}"
                 with z.open(m) as src, open(out, "wb") as f:
                     while chunk := src.read(_CHUNK):
                         f.write(chunk)

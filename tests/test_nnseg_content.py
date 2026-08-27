@@ -160,3 +160,20 @@ def test_a_gzipped_nrrd_does_not_become_a_nifti(tmp_path):
     p = tmp_path / "blob"
     p.write_bytes(gzip.compress(b"NRRD0004\ntype: short\ndimension: 3\n"))
     assert guess_name(p) == "input.nrrd.gz"
+
+
+def test_two_members_that_flatten_onto_one_name_both_survive(tmp_path):
+    """Dropping one would silently change what the tree IS - and a synthesized
+    de-duplication name can itself collide with a real member."""
+    import zipfile
+
+    from nnseg.content import extract_zip
+    z = tmp_path / "s.zip"
+    with zipfile.ZipFile(z, "w") as f:
+        f.writestr("a/IM1.dcm", b"one")
+        f.writestr("b/IM1.dcm", b"two")
+        f.writestr("1_IM1.dcm", b"three")        # collides with a naive rename
+    out = tmp_path / "x"
+    files = extract_zip(z, out)
+    assert len(files) == 3
+    assert sorted(p.read_bytes() for p in out.iterdir()) == [b"one", b"three", b"two"]
