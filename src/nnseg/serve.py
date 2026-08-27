@@ -16,6 +16,11 @@ contract is deliberately small:
                                    multipart file remains valid shorthand forever. Kind
                                    "url" is reserved for the authenticated tier.
     GET    /v1/jobs                brief status of every known job
+    Cache-Control: no-cache on a submit (or an authorized labels GET) means "do not
+    serve me a stored result" - RFC 9111, so the recompute is still published. An
+    engine may decline to be served from cache at all; VoxTell does, because its
+    free-text prompts make the key space unbounded.
+
     GET    /v1/jobs/{id}           full status; includes result metadata once done,
                                    its `key` (the handle for the stored result) and a
                                    `links` object - follow those rather than building
@@ -87,6 +92,38 @@ def result_key(identity, task, options, weights_versions, version=None) -> str:
                           "weights": list(weights_versions),
                           "nnseg": version or _version()}, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def wants_no_cache(request) -> bool:
+    """Whether the request asked not to be served a stored result.
+
+    RFC 9111 `Cache-Control: no-cache` - "do not reuse a stored response" - which
+    is exactly the lever a caller needs after the model behind a task changes
+    without the cache key changing. Note it does NOT mean "do not store": the
+    recomputed result is published as usual, so artifacts, `key` and `links`
+    survive. `no-store` is a separate directive we deliberately do not implement.
+    """
+    raw = ""
+    try:
+        raw = request.headers.get("cache-control") or ""
+    except Exception:
+        return False
+    return any(d.strip().lower() == "no-cache" for d in raw.split(","))
+
+
+def engine_serves_from_cache(task) -> bool:
+    """Whether this task's ENGINE allows a stored result to be served.
+
+    An engine whose request space is unbounded (VoxTell's free text) sets this
+    False: the lookup would almost never hit, and the entries only evict results
+    that do get re-read. Routed by the task's grammar, the same way the worker
+    dispatch resolves an engine, so no catalog is needed here.
+    """
+    try:
+        from .engines.registry import engine_for_task
+        return bool(engine_for_task(task).serve_from_cache)
+    except Exception:
+        return True                    # unknown engine: behave as before
 
 
 def resource_links(task, identity, options, *, preview=False, statistics=False) -> dict:
@@ -1601,7 +1638,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # ResultCache), which is what keeps the artifacts, `key` and `links` intact on
         # a forced recompute. Popped before keying: a cache directive is not part of
         # what identifies a result, or every forced run would land in its own entry.
-        no_cache = bool(opts.pop("no_cache", False))
+        no_cache = bool(opts.pop("no_cache", False)) or wants_no_cache(request)
         if len(src) != 1:
             raise HTTPException(422, "multi-channel input is not yet supported over the "
                                      f"wire (got {len(src)} sources)")
@@ -1622,6 +1659,10 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                      f"{len(names)} catalog tasks, e.g. "
                                      + ", ".join(names[:4]))
         task = canonical
+        # ...and the engine may decline to be served from cache at all (see
+        # engine_serves_from_cache): a per-engine default, overridable per request
+        # only in the stricter direction - a caller cannot ask to be memoized.
+        no_cache = no_cache or not engine_serves_from_cache(task)
         try:                               # fail at submit where the spec already knows
             chan = (seg.describe(task) or {}).get("channel_names")
         except Exception:
@@ -1923,7 +1964,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 task = canonical
                 key = derive_key(srcobj.identity(ident), task, gopts)
                 fname = f"{_task_stem(task)}_{ident[:8]}{tok}.seg.nrrd"
-                hit = executor.cache_get(key)
+                # Cache-Control: no-cache from an authorized caller skips the
+                # lookup; everything below is the ordinary miss path, so the
+                # anonymous rule and "a plain GET is a read" still hold - forcing
+                # a recompute from this URL also needs Prefer: wait.
+                skip = (wants_no_cache(request) and authed(request)) or \
+                    not engine_serves_from_cache(task)
+                hit = None if skip else executor.cache_get(key)
                 if hit is not None:
                     return FileResponse(hit[0], media_type="application/octet-stream",
                                         filename=fname,

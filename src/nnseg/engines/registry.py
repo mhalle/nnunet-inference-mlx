@@ -60,6 +60,14 @@ class Engine:
     # worker's _compute hook. The field exists so local dispatch is a function
     # body, not a new seam - see EcosystemCatalog.engine_of.
     compute: Callable | None = None
+    #: Whether a stored result may be SERVED for a repeat request (RFC 9111
+    #: `no-cache` when False - results are still stored, so artifacts, the job's
+    #: `key` and its `links` all keep working; `no-store` is a different thing we
+    #: do not offer). False suits an engine whose request space is effectively
+    #: unbounded, where a lookup almost never hits and the entries only push
+    #: useful ones out of a shared LRU - VoxTell, whose free-text prompts hash
+    #: into the key, is the case this exists for.
+    serve_from_cache: bool = True
     description: str = ""
 
 
@@ -101,6 +109,9 @@ ENGINES: dict[str, Engine] = {
         name="voxtell",
         enabled_env="NNSEG_VOXTELL",
         weights_identity=_voxtell_identity,
+        # free text means an unbounded key space and interactive, low-reuse
+        # requests: memoizing them evicts results that do get re-read
+        serve_from_cache=False,
         description="VoxTell free-text promptable segmentation (prompts are input)",
     ),
     "monai": Engine(

@@ -2558,3 +2558,56 @@ def test_links_are_absent_where_a_result_is_not_path_addressable(tmp_path):
     links = wait_state(client, jid)["links"]
     assert links["result"].endswith("/result")
     assert "labels" not in links and "meta" not in links
+
+
+# -- cache control: RFC 9111 semantics, per request and per engine ----------
+
+def test_cache_control_no_cache_forces_a_recompute(tmp_path):
+    """`Cache-Control: no-cache` means "do not serve me a stored result", so an
+    identical submit runs again instead of being served the memo. It does NOT mean
+    no-store: the fresh result is still published, which is what keeps the job's
+    key, links and artifacts working on a forced recompute."""
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, cache_dir=tmp_path / "rc")
+    client = TestClient(create_app(ex))
+
+    def post(**headers):
+        r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", b"\x1f\x8bdata")},
+                        data={"task": "total_fast", "options": "{}"}, headers=headers)
+        assert r.status_code == 202, r.text
+        return wait_state(client, r.json()["id"])
+
+    first = post()
+    assert len(seg.calls) == 1 and first.get("key")
+    served = post()                                  # identical: served from the store
+    assert len(seg.calls) == 1 and served.get("cached") is True
+    forced = post(**{"Cache-Control": "no-cache"})   # ...unless the caller says no
+    assert len(seg.calls) == 2, "no-cache must not be served from the store"
+    assert not forced.get("cached")
+    assert forced.get("key") == first.get("key"), "same request, same handle - it was stored"
+
+
+def test_the_header_is_parsed_as_a_directive_list_not_a_substring():
+    """`no-cache` is one directive among several, and matching must not fire on
+    e.g. `no-cache-extension` or `max-age=0`."""
+    from nnseg.serve import wants_no_cache
+
+    class R:                                   # a request is only its headers here
+        def __init__(self, v): self.headers = {"cache-control": v}
+    assert wants_no_cache(R("no-cache"))
+    assert wants_no_cache(R("max-age=0, no-cache"))
+    assert wants_no_cache(R("No-Cache"))       # directives are case-insensitive
+    assert not wants_no_cache(R("max-age=0"))
+    assert not wants_no_cache(R("no-cache-extension"))
+    assert not wants_no_cache(R(""))
+
+
+def test_an_engine_can_decline_to_be_served_from_cache(monkeypatch):
+    """VoxTell's free-text prompts hash into the key, so the request space is
+    unbounded and a lookup almost never hits - it opts out per engine, while the
+    nnU-Net catalogs keep memoizing."""
+    from nnseg.serve import engine_serves_from_cache
+    assert engine_serves_from_cache("ts:total_fast") is True
+    assert engine_serves_from_cache("monai:spleen_ct_segmentation") is True
+    assert engine_serves_from_cache("voxtell:text") is False
+    assert engine_serves_from_cache("nonsense:task") is True   # unknown: unchanged
