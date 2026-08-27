@@ -1,0 +1,102 @@
+"""Content addressing: what a digest means, and who is allowed to decide it.
+
+The store itself, without a server. The rule under test throughout is that the
+SERVER does the addressing - a digest is a measurement of bytes that arrived,
+never a label a caller attached to them.
+"""
+import pytest
+
+from nnseg.content import (BLOB, TREE, ContentStore, DigestMismatch, digest_dir,
+                           digest_file, is_digest, tree_digest)
+from nnseg.serve import SeriesCache
+
+
+@pytest.fixture
+def store(tmp_path):
+    return ContentStore(SeriesCache(tmp_path / "cache", lambda k, e: None))
+
+
+def _file(d, name, data):
+    p = d / name
+    p.write_bytes(data)
+    return p
+
+
+def test_a_blob_keeps_exactly_the_identity_uploads_have_always_had(tmp_path, store):
+    """`sha256:<hex>` of the bytes - the same string the upload path produced
+    before any of this existed, so no cached result changes key."""
+    import hashlib
+    p = _file(tmp_path, "scan.nii.gz", b"\x1f\x8bvolume")
+    assert digest_file(p) == BLOB + hashlib.sha256(b"\x1f\x8bvolume").hexdigest()
+
+
+def test_storing_the_same_bytes_twice_costs_one_entry(tmp_path, store):
+    a = _file(tmp_path, "a.nii.gz", b"identical")
+    b = _file(tmp_path, "b.nii.gz", b"identical")      # different name, same content
+    assert store.put_file(a) == store.put_file(b)
+
+
+def test_a_declared_digest_is_checked_against_the_bytes(tmp_path, store):
+    p = _file(tmp_path, "a.nii.gz", b"real bytes")
+    with pytest.raises(DigestMismatch) as e:
+        store.put_file(p, expect=BLOB + "0" * 64)
+    assert e.value.actual == digest_file(p)
+    assert not store.has(BLOB + "0" * 64)              # nothing stored under the lie
+
+
+def test_a_tree_digest_does_not_depend_on_order_or_filenames(tmp_path):
+    """A DICOM series orders itself from its headers; the names on disk are an
+    accident of whoever exported it, and the order of arrival is the client's
+    business. Neither may change the identity."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    for i, data in enumerate([b"s1", b"s2", b"s3"]):
+        _file(a, f"IM_{i}.dcm", data)
+    for i, data in enumerate([b"s3", b"s1", b"s2"]):   # other order, other names
+        _file(b, f"zz{9 - i}.dcm", data)
+    assert digest_dir(a) == digest_dir(b)
+    assert digest_dir(a).startswith(TREE)
+
+
+def test_a_tree_and_a_blob_of_the_same_bytes_are_different_things(tmp_path, store):
+    """One member is still a tree if it was sent as one - the grammar says what
+    the reader gets handed, and a directory means DICOM series to SimpleITK."""
+    d = tmp_path / "one"; d.mkdir()
+    p = _file(d, "only.dcm", b"solo")
+    assert store.put_dir(d) != store.put_file(p)
+
+
+def test_resolve_hands_back_a_file_for_a_blob_and_a_directory_for_a_tree(tmp_path, store):
+    p = _file(tmp_path, "scan.nii.gz", b"volume")
+    d = tmp_path / "series"; d.mkdir()
+    _file(d, "IM0.dcm", b"a"); _file(d, "IM1.dcm", b"b")
+    assert store.resolve(store.put_file(p)).is_file()
+    assert store.resolve(store.put_dir(d)).is_dir()
+
+
+def test_tree_members_are_flattened_to_basenames(tmp_path, store):
+    """An archive member may name any path it likes, including one with `..` in
+    it. A store keyed by content has no business reproducing someone's layout."""
+    d = tmp_path / "nested"; (d / "sub").mkdir(parents=True)
+    _file(d / "sub", "IM0.dcm", b"a")
+    _file(d, "IM1.dcm", b"b")
+    where = store.resolve(store.put_dir(d))
+    assert sorted(p.name for p in where.iterdir()) == ["IM0.dcm", "IM1.dcm"]
+    assert not (where / "sub").exists()
+
+
+def test_is_digest_separates_content_keys_from_source_ids():
+    assert is_digest(BLOB + "a" * 64) and is_digest(TREE + "b" * 64)
+    assert not is_digest("idc:a05fb365-dfd2-4116-ab8e-a7262d2c169c")
+    assert not is_digest("deadbeef")
+
+
+def test_an_empty_directory_is_not_a_tree(tmp_path, store):
+    d = tmp_path / "empty"; d.mkdir()
+    with pytest.raises(FileNotFoundError):
+        store.put_dir(d)
+
+
+def test_tree_digest_is_stable_across_calls():
+    members = [BLOB + "a" * 64, BLOB + "b" * 64]
+    assert tree_digest(members) == tree_digest(reversed(members))

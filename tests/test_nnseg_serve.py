@@ -2794,3 +2794,96 @@ def test_an_engine_can_decline_to_be_served_from_cache(monkeypatch):
     assert engine_serves_from_cache("monai:spleen_ct_segmentation") is True
     assert engine_serves_from_cache("voxtell:text") is False
     assert engine_serves_from_cache("nonsense:task") is True   # unknown: unchanged
+
+
+# -- the input store: send once, refer by digest ---------------------------
+
+BLOB = b"\x1f\x8bsome-volume-bytes"
+BLOB_SHA = "sha256:" + hashlib.sha256(BLOB).hexdigest()
+
+
+def test_an_upload_becomes_addressable_and_need_not_be_sent_again(tmp_path):
+    """The gap this closes: the same volume for a second task used to mean a
+    second upload and a second copy on disk."""
+    seg, ex, client = make(tmp_path)
+    client.post("/v1/jobs", files={"file": ("scan.nii.gz", BLOB)},
+                data={"task": "total_fast"})
+    assert client.get(f"/v1/inputs/{BLOB_SHA}").json()["bytes"] == len(BLOB)
+
+    r = client.post("/v1/jobs", data={
+        "task": "total", "source": json.dumps([{"kind": "input", "sha256": BLOB_SHA}])})
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+    # referring and re-sending are the same request: same identity, same key
+    assert s["input_identity"] == [BLOB_SHA]
+
+
+def test_a_client_supplied_digest_is_never_taken_on_trust(tmp_path):
+    """The load-bearing rule. If a caller could store bytes Y under digest X,
+    every later job referring to X - and every result memoized against it -
+    would silently be computed on the wrong data."""
+    _, _, client = make(tmp_path)
+    lie = "sha256:" + "0" * 64
+    r = client.put(f"/v1/inputs/{lie}", content=b"not what I said it was")
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "digest_mismatch" and detail["declared"] == lie
+    assert client.get(f"/v1/inputs/{lie}").status_code == 404      # nothing stored
+
+
+def test_preload_then_submit_without_sending_bytes(tmp_path):
+    """The preload path: push the volume while the user is still choosing a
+    task, so submit carries no payload at all."""
+    _, _, client = make(tmp_path)
+    assert client.get(f"/v1/inputs/{BLOB_SHA}").status_code == 404
+    put = client.put(f"/v1/inputs/{BLOB_SHA}", content=BLOB)
+    assert put.status_code == 200 and put.json()["stored"] is True
+    assert client.put(f"/v1/inputs/{BLOB_SHA}", content=BLOB).json()["stored"] is False
+
+    r = client.post("/v1/jobs", data={
+        "task": "total_fast",
+        "source": json.dumps([{"kind": "input", "sha256": BLOB_SHA}])})
+    assert r.status_code == 202, r.text
+    assert wait_state(client, r.json()["id"], ("done",))["state"] == "done"
+
+
+def test_referring_to_content_the_server_does_not_have_says_resend(tmp_path):
+    """An LRU store means a digest can stop being valid. That has to be a
+    recoverable answer, not a mysterious failure."""
+    _, _, client = make(tmp_path)
+    gone = "sha256:" + "a" * 64
+    r = client.post("/v1/jobs", data={
+        "task": "total_fast", "source": json.dumps([{"kind": "input", "sha256": gone}])})
+    assert r.status_code == 410
+    assert r.json()["detail"]["code"] == "input_gone"
+    assert "send the bytes again" in r.json()["detail"]["message"]
+
+
+def test_a_malformed_digest_is_refused_before_anything_else(tmp_path):
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/jobs", data={
+        "task": "total_fast",
+        "source": json.dumps([{"kind": "input", "sha256": "deadbeef"}])})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "bad_digest"
+
+
+def test_four_channels_can_be_sent_once_and_reused_by_role(tmp_path, monkeypatch):
+    """Where this pays off: four volumes uploaded once, then bound to roles for
+    any number of later tasks without re-sending a byte."""
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    digests = {}
+    for role, b in blobs.items():
+        d = "sha256:" + hashlib.sha256(b).hexdigest()
+        assert client.put(f"/v1/inputs/{d}", content=b).json()["stored"] is True
+        digests[role] = d
+    r = client.post("/v1/jobs", data={
+        "task": "total_fast",
+        "source": json.dumps([{"kind": "input", "sha256": digests[x], "role": x}
+                              for x in ("FLAIR", "T2", "T1", "T1c")])})   # permuted
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+    assert s["input_identity"] == sorted(f"{k}={v}" for k, v in digests.items())
+    got = seg.inputs[0]
+    assert set(got) == set(ROLES)
+    assert Path(got["T1c"]).read_bytes() == blobs["T1c"]      # right bytes per role

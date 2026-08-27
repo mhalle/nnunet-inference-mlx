@@ -16,6 +16,12 @@ contract is deliberately small:
                                    multipart file remains valid shorthand forever. Kind
                                    "url" is reserved for the authenticated tier.
     GET    /v1/jobs                brief status of every known job
+    GET    /v1/inputs/{digest}     whether this server already holds that content
+    PUT    /v1/inputs/{digest}     store it (preload). The digest in the URL is
+                                   CHECKED against the bytes, never trusted; a
+                                   source may then be {"kind":"input","sha256":...}
+                                   instead of re-sending. No route hands input
+                                   bytes back.
     Cache-Control: no-cache on a submit (or an authorized labels GET) means "do not
     serve me a stored result" - RFC 9111, so the recompute is still published. An
     engine may decline to be served from cache at all; VoxTell does, because its
@@ -58,6 +64,7 @@ LANs. The authenticated deployment is the Modal one, where the platform supplies
 both the queue (spawn + autoscaler) and the auth (proxy tokens).
 """
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -68,6 +75,8 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import content
+from .content import ContentStore, is_digest
 from .errors import Cancelled, InputError, NnsegError, ResourceError
 from .progress import CancelToken, Reporter
 
@@ -327,10 +336,18 @@ class SeriesCache:
         e = self._entry(series)
         return e.exists() and not (e / self.MARKER).exists()
 
-    def get_or_fetch(self, series: str, *, check=None, credentials=None) -> Path:
+    def get_or_fetch(self, series: str, *, check=None, credentials=None,
+                     fetch=None) -> Path:
         """Return the series content directory, fetching if needed (blocking).
         ``check`` is called while waiting on another writer; raise from it to
-        cancel the wait."""
+        cancel the wait.
+
+        ``fetch`` overrides how the content is produced for this call only, so a
+        caller that ALREADY has the bytes - an upload being adopted into the
+        content store - reuses this method's claim, wait-on-another-writer and
+        commit rather than growing a second copy of them. Two callers storing the
+        same content at once behave exactly like two jobs fetching one series:
+        the first writes, the second waits and then finds it there."""
         while True:
             entry = self._entry(series)
             marker = entry / self.MARKER
@@ -388,8 +405,9 @@ class SeriesCache:
             token = self._claim_owner(entry)
             hb = self._hb_start(entry)
             try:
-                dest = Path(self.fetch(series, entry, credentials=credentials)
-                            if credentials is not None else self.fetch(series, entry))
+                fn = fetch or self.fetch
+                dest = Path(fn(series, entry, credentials=credentials)
+                            if credentials is not None else fn(series, entry))
                 self._commit(entry, key=series, token=token)
                 return dest
             except BaseException:
@@ -779,6 +797,10 @@ class LocalExecutor:
         self.series_cache = SeriesCache(self.workdir / "series_cache", self._fetch_source,
                                         budget_bytes=input_cache_bytes)
         self.read_ahead = ReadAhead(read_fn)
+        # Uploads addressed by their own bytes, sharing the series cache's root,
+        # budget and pin discipline - an entry is an entry whether a client sent
+        # it or the server fetched it.
+        self.content = ContentStore(self.series_cache)
         self.artifacts = set(artifacts or ())
         self._artifacts_pending: dict = {}   # cache_key -> (owner jid, set at)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
@@ -978,6 +1000,19 @@ class LocalExecutor:
             self._emit(rec)
 
     # -- the dispatcher ------------------------------------------------------
+    def _from_store(self, entry, pinned: list):
+        """Resolve an ``input`` source: content this server already holds.
+
+        Nothing is fetched or copied - the bytes are in the store already, which
+        is the whole point of referring by digest. Pinned like any other input,
+        because the store is LRU and the entry could otherwise be evicted out
+        from under a running job.
+        """
+        digest = str(entry.get("id") or entry.get("sha256") or "")
+        self.content.pin(digest)
+        pinned.append(digest)
+        return self.content.resolve(digest)
+
     def _stage_many(self, rec, entries, reporter, pinned: list) -> dict:
         """Stage every input of a multi-input job; returns ``{role: path}``.
 
@@ -998,6 +1033,9 @@ class LocalExecutor:
             kind = entry.get("kind", "upload")
             if kind == "upload":
                 staged[role] = path
+                continue
+            if kind == "input":
+                staged[role] = self._from_store(entry, pinned)
                 continue
             ident = str(entry.get("id") or entry.get("crdc_series_uuid") or "")
             key = f"{kind}:{ident}"
@@ -1044,7 +1082,9 @@ class LocalExecutor:
                 else:
                     src = entries[0]
                     kind = src.get("kind", "upload")
-                    if kind != "upload":
+                    if kind == "input":
+                        rec.input_path = inp = self._from_store(src, pinned)
+                    elif kind != "upload":
                         ident = src.get("id") or src.get("crdc_series_uuid")
                         key = f"{kind}:{ident}"
                         self.series_cache.pin(key)
@@ -1555,6 +1595,83 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
     import datetime as _dt
     _started_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
+    # -- the input store: send once, refer by digest ------------------------
+    # Deliberately no route that hands input BYTES back. A client that referred
+    # to a digest already has them, and serving them would turn "knows a hash"
+    # into "can read what someone uploaded". Presence and storage only.
+
+    def _store_or_404():
+        store = getattr(executor, "content", None)
+        if store is None:
+            raise HTTPException(404, "this server has no input store")
+        return store
+
+    @app.get("/v1/inputs/{digest}")
+    def input_status(digest: str, request: Request):
+        """Whether this server already holds that content - the call a client
+        makes before deciding whether an upload is needed at all."""
+        store = _store_or_404()
+        if not is_digest(digest):
+            raise HTTPException(422, {
+                "code": "bad_digest",
+                "message": f"expected {content.BLOB}<hex> or {content.TREE}<hex>"})
+        if not store.has(digest):
+            raise HTTPException(404, {"code": "input_gone", "digest": digest,
+                                      "message": "not held by this server"})
+        where = store.resolve(digest)
+        files = sorted(p for p in where.rglob("*") if p.is_file()) \
+            if where.is_dir() else [where]
+        return {"digest": digest,
+                "kind": "tree" if digest.startswith(content.TREE) else "blob",
+                "members": len(files),
+                "bytes": sum(p.stat().st_size for p in files)}
+
+    @app.put("/v1/inputs/{digest}")
+    async def put_input(digest: str, request: Request):
+        """Store content under the digest of its own bytes - the preload call.
+
+        The digest in the URL is what the caller CLAIMS. It is checked against
+        the bytes as they land and never taken on trust: accepting it would let
+        one caller store bytes Y under digest X and silently poison every later
+        job - and every memoized result - that refers to X.
+        """
+        require_auth(request)              # anonymous never computes, and never stores
+        store = _store_or_404()
+        if not is_digest(digest):
+            raise HTTPException(422, {
+                "code": "bad_digest",
+                "message": f"expected {content.BLOB}<hex> or {content.TREE}<hex>"})
+        if store.has(digest):
+            return {"digest": digest, "stored": False, "reason": "already held"}
+        if digest.startswith(content.TREE):
+            raise HTTPException(422, {
+                "code": "unsupported",
+                "message": "a tree is stored by submitting its members; single "
+                           "blobs only on this route for now"})
+        import tempfile
+        jid, jdir = executor.new_job_dir()  # a scratch dir on the right filesystem
+        try:
+            fd, tmp = tempfile.mkstemp(dir=jdir)
+            os.close(fd)
+            tmp = Path(tmp)
+            h = hashlib.sha256()
+            with open(tmp, "wb") as f:
+                async for chunk in request.stream():
+                    h.update(chunk)
+                    f.write(chunk)
+            actual = f"sha256:{h.hexdigest()}"
+            if actual != digest:
+                raise HTTPException(422, {
+                    "code": "digest_mismatch", "declared": digest, "actual": actual,
+                    "message": "the bytes are not the ones you said they were; "
+                               "nothing was stored"})
+            store.put_file(tmp, computed=actual)
+            return {"digest": actual, "stored": True,
+                    "bytes": tmp.stat().st_size}
+        finally:
+            import shutil
+            shutil.rmtree(jdir, ignore_errors=True)
+
     @app.get("/v1/health")
     def health():
         policy = getattr(seg, "policy", {})
@@ -1728,6 +1845,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         no_cache = bool(opts.pop("no_cache", False)) or wants_no_cache(request)
         for entry in src:                  # every source, not just the first
             kind = entry.get("kind", "upload")
+            if kind == "input":
+                continue                   # a digest, resolved against the store
             if kind == "url":
                 raise HTTPException(422, "source kind 'url' is reserved for the "
                                          "authenticated tier")
@@ -1779,7 +1898,15 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 while chunk := await upload.read(1 << 20):
                     h.update(chunk)
                     f.write(chunk)
-            return dest, f"sha256:{h.hexdigest()}"
+            digest = f"sha256:{h.hexdigest()}"
+            store = getattr(executor, "content", None)
+            if store is not None:
+                # Addressable from now on: the same bytes submitted again - for
+                # another task, or as another channel - can be referred to by
+                # this digest instead of re-sent. `computed`, not `expect`: the
+                # digest was taken here, from these bytes, as they streamed.
+                store.put_file(dest, computed=digest)
+            return dest, digest
 
         staged, idents = [], []
         for role, entry in binding:
@@ -1799,6 +1926,29 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                                    f"named {part!r}", "part": part})
                 dest, digest = await _save(upload, role)
                 staged.append((role, dest))
+                idents.append(digest)
+                continue
+            if kind == "input":
+                # A reference to content this server already holds. Its identity
+                # IS the digest, which is exactly what an upload of the same
+                # bytes produces - so referring and re-sending land on the same
+                # result-cache key, as they must.
+                digest = str(entry.get("sha256") or entry.get("digest")
+                             or entry.get("id") or "").strip()
+                if not is_digest(digest):
+                    raise HTTPException(422, {
+                        "code": "bad_digest",
+                        "message": f"{digest!r} is not a content digest; expected "
+                                   f"{content.BLOB}<hex> or {content.TREE}<hex>"})
+                store = getattr(executor, "content", None)
+                if store is None or not store.has(digest):
+                    raise HTTPException(410, {
+                        "code": "input_gone",
+                        "message": f"{digest} is not held by this server (never "
+                                   "stored, or evicted); send the bytes again",
+                        "digest": digest})
+                entry["id"] = digest
+                staged.append((role, None))
                 idents.append(digest)
                 continue
             if file is not None and not any(
