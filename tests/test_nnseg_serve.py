@@ -1056,7 +1056,7 @@ def test_custom_source_end_to_end(tmp_path):
     # completed-segmentations listing shows it with its path
     segs = client.get("/v1/segmentations").json()["segmentations"]
     assert any(e["identity"] == ["toy:sp042"]
-               and e["path"] == "/v1/toy/sp042/total_fast/labels.seg.nrrd"
+               and e["links"]["labels"] == "/v1/toy/sp042/total_fast/labels.seg.nrrd"
                for e in segs)
 
 
@@ -1087,7 +1087,7 @@ def test_segmentations_listing_shape(tmp_path, monkeypatch):
     e = segs[0]
     assert e["task"] == "total_fast" and e["identity"] == [f"idc:{u}"]
     assert e["bytes"] > 0 and e["computed"]
-    assert e["path"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert e["links"]["labels"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
 
 
 def test_slashed_identifiers_hash_into_the_cache(tmp_path):
@@ -1346,7 +1346,7 @@ def test_preview_renders_and_serves(tmp_path, monkeypatch):
     wait_artifact(client, f"/v1/idc/{u}/total_fast/preview.png")
     segs = client.get("/v1/segmentations").json()["segmentations"]
     e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
-    assert e["preview"] == f"/v1/idc/{u}/total_fast/preview.png"
+    assert e["links"]["preview"] == f"/v1/idc/{u}/total_fast/preview.png"
     # a result without a preview 404s cleanly rather than erroring
     assert client.get(f"/v1/idc/{u}/total/preview.png").status_code == 404
     # grid-variant labels (different shape from the input) still render: the
@@ -1414,7 +1414,7 @@ def test_grid_variant_1mm_is_a_distinct_addressable_resource(tmp_path, monkeypat
     assert s["cached"] is True and len(seg.calls) == 2   # cache hit, not a third run
 
     segs = client.get("/v1/segmentations").json()["segmentations"]
-    paths = {e.get("path") for e in segs}
+    paths = {e.get("links", {}).get("labels") for e in segs}
     assert f"{base}/labels.seg.nrrd" in paths
     assert f"{base}/labels_res-1mm.seg.nrrd" in paths
 
@@ -1495,7 +1495,7 @@ def test_statistics_computed_and_served_json_and_tsv(tmp_path, monkeypatch):
     wait_artifact(client, f"{base}/statistics.json")
     segs = client.get("/v1/segmentations").json()["segmentations"]
     e = next(x for x in segs if x["identity"] == [f"idc:{u}"])
-    assert e["statistics"] == f"{base}/statistics.tsv"
+    assert e["links"]["statistics"] == f"{base}/statistics.tsv"
     assert client.get(f"{base}/statistics_res-1mm.json").status_code == 404
 
 
@@ -2515,3 +2515,46 @@ def test_prepare_preserves_the_version_pin(tmp_path):
         assert seen == ["ts:total_fast"]
     finally:
         ex.close()
+
+
+def test_a_job_hands_back_its_key_and_the_urls_for_everything_it_made(tmp_path, monkeypatch):
+    """A client should never assemble a path-surface URL itself: which identities
+    are addressable, the grid-variant infix, and which options keep a result
+    addressable are all the server's decisions. The job carries `key` (the handle
+    for the stored result) and a `links` object."""
+    from nnseg import serve as serve_mod
+    monkeypatch.setattr(serve_mod, "_idc_enabled", lambda: True)
+
+    def fake_fetch(series, jobdir):
+        d = jobdir / "series"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s.dcm").write_bytes(b"d")
+        return d
+
+    ex = LocalExecutor(FakeSegmenter(), workdir=tmp_path, cache_dir=tmp_path / "rc",
+                       fetch_idc_fn=fake_fetch)
+    client = TestClient(create_app(ex))
+    u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
+    jid = _idc_submit(client, u)
+    d = wait_state(client, jid, ("done",))
+    links = d["links"]
+    assert links["self"] == f"/v1/jobs/{jid}"
+    assert links["events"] == f"/v1/jobs/{jid}/events"
+    assert links["result"] == f"/v1/jobs/{jid}/result"
+    # path-surface URLs, built by the server from the identity it recorded
+    assert links["labels"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
+    assert links["meta"] == f"/v1/idc/{u}/total_fast/meta.json"
+    assert d.get("key"), "the job should hand back the handle for its result"
+    # and following the link actually works
+    assert client.get(links["labels"]).status_code == 200
+
+
+def test_links_are_absent_where_a_result_is_not_path_addressable(tmp_path):
+    """An upload is identified by its sha256, which the path surface does not
+    address - so the job offers its job-scoped URLs and no labels link, rather
+    than a URL that would 404."""
+    seg, ex, client = make(tmp_path)
+    jid = submit(client)                      # a plain upload
+    links = wait_state(client, jid)["links"]
+    assert links["result"].endswith("/result")
+    assert "labels" not in links and "meta" not in links

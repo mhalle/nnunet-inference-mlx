@@ -16,7 +16,10 @@ contract is deliberately small:
                                    multipart file remains valid shorthand forever. Kind
                                    "url" is reserved for the authenticated tier.
     GET    /v1/jobs                brief status of every known job
-    GET    /v1/jobs/{id}           full status; includes result metadata once done
+    GET    /v1/jobs/{id}           full status; includes result metadata once done,
+                                   its `key` (the handle for the stored result) and a
+                                   `links` object - follow those rather than building
+                                   path-surface URLs client-side
     GET    /v1/jobs/{id}/events    Server-Sent Events: status snapshots until terminal
     GET    /v1/jobs/{id}/result    the label volume (.nii.gz)
     DELETE /v1/jobs/{id}           cancel an active job / delete a finished one
@@ -84,6 +87,36 @@ def result_key(identity, task, options, weights_versions, version=None) -> str:
                           "weights": list(weights_versions),
                           "nnseg": version or _version()}, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def resource_links(task, identity, options, *, preview=False, statistics=False) -> dict:
+    """The path-surface URLs for a finished result - ``{}`` when it is not
+    path-addressable.
+
+    The one place this URL grammar is written. Clients should follow these
+    rather than assembling paths from a task name and an identity: the infix
+    for grid variants, which identities are addressable at all (a single
+    source identity, not an upload's sha256), and which options keep a result
+    addressable are all decisions the server owns and can change.
+    """
+    ident = list(identity or [])
+    if (len(ident) != 1 or ":" not in str(ident[0])
+            or str(ident[0]).startswith("sha256:")):
+        return {}                       # uploads and multi-source: job-scoped only
+    opts = options or {}
+    tok = next((t for t, o in GRID_TOKENS.items() if o == opts), None)
+    if opts and tok is None:
+        return {}                       # non-menu options have no path form
+    infix = f"_{tok}" if tok else ""
+    prefix, one = str(ident[0]).split(":", 1)
+    base = f"/v1/{prefix}/{one}/{task}"
+    links = {"labels": f"{base}/labels{infix}.seg.nrrd",
+             "meta": f"{base}/meta{infix}.json"}
+    if preview:
+        links["preview"] = f"{base}/preview{infix}.png"
+    if statistics:
+        links["statistics"] = f"{base}/statistics{infix}.tsv"
+    return links
 
 
 def weights_versions_of(segmenter, task) -> list:
@@ -425,23 +458,12 @@ class ResultCache:
                      "identity": meta.get("identity"),
                      "options": meta.get("options"),
                      "computed": meta.get("computed"), "bytes": st.st_size}
-            has_preview = (d / "preview.png").exists()
-            ident = meta.get("identity") or []
-            if (len(ident) == 1 and ":" in str(ident[0])
-                    and not str(ident[0]).startswith("sha256:")):
-                prefix, one = str(ident[0]).split(":", 1)
-                opts = meta.get("options") or {}
-                tok = next((t for t, o in GRID_TOKENS.items() if o == opts), None)
-                infix = f"_{tok}" if tok else ""
-                if not opts or tok:            # default or a menu token: addressable
-                    entry["path"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
-                                     f"labels{infix}.seg.nrrd")
-                    if has_preview:
-                        entry["preview"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
-                                            f"preview{infix}.png")
-                    if (d / "statistics.json").exists():
-                        entry["statistics"] = (f"/v1/{prefix}/{one}/{meta.get('task')}/"
-                                               f"statistics{infix}.tsv")
+            links = resource_links(meta.get("task"), meta.get("identity"),
+                                   meta.get("options"),
+                                   preview=(d / "preview.png").exists(),
+                                   statistics=(d / "statistics.json").exists())
+            if links:
+                entry["links"] = links
             out.append(entry)
         out.sort(key=lambda e: e.get("computed") or 0, reverse=True)
         return out[:limit]
@@ -1125,6 +1147,12 @@ class LocalExecutor:
             d["error"] = rec.error
         if not brief and rec.input_identity:
             d["input_identity"] = list(rec.input_identity)
+        if not brief:
+            # the handle for this result, and the options its URL form depends on
+            if rec.cache_key:
+                d["key"] = rec.cache_key
+            if rec.options:
+                d["options"] = dict(rec.options)
         if rec.cached:
             d["cached"] = True
         if not brief and rec.state == "done" and rec.result is not None:
@@ -1676,10 +1704,37 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             raise HTTPException(404, f"no job {jid!r}")
         return s
 
+    def _with_links(d: dict) -> dict:
+        """Add the job's key and the URLs for everything it produced.
+
+        Built here rather than in either executor: both LocalExecutor and
+        ModalExecutor assemble their own status dict, and a thing written twice
+        drifts (this codebase has paid for that already). Clients follow these
+        instead of reconstructing paths - the URL grammar is the server's.
+        """
+        if not isinstance(d, dict):
+            return d
+        out = dict(d)
+        key = out.pop("cache_key", None) or out.get("key")
+        if key:
+            out["key"] = key
+        jid = out.get("id")
+        links = {"self": f"/v1/jobs/{jid}", "events": f"/v1/jobs/{jid}/events"}
+        if out.get("state") == "done":
+            links["result"] = f"/v1/jobs/{jid}/result"
+            kinds = set(getattr(executor, "artifacts", ()) or ())
+            links.update(resource_links(
+                out.get("task"), out.get("input_identity"), out.get("options"),
+                # the artifact overlap runs after done, so advertise what this
+                # deployment renders rather than probing the cache per request
+                preview="preview" in kinds, statistics="statistics" in kinds))
+        out["links"] = links
+        return out
+
     @app.get("/v1/jobs/{jid}")
     def status(request: Request, jid: str):
         require_auth(request)
-        return _status_or_404(jid)
+        return _with_links(_status_or_404(jid))
 
     @app.get("/v1/jobs/{jid}/events")
     async def events(request: Request, jid: str):

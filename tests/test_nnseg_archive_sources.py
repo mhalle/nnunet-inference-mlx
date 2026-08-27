@@ -272,7 +272,7 @@ def test_slashed_identifiers_get_the_full_path_surface(tmp_path, monkeypatch):
         pass
     segs = client.get("/v1/segmentations").json()["segmentations"]
     e = next(x for x in segs if x["identity"] == [f"deep:{ident}"])
-    assert e["path"] == url                              # slashed path listed
+    assert e["links"]["labels"] == url                   # slashed path listed
     d = client.delete(url)
     assert d.status_code == 200 and d.json()["deleted"]
     assert client.head(url).status_code == 404           # gone

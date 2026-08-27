@@ -1152,7 +1152,10 @@ class ModalExecutor:
         if meta is None:
             return None
         keys = ("id", "task", "state", "created", "started", "finished",
-                "progress", "error", "input_identity", "cached")
+                "progress", "error", "input_identity", "cached",
+                # the result handle and the options its URL form depends on -
+                # serve's job route turns these into `key` + `links`
+                "cache_key", "options")
         d = {k: meta.get(k) for k in keys if meta.get(k) is not None}
         if meta.get("state") == "done" and meta.get("result") is not None:
             d["result"] = meta["result"]
