@@ -43,13 +43,27 @@ def label_names(bundle_dir) -> dict[int, str]:
             if str(v).lower() != "background"}
 
 
-def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None):
+def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
+                timings: dict | None = None):
     """Drive the bundle's own inference workflow over exactly one image.
 
     Overrides only the three things that are ours to decide - which image, where
     the output goes, and which device - and leaves the bundle's transforms,
     network and inferer untouched.
+
+    **Built per job, deliberately for now.** Every other engine caches its model
+    across jobs (nnU-Net's ModelCache, FastSurfer's _RUNNERS, SynthStrip's
+    _MODELS, VoxTell's _PREDICTORS), and this one does not, because a
+    ``ConfigWorkflow`` resolves the network *and* the datalist into one cached
+    parser: re-running it would re-run the same image, so reuse means reaching
+    into the parser's resolved content, which is exactly the kind of thing that
+    breaks across heterogeneous bundles. The build is timed separately so the
+    decision is made on a number rather than a guess - if ``build`` turns out to
+    be a large share of a warm run, caching earns its fragility; if it is a
+    second, it does not.
     """
+    import time
+
     from monai.bundle import create_workflow
 
     overrides = {
@@ -59,12 +73,18 @@ def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None):
         "output_dir": str(out_dir),
         "device": device,
     }
+    t0 = time.perf_counter()
     workflow = create_workflow(
         workflow_name=None, config_file=str(bundle_dir / "configs" / "inference.json"),
         workflow_type="inference", **overrides)
     workflow.initialize()
+    if timings is not None:
+        timings["build"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     workflow.run()
     workflow.finalize()
+    if timings is not None:
+        timings["infer"] = time.perf_counter() - t0
 
 
 def segment(image_input, bundle: str, *, root, version: str | None = None,
@@ -111,7 +131,8 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
 
         report.tick(0, 1)
         _t = time.perf_counter()
-        _run_bundle(bundle_dir, in_path, out_path, device, progress=progress)
+        _run_bundle(bundle_dir, in_path, out_path, device, progress=progress,
+                    timings=timings)
         timings["network"] = time.perf_counter() - _t
         report.tick(1, 1)
 

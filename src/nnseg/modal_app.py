@@ -943,7 +943,13 @@ if MONAI:
             """Heavy imports before the memory snapshot (see FastSurferWorker.preload)."""
             _pkg_dir()
             import torch  # noqa: F401
-            import monai  # noqa: F401
+            import monai  # noqa: F401 - eagerly loads transforms/networks/inferers...
+            # ...but monai/__init__ EXCLUDES monai.bundle from that eager load
+            # ("(^(monai.bundle))" in its exclude_pattern), and monai.bundle is the
+            # only part this engine actually calls. Importing it here is what puts
+            # it in the snapshot instead of on the first request after every restore.
+            import monai.bundle  # noqa: F401
+            import monai.transforms  # noqa: F401 - the chain every bundle composes
             import nnseg  # noqa: F401
 
         def _bundle_of(self, task: str) -> str:
