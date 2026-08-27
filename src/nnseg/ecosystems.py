@@ -418,11 +418,27 @@ class SynthStripEcosystem(EngineEcosystem):
     structures = ["Brain"]
 
 
+class VoxTellEcosystem(EngineEcosystem):
+    """VoxTell free-text promptable segmentation. Unlike every other catalog entry,
+    ``voxtell:text`` has **no fixed label set** - the prompts are an input, passed
+    as ``options={"prompts": [...]}``, and they hash into the result-cache key. So
+    ``structures`` is deliberately absent from info(): what it segments is whatever
+    the caller asks for."""
+
+    name = "voxtell"
+    engine = "voxtell"
+    description = ("VoxTell free-text promptable segmentation (engine); "
+                   'prompts are an input: options={"prompts": ["liver", ...]}')
+    task_names = ("text",)
+    modality = "CT / MR / PET"
+
+
 #: The ecosystems each engine contributes when its engine is enabled. The
 #: nnU-Net catalogs are always present; engine catalogs appear only where their
 #: engine does, so the catalog can never list a task no worker can run.
 _ENGINE_ECOSYSTEMS = {"fastsurfer": FastSurferEcosystem,
-                      "synthstrip": SynthStripEcosystem}
+                      "synthstrip": SynthStripEcosystem,
+                      "voxtell": VoxTellEcosystem}
 
 
 def default_ecosystems() -> list:

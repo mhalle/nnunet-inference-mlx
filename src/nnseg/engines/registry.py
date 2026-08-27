@@ -71,6 +71,10 @@ def _synthstrip_identity() -> list[dict]:
     return [{"id": "synthstrip", "version": "v1"}]
 
 
+def _voxtell_identity() -> list[dict]:
+    return [{"id": "voxtell", "version": "v1.1"}]
+
+
 ENGINES: dict[str, Engine] = {
     NNUNETV2: Engine(
         name=NNUNETV2,
@@ -88,6 +92,12 @@ ENGINES: dict[str, Engine] = {
         weights_identity=_synthstrip_identity,
         description="SynthStrip brain extraction (signed distance transform)",
     ),
+    "voxtell": Engine(
+        name="voxtell",
+        enabled_env="NNSEG_VOXTELL",
+        weights_identity=_voxtell_identity,
+        description="VoxTell free-text promptable segmentation (prompts are input)",
+    ),
 }
 
 # Which engine runs each ecosystem's tasks. Ecosystems not listed here run on the
@@ -95,6 +105,7 @@ ENGINES: dict[str, Engine] = {
 ECOSYSTEM_ENGINE: dict[str, str] = {
     "fastsurfer": "fastsurfer",
     "synthstrip": "synthstrip",
+    "voxtell": "voxtell",
 }
 
 

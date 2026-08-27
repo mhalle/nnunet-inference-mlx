@@ -141,9 +141,11 @@ def test_version_self_report(tmp_path):
     assert v["packages"].get("torch", {}).get("version")
     # weights map is present (empty with the FakeSegmenter, which has no catalog)
     assert isinstance(v["weights"], dict)
-    # every engine is listed with whether this deployment can run it
-    assert set(v["engines"]) == {"nnunetv2", "fastsurfer", "synthstrip"}
-    assert v["engines"]["nnunetv2"]["enabled"] is True        # the default engine
+    # every engine is listed with whether this deployment can run it - taken from
+    # the registry, so adding an engine extends the report instead of breaking this
+    from nnseg.engines import registry as _reg
+    assert set(v["engines"]) == set(_reg.ENGINES)
+    assert v["engines"][_reg.NNUNETV2]["enabled"] is True     # the default engine
     assert v["engines"]["fastsurfer"]["enabled"] is False     # not enabled in tests
 
 

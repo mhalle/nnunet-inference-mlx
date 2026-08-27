@@ -79,6 +79,7 @@ _engines = _engine_registry()
 # resolves the @app.cls decorators now; the registry reads the same env vars.
 FASTSURFER = _engines.enabled("fastsurfer")
 SYNTHSTRIP = _engines.enabled("synthstrip")
+VOXTELL = _engines.enabled("voxtell")
 
 
 def _pkg_dir() -> Path:
@@ -169,6 +170,38 @@ synthstrip_image = (
     # Bake the 29 MB weights into the image at BUILD (to synthstrip-torch's default cache)
     # so cold containers don't re-download from MGH. Same rationale as FastSurfer above.
     .run_commands("python -c 'import synthstrip_torch; synthstrip_torch.fetch_weights()'")
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+)
+
+# VoxTell engine image (built only when enabled). The `voxtell` extra brings the package
+# and its own tree (torch<2.9, nnunetv2, transformers, huggingface_hub); `idc` brings
+# obstore, `preview` matplotlib for the serve-core preview.
+#
+# Weights policy differs from the other engines, deliberately. The VoxTell checkpoint and
+# the precomputed text-embedding bank are baked at BUILD (small, and they cover the common
+# prompts with no text backbone at all). But a prompt outside that bank is embedded on the
+# fly by Qwen3-Embedding-4B - ~8 GB, which would bloat the image and slow every cold pull,
+# and the cold pull IS the cold start here. So HF_HOME points at the PERSISTENT weights
+# volume instead: the backbone is fetched once ever and every later cold container reads it
+# locally - the same treatment nnU-Net's weights already get.
+voxtell_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .uv_sync(extras=["voxtell", "idc", "preview"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
+    # Bake the checkpoint into the image at a FIXED path (it is small) and address it by
+    # VOXTELL_MODEL, so it stays findable after HF_HOME moves to the volume below.
+    .run_commands(
+        "python -c \""
+        "import shutil;"
+        "from voxtell.inference.predictor import download_voxtell_model as d;"
+        "shutil.copytree(d(), '/opt/voxtell/model', dirs_exist_ok=True)\""
+    )
+    # The runtime caches - the small embedding bank, and the Qwen3 backbone that only a
+    # prompt outside that bank needs - live on the PERSISTENT weights volume, so they are
+    # fetched once ever and every later cold container reads them locally.
+    .env({"VOXTELL_MODEL": "/opt/voxtell/model", "HF_HOME": f"{WEIGHTS_ROOT}/hf"})
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -827,10 +860,53 @@ if SYNTHSTRIP:
 #: only where its engine is enabled), hence the lookup by name.
 _WORKER_CLASSES = {_engines.NNUNETV2: "Worker",
                    "fastsurfer": "FastSurferWorker",
-                   "synthstrip": "SynthStripWorker"}
+                   "synthstrip": "SynthStripWorker",
+                   "voxtell": "VoxTellWorker"}
 assert set(_WORKER_CLASSES) == set(_engines.ENGINES), (
     "every engine needs a worker class (and vice versa): "
     f"{sorted(_WORKER_CLASSES)} vs {sorted(_engines.ENGINES)}")
+
+
+if VOXTELL:
+    @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
+             max_containers=MAX_CONTAINERS, image=voxtell_image,
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             enable_memory_snapshot=SNAPSHOT, **_cls_extra)
+    class VoxTellWorker(_WorkerBase):
+        """The VoxTell engine worker: free-text prompts instead of a fixed task.
+
+        The only worker whose compute reads the job's ``options`` for what to
+        segment - ``{"prompts": [...]}`` - which is also what makes two prompt lists
+        two different cache entries."""
+
+        engine = "voxtell"
+
+        @modal.enter(snap=SNAPSHOT)
+        def preload(self):
+            """Heavy imports before the memory snapshot (see FastSurferWorker.preload)."""
+            _pkg_dir()
+            import torch  # noqa: F401
+            import voxtell.inference.predictor  # noqa: F401 - the model import graph
+            import nnseg  # noqa: F401
+            if GPU_SNAPSHOT:
+                from nnseg.engines import voxtell
+                voxtell._get_predictor("cuda")
+
+        def _compute(self, input_path, meta, on_progress, token):
+            from nnseg.engines import voxtell
+            opts = dict(meta.get("options") or {})
+            seg = voxtell.segment(input_path, opts.get("prompts"), device="cuda",
+                                  progress=on_progress, cancel=token)
+            # The text backbone and embedding bank land in HF_HOME on the weights
+            # volume; commit once per container so the next cold start reads them
+            # instead of re-downloading (the whole point of caching them there).
+            if not getattr(self, "_hf_committed", False):
+                try:
+                    weights_vol.commit()
+                    self._hf_committed = True
+                except Exception as e:                  # never fail a finished job on this
+                    print(f"[voxtell] weights volume commit failed: {e}", flush=True)
+            return seg
 
 
 def _worker_classes() -> dict:

@@ -77,6 +77,12 @@ synthstrip = ["synthstrip-torch", "scipy"]
 # subpackages, so a plain `pip install git+.../FastSurfer` is import-broken - hence
 # the fork. Heavy tree dropped in the fork; conflicts with the other engines below.
 fastsurfer = ["fastsurfer-lean"]
+# The VoxTell engine (nnseg.engines.voxtell): free-text promptable segmentation from
+# MIC-DKFZ. Its own environment because it pins `torch>=2.0,<2.9` while the torch extra
+# is unbounded (and resolves well past that) - declared conflicting below. The package
+# brings its own tree (nnunetv2, dynamic-network-architectures, transformers,
+# huggingface_hub); weights + the precomputed text-embedding bank come from the HF hub.
+voxtell = ["voxtell>=0.1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -99,6 +105,7 @@ conflicts = [
       { extra = "torch" },
       { extra = "synthstrip" },
       { extra = "fastsurfer" },
+      { extra = "voxtell" },
     ],
 ]
 
