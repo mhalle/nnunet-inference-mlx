@@ -1595,6 +1595,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 raise ValueError("source must be a JSON list of objects")
         except ValueError as e:
             raise HTTPException(422, f"bad request: {e}") from e
+        # RFC 9111 semantics, deliberately: `no-cache` means "do not SERVE a stored
+        # result", not "do not store one" - that is `no-store`, which we do not offer.
+        # So this skips the lookup and still publishes (see the overwriting put in
+        # ResultCache), which is what keeps the artifacts, `key` and `links` intact on
+        # a forced recompute. Popped before keying: a cache directive is not part of
+        # what identifies a result, or every forced run would land in its own entry.
         no_cache = bool(opts.pop("no_cache", False))
         if len(src) != 1:
             raise HTTPException(422, "multi-channel input is not yet supported over the "
