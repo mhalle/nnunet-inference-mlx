@@ -203,3 +203,48 @@ def test_a_missing_channel_is_named(tmp_path):
     with pytest.raises(InputError) as e:
         _stack_inputs({"T1c": _img(), "T2": _img()}, root, "multi", lambda x: x)
     assert "FLAIR" in str(e.value)
+
+
+def _bundle_with_outputs(root, channel_def, name="out", version="1.0"):
+    import json as _json
+    d = root / "monai" / f"{name}_v{version}" / "configs"
+    d.mkdir(parents=True)
+    (d / "metadata.json").write_text(_json.dumps({"network_data_format": {
+        "inputs": {"image": {"modality": "CT", "num_channels": 1}},
+        "outputs": {"pred": {"channel_def": channel_def}}}}))
+    return d.parent
+
+
+def test_a_labelmap_bundle_names_its_values(tmp_path):
+    from nnseg.engines.monai_bundle import resolve_label_names
+    root = _bundle_with_outputs(tmp_path, {"0": "background", "1": "spleen",
+                                           "2": "liver"})
+    names, prov = resolve_label_names(root, [1, 2])
+    assert names == {1: "spleen", 2: "liver"} and prov == {}
+
+
+def test_a_region_head_is_not_read_as_a_labelmap(tmp_path):
+    """brats declares three overlapping REGIONS as output channels, then writes
+    BraTS's own 1/2/4 encoding. Read as a labelmap it called its background
+    'Tumor core' - 95% of the volume - and never named value 4."""
+    from nnseg.engines.monai_bundle import resolve_label_names
+    root = _bundle_with_outputs(tmp_path, {"0": "Tumor core", "1": "Whole tumor",
+                                           "2": "Enhancing tumor"})
+    names, prov = resolve_label_names(root, [1, 2, 4])
+    assert names == {1: "label 1", 2: "label 2", 4: "label 4"}
+    assert prov["labels_unnamed"] is True
+    assert prov["declared_channels"] == ["Tumor core", "Whole tumor",
+                                         "Enhancing tumor"]
+    assert "does not interpret region heads" in prov["labels_note"]
+
+
+def test_a_region_head_is_caught_even_when_its_values_look_plausible(tmp_path):
+    """The structural signal - no `background` entry - has to carry this, because
+    a run that happens to emit only values 1 and 2 is indistinguishable from a
+    labelmap by value alone."""
+    from nnseg.engines.monai_bundle import resolve_label_names
+    root = _bundle_with_outputs(tmp_path, {"0": "Tumor core", "1": "Whole tumor",
+                                           "2": "Enhancing tumor"})
+    names, prov = resolve_label_names(root, [1, 2])
+    assert names == {1: "label 1", 2: "label 2"}
+    assert prov["labels_unnamed"] is True

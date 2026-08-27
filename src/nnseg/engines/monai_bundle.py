@@ -45,16 +45,65 @@ def weights_installed(bundle: str, version: str) -> list[dict]:
     return [{"id": bundle, "version": version}]
 
 
-def label_names(bundle_dir) -> dict[int, str]:
-    """``{label value: name}`` from the bundle's own metadata, background dropped."""
+def _output_channel_def(bundle_dir) -> dict:
     import json
     from pathlib import Path
 
     meta = json.loads((Path(bundle_dir) / "configs" / "metadata.json").read_text())
     fmt = (meta.get("network_data_format") or {})
-    channel_def = ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
-    return {int(k): str(v) for k, v in channel_def.items()
+    return ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
+
+
+def label_names(bundle_dir) -> dict[int, str]:
+    """``{label value: name}`` from the bundle's own metadata, background dropped."""
+    return {int(k): str(v) for k, v in _output_channel_def(bundle_dir).items()
             if str(v).lower() != "background"}
+
+
+def resolve_label_names(bundle_dir, present) -> tuple[dict, dict]:
+    """Names for the values actually written, and provenance about how we got them.
+
+    ``channel_def`` on the OUTPUT side means one of two different things, and
+    reading the wrong one produces confidently mislabeled results rather than an
+    error:
+
+    * a **labelmap**, where the keys ARE the voxel values - spleen, wholeBody.
+      These declare a ``background`` entry, because value 0 needs a name.
+    * a **region head**, where the keys are output CHANNELS covering *overlapping*
+      regions - ``brats_mri_segmentation`` emits Tumor core / Whole tumor /
+      Enhancing tumor, then writes a labelmap in BraTS's own 1/2/4 encoding.
+      These have no background entry, because no channel is background.
+
+    Read as a labelmap, brats reported its background - 95 % of the volume - as
+    "Tumor core: 6372 ml", and never named value 4 at all.
+
+    So: two independent checks, either of which means the keys are not voxel
+    values. A missing ``background`` entry is the structural signal and catches
+    the case whatever the model happened to output; values outside the declared
+    keys catch anything the first misses. When they fire, the values are reported
+    as themselves - honest, and the volumes survive - and what the bundle
+    declares is preserved in provenance rather than applied to the wrong things.
+
+    **nnseg does not yet interpret region heads.** Overlapping regions do not fit
+    one labelmap or a ``{value: name}`` schema, and representing them properly is
+    a design question (the same one nnU-Net's sigmoid/region heads raise, listed
+    there as not-yet-supported). This function only refuses to guess.
+    """
+    declared = label_names(bundle_dir)
+    raw = _output_channel_def(bundle_dir)
+    has_background = any(str(v).lower() == "background" for v in raw.values())
+    unexpected = sorted(set(present or ()) - set(declared))
+    if has_background and not unexpected:
+        return declared, {}
+    return ({int(v): f"label {int(v)}" for v in (present or ())},
+            {"labels_unnamed": True,
+             "declared_channels": [str(raw[k]) for k in sorted(raw, key=int)],
+             "labels_note":
+                 "this bundle's channel_def describes output channels, not voxel "
+                 "values" + (f"; values {unexpected} are outside it" if unexpected
+                             else " (no background entry)")
+                 + " - nnseg does not interpret region heads, so the values are "
+                   "reported as themselves"})
 
 
 def input_roles(bundle_dir) -> list:
@@ -315,8 +364,8 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
     timings["restore"] = time.perf_counter() - _t
 
     arr = sitk.GetArrayFromImage(out)
-    names = label_names(bundle_dir)
     present = sorted({int(v) for v in np.unique(arr) if v != 0})
+    names, label_prov = resolve_label_names(bundle_dir, present)
     print(f"[monai] bundle={bundle} labels_present={len(present)}/{len(names)} "
           f"grid={out.GetSize()}", flush=True)
 
@@ -327,6 +376,6 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
             "bundle_version": eco._entry(bundle)["version"],
             "network": f"MONAI bundle {bundle}",
             "labels_declared": len(names), "labels_present": len(present),
-            "device": device}
+            "device": device, **label_prov}
     return Segmentation(labels=out, schema=LabelSchema(names=names), grid=grid,
                         spec=None, timings=timings, provenance=prov)
