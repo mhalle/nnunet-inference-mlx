@@ -249,3 +249,62 @@ def guess_name(path) -> str | None:
             return None
         return inner + ".gz" if inner else None
     return _inner_name(head)
+
+
+#: A zip is transport, not identity - so extraction is where the hostile cases
+#: live, and none of them should reach a store keyed by content.
+MAX_MEMBERS = 20_000            # a long CT series is a few thousand instances
+MAX_BYTES = 8 << 30
+
+
+class ArchiveError(ValueError):
+    """The archive cannot be safely or sensibly unpacked."""
+
+
+def extract_zip(archive, dest, *, max_members: int = MAX_MEMBERS,
+                max_bytes: int = MAX_BYTES) -> list:
+    """Unpack ``archive`` into ``dest``, flattened, returning the files written.
+
+    Every member is written under its BASENAME. A zip may name any path it
+    likes - absolute, or salted with ``..`` - and the usual advice is to
+    validate those paths; here there is nothing to validate against, because a
+    store keyed by content has no business reproducing someone's directory
+    layout in the first place. Flattening removes the whole class rather than
+    checking for it.
+
+    Sizes are read from the header and enforced against a running total, so an
+    archive that expands to a hundred times its size is refused while unpacking
+    rather than after filling the disk.
+    """
+    import zipfile
+
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    written, total, seen = [], 0, {}
+    try:
+        with zipfile.ZipFile(archive) as z:
+            members = [m for m in z.infolist() if not m.is_dir()]
+            if not members:
+                raise ArchiveError("the archive holds no files")
+            if len(members) > max_members:
+                raise ArchiveError(
+                    f"{len(members)} members exceeds the {max_members} limit")
+            for m in members:
+                name = Path(m.filename.replace("\\", "/")).name
+                if not name or name in (".", ".."):
+                    continue               # a directory entry in disguise
+                total += m.file_size
+                if total > max_bytes:
+                    raise ArchiveError(
+                        f"the archive expands past the {max_bytes} byte limit")
+                # Two members can flatten onto one name (a/IM1 and b/IM1). Keep
+                # both: dropping one would silently change what the tree IS.
+                seen[name] = seen.get(name, 0) + 1
+                out = dest / (name if seen[name] == 1 else f"{seen[name]}_{name}")
+                with z.open(m) as src, open(out, "wb") as f:
+                    while chunk := src.read(_CHUNK):
+                        f.write(chunk)
+                written.append(out)
+    except zipfile.BadZipFile as e:
+        raise ArchiveError(f"not a readable zip archive: {e}") from e
+    return written

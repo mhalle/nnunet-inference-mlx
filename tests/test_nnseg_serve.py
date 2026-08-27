@@ -2916,3 +2916,101 @@ def test_a_preloaded_blob_keeps_a_readable_name(tmp_path):
     assert client.put(f"/v1/inputs/{d}", content=raw).json()["stored_as"] \
         == "input.nii.gz"
     assert sitk.ReadImage(str(ex.content.resolve(d))).GetSize() == (6, 5, 4)
+
+
+# -- DICOM series: many files, one input -----------------------------------
+
+def _dicom_dir(tmp_path, n=3, name="series", uid="1.2.3.4"):
+    """A tiny but real DICOM series, so SimpleITK genuinely recognizes it."""
+    sitk = pytest.importorskip("SimpleITK")
+    import numpy as np
+    d = tmp_path / name
+    d.mkdir()
+    w = sitk.ImageFileWriter()
+    w.KeepOriginalImageUIDOn()
+    for i in range(n):
+        sl = sitk.GetImageFromArray(np.full((1, 4, 4), i + 1, np.int16))
+        for tag, val in (("0008|0060", "MR"), ("0020|000e", uid),
+                         ("0020|0013", str(i + 1)), ("0008|0018", f"{uid}.{i}"),
+                         ("0020|0032", f"0\\0\\{i}"), ("0020|0037", "1\\0\\0\\0\\1\\0")):
+            sl.SetMetaData(tag, val)
+        w.SetFileName(str(d / f"IM{i}.dcm"))
+        w.Execute(sl)
+    return d
+
+
+def _zip_of(d, out):
+    import zipfile
+    with zipfile.ZipFile(out, "w") as z:
+        for p in sorted(d.iterdir()):
+            z.write(p, arcname=f"study/{p.name}")     # nested on purpose
+    return out
+
+
+def test_a_dicom_series_is_stored_as_one_tree(tmp_path):
+    _, ex, client = make(tmp_path)
+    d = _dicom_dir(tmp_path)
+    files = [("f", (p.name, p.read_bytes())) for p in sorted(d.iterdir())]
+    r = client.post("/v1/inputs", files=files)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "tree" and body["members"] == 3
+    assert body["digest"].startswith("sha256-tree:")
+    assert body["series_instance_uid"] == "1.2.3.4"
+    assert ex.content.resolve(body["digest"]).is_dir()
+
+
+def test_a_zip_and_loose_parts_of_one_series_are_the_same_input(tmp_path):
+    """Transport must not change identity: the zip's timestamps, member order
+    and nesting are its own business."""
+    _, _, client = make(tmp_path)
+    d = _dicom_dir(tmp_path)
+    loose = client.post("/v1/inputs", files=[("f", (p.name, p.read_bytes()))
+                                             for p in sorted(d.iterdir())]).json()
+    z = _zip_of(d, tmp_path / "s.zip")
+    zipped = client.post("/v1/inputs",
+                         files={"archive": ("s.zip", z.read_bytes())}).json()
+    assert zipped["kind"] == "tree"
+    assert zipped["digest"] == loose["digest"]
+
+
+def test_a_mixed_folder_is_refused_and_names_the_series(tmp_path):
+    """Two series in one drop means reading 'the' series is a choice, and
+    choosing silently is how a plausible wrong result gets produced."""
+    _, _, client = make(tmp_path)
+    a = _dicom_dir(tmp_path, name="a", uid="1.2.3.4")
+    b = _dicom_dir(tmp_path, name="b", uid="9.8.7.6")
+    files = [("f", (f"{p.parent.name}_{p.name}", p.read_bytes()))
+             for p in sorted(a.iterdir()) + sorted(b.iterdir())]
+    r = client.post("/v1/inputs", files=files)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "multiple_series"
+    assert detail["series_instance_uids"] == ["1.2.3.4", "9.8.7.6"]
+
+
+def test_a_stored_series_runs_a_job_without_being_sent_again(tmp_path):
+    _, _, client = make(tmp_path)
+    d = _dicom_dir(tmp_path)
+    digest = client.post("/v1/inputs", files=[("f", (p.name, p.read_bytes()))
+                                              for p in sorted(d.iterdir())]).json()["digest"]
+    r = client.post("/v1/jobs", data={
+        "task": "total_fast",
+        "source": json.dumps([{"kind": "input", "sha256": digest}])})
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+    assert s["input_identity"] == [digest]
+
+
+def test_a_hostile_archive_cannot_escape_or_explode(tmp_path):
+    import zipfile
+    _, ex, client = make(tmp_path)
+    z = tmp_path / "evil.zip"
+    with zipfile.ZipFile(z, "w") as f:
+        f.writestr("../../../etc/passwd", b"pwned")
+        f.writestr("/abs/IM1.dcm", b"slice")
+    body = client.post("/v1/inputs",
+                       files={"archive": ("evil.zip", z.read_bytes())}).json()
+    where = ex.content.resolve(body["digest"])
+    assert sorted(p.name for p in where.iterdir()) == ["IM1.dcm", "passwd"]
+    assert not (tmp_path / "etc").exists()

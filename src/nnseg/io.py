@@ -323,3 +323,21 @@ def reorient(array_zyx, geometry: "Geometry", target: str):
 
 def write(image, path, *, compress: bool = True) -> None:
     _sitk().WriteImage(image, str(path), compress)
+
+
+def dicom_series_ids(directory) -> list:
+    """Every DICOM SeriesInstanceUID present in ``directory``.
+
+    Empty when the directory holds no DICOM at all - a NIfTI, an Analyze
+    hdr/img pair - which is a normal answer, not a failure.
+
+    Exists so that a folder someone dropped in can be checked BEFORE it becomes
+    an input. A mixed folder (two series, or a series plus a derived object) is
+    the case where reading "the" series means picking one, and picking silently
+    is how a plausible, wrong segmentation gets produced.
+    """
+    sitk = _sitk()
+    try:
+        return list(sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(directory)))
+    except Exception:
+        return []

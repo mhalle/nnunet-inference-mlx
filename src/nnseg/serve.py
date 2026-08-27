@@ -17,6 +17,9 @@ contract is deliberately small:
                                    "url" is reserved for the authenticated tier.
     GET    /v1/jobs                brief status of every known job
     GET    /v1/inputs/{digest}     whether this server already holds that content
+    POST   /v1/inputs             store a multi-file input (a DICOM series) as
+                                   one tree - several parts, or a zip; returns
+                                   its digest
     PUT    /v1/inputs/{digest}     store it (preload). The digest in the URL is
                                    CHECKED against the bytes, never trusted; a
                                    source may then be {"kind":"input","sha256":...}
@@ -1647,8 +1650,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         if digest.startswith(content.TREE):
             raise HTTPException(422, {
                 "code": "unsupported",
-                "message": "a tree is stored by submitting its members; single "
-                           "blobs only on this route for now"})
+                "message": "a tree is stored by POSTing its members (or a zip) "
+                           "to /v1/inputs; this route takes single blobs, whose "
+                           "digest a client can compute before sending"})
         import tempfile
         jid, jdir = executor.new_job_dir()  # a scratch dir on the right filesystem
         try:
@@ -1683,6 +1687,96 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         finally:
             import shutil
             shutil.rmtree(jdir, ignore_errors=True)
+
+    @app.post("/v1/inputs")
+    async def post_input(request: Request, kind: str | None = None,
+                         expect: str | None = None):
+        """Store a multi-file input - a DICOM series - as one tree.
+
+        Transport is the client's convenience: several multipart parts, or one
+        zip. Identity is neither. The tree's digest is taken over the sorted
+        digests of its MEMBERS, so it survives the order they arrived in, the
+        names they were given, and the zip metadata of whatever carried them -
+        the same series zipped twice differs in timestamps and member order, and
+        keying on those bytes would make dedupe stop working while appearing to.
+
+        Returns the digest, because a client cannot be expected to have computed
+        our Merkle root before sending; one that HAS may pass ``expect`` and have
+        it checked, or GET it first and skip the upload entirely.
+        """
+        require_auth(request)              # anonymous never computes, and never stores
+        store = _store_or_404()
+        form = await request.form()
+        # multi_items(), not values(): a form is a MULTIdict, and several
+        # parts sharing one name - which is how a client sends a series -
+        # collapse to a single value through the dict-shaped accessor.
+        uploads = [v for _, v in form.multi_items() if hasattr(v, "read")]
+        if not uploads:
+            raise HTTPException(422, {
+                "code": "no_content",
+                "message": "POST /v1/inputs takes one or more file parts, or a "
+                           "single zip"})
+        if kind not in (None, "tree", "blob"):
+            raise HTTPException(422, {"code": "bad_kind",
+                                      "message": "kind must be 'tree' or 'blob'"})
+        import shutil
+        jid, work = executor.new_job_dir()
+        try:
+            staged = work / "in"
+            staged.mkdir()
+            for i, up in enumerate(uploads):
+                name = Path(getattr(up, "filename", None) or f"part{i}").name
+                with open(staged / f"{i}_{name}", "wb") as f:
+                    while chunk := await up.read(1 << 20):
+                        f.write(chunk)
+            files = sorted(staged.iterdir())
+            # One zip is an ARCHIVE of members, not a member itself - unpack it
+            # unless the caller explicitly asked for a blob.
+            if len(files) == 1 and kind != "blob" and \
+                    files[0].read_bytes()[:4] == b"PK\x03\x04":
+                unpacked = work / "unpacked"
+                try:
+                    files = sorted(content.extract_zip(files[0], unpacked))
+                except content.ArchiveError as e:
+                    raise HTTPException(422, {"code": "bad_archive",
+                                              "message": str(e)}) from e
+                staged = unpacked
+            as_tree = kind == "tree" or (kind is None and len(files) > 1) or \
+                staged.name == "unpacked"
+            if not as_tree:
+                name = Path(getattr(uploads[0], "filename", "") or "").name \
+                    or content.guess_name(files[0])
+                if not name:
+                    raise HTTPException(422, {
+                        "code": "unknown_format",
+                        "message": "could not identify this content; name the "
+                                   "part or pass kind=tree"})
+                digest = store.put_file(files[0], expect=expect,
+                                        name=Path(name).name)
+                return {"digest": digest, "kind": "blob", "members": 1,
+                        "stored": True, "bytes": files[0].stat().st_size}
+            # Refuse a mixed folder rather than pick a series out of it: reading
+            # "the" series when there are two means choosing one, and choosing
+            # silently is how a plausible, wrong segmentation gets produced.
+            from nnseg.io import dicom_series_ids
+            series = dicom_series_ids(staged)
+            if len(series) > 1:
+                raise HTTPException(422, {
+                    "code": "multiple_series",
+                    "message": f"these {len(files)} files hold {len(series)} DICOM "
+                               "series; submit one series per input",
+                    "series_instance_uids": sorted(series)})
+            digest = store.put_dir(staged, expect=expect)
+            return {"digest": digest, "kind": "tree", "members": len(files),
+                    "stored": True,
+                    "bytes": sum(p.stat().st_size for p in files),
+                    "series_instance_uid": series[0] if series else None}
+        except content.DigestMismatch as e:
+            raise HTTPException(422, {"code": "digest_mismatch",
+                                      "declared": e.expected, "actual": e.actual,
+                                      "message": str(e)}) from e
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     @app.get("/v1/health")
     def health():
