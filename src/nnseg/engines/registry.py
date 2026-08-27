@@ -14,18 +14,23 @@ Adding an engine is one row here plus a worker class in
 :mod:`nnseg.modal_app` that declares its image and compute.
 
 Deliberately a **static registry, not a plugin framework** - engines are a
-closed set we ship and test together (YAGNI). It is also deliberately
-**dependency-free**: no torch, no SimpleITK, not even an import of the engine
-modules. ``importing nnseg`` must stay torch-free (see
-``docs/dependency-discipline.md``), and ``info()`` on the lean API image reads
-these constants, so the version literals live *here* and the engine modules
-re-export them.
+closed set we ship and test together (YAGNI). It is also deliberately **light**:
+no torch, no SimpleITK, not even an import of the engine modules. ``importing
+nnseg`` must stay torch-free (see ``docs/dependency-discipline.md``), and
+``info()`` on the lean API image reads these constants, so the version literals
+live *here* and the engine modules re-export them. The one dependency it does
+take is pydantic, for the parameter schemas below - 27 ms to import and 7.8 MB
+on disk, against a core that already requires SimpleITK's 183 MB, and it buys
+the published schema, the enforced validation and the OpenAPI document from one
+declaration.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from typing import Callable
+
+from ..schemas import GRADED_RESTORE, NoParams, Params, VoxTellParams
 
 # The nnU-Net runtime. Named for the upstream major version it runs: nnU-Net v1
 # has a different checkpoint layout and would need its own loader, hence its own
@@ -68,6 +73,25 @@ class Engine:
     #: useful ones out of a shared LRU - VoxTell, whose free-text prompts hash
     #: into the key, is the case this exists for.
     serve_from_cache: bool = True
+    #: The engine's own parameters, as a pydantic model. Generates the JSON
+    #: Schema ``describe()`` publishes AND validates the request at submit, from
+    #: one declaration. Our processing knobs are a separate group and are not
+    #: listed here - see :func:`nnseg.schemas.parameter_groups`.
+    parameters: type[Params] = NoParams
+    #: Whether this engine can consume more than one input image. Introspection
+    #: precedes capability on purpose: a multi-channel model may *declare* its
+    #: roles (so a client can see what it would need) while the engine that runs
+    #: it still refuses to be handed them.
+    multi_input: bool = False
+    #: Read-only facts about what this engine does to a result - published so a
+    #: client can see behavior it cannot change. Empty when the answer is
+    #: per-task rather than per-engine (MONAI, where each bundle's own
+    #: postprocessing decides).
+    behavior: dict = field(default_factory=dict)
+    #: Whether nnseg's processing knobs (``grid``, ``interp``, ...) apply. False
+    #: for engines that run someone else's chain end to end, where offering them
+    #: would be advertising a knob we do not turn.
+    processing_knobs: bool = True
     description: str = ""
 
 
@@ -91,18 +115,25 @@ def _voxtell_identity() -> list[dict]:
 ENGINES: dict[str, Engine] = {
     NNUNETV2: Engine(
         name=NNUNETV2,
+        # the only engine whose surrounding pipeline is ours, so the only one
+        # where our processing knobs are real
+        behavior=GRADED_RESTORE,
         description="nnU-Net v2 networks (TotalSegmentator, MOOSE, and stock models)",
     ),
     "fastsurfer": Engine(
         name="fastsurfer",
         enabled_env="NNSEG_FASTSURFER",
         weights_identity=_fastsurfer_identity,
+        behavior=GRADED_RESTORE,
+        processing_knobs=False,
         description="FastSurferVINN 2.5D view-aggregation parcellation",
     ),
     "synthstrip": Engine(
         name="synthstrip",
         enabled_env="NNSEG_SYNTHSTRIP",
         weights_identity=_synthstrip_identity,
+        behavior=GRADED_RESTORE,
+        processing_knobs=False,
         description="SynthStrip brain extraction (signed distance transform)",
     ),
     "voxtell": Engine(
@@ -112,12 +143,21 @@ ENGINES: dict[str, Engine] = {
         # free text means an unbounded key space and interactive, low-reuse
         # requests: memoizing them evicts results that do get re-read
         serve_from_cache=False,
+        parameters=VoxTellParams,
+        processing_knobs=False,
+        behavior={"restore": {
+            "mode": "none", "owner": "engine",
+            "note": "masks come back on the reader's grid; nnseg does not resample"}},
         description="VoxTell free-text promptable segmentation (prompts are input)",
     ),
     "monai": Engine(
         name="monai",
         enabled_env="NNSEG_MONAI",
         weights_identity=None,          # per bundle - see MonaiEcosystem
+        processing_knobs=False,
+        # no `behavior` constant: each bundle's own postprocessing decides
+        # whether it inverts probabilities or a labelmap, so the fact is per task
+        # and read from the installed bundle - see MonaiEcosystem.describe_task
         description="MONAI model zoo bundles (each carries its own transforms)",
     ),
 }

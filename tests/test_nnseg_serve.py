@@ -341,6 +341,8 @@ def test_idc_source_fetches_at_dispatch(tmp_path, monkeypatch):
 
 
 def test_multichannel_model_rejected_at_submit(tmp_path):
+    """Still refused - but the refusal now NAMES the inputs it wanted, so a
+    client can tell what to send instead of only that it was wrong."""
     seg = FakeSegmenter()
     seg.describe = lambda task: {"name": task, "channel_names": {"0": "T1", "1": "T2"}}
     ex = LocalExecutor(seg, workdir=tmp_path)
@@ -348,7 +350,9 @@ def test_multichannel_model_rejected_at_submit(tmp_path):
     r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
                     data={"task": "total_fast"})
     assert r.status_code == 422
-    assert "2 input channels" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert detail["code"] == "multi_input_unsupported"
+    assert detail["declared"] == ["T1", "T2"]
 
 
 def test_health_advertises_source_kinds(tmp_path):
@@ -364,6 +368,79 @@ def test_real_segmenter_describe_enrichment(tmp_path):
     assert d["configuration"] is None
     assert d["weights_installed"] and all(e["installed"] is False for e in d["weights_installed"])
     assert d["channel_names"] is None
+
+
+def test_describe_publishes_what_a_client_needs_to_build_a_request(tmp_path):
+    """GET /v1/tasks/{task} is the introspection surface: which images the task
+    takes, which options it accepts, and what it does that cannot be changed."""
+    from nnseg import Segmenter
+    ex = LocalExecutor(Segmenter(weights=tmp_path), workdir=tmp_path)
+    d = TestClient(create_app(ex)).get("/v1/tasks/total_fast").json()
+    # One input. It is named generically here because nothing is installed - the
+    # model's own channel name comes from its dataset.json, and inventing "CT"
+    # before reading it would be exactly the guess this design refuses to make.
+    assert len(d["inputs"]) == 1 and d["inputs"][0]["name"] == "image"
+    assert d["inputs"][0]["required"] is True and d["inputs"][0]["channel"] == 0
+    assert "grid" in d["parameters"]["processing"]["properties"]
+    assert d["parameters"]["algorithm"]["properties"] == {}      # nnU-Net has none
+    assert d["behavior"]["restore"]["mode"] == "graded"
+
+
+def test_an_option_we_do_not_know_is_refused_at_submit(tmp_path):
+    """Silence is the worst answer: accepting an unknown key leaves the caller
+    believing a knob was turned."""
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                    data={"task": "total_fast", "options": json.dumps({"gird": 1.5})})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "unknown_parameter"
+    assert "did you mean 'grid'" in detail["message"]
+
+
+def test_deployment_policy_cannot_be_set_by_a_request(tmp_path):
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                    data={"task": "total_fast",
+                          "options": json.dumps({"device": "cuda"})})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "unknown_parameter"
+
+
+def test_a_documented_option_still_goes_through(tmp_path):
+    """The tightening must not cost the wire option that is actually documented."""
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                    data={"task": "total_fast", "options": json.dumps({"grid": 1.0})})
+    assert r.status_code == 202, r.text
+
+
+@pytest.mark.parametrize("role,status", [
+    ("image", 202),       # the declared spelling
+    ("IMAGE", 202),       # case is not a distinction
+    (None, 202),          # a single-input task need not name its input
+    ("T1", 422),          # a role this task does not have
+])
+def test_a_role_on_a_single_input_task_is_checked_not_ignored(tmp_path, role, status):
+    _, _, client = make(tmp_path)
+    entry = {"kind": "upload"}
+    if role is not None:
+        entry["role"] = role
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                    data={"task": "total_fast", "source": json.dumps([entry])})
+    assert r.status_code == status, r.text
+    if status == 422:
+        assert r.json()["detail"]["code"] == "unknown_role"
+
+
+def test_two_sources_for_a_one_input_task_say_so(tmp_path):
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                    data={"task": "total_fast",
+                          "source": json.dumps([{"kind": "upload"}, {"kind": "upload"}])})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "input_count" and detail["got"] == 2
 
 
 def test_idc_not_found_names_probed_buckets(tmp_path, monkeypatch):

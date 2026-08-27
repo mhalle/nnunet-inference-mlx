@@ -490,6 +490,23 @@ class VoxTellEcosystem(ImageBakedEcosystem):
 MONAI_MANIFEST = Path(__file__).parent / "data" / "monai_bundles.json"
 
 
+def _ordered_channel_def(channel_def) -> list:
+    """A model's declared channel names, in channel order.
+
+    Keys are strings in the JSON (``"0"``, ``"1"``, ...), so they are sorted
+    numerically rather than lexically - a ten-channel model must not put
+    ``"10"`` between ``"1"`` and ``"2"``. Returns ``[]`` when nothing usable is
+    declared, which the caller reads as "this model did not name its inputs".
+    """
+    if not isinstance(channel_def, dict):
+        return []
+    try:
+        items = sorted(channel_def.items(), key=lambda kv: int(kv[0]))
+    except (TypeError, ValueError):
+        return []
+    return [str(v) for _, v in items]
+
+
 class MonaiEcosystem(EngineEcosystem):
     """The MONAI model zoo: a CATALOG of bundles run by the ``monai`` engine.
 
@@ -593,20 +610,82 @@ class MonaiEcosystem(EngineEcosystem):
         return [out]
 
     def describe_task(self, task: str, root) -> dict:
-        """Modality, structures and channel count from the installed bundle."""
+        """Modality, structures, input roles and restore behavior, all read from
+        the installed bundle."""
+        from .schemas import input_specs, single_input
+
         fmt = (self.bundle_metadata(task, root).get("network_data_format") or {})
         inp = (fmt.get("inputs") or {}).get("image") or {}
         channel_def = ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
         out = {"structures": [str(v) for k, v in sorted(channel_def.items(),
                                                         key=lambda kv: int(kv[0]))
                               if str(v).lower() != "background"]}
-        if inp.get("modality"):
-            out["modality"] = str(inp["modality"])
-        n_in = inp.get("num_channels") or 1
-        if int(n_in) > 1:
-            # the wire refuses multi-channel at submit; give it something to refuse on
-            out["channel_names"] = [f"channel_{i}" for i in range(int(n_in))]
+        modality = str(inp["modality"]) if inp.get("modality") else None
+        if modality:
+            out["modality"] = modality
+
+        n_in = int(inp.get("num_channels") or 1)
+        roles = _ordered_channel_def(inp.get("channel_def"))
+        if n_in == 1:
+            out["inputs"] = single_input(modality)
+        elif len(roles) == n_in:
+            out["inputs"] = input_specs(roles, modality=modality)
+            out["channel_names"] = roles
+        else:
+            # The bundle claims N channels and names fewer - renalStructures_CECT
+            # declares 3 and names one ("image"). There is no honest way to bind
+            # the rest: position is exactly what cannot be trusted here, since
+            # MONAI's BraTS bundle orders T1c first where nnU-Net's own BraTS
+            # convention puts FLAIR there. So: refuse, and say why.
+            out["inputs"] = None
+            out["inputs_incomplete"] = {
+                "channels": n_in, "named": roles,
+                "reason": f"the bundle declares {n_in} input channels but names "
+                          f"{len(roles)}; nnseg will not bind inputs by position"}
+            out["channel_names"] = roles or [f"channel_{i}" for i in range(n_in)]
+        out["behavior"] = {"restore": self._restore_fact(task, root)}
         return out
+
+    def _restore_fact(self, task: str, root) -> dict:
+        """How this bundle brings its prediction back to the input grid.
+
+        A *fact*, not a knob: the bundle's own postprocessing decides, and the
+        two orders in the wild give materially different boundaries.
+        ``spleen_ct_segmentation`` inverts its spacing transform BEFORE argmax,
+        so probabilities are resampled and the boundary is graded;
+        ``wholeBody_ct_segmentation`` argmaxes first and inverts a labelmap with
+        ``nearest_interp``, which snaps every boundary to the model's grid. We do
+        not override either - running the bundle's own config is the whole point
+        of this engine - so the least we can do is let a client see which one it
+        is getting before choosing a model.
+        """
+        try:
+            from .engines.monai_bundle import inference_config
+            cfg = inference_config(self.bundle_root(task, root))
+            if cfg.suffix != ".json":
+                # YAML would need a parser the lean API image does not carry
+                raise ValueError(f"{cfg.suffix} config")
+            post = json.loads(cfg.read_text()).get("postprocessing") or {}
+            transforms = post.get("transforms") if isinstance(post, dict) else None
+            order = [str((t or {}).get("_target_", "")) for t in (transforms or [])
+                     if isinstance(t, dict)]
+            invert = next((i for i, t in enumerate(order) if t.endswith("Invertd")), None)
+            argmax = next((i for i, t in enumerate(order) if t.endswith("AsDiscreted")), None)
+        except Exception as e:                      # unreadable/absent/YAML: say so
+            return {"mode": "unknown", "owner": "bundle", "note": f"not determined ({e})"}
+        if invert is None:
+            # nothing inverts, so the prediction stays on the model's grid and
+            # nnseg's own nearest-neighbour resample is what the caller gets
+            return {"mode": "label-nearest", "owner": "nnseg",
+                    "note": "the bundle does not invert its spacing transform; "
+                            "nnseg resamples the labelmap to the input grid"}
+        if argmax is not None and argmax < invert:
+            return {"mode": "label-nearest", "owner": "bundle",
+                    "note": "this bundle argmaxes before inverting its spacing "
+                            "transform, so boundaries are snapped to the model's grid"}
+        return {"mode": "graded", "owner": "bundle",
+                "note": "this bundle inverts its spacing transform before argmax, "
+                        "so class probabilities are resampled and argued after"}
 
     def info(self, task: str, root) -> dict:
         out = super().info(task, root)
@@ -618,7 +697,31 @@ class MonaiEcosystem(EngineEcosystem):
             out["summary"] = entry["task"]
         if not out.get("materialized"):
             out["n_structures"] = max(int(entry.get("n_labels", 1)) - 1, 0)
+            out.update(self._preinstall_inputs(entry, out.get("modality")))
         return out
+
+    def _preinstall_inputs(self, entry: dict, modality) -> dict:
+        """What can honestly be said about a bundle's inputs before it is
+        installed.
+
+        The manifest records the channel *count* (generator-derived from the
+        bundle's own metadata), which is enough for the single-input case that
+        covers most of the zoo. It does not always carry the channel *names*, and
+        a multi-channel task without names cannot be described as one image
+        without lying about it - so that case reports no inputs and says where
+        the names come from.
+        """
+        from .schemas import input_specs, single_input
+
+        n_in = int(entry.get("in_channels") or 1)
+        roles = _ordered_channel_def(entry.get("channel_def"))
+        if len(roles) == n_in:
+            return {"inputs": input_specs(roles, modality=modality)}
+        if n_in <= 1:
+            return {"inputs": single_input(modality)}
+        return {"inputs": None,
+                "inputs_hint": f"this bundle takes {n_in} input channels; their "
+                               "names are read from the bundle once installed"}
 
 
 #: The ecosystems each engine contributes when its engine is enabled. The

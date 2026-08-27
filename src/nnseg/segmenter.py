@@ -110,6 +110,30 @@ class Segmenter:
         """Every task name in the catalog."""
         return self.catalog.names()
 
+    def _introspection(self, d: dict) -> dict:
+        """Add the block every task carries, whatever engine runs it: which
+        images it takes (``inputs``), what a caller may send (``parameters``),
+        and what the engine does that a caller cannot change (``behavior``).
+
+        Uniform on purpose. A client should not have to know which engine is
+        behind a task in order to build a valid request for it - that mapping is
+        this tier's job, done once, rather than every client's job done N times.
+
+        Never overwrites what an ecosystem already answered from the model's own
+        metadata: ``inputs: None`` from a bundle that declared its channels
+        incompletely means "not bindable", and must not be quietly replaced by a
+        plausible default.
+        """
+        from .engines.registry import ENGINES, NNUNETV2
+        from .schemas import declared_inputs, parameter_groups
+        eng = ENGINES.get(d.get("engine") or NNUNETV2) or ENGINES[NNUNETV2]
+        d.setdefault("parameters", parameter_groups(eng.parameters,
+                                                    processing=eng.processing_knobs))
+        if eng.behavior:
+            d.setdefault("behavior", dict(eng.behavior))
+        d["inputs"] = declared_inputs(d)
+        return d
+
     def describe(self, task) -> dict:
         """What a task is and what it needs, without running or downloading anything.
 
@@ -130,9 +154,10 @@ class Segmenter:
             if info is not None and not info.get("materialized", True):
                 # weights not installed yet: report what is knowable without
                 # downloading anything, and how to materialize the rest
-                return {**info, "folds_default": list(self.policy["folds"]),
-                        "hint": "structures are read from the checkpoint once "
-                                "installed; prepare() or first use installs it"}
+                return self._introspection(
+                    {**info, "folds_default": list(self.policy["folds"]),
+                     "hint": "structures are read from the checkpoint once "
+                             "installed; prepare() or first use installs it"})
             if info is not None and not info.get("task_spec", True):
                 # This ecosystem's tasks have no nnU-Net TaskSpec (an engine runs
                 # its own network), so _resolve_spec would raise; its describe IS
@@ -142,7 +167,8 @@ class Segmenter:
                 # on `engine` would take this path for every task and silently
                 # drop structures/weights from describe - which moves every
                 # result-cache key and re-splits the API and worker keys.
-                return {**info, "folds_default": list(self.policy["folds"])}
+                return self._introspection(
+                    {**info, "folds_default": list(self.policy["folds"])})
         spec = _resolve_spec(task, self.catalog)
         from .engines.registry import NNUNETV2
         d = {"name": spec.name, "lineage": spec.lineage, "modality": spec.modality,
@@ -179,7 +205,7 @@ class Segmenter:
             installed.append(entry)
         d["weights_installed"] = installed
         d["channel_names"] = channels
-        return d
+        return self._introspection(d)
 
     def structures(self, task) -> list[str]:
         """The structure names a task produces, in label order."""

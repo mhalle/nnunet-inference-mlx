@@ -17,6 +17,23 @@ class InputError(NnsegError, ValueError):
     """The image or the arguments are unusable: not 3D, unreadable, contradictory options."""
 
 
+class RequestError(InputError):
+    """A request that can be refused before any work starts: an unknown
+    parameter, a missing input role, a role bound twice.
+
+    Carries a machine-readable ``code`` plus the fields a client needs in order
+    to fix the request. The point is that the API answers in ONE error
+    vocabulary: without this, the shape of a rejection would depend on which
+    validator happened to catch it, and a client would have to learn pydantic's
+    ``loc``/``msg``/``type`` alongside ours.
+    """
+
+    def __init__(self, code: str, message: str, **detail):
+        super().__init__(message)
+        self.code = code
+        self.detail = {"code": code, "message": message, **detail}
+
+
 class ModelNotFound(NnsegError, FileNotFoundError):
     """A model, configuration, fold or weights file is not where it should be.
 

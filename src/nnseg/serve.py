@@ -111,6 +111,43 @@ def wants_no_cache(request) -> bool:
     return any(d.strip().lower() == "no-cache" for d in raw.split(","))
 
 
+def _validate_request(seg, task, sources: list, options: dict) -> list:
+    """Check a submit against what the task itself declares.
+
+    Two things, both answerable before any work starts: the options are validated
+    against the task's published parameter schema (the same declaration that
+    generates the schema clients read, so the advertised contract and the
+    enforced one cannot drift), and the sources are bound to the task's declared
+    inputs **by name**.
+
+    Returns the ``[(role, source), ...]`` binding in the model's channel order.
+    Nothing consumes the ordering yet - no engine accepts more than one input -
+    but the refusal a multi-input task gets is now the accurate one, naming the
+    roles it wanted.
+
+    A task whose spec cannot be resolved at all is left alone deliberately: that
+    is the worker's error to raise, with the worker's context, and guessing at it
+    here would turn a clear downstream failure into a confusing 422.
+    """
+    from fastapi import HTTPException      # an extra, so imported at call time
+
+    from .engines.registry import ENGINES, NNUNETV2
+    from .errors import RequestError
+    from .schemas import (bind_sources, declared_inputs, validate_options,
+                          wire_params)
+    try:
+        desc = seg.describe(task) or {}
+    except Exception:
+        return []
+    eng = ENGINES.get(desc.get("engine") or NNUNETV2) or ENGINES[NNUNETV2]
+    try:
+        validate_options(wire_params(eng.parameters, eng.processing_knobs), options)
+        return bind_sources(sources, declared_inputs(desc),
+                            multi_input=eng.multi_input, task=task)
+    except RequestError as e:
+        raise HTTPException(422, e.detail) from e
+
+
 def engine_serves_from_cache(task) -> bool:
     """Whether this task's ENGINE allows a stored result to be served.
 
@@ -1639,19 +1676,18 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # a forced recompute. Popped before keying: a cache directive is not part of
         # what identifies a result, or every forced run would land in its own entry.
         no_cache = bool(opts.pop("no_cache", False)) or wants_no_cache(request)
-        if len(src) != 1:
-            raise HTTPException(422, "multi-channel input is not yet supported over the "
-                                     f"wire (got {len(src)} sources)")
-        kind = src[0].get("kind", "upload")
-        if kind == "url":
-            raise HTTPException(422, "source kind 'url' is reserved for the "
-                                     "authenticated tier")
-        if kind != "upload" and kind not in sources:
-            raise HTTPException(422, f"unknown source kind {kind!r}; this server "
-                                     f"offers upload, {', '.join(sources)}")
-        if kind != "upload" and not _source_enabled(sources[kind]):
-            raise HTTPException(422, f"source kind {kind!r} is not enabled on this "
-                                     "server (missing dependency)")
+        for entry in src:                  # every source, not just the first
+            kind = entry.get("kind", "upload")
+            if kind == "url":
+                raise HTTPException(422, "source kind 'url' is reserved for the "
+                                         "authenticated tier")
+            if kind != "upload" and kind not in sources:
+                raise HTTPException(422, f"unknown source kind {kind!r}; this server "
+                                         f"offers upload, {', '.join(sources)}")
+            if kind != "upload" and not _source_enabled(sources[kind]):
+                raise HTTPException(422, f"source kind {kind!r} is not enabled on this "
+                                         "server (missing dependency)")
+        kind = src[0].get("kind", "upload") if src else "upload"
         canonical = canon_task(task)
         if canonical is None:              # catalog names only at the wire boundary
             names = seg.tasks()
@@ -1663,13 +1699,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # engine_serves_from_cache): a per-engine default, overridable per request
         # only in the stricter direction - a caller cannot ask to be memoized.
         no_cache = no_cache or not engine_serves_from_cache(task)
-        try:                               # fail at submit where the spec already knows
-            chan = (seg.describe(task) or {}).get("channel_names")
-        except Exception:
-            chan = None
-        if chan and len(chan) > 1:
-            raise HTTPException(422, f"{task!r} needs {len(chan)} input channels; "
-                                     "multi-channel is not yet supported over the wire")
+        # Everything the task itself knows about the request: which images it
+        # takes, and which options it accepts. Refused HERE, at submit, where the
+        # answer is already in hand - not deep inside a worker minutes later, and
+        # never in silence (an option we do not know is a typo or a stale client,
+        # and accepting it leaves the caller believing a knob was turned).
+        _validate_request(seg, task, src, opts)
         if not executor.accepting:
             raise HTTPException(429, "queue is full, retry later",
                                 headers={"Retry-After": "30"})
