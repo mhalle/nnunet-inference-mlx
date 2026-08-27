@@ -72,6 +72,10 @@ def newest_versions(info: dict) -> dict:
     return {n: (v, e) for n, (_, v, e) in out.items()}
 
 
+#: Scaffolding in the zoo that parses as a segmentation bundle but is not a model.
+TEMPLATES = ("segmentation_template", "classification_template")
+
+
 def segmentation_facts(meta: dict) -> dict | None:
     """Listing facts for a 3D segmentation bundle, or None if it is not one."""
     fmt = meta.get("network_data_format") or {}
@@ -103,6 +107,9 @@ def build(keep_all: bool = False) -> dict:
             meta = fetch_json(METADATA.format(bundle=name))
         except Exception as e:                       # a bundle without metadata in the repo
             skipped.append(f"{name}: metadata unavailable ({type(e).__name__})")
+            continue
+        if name in TEMPLATES:
+            skipped.append(f"{name}: a bundle template, not a model")
             continue
         facts = segmentation_facts(meta)
         if facts is None:
