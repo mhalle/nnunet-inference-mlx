@@ -151,12 +151,22 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
         nio.read_image(str(image_input))
 
     timings: dict[str, float] = {}
-    with tempfile.TemporaryDirectory() as td:
+    # Staging is a real cost, so pay as little of it as possible. A bundle's own
+    # config loads from a FILE (datalist -> LoadImaged), and there is no supported
+    # way to hand it the array we already decoded - injecting an in-memory
+    # MetaTensor means replacing the loader in each bundle's chain, which is the
+    # per-bundle surgery this engine exists to avoid. So: write UNCOMPRESSED (.nii,
+    # not .nii.gz) into tmpfs when there is one. gzip is the dominant IO cost in
+    # this pipeline - a warm total_fast case measured 82 % decompression - and it
+    # buys nothing for a file that exists for one read, seconds from now.
+    shm = Path("/dev/shm")
+    parent = str(shm) if shm.is_dir() else None
+    with tempfile.TemporaryDirectory(dir=parent) as td:
         td = Path(td)
-        in_path, out_path = td / "input.nii.gz", td / "out"
+        in_path, out_path = td / "input.nii", td / "out"
         out_path.mkdir()
         _t = time.perf_counter()
-        sitk.WriteImage(img, str(in_path))
+        sitk.WriteImage(img, str(in_path), False)      # useCompression=False
         timings["stage"] = time.perf_counter() - _t
 
         report.tick(0, 1)
