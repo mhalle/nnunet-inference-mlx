@@ -177,3 +177,47 @@ def test_two_members_that_flatten_onto_one_name_both_survive(tmp_path):
     files = extract_zip(z, out)
     assert len(files) == 3
     assert sorted(p.read_bytes() for p in out.iterdir()) == [b"one", b"three", b"two"]
+
+
+# -- Windows: every key we generate contains a colon ------------------------
+
+def test_the_colon_is_reserved_on_windows_and_not_on_posix():
+    """Every key the stores are handed contains a colon - idc:<uuid>,
+    sha256:<hex>, sha256-tree:<hex> - and on Windows that is the Alternate Data
+    Stream separator, illegal in a filename. Platform-conditional so POSIX
+    layouts (and the deployed caches keyed by them) do not move."""
+    from nnseg.serve import unsafe_path_chars
+    assert ":" in unsafe_path_chars("nt")
+    assert ":" not in unsafe_path_chars("posix")
+    for c in '<>:"|?*':
+        assert c in unsafe_path_chars("nt")
+
+
+def test_every_key_grammar_we_generate_is_a_legal_windows_directory(tmp_path,
+                                                                    monkeypatch):
+    """The bug this guards: the store turns keys straight into directory names,
+    and its safe-check screened separators and NUL but never the colon."""
+    from nnseg.serve import SeriesCache, unsafe_path_chars
+    monkeypatch.setattr(SeriesCache, "_UNSAFE", unsafe_path_chars("nt"))
+    cache = SeriesCache(tmp_path / "c", lambda k, e: None)
+    keys = [BLOB + "a" * 64, TREE + "b" * 64,
+            "idc:a05fb365-dfd2-4116-ab8e-a7262d2c169c",
+            "tcia:1.3.6.1.4.1.14519.5.2.1", "zenodo:10.5281/zenodo.123"]
+    names = set()
+    for k in keys:
+        name = cache._entry(k).name
+        assert not any(c in name for c in unsafe_path_chars("nt")), \
+            f"{k!r} -> {name!r} is not a legal Windows path component"
+        names.add(name)
+    assert len(names) == len(keys)          # and still collision-free
+
+
+def test_posix_layout_is_unchanged(tmp_path):
+    """Guards against fixing Windows by invalidating every deployed cache
+    entry: on POSIX a colon key must keep its readable verbatim name."""
+    from nnseg.serve import SeriesCache, unsafe_path_chars
+    if unsafe_path_chars() != unsafe_path_chars("posix"):
+        pytest.skip("this assertion describes POSIX hosts")
+    cache = SeriesCache(tmp_path / "c", lambda k, e: None)
+    assert cache._entry(BLOB + "abc").name == BLOB + "abc"
+    assert cache._entry("idc:a05fb365").name == "idc:a05fb365"

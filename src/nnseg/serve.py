@@ -233,6 +233,24 @@ def weights_versions_of(segmenter, task) -> list:
         return ["unknown"]
 
 
+def unsafe_path_chars(os_name: str | None = None) -> str:
+    """Characters that cannot appear in a path component on this platform.
+
+    POSIX forbids only the separator and NUL. Windows additionally reserves
+    ``< > : " | ? *`` - and the COLON is the one that matters, because every key
+    the stores are given contains one: ``idc:<uuid>``, ``sha256:<hex>``,
+    ``sha256-tree:<hex>``. There it is the Alternate Data Stream separator and is
+    illegal in a filename, so the whole store layer would fail on Windows. That
+    has simply never been exercised - everything runs on macOS and Linux.
+
+    Platform-conditional on purpose: making ``:`` universally unsafe would
+    re-path every existing entry on POSIX and invalidate the deployed caches to
+    fix a platform they are not on. Takes ``os_name`` so the rule itself is
+    testable from a machine that is not Windows.
+    """
+    return "/\\\x00" + ('<>:"|?*' if (os_name or os.name) == "nt" else "")
+
+
 class SeriesCache:
     """Series-keyed staging for fetched inputs: one directory per series under
     ``root``, claimed by atomic mkdir, committed by a ``.done`` marker holding
@@ -255,13 +273,17 @@ class SeriesCache:
         self._lock = threading.Lock()          # eviction + pin bookkeeping
         self._pins: dict = {}                  # entry name -> refcount
 
+    #: see :func:`unsafe_path_chars` - the colon is why this exists
+    _UNSAFE = unsafe_path_chars()
+
     def _entry(self, series: str) -> Path:
         # Keys become directory names. Filesystem-safe keys keep their readable
         # verbatim name (a cache you can ls); anything else - separators, dot
-        # names, absurd lengths - maps to a deterministic hash, so identifiers
-        # with slashes (DOIs, org/name ids) are safe by construction rather
-        # than forbidden.
-        safe = ("/" not in series and "\\" not in series and "\x00" not in series
+        # names, absurd lengths, and on Windows the reserved characters - maps to
+        # a deterministic hash, so identifiers with slashes (DOIs, org/name ids)
+        # or colons (every content digest) are safe by construction rather than
+        # forbidden.
+        safe = (not any(c in series for c in self._UNSAFE)
                 and series not in (".", "..") and 0 < len(series) <= 200)
         if safe:
             return self.root / series
