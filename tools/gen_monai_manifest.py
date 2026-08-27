@@ -109,13 +109,18 @@ def build(keep_all: bool = False) -> dict:
             skipped.append(f"{name}: not a 3D labelled segmentation bundle")
             continue
         # The zoo has moved hosting: recent entries' "source" is a Hugging Face
-        # REPO PAGE, not a downloadable archive (and they publish no checksum).
-        # monai.bundle.download is what knows how to resolve each host, so record
-        # WHICH host rather than a URL we would have to fetch ourselves.
+        # REPO PAGE, not a downloadable archive (and they publish no checksum), so
+        # we record which HOST monai.bundle.download should resolve rather than a
+        # URL to fetch ourselves.
+        #
+        # "monaihosting" is the right answer for both old and new: that branch
+        # tries huggingface_hub `MONAI/<name>` first and falls back to NGC. Do NOT
+        # map HF-hosted bundles to source="huggingface_hub" - that branch demands
+        # an explicit `repo="owner/name"` and its own default is the three-part
+        # "Project-MONAI/model-zoo/hosting_storage_v1", which fails MONAI's own
+        # validator (hit live 2026-08-27).
         url = entry.get("source") or ""
-        host = ("huggingface_hub" if "huggingface.co" in url
-                else "github" if "github.com" in url
-                else "monaihosting")
+        host = "github" if "github.com" in url else "monaihosting"
         bundles[name] = {"version": version, "source": host, "url": url,
                          "checksum": entry.get("checksum"), **facts}
     return {"source": "Project-MONAI/model-zoo models/model_info.json",

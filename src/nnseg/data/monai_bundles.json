@@ -4,7 +4,7 @@
  "bundles": {
   "spleen_ct_segmentation": {
    "version": "0.6.1",
-   "source": "huggingface_hub",
+   "source": "monaihosting",
    "url": "https://huggingface.co/MONAI/spleen_ct_segmentation/tree/0.6.1",
    "checksum": "",
    "modality": "CT",
@@ -20,7 +20,7 @@
   },
   "wholeBody_ct_segmentation": {
    "version": "0.2.7",
-   "source": "huggingface_hub",
+   "source": "monaihosting",
    "url": "https://huggingface.co/MONAI/wholeBody_ct_segmentation/tree/0.2.7",
    "checksum": "",
    "modality": "CT",
@@ -37,7 +37,7 @@
   },
   "pancreas_ct_dints_segmentation": {
    "version": "0.5.2",
-   "source": "huggingface_hub",
+   "source": "monaihosting",
    "url": "https://huggingface.co/MONAI/pancreas_ct_dints_segmentation/tree/0.5.2",
    "checksum": "",
    "modality": "CT",
@@ -56,7 +56,7 @@
   },
   "swin_unetr_btcv_segmentation": {
    "version": "0.5.8",
-   "source": "huggingface_hub",
+   "source": "monaihosting",
    "url": "https://huggingface.co/MONAI/swin_unetr_btcv_segmentation/tree/0.5.8",
    "checksum": "",
    "modality": "CT",
@@ -74,7 +74,7 @@
   },
   "wholeBrainSeg_Large_UNEST_segmentation": {
    "version": "0.2.7",
-   "source": "huggingface_hub",
+   "source": "monaihosting",
    "url": "https://huggingface.co/MONAI/wholeBrainSeg_Large_UNEST_segmentation/tree/0.2.7",
    "checksum": "",
    "modality": "MRI",
