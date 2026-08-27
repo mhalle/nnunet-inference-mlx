@@ -15,7 +15,8 @@ from nnseg.engines import voxtell as vt
 class FakePredictor:
     """Records what it was handed and returns one mask per prompt.
 
-    ``mask_fn(i, shape)`` builds prompt i's mask in VoxTell's own (X, Y, Z) frame.
+    ``mask_fn(i, shape)`` builds prompt i's mask in the frame VoxTell is handed,
+    which is SimpleITK (Z, Y, X) after RAS reorientation - see the engine docstring.
     """
 
     def __init__(self, mask_fn=None):
@@ -61,38 +62,49 @@ def test_prompts_must_be_present_and_non_empty():
     assert vt.normalize_prompts([" liver ", "spleen"]) == ["liver", "spleen"]
 
 
-def test_the_model_gets_a_transposed_array_and_the_result_comes_back_on_the_input_grid(monkeypatch):
-    """VoxTell wants nibabel order (X, Y, Z); nnseg holds SimpleITK (Z, Y, X). The
-    engine must reverse the axes both ways - on a non-cubic volume a missed transpose
-    changes the shape, which is exactly what this catches."""
+def test_the_model_is_handed_simpleitk_axis_order_not_nibabel_order(monkeypatch):
+    """The contract, and the bug it replaced. VoxTell's training reader is nnU-Net's
+    NibabelIOWithReorient, which reorients to RAS and then transposes to SimpleITK's
+    (Z, Y, X) - so the array a SimpleITK reader already holds goes over as-is.
+    "Fixing" it to nibabel's (X, Y, Z) feeds the model a transposed volume, which it
+    happily segments into plausible masks of the wrong anatomy. Non-cubic shape, so a
+    transpose shows up here rather than in a radiologist's review."""
     img = _image((4, 5, 6))                       # (Z, Y, X)
     seg, fake = _run(monkeypatch, ["liver"], image=img)
-    assert fake.seen_shape == (6, 5, 4)           # handed over as (X, Y, Z)
+    assert fake.seen_shape == (4, 5, 6)           # NOT (6, 5, 4)
     arr = sitk.GetArrayFromImage(seg.labels)
     assert arr.shape == (4, 5, 6)                 # and returned on the input's own grid
     assert seg.labels.GetSpacing() == img.GetSpacing()
 
 
-def _slab(i, shape):                               # (X, Y, Z): the first two X planes
+def _slab(i, shape):                               # (Z, Y, X): the first two Z planes
     m = np.zeros(shape, dtype=np.uint8)
     m[:2, :, :] = 1
     return m
 
 
+def _xslab(i, shape):                              # (Z, Y, X): the first two X planes
+    m = np.zeros(shape, dtype=np.uint8)
+    m[:, :, :2] = 1
+    return m
+
+
 def test_a_mask_lands_on_the_axis_it_was_set_on(monkeypatch):
-    """Shape alone would not catch a swap of two equal-length axes, so place a slab on
-    one axis in the model's frame and require it on the matching axis of the output.
-    The input is already RAS, so this isolates the transpose from any flips."""
+    """Shape alone cannot catch a swap of two equal-length axes, so place a slab on one
+    axis in the model's frame and require it on the matching axis of the output. The
+    input is already RAS, so no flips are involved and this isolates axis order."""
     seg, _ = _run(monkeypatch, ["liver"], mask_fn=_slab, image=_image((4, 5, 6), ras=True))
-    arr = sitk.GetArrayFromImage(seg.labels)       # (Z, Y, X): X is the LAST axis
-    assert arr[:, :, :2].all() and not arr[:, :, 2:].any()
+    arr = sitk.GetArrayFromImage(seg.labels)       # same (Z, Y, X) frame
+    assert arr[:2].all() and not arr[2:].any()     # a Z slab stays a Z slab
 
 
-def test_a_non_ras_input_is_reoriented_and_the_result_comes_back_in_its_own_frame(monkeypatch):
-    """A LPS input is flipped into RAS for the model and flipped back afterwards, so a
-    slab on RAS's first X planes belongs on the LAST X planes of the returned volume.
-    That round-trip is what keeps left and right where the caller put them."""
-    seg, _ = _run(monkeypatch, ["liver"], mask_fn=_slab, image=_image((4, 5, 6)))
+def test_a_non_ras_input_is_flipped_into_ras_and_the_result_is_flipped_back(monkeypatch):
+    """The reorientation round-trip - what actually keeps left and right where the caller
+    put them. A LPS input is flipped into RAS for the model, so a slab the model puts on
+    RAS's FIRST two X planes must come back on the LAST two X planes of the LPS volume.
+    Uses X because that is an axis the LPS<->RAS flip actually moves (Z is untouched, so
+    a Z slab would pass this test even if the flip were dropped entirely)."""
+    seg, _ = _run(monkeypatch, ["liver"], mask_fn=_xslab, image=_image((4, 5, 6)))
     arr = sitk.GetArrayFromImage(seg.labels)
     assert arr[:, :, -2:].all() and not arr[:, :, :-2].any()
 

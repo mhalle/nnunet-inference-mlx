@@ -82,7 +82,7 @@ fastsurfer = ["fastsurfer-lean"]
 # is unbounded (and resolves well past that) - declared conflicting below. The package
 # brings its own tree (nnunetv2, dynamic-network-architectures, transformers,
 # huggingface_hub); weights + the precomputed text-embedding bank come from the HF hub.
-voxtell = ["voxtell>=0.1"]
+voxtell = ["voxtell"]
 
 [build-system]
 requires = ["hatchling"]
@@ -116,6 +116,10 @@ nnunetv2 = { path = "../upstream/nnUNet", editable = true }
 # fastsurfer-lean = our slimmed FastSurfer fork (parcellation CNN only, packaging fixed).
 # Pinned to the slim branch's rev; import namespace stays FastSurferCNN.
 fastsurfer-lean = { git = "https://github.com/mhalle/fastsurfer-lean.git", rev = "041062008b1276b2fb21c886d6943f7bfc3bba6e" }
+# voxtell = MIC-DKFZ's free-text promptable segmentation. Pinned to a git rev, not the
+# PyPI release: 0.1.0 on PyPI predates helpers this engine uses (download_voxtell_model),
+# and pinning the rev means the source we integrated against is the source that runs.
+voxtell = { git = "https://github.com/MIC-DKFZ/VoxTell.git", rev = "8ef0332aec5d5dff925d6f6370386c00334b57ab" }
 # synthstrip-torch = our standalone SynthStrip inference package (StripModel + surfa conform
 # + SDT; weights fetched from MGH at runtime). Import namespace: synthstrip_torch.
 synthstrip-torch = { git = "https://github.com/mhalle/synthstrip-torch.git", rev = "1b871fb1f98fbe60ed1efe87de34a8703a106b44" }
