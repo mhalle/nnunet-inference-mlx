@@ -100,3 +100,39 @@ def test_an_empty_directory_is_not_a_tree(tmp_path, store):
 def test_tree_digest_is_stable_across_calls():
     members = [BLOB + "a" * 64, BLOB + "b" * 64]
     assert tree_digest(members) == tree_digest(reversed(members))
+
+
+@pytest.mark.parametrize("ext", [".nii.gz", ".nii", ".nrrd", ".mha"])
+def test_the_format_is_read_from_the_content_not_the_name(tmp_path, ext):
+    """A content-addressed store keeps the bytes and nothing else, but SimpleITK
+    picks its reader from the EXTENSION - so an entry stored under a nameless
+    temp file is unreadable however correct its digest is. Found by a live run,
+    because a fake segmenter never opens the file it is handed."""
+    sitk = pytest.importorskip("SimpleITK")
+    import numpy as np
+
+    from nnseg.content import guess_name
+    src = tmp_path / f"volume{ext}"
+    sitk.WriteImage(sitk.GetImageFromArray(np.zeros((4, 5, 6), np.int16)), str(src))
+    anonymous = tmp_path / "tmp9f3a2b"          # what mkstemp hands you
+    anonymous.write_bytes(src.read_bytes())
+    assert guess_name(anonymous).endswith(ext)
+
+
+def test_content_we_cannot_identify_is_refused_rather_than_mislabelled(tmp_path):
+    from nnseg.content import guess_name
+    p = tmp_path / "junk"
+    p.write_bytes(b"not a medical image at all")
+    assert guess_name(p) is None
+
+
+def test_a_gzipped_nrrd_does_not_become_a_nifti(tmp_path):
+    """Gzip is unwrapped before deciding. Assuming .nii.gz would store a gzipped
+    NRRD under a name that cannot read it - rare, and therefore the case nobody
+    notices until it fails."""
+    import gzip
+
+    from nnseg.content import guess_name
+    p = tmp_path / "blob"
+    p.write_bytes(gzip.compress(b"NRRD0004\ntype: short\ndimension: 3\n"))
+    assert guess_name(p) == "input.nrrd.gz"

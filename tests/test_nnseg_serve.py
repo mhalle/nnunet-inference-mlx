@@ -2836,9 +2836,10 @@ def test_preload_then_submit_without_sending_bytes(tmp_path):
     task, so submit carries no payload at all."""
     _, _, client = make(tmp_path)
     assert client.get(f"/v1/inputs/{BLOB_SHA}").status_code == 404
-    put = client.put(f"/v1/inputs/{BLOB_SHA}", content=BLOB)
+    put = client.put(f"/v1/inputs/{BLOB_SHA}?filename=scan.nii.gz", content=BLOB)
     assert put.status_code == 200 and put.json()["stored"] is True
-    assert client.put(f"/v1/inputs/{BLOB_SHA}", content=BLOB).json()["stored"] is False
+    assert client.put(f"/v1/inputs/{BLOB_SHA}?filename=scan.nii.gz",
+                      content=BLOB).json()["stored"] is False
 
     r = client.post("/v1/jobs", data={
         "task": "total_fast",
@@ -2875,7 +2876,8 @@ def test_four_channels_can_be_sent_once_and_reused_by_role(tmp_path, monkeypatch
     digests = {}
     for role, b in blobs.items():
         d = "sha256:" + hashlib.sha256(b).hexdigest()
-        assert client.put(f"/v1/inputs/{d}", content=b).json()["stored"] is True
+        assert client.put(f"/v1/inputs/{d}?filename={role}.nii.gz",
+                          content=b).json()["stored"] is True
         digests[role] = d
     r = client.post("/v1/jobs", data={
         "task": "total_fast",
@@ -2887,3 +2889,30 @@ def test_four_channels_can_be_sent_once_and_reused_by_role(tmp_path, monkeypatch
     got = seg.inputs[0]
     assert set(got) == set(ROLES)
     assert Path(got["T1c"]).read_bytes() == blobs["T1c"]      # right bytes per role
+
+
+def test_content_that_names_no_format_is_refused_at_preload(tmp_path):
+    """A blob stored under a nameless temp file is unreadable however correct its
+    digest is - so it is refused at the door rather than at read time, inside a
+    worker, minutes later."""
+    _, _, client = make(tmp_path)
+    junk = b"not a medical image"
+    d = "sha256:" + hashlib.sha256(junk).hexdigest()
+    r = client.put(f"/v1/inputs/{d}", content=junk)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "unknown_format"
+
+
+def test_a_preloaded_blob_keeps_a_readable_name(tmp_path):
+    """The live-run bug in one assertion: what lands in the store must be
+    openable by a reader that dispatches on the extension."""
+    sitk = pytest.importorskip("SimpleITK")
+    import numpy as np
+    _, ex, client = make(tmp_path)
+    src = tmp_path / "vol.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(np.zeros((4, 5, 6), np.int16)), str(src))
+    raw = src.read_bytes()
+    d = "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert client.put(f"/v1/inputs/{d}", content=raw).json()["stored_as"] \
+        == "input.nii.gz"
+    assert sitk.ReadImage(str(ex.content.resolve(d))).GetSize() == (6, 5, 4)

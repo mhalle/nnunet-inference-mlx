@@ -38,6 +38,7 @@ The image mounts the *running* nnseg package (works from an editable checkout or
 installed wheel alike). TODO(release): switch to ``uv_pip_install("nnseg==<ver>")``
 once published, so a deploy is pinned to a version instead of a working tree.
 """
+import functools
 import os
 import sys
 import threading
@@ -59,7 +60,11 @@ JOBS_TTL_H = float(os.environ.get("NNSEG_JOBS_TTL_H", "72"))
 ARTIFACTS = set(filter(None, os.environ.get("NNSEG_ARTIFACTS",
                                             "preview,statistics").split(",")))
 RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
-WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
+WEIGHTS_ROOT, SCRATCH_ROOT, CACHE_ROOT = "/weights", "/scratch", "/cache"
+INPUTS_ROOT = "/inputs"
+# Inputs get a bigger floor than fetched series: a re-fetchable IDC series
+# costs a download when evicted, an uploaded volume is simply gone.
+INPUTS_GB = float(os.environ.get("NNSEG_INPUTS_GB", "50"))
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
 
 
@@ -240,7 +245,14 @@ api_image = (
 
 app = modal.App(APP_NAME, image=image)
 weights_vol = modal.Volume.from_name("nnseg-weights", create_if_missing=True)
-jobs_vol = modal.Volume.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
+scratch_vol = modal.Volume.from_name(f"{APP_NAME}-scratch", create_if_missing=True)
+# Uploaded inputs, addressed by their own bytes. A volume of its own rather than
+# a prefix under the scratch one because the lifetimes are opposites: job
+# directories churn and are deleted, while a preloaded input exists precisely to
+# survive the scale-to-zero that makes preloading worth doing. Separate volumes
+# are also what makes "inputs outlive results" expressible - an evicted result
+# can be recomputed from its recipe, an evicted upload is simply gone.
+inputs_vol = modal.Volume.from_name(f"{APP_NAME}-inputs", create_if_missing=True)
 jobs_dict = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 cache_vol = modal.Volume.from_name(f"{APP_NAME}-cache", create_if_missing=True)
 
@@ -370,8 +382,8 @@ def _prefetch_next(current_jid: str, stop, cache, read_ahead, vol_lock) -> None:
                 try:
                     local = None
                     with vol_lock:
-                        jobs_vol.reload()
-                        srcs = list((Path(JOBS_ROOT) / njid).glob("input_*"))
+                        scratch_vol.reload()
+                        srcs = list((Path(SCRATCH_ROOT) / njid).glob("input_*"))
                         if srcs:
                             tmp.mkdir(exist_ok=True)
                             local = tmp / srcs[0].name
@@ -413,7 +425,7 @@ def _bound_jobs_store(current_jid: str) -> None:
     import shutil
     now, ttl_s = time.time(), JOBS_TTL_H * 3600.0
     try:
-        jdir = Path(JOBS_ROOT) / current_jid
+        jdir = Path(SCRATCH_ROOT) / current_jid
         for f in jdir.glob("input_*"):
             f.unlink(missing_ok=True)
         purged = []
@@ -425,7 +437,7 @@ def _bound_jobs_store(current_jid: str) -> None:
             if k != current_jid and _purgeable(m, now, ttl_s):
                 purged.append(k)
         for k in purged:
-            shutil.rmtree(Path(JOBS_ROOT) / k, ignore_errors=True)
+            shutil.rmtree(Path(SCRATCH_ROOT) / k, ignore_errors=True)
             try:
                 del jobs_dict[k]
             except Exception:
@@ -455,7 +467,7 @@ def _bound_jobs_store(current_jid: str) -> None:
                         pass
         if purged:
             print(f"[purge] {len(purged)} finished jobs past {JOBS_TTL_H:g}h TTL", flush=True)
-        jobs_vol.commit()
+        scratch_vol.commit()
     except Exception as e:
         print(f"[purge] failed: {e}", flush=True)
 
@@ -479,6 +491,34 @@ def _emit(jid: str, update: dict) -> None:
 
 
 _cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
+
+
+#: Serializes write+commit against reload on the inputs volume - a reload
+#: between a write and its commit would discard the write.
+_INPUTS_LOCK = threading.Lock()
+
+
+def _content_store():
+    """The input store, on its own Volume so it outlives every container.
+
+    Volumes are not a POSIX-coherent shared filesystem: a write is published by
+    commit() and someone else's write is seen by reload(). The single-writer
+    claim inside SeriesCache is therefore not a true mutex across containers -
+    but content addressing makes that harmless, because two writers of the same
+    digest write identical bytes. What must hold is that a reader never sees a
+    half-written entry, and the .done marker plus commit-after-write gives that:
+    a reload lands on a committed version or the previous one.
+    """
+    from nnseg.content import ContentStore
+    from nnseg.serve import SeriesCache
+
+    def _no_fetch(key, entry):             # nothing is ever FETCHED into this one
+        raise FileNotFoundError(f"{key} is not held by this server")
+
+    cache = SeriesCache(Path(INPUTS_ROOT) / "content", _no_fetch,
+                        budget_bytes=int(INPUTS_GB * (1 << 30)))
+    return ContentStore(cache, commit=inputs_vol.commit, refresh=inputs_vol.reload,
+                        lock=_INPUTS_LOCK)
 
 
 def _reference(staged):
@@ -507,7 +547,7 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
     meta = jobs_dict.get(jid)
     if meta is None or meta.get("state") == "cancelled":
         return
-    jdir = Path(JOBS_ROOT) / jid
+    jdir = Path(SCRATCH_ROOT) / jid
     last = {"t": 0.0}
 
     def on_progress(p):
@@ -541,13 +581,17 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
             # exactly like a single-input job through the same pinned cache.
             rep = Reporter.of(on_progress, cancel=token)
             with ctx._vol_lock:
-                jobs_vol.reload()
+                scratch_vol.reload()
             staged = {}
             for entry in entries:
                 role = entry.get("role") or "image"
                 kind = entry.get("kind", "upload")
                 if kind == "upload":
                     staged[role] = next(jdir.glob(f"input_{role}_*"))
+                    continue
+                if kind == "input":
+                    staged[role] = ctx.content.resolve(
+                        str(entry.get("id") or entry.get("sha256") or ""))
                     continue
                 ident = str(entry.get("id") or entry.get("crdc_series_uuid") or "")
                 key = f"{kind}:{ident}"
@@ -561,7 +605,10 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
                 print(f"[fetch] {role} {ident[:13]} {time.time() - t_f:.1f}s", flush=True)
                 rep.check()
             input_path = staged
-        elif (kind := entries[0].get("kind", "upload")) != "upload":
+        elif (kind := entries[0].get("kind", "upload")) == "input":
+            # content this server already holds: nothing to fetch or copy
+            input_path = ctx.content.resolve(str(entries[0].get("id") or ""))
+        elif kind != "upload":
             src = entries[0]
             rep = Reporter.of(on_progress, cancel=token)
             ident = src.get("id") or src.get("crdc_series_uuid")
@@ -595,13 +642,13 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
                 input_path = preread
             else:
                 with ctx._vol_lock:
-                    jobs_vol.reload()
+                    scratch_vol.reload()
                 input_path = next(jdir.glob("input_*"))
         from nnseg.serve import RESULT_NAME, ResultCache
         s = ctx._compute(input_path, meta, on_progress, token)
         with ctx._vol_lock:
             s.save(jdir / RESULT_NAME)
-            jobs_vol.commit()
+            scratch_vol.commit()
         result = {"names": {int(k): v for k, v in s.schema.names.items()},
                   "volumes_ml": {k: round(float(v), 2)
                                  for k, v in s.volumes_ml().items()},
@@ -714,6 +761,7 @@ class _WorkerBase:
         self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
                                         budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
         self.read_ahead = ReadAhead()
+        self.content = _content_store()      # uploads referred to by digest
         self._vol_lock = threading.Lock()    # scan-thread reload vs save+commit
         # Never reset: under the GPU snapshot `preload` already ran and recorded
         # WARM_TASK here, and wiping it costs a redundant prepare + a multi-GB
@@ -773,7 +821,8 @@ class _WorkerBase:
 
 @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
          max_containers=MAX_CONTAINERS,
-         volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+         volumes={WEIGHTS_ROOT: weights_vol, SCRATCH_ROOT: scratch_vol,
+                  CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol},
          enable_memory_snapshot=SNAPSHOT, **_cls_extra)
 class Worker(_WorkerBase):
     """The nnU-Net worker: runs every ecosystem whose engine is ``nnunetv2``
@@ -849,7 +898,8 @@ class _EngineShim:
 if FASTSURFER:
     @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=fs_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             volumes={WEIGHTS_ROOT: weights_vol, SCRATCH_ROOT: scratch_vol,
+                  CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class FastSurferWorker(_WorkerBase):
         """The FastSurfer engine worker: the shared scheduler + serve-core from
@@ -884,7 +934,8 @@ if FASTSURFER:
 if SYNTHSTRIP:
     @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=synthstrip_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             volumes={WEIGHTS_ROOT: weights_vol, SCRATCH_ROOT: scratch_vol,
+                  CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class SynthStripWorker(_WorkerBase):
         """The SynthStrip engine worker: the shared scheduler + serve-core, with
@@ -927,7 +978,8 @@ assert set(_WORKER_CLASSES) == set(_engines.ENGINES), (
 if VOXTELL:
     @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=voxtell_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             volumes={WEIGHTS_ROOT: weights_vol, SCRATCH_ROOT: scratch_vol,
+                  CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class VoxTellWorker(_WorkerBase):
         """The VoxTell engine worker: free-text prompts instead of a fixed task.
@@ -969,7 +1021,8 @@ if VOXTELL:
 if MONAI:
     @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=monai_image,
-             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             volumes={WEIGHTS_ROOT: weights_vol, SCRATCH_ROOT: scratch_vol,
+                  CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
     class MonaiWorker(_WorkerBase):
         """The MONAI engine worker: a CATALOG of bundles, so unlike the other engine
@@ -1050,11 +1103,18 @@ def _spawn_worker(task: str, jid: str, source_tokens=None):
 class ModalExecutor:
     """The :func:`nnseg.serve.create_app` executor protocol over Modal primitives."""
 
-    # One lock per API container: a jobs_vol.reload() here discards other
+    # One lock per API container: a scratch_vol.reload() here discards other
     # requests' uncommitted upload writes (the api function runs many inputs
     # concurrently), so every reload and every upload-write+commit serialize
     # through it. The worker has its own _vol_lock for the same reason.
     volume_guard = threading.Lock()
+
+    @functools.cached_property
+    def content(self):
+        """Where a PUT /v1/inputs lands, and what a {"kind": "input"} source is
+        checked against at submit. The same volume the workers read, so content
+        stored here is resolvable there."""
+        return _content_store()
 
     @property
     def sources(self):
@@ -1086,7 +1146,7 @@ class ModalExecutor:
     def new_job_dir(self):
         import uuid
         jid = uuid.uuid4().hex[:12]
-        d = Path(JOBS_ROOT) / jid
+        d = Path(SCRATCH_ROOT) / jid
         d.mkdir(parents=True, exist_ok=True)
         return jid, d
 
@@ -1142,7 +1202,7 @@ class ModalExecutor:
         # through a Dict to another container would be sending it a lie.
         from nnseg.serve import result_key
         with self.volume_guard:
-            jobs_vol.commit()                # make any upload visible to the worker
+            scratch_vol.commit()                # make any upload visible to the worker
         key = None
         if identity:
             key = result_key(identity, task, options,
@@ -1246,8 +1306,8 @@ class ModalExecutor:
             del jobs_dict[jid]
         except Exception:
             pass
-        shutil.rmtree(Path(JOBS_ROOT) / jid, ignore_errors=True)
-        jobs_vol.commit()
+        shutil.rmtree(Path(SCRATCH_ROOT) / jid, ignore_errors=True)
+        scratch_vol.commit()
         return state, True
 
     def result_file(self, jid):
@@ -1263,14 +1323,14 @@ class ModalExecutor:
                 pass
             return meta["state"], (p if p.exists() else None)
         with self.volume_guard:
-            jobs_vol.reload()
-        p = Path(JOBS_ROOT) / jid / RESULT_NAME
+            scratch_vol.reload()
+        p = Path(SCRATCH_ROOT) / jid / RESULT_NAME
         return meta["state"], (p if p.exists() else None)
 
 
 @app.function(cpu=2.0, memory=2048, scaledown_window=300, image=api_image,
-              volumes={JOBS_ROOT: jobs_vol, WEIGHTS_ROOT: weights_vol,
-                       CACHE_ROOT: cache_vol})
+              volumes={SCRATCH_ROOT: scratch_vol, WEIGHTS_ROOT: weights_vol,
+                       CACHE_ROOT: cache_vol, INPUTS_ROOT: inputs_vol})
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app(requires_proxy_auth=PROXY_AUTH)
 def api():

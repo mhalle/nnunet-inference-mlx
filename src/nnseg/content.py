@@ -93,11 +93,37 @@ class ContentStore:
     a client uploaded it or the server fetched it.
     """
 
-    def __init__(self, cache):
+    def __init__(self, cache, *, commit=None, refresh=None, lock=None):
+        import contextlib
         self.cache = cache
+        # A refresh of a shared backing store can DISCARD writes that are on disk
+        # but not yet published - so a store that needs commit/reload also needs
+        # the write and its commit to be one indivisible step against any reload.
+        # This is the same hazard the jobs volume already guards against, and the
+        # reason the hook is a lock rather than a flag.
+        self._lock = lock or contextlib.nullcontext()
+        # Hooks for a backing store that is not a plain local filesystem. Modal
+        # Volumes need an explicit commit to publish a write and an explicit
+        # reload to see someone else's - so they are passed in rather than
+        # imported, and this module keeps knowing nothing about Modal.
+        self._commit = commit
+        self._refresh = refresh
 
     def has(self, digest: str) -> bool:
-        return self.cache.has(digest)
+        """Whether the content is here.
+
+        Optimistic: a local hit answers immediately, and only a MISS pays for
+        refreshing a shared backing store. That ordering matters - this is called
+        on every submit that refers to a digest, and a refresh per call would put
+        a network round trip in front of the common case.
+        """
+        if self.cache.has(digest):
+            return True
+        if self._refresh is not None:
+            with self._lock:
+                self._refresh()
+            return self.cache.has(digest)
+        return False
 
     def resolve(self, digest: str) -> Path:
         """What to hand the reader: the FILE for a blob, the DIRECTORY for a tree.
@@ -107,6 +133,8 @@ class ContentStore:
         SimpleITK - so guessing from the entry's shape would turn a one-slice
         series into a single-file read.
         """
+        if not self.cache.has(digest):
+            self.has(digest)               # refresh a shared store before failing
         content = self.cache.path(digest)
         if digest.startswith(TREE):
             return content
@@ -176,4 +204,48 @@ class ContentStore:
                 shutil.copyfile(src, content / Path(name).name)
             return content
 
-        self.cache.get_or_fetch(digest, fetch=write)
+        with self._lock:               # no reload may land between these two
+            self.cache.get_or_fetch(digest, fetch=write)
+            if self._commit is not None:
+                self._commit()             # publish it to everyone else
+
+
+#: Magic-number sniffing, because a content-addressed store keeps the BYTES and
+#: the bytes alone - and SimpleITK picks its reader from the file EXTENSION. An
+#: entry stored under a name with no suffix is unreadable however correct its
+#: digest is, which is a failure that only shows up when something actually opens
+#: it (a fake segmenter in a test never will).
+_NIFTI_MAGIC_OFFSET = 344
+
+
+def _inner_name(head: bytes) -> str | None:
+    if head[:4] == b"NRRD":
+        return "input.nrrd"
+    if head[:10] == b"ObjectType":
+        return "input.mha"
+    if head[128:132] == b"DICM":
+        return "input.dcm"
+    magic = head[_NIFTI_MAGIC_OFFSET:_NIFTI_MAGIC_OFFSET + 4]
+    if magic in (b"n+1\x00", b"ni1\x00"):
+        return "input.nii"
+    return None
+
+
+def guess_name(path) -> str | None:
+    """A filename whose extension names the format, read from the content.
+
+    Gzip is unwrapped before deciding, rather than assumed to be NIfTI: a
+    gzipped NRRD is rare but stored under ``.nii.gz`` it would be unreadable,
+    and "rare" is exactly the case nobody notices until it fails.
+    """
+    with open(path, "rb") as f:
+        head = f.read(512)
+    if head[:2] == b"\x1f\x8b":
+        import gzip
+        try:
+            with gzip.open(path, "rb") as g:
+                inner = _inner_name(g.read(512))
+        except OSError:
+            return None
+        return inner + ".gz" if inner else None
+    return _inner_name(head)

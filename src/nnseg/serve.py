@@ -1627,7 +1627,8 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 "bytes": sum(p.stat().st_size for p in files)}
 
     @app.put("/v1/inputs/{digest}")
-    async def put_input(digest: str, request: Request):
+    async def put_input(digest: str, request: Request,
+                        filename: str | None = None):
         """Store content under the digest of its own bytes - the preload call.
 
         The digest in the URL is what the caller CLAIMS. It is checked against
@@ -1665,8 +1666,19 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     "code": "digest_mismatch", "declared": digest, "actual": actual,
                     "message": "the bytes are not the ones you said they were; "
                                "nothing was stored"})
-            store.put_file(tmp, computed=actual)
-            return {"digest": actual, "stored": True,
+            # The store keeps bytes, but SimpleITK chooses its reader from the
+            # EXTENSION - so an entry has to land under a name that names its
+            # format, or it is unreadable however correct its digest is. The
+            # caller may say; otherwise it is read out of the content.
+            name = filename or content.guess_name(tmp)
+            if not name:
+                raise HTTPException(422, {
+                    "code": "unknown_format",
+                    "message": "could not identify this content (expected NIfTI, "
+                               "NRRD, MetaImage or DICOM); pass ?filename= to "
+                               "name it explicitly"})
+            store.put_file(tmp, computed=actual, name=Path(name).name)
+            return {"digest": actual, "stored": True, "stored_as": Path(name).name,
                     "bytes": tmp.stat().st_size}
         finally:
             import shutil
