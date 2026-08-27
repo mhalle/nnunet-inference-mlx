@@ -1916,10 +1916,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                         "code": "unknown_format",
                         "message": "could not identify this content; name the "
                                    "part or pass kind=tree"})
-                digest = store.put_file(files[0], expect=expect,
-                                        name=Path(name).name)
+                digest = content.digest_file(files[0])
+                already = store.has(digest)     # honest about a no-op adopt
+                store.put_file(files[0], expect=expect, name=Path(name).name,
+                               computed=digest)
                 return {"digest": digest, "kind": "blob", "members": 1,
-                        "stored": True, "bytes": files[0].stat().st_size}
+                        "stored": not already, "bytes": files[0].stat().st_size}
             # Refuse a mixed folder rather than pick a series out of it: reading
             # "the" series when there are two means choosing one, and choosing
             # silently is how a plausible, wrong segmentation gets produced.
@@ -1931,9 +1933,11 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     "message": f"these {len(files)} files hold {len(series)} DICOM "
                                "series; submit one series per input",
                     "series_instance_uids": sorted(series)})
-            digest = store.put_dir(staged, expect=expect)
+            digest = content.digest_dir(staged)
+            already = store.has(digest)         # honest about a no-op adopt
+            store.put_dir(staged, expect=expect)
             return {"digest": digest, "kind": "tree", "members": len(files),
-                    "stored": True,
+                    "stored": not already,
                     "bytes": sum(p.stat().st_size for p in files),
                     "series_instance_uid": series[0] if series else None}
         except content.DigestMismatch as e:

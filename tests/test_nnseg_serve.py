@@ -3186,3 +3186,16 @@ def test_both_doors_refuse_the_same_options(tmp_path):
         _validate_request(FakeSegmenter(), "total_fast",
                           [{"kind": "idc", "id": "x"}], {"device": "cuda"})
     assert e.value.detail["code"] == "unknown_parameter"
+
+
+def test_posting_content_the_server_already_holds_says_so(tmp_path):
+    """PUT already reported a no-op adopt honestly; POST claimed it stored
+    something every time. A client using `stored` to decide whether an upload
+    was needed would have learned nothing from it."""
+    _, _, client = make(tmp_path)
+    d = _dicom_dir(tmp_path)
+    files = [("f", (p.name, p.read_bytes())) for p in sorted(d.iterdir())]
+    first = client.post("/v1/inputs", files=files).json()
+    second = client.post("/v1/inputs", files=files).json()
+    assert first["digest"] == second["digest"]
+    assert first["stored"] is True and second["stored"] is False
