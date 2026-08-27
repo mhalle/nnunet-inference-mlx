@@ -63,6 +63,14 @@ class ModelEcosystem:
     and SynthStrip run their own networks - sets :attr:`has_task_spec` to False
     and inherits the whole interface below unchanged; it does not need to
     override anything to refuse.
+
+    Two axes, deliberately independent, because a catalog of engine models needs
+    one of each and welding them together is what would make it fight this class:
+    :attr:`has_task_spec` says whether the nnU-Net pipeline can run the task;
+    :meth:`materialized` / :meth:`ensure` say where the weights come from. The
+    per-task hooks :meth:`weights_identity` and :meth:`describe_task` exist for
+    the same reason - a one-model engine answers both from constants, a catalog
+    answers them from its manifest and its installed models.
     """
 
     name: str = ""
@@ -71,14 +79,42 @@ class ModelEcosystem:
     engine: str = _registry.NNUNETV2
     #: False when tasks are run by an engine's own network rather than an
     #: nnU-Net TaskSpec (drives ``spec()`` and the ``task_spec`` info flag).
+    #: Independent of where the weights live - an ecosystem can have no TaskSpec
+    #: and still install per task; see :meth:`materialized` / :meth:`ensure`.
     has_task_spec: bool = True
-    #: Pre-install metadata for ecosystems that cannot read it from a checkpoint
-    #: (engines know their own modality and label set statically).
+    #: Pre-install metadata for ecosystems that know it statically (a one-model
+    #: engine knows its own modality and label set). A catalog leaves these None
+    #: and answers per task instead - see :meth:`describe_task`.
     modality: str | None = None
     structures: list | None = None
 
     def tasks(self) -> list:
         raise NotImplementedError
+
+    def weights_identity(self, task: str, root) -> list | None:
+        """This task's contribution to the result-cache key, or None.
+
+        Defaults to the engine's constant identity, which is what a one-model
+        engine has (its weights ship with its image). A *catalog* of models
+        overrides this to answer per task - it already holds a manifest with
+        versions in memory, so this stays cheap. It must be cheap: ``info()``
+        runs once per task on ``/v1/tasks`` and ``/v1/version``, so anything that
+        walks the weights volume here lands on two hot endpoints.
+
+        Returns None when the engine has no constant and the ecosystem declares
+        nothing - the nnU-Net path, where the identity is computed per task from
+        the spec's weights ids by :meth:`nnseg.segmenter.Segmenter.describe`.
+        """
+        identity = _registry.ENGINES[self.engine].weights_identity
+        return identity() if identity is not None else None
+
+    def describe_task(self, task: str, root) -> dict:
+        """Per-task metadata an ecosystem can read from the model itself once it
+        is installed - ``modality`` and ``structures``. Empty by default; the
+        nnU-Net ecosystems get theirs from the TaskSpec, one-model engines from
+        their class attributes, and a catalog reads its model's own metadata
+        (the "the checkpoint is the spec" rule)."""
+        return {}
 
     def materialized(self, task: str, root) -> bool:
         """Whether spec() can answer without installing anything."""
@@ -125,13 +161,17 @@ class ModelEcosystem:
             out["modality"] = self.modality
         if self.structures is not None:
             out["structures"] = list(self.structures)
-        identity = _registry.ENGINES[self.engine].weights_identity
+        identity = self.weights_identity(task, root)
         if identity is not None:
-            out["weights_installed"] = identity()
-        if out["materialized"] and self.has_task_spec:
-            spec = self.spec(task, root)
-            out["modality"] = spec.modality
-            out["structures"] = sorted(spec.label_map.values())
+            out["weights_installed"] = identity
+        if out["materialized"]:
+            if self.has_task_spec:
+                spec = self.spec(task, root)
+                out["modality"] = spec.modality
+                out["structures"] = sorted(spec.label_map.values())
+            else:
+                # a catalog of engine models reads its own metadata per task
+                out.update(self.describe_task(task, root))
         return out
 
 
@@ -341,14 +381,25 @@ def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None,
 
 class EngineEcosystem(ModelEcosystem):
     """An ecosystem whose tasks are run by an engine's own network rather than an
-    nnU-Net TaskSpec. It exists in the catalog so ``eco:task`` resolves, lists and
-    describes; the weights ship with the engine's image, so there is nothing to
-    install and nothing to materialize.
+    nnU-Net TaskSpec.
 
-    Subclasses declare data only - name, engine, tasks, modality, structures.
+    That is the ONLY thing this class asserts. Whether the weights ship with the
+    engine's image is a separate question, answered by
+    :class:`ImageBakedEcosystem` below - an engine ecosystem is free to install
+    per task instead (a catalog of models does), and conflating the two is what
+    would force a many-task engine catalog to fight this class.
     """
 
     has_task_spec = False
+
+
+class ImageBakedEcosystem(EngineEcosystem):
+    """An engine ecosystem whose weights ship inside the engine's own image:
+    always materialized, nothing to install. The one-model engines
+    (FastSurfer, SynthStrip, VoxTell) are all this shape.
+
+    Subclasses declare data only - name, engine, task_names, modality, structures.
+    """
 
     #: Task names this engine offers.
     task_names: tuple = ()
@@ -363,7 +414,7 @@ class EngineEcosystem(ModelEcosystem):
         return None
 
 
-class FastSurferEcosystem(EngineEcosystem):
+class FastSurferEcosystem(ImageBakedEcosystem):
     """FastSurfer whole-brain parcellation (2.5D view-aggregation, not nnU-Net).
     Its checkpoints are baked into the FastSurfer worker image."""
 
@@ -406,7 +457,7 @@ def registry(ecosystems=None) -> dict:
     return out
 
 
-class SynthStripEcosystem(EngineEcosystem):
+class SynthStripEcosystem(ImageBakedEcosystem):
     """SynthStrip brain extraction (skull-strip): a contrast-agnostic learned
     brain-mask UNet, not nnU-Net. Weights are baked into the worker image."""
 
@@ -418,7 +469,7 @@ class SynthStripEcosystem(EngineEcosystem):
     structures = ["Brain"]
 
 
-class VoxTellEcosystem(EngineEcosystem):
+class VoxTellEcosystem(ImageBakedEcosystem):
     """VoxTell free-text promptable segmentation. Unlike every other catalog entry,
     ``voxtell:text`` has **no fixed label set** - the prompts are an input, passed
     as ``options={"prompts": [...]}``, and they hash into the result-cache key. So

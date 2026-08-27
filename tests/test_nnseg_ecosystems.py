@@ -206,3 +206,72 @@ def test_synthstrip_ecosystem_lists_but_refuses_spec(tmp_path):
     assert info["weights_installed"] == [{"id": "synthstrip", "version": "v1"}]
     with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
         cat.get("synthstrip:mask")
+
+
+# -- the seams a many-task engine catalog needs (MONAI is the first; see
+#    medseg/docs/monai-bundles.md). Pinned here because all four ecosystems that
+#    exist today are one-model engines or nnU-Net catalogs, so nothing else would
+#    notice if these regressed.
+
+def test_engine_ecosystem_does_not_imply_image_baked_weights(tmp_path):
+    """has_task_spec (can the nnU-Net pipeline run it?) and materialization (where
+    do the weights come from?) are independent axes. An engine catalog needs
+    has_task_spec=False WITH a real install per task."""
+    from pathlib import Path
+
+    from nnseg.ecosystems import EngineEcosystem, ImageBakedEcosystem
+
+    assert EngineEcosystem.has_task_spec is False
+    # the base engine class must NOT decide materialization for its subclasses
+    assert "materialized" not in vars(EngineEcosystem)
+    assert "ensure" not in vars(EngineEcosystem)
+    # the image-baked flavour is what supplies the always-materialized behaviour
+    assert vars(ImageBakedEcosystem)["materialized"] is not None
+
+    class Catalog(EngineEcosystem):          # no TaskSpec, but installs per task
+        name, engine = "cat", "fastsurfer"
+        def tasks(self): return ["m"]
+        def materialized(self, task, root): return (Path(root) / task).is_dir()
+        def ensure(self, task, root, progress=None, version=None):
+            (Path(root) / task).mkdir(parents=True, exist_ok=True)
+
+    eco = Catalog()
+    assert eco.info("m", tmp_path)["materialized"] is False
+    eco.ensure("m", tmp_path)
+    assert eco.info("m", tmp_path)["materialized"] is True
+
+
+def test_weights_identity_and_metadata_can_be_answered_per_task(tmp_path):
+    """A catalog knows a version per model, not one constant - and reads modality
+    and structures from the model itself once installed."""
+    from nnseg.ecosystems import EngineEcosystem
+
+    class Catalog(EngineEcosystem):
+        name, engine = "cat", "fastsurfer"
+        def tasks(self): return ["a", "b"]
+        def materialized(self, task, root): return True
+        def ensure(self, task, root, progress=None, version=None): return None
+        def weights_identity(self, task, root):
+            return [{"id": f"bundle-{task}", "version": "1.2.3"}]
+        def describe_task(self, task, root):
+            return {"modality": "CT", "structures": ["spleen", "liver"]}
+
+    eco = Catalog()
+    a, b = eco.info("a", tmp_path), eco.info("b", tmp_path)
+    assert a["weights_installed"] == [{"id": "bundle-a", "version": "1.2.3"}]
+    assert b["weights_installed"] == [{"id": "bundle-b", "version": "1.2.3"}]
+    assert a["structures"] == ["spleen", "liver"] and a["modality"] == "CT"
+    # distinct identities per task must reach the cache key, or two models collide
+    from nnseg.serve import result_key
+    key = lambda i: result_key(("sha256:x",), "cat:t", {},
+                               [f"{e['id']}={e['version']}" for e in i["weights_installed"]])
+    assert key(a) != key(b)
+
+
+def test_one_model_engines_still_take_their_identity_from_the_registry(tmp_path):
+    """The default path is unchanged: an image-baked engine answers from the
+    engine registry's constant, with no per-task work."""
+    from nnseg.ecosystems import FastSurferEcosystem
+    from nnseg.engines import registry as R
+    eco = FastSurferEcosystem()
+    assert eco.weights_identity("brain", tmp_path) == R.ENGINES["fastsurfer"].weights_identity()
