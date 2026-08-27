@@ -217,3 +217,17 @@ def test_spawn_worker_routes_by_engine_not_by_task_prefix():
     assert R.engine_for_task("custom:mine").name == R.NNUNETV2
     assert R.engine_for_task("fastsurfer:brain").name == "fastsurfer"
     assert modal_app._WORKER_CLASSES.keys() == R.ENGINES.keys()
+
+
+def test_the_two_executors_speak_the_same_submit_signature():
+    """One protocol, two implementations - and the wire calls whichever it has.
+    A parameter added to one and not the other is a 500 that only appears on the
+    deployed side, which is exactly how `inputs` first shipped broken."""
+    import inspect
+
+    from nnseg.modal_app import ModalExecutor
+    from nnseg.serve import LocalExecutor
+    local = inspect.signature(LocalExecutor.submit).parameters
+    modal_ = inspect.signature(ModalExecutor.submit).parameters
+    assert set(local) - {"self"} <= set(modal_), \
+        f"ModalExecutor.submit is missing {sorted(set(local) - set(modal_))}"

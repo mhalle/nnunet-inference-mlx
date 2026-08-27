@@ -1132,7 +1132,14 @@ class ModalExecutor:
                           self._fresh_weights_versions(task))
 
     def submit(self, jid, jdir, input_path, task, options, *, source=None,
-               identity=(), no_cache: bool = False, source_tokens=None):
+               identity=(), no_cache: bool = False, source_tokens=None,
+               inputs: tuple = ()):
+        # `inputs` (the role -> local path binding) is accepted for signature
+        # parity with LocalExecutor and deliberately not forwarded: this executor
+        # is stateless by construction, and the worker rebuilds the binding from
+        # `source` - each entry carries its canonical role, and uploads were
+        # written into the job dir under that role. Sending server-local paths
+        # through a Dict to another container would be sending it a lie.
         from nnseg.serve import result_key
         with self.volume_guard:
             jobs_vol.commit()                # make any upload visible to the worker

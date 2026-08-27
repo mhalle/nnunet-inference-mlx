@@ -141,6 +141,37 @@ def inference_config(bundle_dir):
         f"no inference config in {bundle_dir}/configs (have: {', '.join(have)})")
 
 
+def _datalist_overrides(bundle_dir, paths: list) -> dict:
+    """Point the bundle's own case list at the file(s) we staged.
+
+    Bundles do not agree on how a case gets in. ``spleen_ct_segmentation``
+    resolves a ``datalist`` list directly; ``brats_mri_segmentation`` loads a
+    Decathlon JSON named by ``data_list_file_path`` and joined against
+    ``dataset_dir``. Overriding the wrong one is worse than an error - the
+    bundle quietly keeps its author's hardcoded path
+    (``/workspace/data/medical/brats2018challenge``) and fails somewhere far from
+    the cause, which is exactly how this surfaced the first time.
+
+    So read which mechanism the config actually exposes and drive that one. This
+    is the same kind of adaptation as finding ``inference.json`` vs
+    ``inference.yaml``: a knob the bundle publishes, not surgery on its chain.
+    """
+    import json
+    from pathlib import Path
+
+    from monai.bundle import ConfigParser
+
+    cfg = ConfigParser.load_config_file(str(inference_config(bundle_dir)))
+    # a list of channel files is ONE case; MONAI's loader stacks it
+    item = [str(p) for p in paths] if len(paths) > 1 else str(paths[0])
+    parent = Path(paths[0]).parent
+    if "data_list_file_path" in cfg:
+        dl = parent / "datalist.json"
+        dl.write_text(json.dumps({"testing": [{"image": item}]}))
+        return {"data_list_file_path": str(dl), "dataset_dir": str(parent)}
+    return {"datalist": [item], "dataset_dir": str(parent)}
+
+
 def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
                 timings: dict | None = None):
     """Drive the bundle's own inference workflow over exactly one image.
@@ -169,10 +200,9 @@ def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
     paths = image_path if isinstance(image_path, list) else [image_path]
     overrides = {
         "bundle_root": str(bundle_dir),
-        "dataset_dir": str(paths[0].parent),
-        "datalist": [[str(p) for p in paths] if len(paths) > 1 else str(paths[0])],
         "output_dir": str(out_dir),
         "device": device,
+        **_datalist_overrides(bundle_dir, paths),
     }
     t0 = time.perf_counter()
     workflow = create_workflow(

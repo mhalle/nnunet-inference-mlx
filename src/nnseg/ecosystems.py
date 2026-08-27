@@ -490,6 +490,21 @@ class VoxTellEcosystem(ImageBakedEcosystem):
 MONAI_MANIFEST = Path(__file__).parent / "data" / "monai_bundles.json"
 
 
+#: Whose job co-registration is - published on every multi-input task so a client
+#: reads it up front instead of discovering it from a refusal. A multi-channel
+#: network consumes ONE tensor, so its channels must already share a grid, and
+#: producing that is a registration step belonging upstream where the caller can
+#: see and check it. Slicer registers before it ever calls us; doing it silently
+#: inside an inference call would be a geometry decision taken on someone else's
+#: behalf, which is the shape of every geometry bug this project has paid for.
+ASSUMED_PREREGISTERED = {
+    "mode": "assumed-preregistered", "owner": "caller",
+    "note": "channels are stacked in the model's declared order and must already "
+            "be co-registered on a common grid; nnseg does not register or "
+            "resample them, and refuses inputs whose grids differ",
+}
+
+
 def _ordered_channel_def(channel_def) -> list:
     """A model's declared channel names, in channel order.
 
@@ -645,18 +660,7 @@ class MonaiEcosystem(EngineEcosystem):
             out["channel_names"] = roles or [f"channel_{i}" for i in range(n_in)]
         out["behavior"] = {"restore": self._restore_fact(task, root)}
         if out.get("inputs") and len(out["inputs"]) > 1:
-            # Say plainly whose job registration is. A multi-channel network
-            # consumes ONE tensor, so its channels must already share a grid -
-            # and producing that is a registration step that belongs upstream,
-            # where the caller can see and check it. Slicer registers before it
-            # ever calls us; doing it silently here would be a geometry decision
-            # taken on someone else's behalf.
-            out["behavior"]["alignment"] = {
-                "mode": "assumed-preregistered", "owner": "caller",
-                "note": "channels are stacked in the bundle's declared order and "
-                        "must already be co-registered on a common grid; nnseg "
-                        "does not register or resample them, and refuses inputs "
-                        "whose grids differ"}
+            out["behavior"]["alignment"] = dict(ASSUMED_PREREGISTERED)
         return out
 
     def _restore_fact(self, task: str, root) -> dict:
@@ -729,7 +733,12 @@ class MonaiEcosystem(EngineEcosystem):
         n_in = int(entry.get("in_channels") or 1)
         roles = _ordered_channel_def(entry.get("channel_def"))
         if len(roles) == n_in:
-            return {"inputs": input_specs(roles, modality=modality)}
+            out = {"inputs": input_specs(roles, modality=modality)}
+            if n_in > 1:
+                # the caller has to know this BEFORE assembling a request, not
+                # after being refused for it
+                out["behavior"] = {"alignment": dict(ASSUMED_PREREGISTERED)}
+            return out
         if n_in <= 1:
             return {"inputs": single_input(modality)}
         return {"inputs": None,
