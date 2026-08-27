@@ -80,6 +80,7 @@ _engines = _engine_registry()
 FASTSURFER = _engines.enabled("fastsurfer")
 SYNTHSTRIP = _engines.enabled("synthstrip")
 VOXTELL = _engines.enabled("voxtell")
+MONAI = _engines.enabled("monai")
 
 
 def _pkg_dir() -> Path:
@@ -202,6 +203,21 @@ voxtell_image = (
     # prompt outside that bank needs - live on the PERSISTENT weights volume, so they are
     # fetched once ever and every later cold container reads them locally.
     .env({"VOXTELL_MODEL": "/opt/voxtell/model", "HF_HOME": f"{WEIGHTS_ROOT}/hf"})
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+)
+
+# MONAI engine image (built only when enabled). The `monai` extra brings monai + torch;
+# the curated bundles declare their own dependency set (itk, pytorch-ignite, einops, timm,
+# ...) and the image carries the union - `tools/gen_monai_manifest.py` prints it, so the
+# list is derived from the bundles rather than guessed. Weights are NOT baked: this is a
+# catalog, so bundles install per task into the persistent weights volume (like nnU-Net and
+# MOOSE), which is why this worker's _prepare/_ensure do real work.
+monai_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .uv_sync(extras=["monai", "idc", "preview"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
     .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
@@ -861,7 +877,8 @@ if SYNTHSTRIP:
 _WORKER_CLASSES = {_engines.NNUNETV2: "Worker",
                    "fastsurfer": "FastSurferWorker",
                    "synthstrip": "SynthStripWorker",
-                   "voxtell": "VoxTellWorker"}
+                   "voxtell": "VoxTellWorker",
+                   "monai": "MonaiWorker"}
 assert set(_WORKER_CLASSES) == set(_engines.ENGINES), (
     "every engine needs a worker class (and vice versa): "
     f"{sorted(_WORKER_CLASSES)} vs {sorted(_engines.ENGINES)}")
@@ -907,6 +924,48 @@ if VOXTELL:
                 except Exception as e:                  # never fail a finished job on this
                     print(f"[voxtell] weights volume commit failed: {e}", flush=True)
             return seg
+
+
+if MONAI:
+    @app.cls(gpu=GPU, timeout=3600, memory=40960, scaledown_window=SCALEDOWN,
+             max_containers=MAX_CONTAINERS, image=monai_image,
+             volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+             enable_memory_snapshot=SNAPSHOT, **_cls_extra)
+    class MonaiWorker(_WorkerBase):
+        """The MONAI engine worker: a CATALOG of bundles, so unlike the other engine
+        workers its _prepare/_ensure do real work - bundles install per task into the
+        weights volume, exactly as the nnU-Net worker installs its models."""
+
+        engine = "monai"
+
+        @modal.enter(snap=SNAPSHOT)
+        def preload(self):
+            """Heavy imports before the memory snapshot (see FastSurferWorker.preload)."""
+            _pkg_dir()
+            import torch  # noqa: F401
+            import monai  # noqa: F401
+            import nnseg  # noqa: F401
+
+        def _bundle_of(self, task: str) -> str:
+            return str(task).partition(":")[2] or str(task)
+
+        def _prepare(self, task: str) -> dict:
+            from nnseg.ecosystems import MonaiEcosystem
+            bundle = self._bundle_of(task)
+            MonaiEcosystem().ensure(bundle, WEIGHTS_ROOT)
+            weights_vol.commit()
+            self._ensured.add(task)
+            return {"engine": self.engine, "task": task, "bundle": bundle}
+
+        def _ensure(self, task: str) -> None:
+            if task not in self._ensured:
+                self._prepare(task)
+
+        def _compute(self, input_path, meta, on_progress, token):
+            from nnseg.engines import monai_bundle
+            return monai_bundle.segment(input_path, self._bundle_of(meta["task"]),
+                                        root=WEIGHTS_ROOT, device="cuda",
+                                        progress=on_progress, cancel=token)
 
 
 def _worker_classes() -> dict:

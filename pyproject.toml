@@ -83,6 +83,12 @@ fastsurfer = ["fastsurfer-lean"]
 # brings its own tree (nnunetv2, dynamic-network-architectures, transformers,
 # huggingface_hub); weights + the precomputed text-embedding bank come from the HF hub.
 voxtell = ["voxtell"]
+# The MONAI engine: a CATALOG of model-zoo bundles, not one model. `monai` brings the
+# runtime; the rest is the union of the curated bundles' own required_packages_version
+# (tools/gen_monai_manifest.py prints it), because a bundle carries its own transform
+# chain and therefore its own deps. Conflicting with the other engines below, as ever.
+monai = ["monai>=1.4", "torch>=2.7", "nibabel", "itk", "pytorch-ignite", "einops",
+         "timm", "scikit-learn", "tensorboard", "fire", "PyYAML"]
 
 [build-system]
 requires = ["hatchling"]
@@ -106,6 +112,7 @@ conflicts = [
       { extra = "synthstrip" },
       { extra = "fastsurfer" },
       { extra = "voxtell" },
+      { extra = "monai" },
     ],
 ]
 

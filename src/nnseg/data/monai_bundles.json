@@ -1,0 +1,98 @@
+{
+ "source": "Project-MONAI/model-zoo models/model_info.json",
+ "note": "labels are read from each installed bundle's own metadata.json; this manifest holds only download + listing facts",
+ "bundles": {
+  "spleen_ct_segmentation": {
+   "version": "0.6.1",
+   "source": "huggingface_hub",
+   "url": "https://huggingface.co/MONAI/spleen_ct_segmentation/tree/0.6.1",
+   "checksum": "",
+   "modality": "CT",
+   "in_channels": 1,
+   "n_labels": 2,
+   "task": "Automated Spleen Segmentation in CT Images",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "tensorboard": "2.17.0"
+   }
+  },
+  "wholeBody_ct_segmentation": {
+   "version": "0.2.7",
+   "source": "huggingface_hub",
+   "url": "https://huggingface.co/MONAI/wholeBody_ct_segmentation/tree/0.2.7",
+   "checksum": "",
+   "modality": "CT",
+   "in_channels": 1,
+   "n_labels": 105,
+   "task": "Multi-organ Segmentation in Whole Body CT Scans",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "itk": "5.4.0",
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "tensorboard": "2.17.0"
+   }
+  },
+  "pancreas_ct_dints_segmentation": {
+   "version": "0.5.2",
+   "source": "huggingface_hub",
+   "url": "https://huggingface.co/MONAI/pancreas_ct_dints_segmentation/tree/0.5.2",
+   "checksum": "",
+   "modality": "CT",
+   "in_channels": 1,
+   "n_labels": 3,
+   "task": "Pancreas and Pancreatic Tumor Segmentation in CT Images",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "fire": "0.6.0",
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "PyYAML": "6.0.1",
+    "scikit-learn": "1.5.1",
+    "tensorboard": "2.17.0"
+   }
+  },
+  "swin_unetr_btcv_segmentation": {
+   "version": "0.5.8",
+   "source": "huggingface_hub",
+   "url": "https://huggingface.co/MONAI/swin_unetr_btcv_segmentation/tree/0.5.8",
+   "checksum": "",
+   "modality": "CT",
+   "in_channels": 1,
+   "n_labels": 14,
+   "task": "Multi-organ Segmentation in Abdominal CT Scans",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "itk": "5.4.0",
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "einops": "0.7.0",
+    "tensorboard": "2.17.0"
+   }
+  },
+  "wholeBrainSeg_Large_UNEST_segmentation": {
+   "version": "0.2.7",
+   "source": "huggingface_hub",
+   "url": "https://huggingface.co/MONAI/wholeBrainSeg_Large_UNEST_segmentation/tree/0.2.7",
+   "checksum": "",
+   "modality": "MRI",
+   "in_channels": 1,
+   "n_labels": 133,
+   "task": "Whole Brain Segmentation in T1W MRI",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "einops": "0.7.0",
+    "fire": "0.6.0",
+    "timm": "0.6.7",
+    "torchvision": "0.19.0",
+    "tensorboard": "2.17.0"
+   }
+  }
+ },
+ "skipped": [],
+ "curated_missing": []
+}

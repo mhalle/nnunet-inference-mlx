@@ -41,7 +41,10 @@ the content-addressed result key. Nothing rejects collisions anymore; only
 the ambiguous short form becomes unusable.
 """
 import json
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 from .engines import registry as _registry
@@ -484,12 +487,147 @@ class VoxTellEcosystem(ImageBakedEcosystem):
     modality = "CT / MR / PET"
 
 
+MONAI_MANIFEST = Path(__file__).parent / "data" / "monai_bundles.json"
+
+
+class MonaiEcosystem(EngineEcosystem):
+    """The MONAI model zoo: a CATALOG of bundles run by the ``monai`` engine.
+
+    The first ecosystem in the "many tasks on a new engine" shape - MOOSE is many
+    tasks on the *existing* nnU-Net engine, because its models are nnU-Net
+    checkpoints, while a MONAI bundle brings its own network *and* its own
+    transform chain. So this is an :class:`EngineEcosystem` (no nnU-Net TaskSpec)
+    that nonetheless installs per task, which is exactly the pair of axes the
+    base class keeps apart.
+
+    **The bundle is the spec**: labels, modality and channel count are read from
+    each installed bundle's own ``configs/metadata.json``, never from the
+    manifest, which holds only download + listing facts (the rule that keeps this
+    from repeating the stale total_mr class map). See medseg/docs/monai-bundles.md.
+    """
+
+    name = "monai"
+    engine = "monai"
+    description = "MONAI model zoo bundles (engine)"
+
+    def __init__(self, manifest: Path | None = None):
+        raw = json.loads(Path(manifest or MONAI_MANIFEST).read_text())
+        self._bundles = raw.get("bundles", raw)
+
+    def tasks(self) -> list:
+        return sorted(self._bundles)
+
+    def _entry(self, task: str) -> dict:
+        try:
+            return self._bundles[task]
+        except KeyError:
+            raise ModelNotFound(
+                f"unknown monai bundle {task!r}; this build curates "
+                f"{sorted(self._bundles)}") from None
+
+    def _dir(self, task: str, root) -> Path:
+        # version in the path: two versions of a bundle can coexist, and an
+        # @version pin then resolves to its own directory rather than fighting.
+        return Path(root) / "monai" / f"{task}_v{self._entry(task)['version']}"
+
+    def materialized(self, task: str, root) -> bool:
+        d = self._dir(task, root)
+        return (d / "configs" / "metadata.json").is_file()
+
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        """Install the bundle through MONAI's own downloader.
+
+        Deliberately not a zip fetch of the manifest's ``url``: the zoo has moved
+        hosting, and its newest entries point at a Hugging Face *repo page* rather
+        than a downloadable archive (which is also why they publish no checksum).
+        ``monai.bundle.download`` is the one thing that knows all of
+        monaihosting / huggingface_hub / github / ngc, so the manifest supplies
+        the name and version and MONAI resolves where that actually lives.
+        """
+        entry = self._entry(task)
+        if version is not None and version != entry["version"]:
+            raise ModelNotFound(
+                f"{task}@{version}: this build curates {task} v{entry['version']}; "
+                "regenerate the manifest to serve another version")
+        if self.materialized(task, root):
+            return
+        from monai.bundle import download          # worker-side only; not on the api image
+
+        dest = self._dir(task, root)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if progress:
+            progress(f"downloading MONAI bundle {task} v{entry['version']}")
+        # MONAI unpacks to <bundle_dir>/<name>; we keep versioned directories so two
+        # versions can coexist, so download into a temp parent and move into place.
+        staging = Path(tempfile.mkdtemp(dir=dest.parent, prefix=".bundle-"))
+        try:
+            download(name=task, version=entry["version"], bundle_dir=str(staging),
+                     source=entry.get("source") or "monaihosting", progress=False)
+            unpacked = staging / task
+            if not (unpacked / "configs" / "metadata.json").is_file():
+                raise ModelNotFound(
+                    f"{task}: the downloaded bundle has no configs/metadata.json under "
+                    f"{unpacked} - the layout is not what this ecosystem expects")
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            os.replace(unpacked, dest)             # atomic: never a half-installed bundle
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def bundle_metadata(self, task: str, root) -> dict:
+        """The installed bundle's own metadata.json (the spec)."""
+        return json.loads((self._dir(task, root) / "configs" / "metadata.json").read_text())
+
+    def bundle_root(self, task: str, root) -> Path:
+        """Where the installed bundle lives - what the engine runs."""
+        return self._dir(task, root)
+
+    def weights_identity(self, task: str, root) -> list:
+        """Per bundle+version, not one constant for the whole engine: two bundles
+        must not collide on one cached result. Read from the manifest already in
+        memory, so ``/v1/tasks`` stays cheap."""
+        entry = self._entry(task)
+        out = {"id": task, "version": entry["version"]}
+        if entry.get("checksum"):        # the zoo omits it on recent releases
+            out["sha1"] = entry["checksum"]
+        return [out]
+
+    def describe_task(self, task: str, root) -> dict:
+        """Modality, structures and channel count from the installed bundle."""
+        fmt = (self.bundle_metadata(task, root).get("network_data_format") or {})
+        inp = (fmt.get("inputs") or {}).get("image") or {}
+        channel_def = ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
+        out = {"structures": [str(v) for k, v in sorted(channel_def.items(),
+                                                        key=lambda kv: int(kv[0]))
+                              if str(v).lower() != "background"]}
+        if inp.get("modality"):
+            out["modality"] = str(inp["modality"])
+        n_in = inp.get("num_channels") or 1
+        if int(n_in) > 1:
+            # the wire refuses multi-channel at submit; give it something to refuse on
+            out["channel_names"] = [f"channel_{i}" for i in range(int(n_in))]
+        return out
+
+    def info(self, task: str, root) -> dict:
+        out = super().info(task, root)
+        entry = self._entry(task)
+        # listing facts, so an uninstalled task still says something useful
+        out.setdefault("modality", entry.get("modality"))
+        out["bundle_version"] = entry["version"]
+        if entry.get("task"):
+            out["summary"] = entry["task"]
+        if not out.get("materialized"):
+            out["n_structures"] = max(int(entry.get("n_labels", 1)) - 1, 0)
+        return out
+
+
 #: The ecosystems each engine contributes when its engine is enabled. The
 #: nnU-Net catalogs are always present; engine catalogs appear only where their
 #: engine does, so the catalog can never list a task no worker can run.
 _ENGINE_ECOSYSTEMS = {"fastsurfer": FastSurferEcosystem,
                       "synthstrip": SynthStripEcosystem,
-                      "voxtell": VoxTellEcosystem}
+                      "voxtell": VoxTellEcosystem,
+                      "monai": MonaiEcosystem}
 
 
 def default_ecosystems() -> list:

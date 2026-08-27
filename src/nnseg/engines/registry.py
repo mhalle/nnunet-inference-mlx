@@ -75,6 +75,11 @@ def _voxtell_identity() -> list[dict]:
     return [{"id": "voxtell", "version": "v1.1"}]
 
 
+# No _monai_identity: the MONAI engine runs a CATALOG of bundles, so the identity
+# is per bundle+version and comes from MonaiEcosystem.weights_identity, not from a
+# constant here. That is what Engine.weights_identity=None means.
+
+
 ENGINES: dict[str, Engine] = {
     NNUNETV2: Engine(
         name=NNUNETV2,
@@ -98,6 +103,12 @@ ENGINES: dict[str, Engine] = {
         weights_identity=_voxtell_identity,
         description="VoxTell free-text promptable segmentation (prompts are input)",
     ),
+    "monai": Engine(
+        name="monai",
+        enabled_env="NNSEG_MONAI",
+        weights_identity=None,          # per bundle - see MonaiEcosystem
+        description="MONAI model zoo bundles (each carries its own transforms)",
+    ),
 }
 
 # Which engine runs each ecosystem's tasks. Ecosystems not listed here run on the
@@ -106,6 +117,7 @@ ECOSYSTEM_ENGINE: dict[str, str] = {
     "fastsurfer": "fastsurfer",
     "synthstrip": "synthstrip",
     "voxtell": "voxtell",
+    "monai": "monai",
 }
 
 
