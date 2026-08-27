@@ -157,6 +157,22 @@ synthstrip_image = (
     .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
 )
 
+# Lean front-end image for the ASGI api/public functions. The api never runs inference -
+# only catalog/describe + orchestration + cache/publish - and `import nnseg` + the whole
+# describe path are torch-free (lazy inference imports), so this image carries NO torch /
+# nnunetv2 / triton / CUDA: just serve-core (fastapi/uvicorn/matplotlib) + obstore + the
+# core deps (numpy/SimpleITK). It cold-starts in a fraction of the worker image's time
+# (the worker's ~16 s cold was the multi-GB image pull). The GPU work stays on the heavy
+# worker image; the api just spawns it.
+api_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")                       # uv sync resolves the whole lock (engine git sources)
+    .uv_sync(extras=["serve", "idc"], frozen=False,
+             extra_options="--no-sources-package nnunetv2")
+    .env({k: os.environ[k] for k in _RUNTIME_KNOBS if k in os.environ})
+    .add_local_dir(_pkg_dir(), remote_path="/root/pkg/nnseg")
+)
+
 app = modal.App(APP_NAME, image=image)
 weights_vol = modal.Volume.from_name("nnseg-weights", create_if_missing=True)
 jobs_vol = modal.Volume.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
@@ -1040,7 +1056,7 @@ class ModalExecutor:
         return meta["state"], (p if p.exists() else None)
 
 
-@app.function(cpu=2.0, memory=2048, scaledown_window=300,
+@app.function(cpu=2.0, memory=2048, scaledown_window=300, image=api_image,
               volumes={JOBS_ROOT: jobs_vol, WEIGHTS_ROOT: weights_vol,
                        CACHE_ROOT: cache_vol})
 @modal.concurrent(max_inputs=100)
@@ -1058,7 +1074,7 @@ def api():
 
 
 if PUBLIC:
-    @app.function(cpu=1.0, memory=1024, scaledown_window=300,
+    @app.function(cpu=1.0, memory=1024, scaledown_window=300, image=api_image,
                   volumes={CACHE_ROOT: cache_vol, WEIGHTS_ROOT: weights_vol})
     @modal.concurrent(max_inputs=100)
     @modal.asgi_app(requires_proxy_auth=False)
