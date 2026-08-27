@@ -40,6 +40,13 @@ peripheral features:
 pip install 'nnunet-inference-mlx[preprocessing,postprocessing]'
 ```
 
+Extras are **role-scoped**: torch and the inference stack live in the `torch` extra (and
+the engine extras), so `import nnseg` is itself **torch-free** — a describe-only front-end
+or a task listing never pays for a multi-GB CUDA torch, and each deployment image installs
+only what its role needs. Contributors: the rules that keep imports and images lean are in
+[docs/dependency-discipline.md](docs/dependency-discipline.md) (enforced by
+`tests/test_nnseg_layering.py`).
+
 ## Quick start
 
 ```python
