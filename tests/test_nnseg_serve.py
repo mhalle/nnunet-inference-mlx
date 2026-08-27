@@ -5,9 +5,11 @@ the cancel token, and returns a Segmentation-shaped result, so the whole contrac
 in milliseconds. The real pipeline behind the same seam is exercised by the CUDA
 harness, not here.
 """
+import hashlib
 import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -43,7 +45,7 @@ class FakeSegmenter:
 
     def __init__(self, gate=None, steps=3, fail=False):
         self.gate, self.steps, self.fail = gate, steps, fail
-        self.calls = []
+        self.calls, self.inputs = [], []
         self.policy = {"device": "fake"}
 
     def tasks(self):
@@ -56,6 +58,7 @@ class FakeSegmenter:
 
     def segment(self, image, task, *, progress=None, cancel=None, **options):
         self.calls.append((str(image), task, options))
+        self.inputs.append(image)                  # unstringified, for role checks
         rep = Reporter.of(progress, cancel=cancel)
         if self.gate is not None:
             self.gate.wait(timeout=5)
@@ -441,6 +444,109 @@ def test_two_sources_for_a_one_input_task_say_so(tmp_path):
     assert r.status_code == 422
     detail = r.json()["detail"]
     assert detail["code"] == "input_count" and detail["got"] == 2
+
+
+ROLES = ("T1c", "T1", "T2", "FLAIR")
+
+
+def _multi(tmp_path, monkeypatch, roles=ROLES):
+    """A server whose task declares `roles` inputs, on an engine that accepts them."""
+    from dataclasses import replace
+
+    from nnseg.engines import registry
+    monkeypatch.setitem(registry.ENGINES, "nnunetv2",
+                        replace(registry.ENGINES["nnunetv2"], multi_input=True))
+    seg = FakeSegmenter()
+    seg.describe = lambda task: {
+        "name": task, "engine": "nnunetv2",
+        "inputs": [{"name": n, "kind": "image", "required": True, "channel": i}
+                   for i, n in enumerate(roles)]}
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    return seg, TestClient(create_app(ex))
+
+
+def _post_multi(client, blobs, order=None):
+    """Upload one part per role; `order` permutes the SOURCE list, not the parts."""
+    order = order or list(blobs)
+    return client.post(
+        "/v1/jobs",
+        files={r: (f"{r}.nii.gz", b) for r, b in blobs.items()},
+        data={"task": "total_fast",
+              "source": json.dumps([{"kind": "upload", "role": r} for r in order])})
+
+
+def test_four_inputs_are_staged_and_handed_to_the_engine_by_role(tmp_path, monkeypatch):
+    """The plumbing test: four IDENTICAL images through the whole path. Nothing
+    here is clinically meaningful - the question is only whether four sources
+    survive submit, staging and dispatch as four named inputs."""
+    seg, client = _multi(tmp_path, monkeypatch)
+    same = b"\x1f\x8bidentical"
+    r = _post_multi(client, dict.fromkeys(ROLES, same),
+                    order=["FLAIR", "T2", "T1", "T1c"])     # deliberately permuted
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+
+    got = seg.inputs[0]
+    assert isinstance(got, dict) and set(got) == set(ROLES)
+    # four separate files on disk, not one file handed over four times
+    assert len({str(p) for p in got.values()}) == 4
+    assert all(Path(p).read_bytes() == same for p in got.values())
+    # identity is role-tagged and sorted, so identical bytes do not collapse
+    assert s["input_identity"] == sorted(
+        f"{role}=sha256:{hashlib.sha256(same).hexdigest()}" for role in ROLES)
+
+
+def test_the_source_order_a_client_happens_to_use_cannot_split_a_cache_key(
+        tmp_path, monkeypatch):
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    a = wait_state(client, _post_multi(client, blobs).json()["id"], ("done",))
+    b = wait_state(client, _post_multi(client, blobs,
+                                       order=["T2", "FLAIR", "T1c", "T1"]
+                                       ).json()["id"], ("done",))
+    assert a["input_identity"] == b["input_identity"]
+
+
+def test_binding_the_same_files_to_different_roles_is_a_different_result(
+        tmp_path, monkeypatch):
+    """Swapping T1c and FLAIR is a different request: the output bytes differ, so
+    the key must too. This is the failure that positional binding would hide."""
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    straight = wait_state(client, _post_multi(client, blobs).json()["id"], ("done",))
+    swapped = dict(blobs, T1c=blobs["FLAIR"], FLAIR=blobs["T1c"])
+    crossed = wait_state(client, _post_multi(client, swapped).json()["id"], ("done",))
+    assert straight["input_identity"] != crossed["input_identity"]
+
+
+def test_a_missing_part_names_the_part_it_wanted(tmp_path, monkeypatch):
+    seg, client = _multi(tmp_path, monkeypatch)
+    r = client.post("/v1/jobs",
+                    files={r: (f"{r}.nii.gz", b"d") for r in ("T1c", "T1", "T2")},
+                    data={"task": "total_fast",
+                          "source": json.dumps([{"kind": "upload", "role": r}
+                                                for r in ROLES])})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "missing_part" and detail["part"] == "FLAIR"
+
+
+def test_multi_input_errors_name_what_was_wrong(tmp_path, monkeypatch):
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: b"d" for r in ROLES}
+    cases = {
+        "missing_role": [{"kind": "upload", "role": r} for r in ROLES[:3]],
+        "duplicate_role": [{"kind": "upload", "role": "T1c"}] * 4,
+        "unknown_role": [{"kind": "upload", "role": r} for r in
+                         ("T1c", "T1", "T2", "PET")],
+        "role_required": [{"kind": "upload"} for _ in ROLES],
+    }
+    for code, source in cases.items():
+        r = client.post("/v1/jobs",
+                        files={r: (f"{r}.nii.gz", b) for r, b in blobs.items()},
+                        data={"task": "total_fast", "source": json.dumps(source)})
+        assert r.status_code == 422, (code, r.text)
+        assert r.json()["detail"]["code"] == code, (code, r.json())
 
 
 def test_idc_not_found_names_probed_buckets(tmp_path, monkeypatch):

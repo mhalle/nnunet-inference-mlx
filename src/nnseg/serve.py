@@ -735,6 +735,12 @@ class JobRecord:
     result: dict | None = None                    # names / volumes_ml / provenance
     labels_path: Path | None = None
     source: list = field(default_factory=list)
+    #: ``((role, path_or_None), ...)`` in the model's channel order, for a task
+    #: that takes more than one input. Empty for the single-input case, which
+    #: keeps using ``input_path``. Paths live here rather than on the ``source``
+    #: entries because those are serialized to clients, and a server filesystem
+    #: path is not theirs to see.
+    input_paths: tuple = ()
     input_identity: tuple = ()
     cached: bool = False
     cache_key: str | None = None
@@ -811,10 +817,10 @@ class LocalExecutor:
 
     def submit(self, jid: str, jdir: Path, input_path, task: str, options: dict,
                *, source=None, identity: tuple = (), no_cache: bool = False,
-               source_tokens: dict | None = None) -> JobRecord:
+               source_tokens: dict | None = None, inputs: tuple = ()) -> JobRecord:
         rec = JobRecord(id=jid, task=task, options=options, dir=jdir, input_path=input_path,
                         source=list(source or [{"kind": "upload"}]), input_identity=tuple(identity),
-                        source_tokens=source_tokens or None)
+                        input_paths=tuple(inputs), source_tokens=source_tokens or None)
         if self.cache is not None and identity:
             rec.cache_key = result_key(identity, task, options,
                                        weights_versions_of(self.segmenter, task))
@@ -972,6 +978,40 @@ class LocalExecutor:
             self._emit(rec)
 
     # -- the dispatcher ------------------------------------------------------
+    def _stage_many(self, rec, entries, reporter, pinned: list) -> dict:
+        """Stage every input of a multi-input job; returns ``{role: path}``.
+
+        Fetches run sequentially inside this one dispatcher thread, each
+        reporting its own ``fetch`` stage so a client can see which sequence is
+        being pulled. The read-ahead cache stays out of this path deliberately:
+        it holds one pre-read volume aimed at the NEXT job, and a multi-input job
+        would evict it for a fraction of its own inputs.
+
+        Uploads were already written at submit and arrive on ``rec.input_paths``;
+        remote sources are fetched here, the same way and through the same
+        pinned series cache as a single-input job.
+        """
+        staged = {}
+        by_role = {e.get("role"): e for e in entries}
+        for role, path in rec.input_paths:
+            entry = by_role.get(role) or {}
+            kind = entry.get("kind", "upload")
+            if kind == "upload":
+                staged[role] = path
+                continue
+            ident = str(entry.get("id") or entry.get("crdc_series_uuid") or "")
+            key = f"{kind}:{ident}"
+            self.series_cache.pin(key)
+            pinned.append(key)
+            reporter.stage("fetch", f"{role} {ident[:8]}")
+            staged[role] = self.series_cache.get_or_fetch(
+                key, check=reporter.check,
+                credentials=(rec.source_tokens or {}).get(kind))
+            reporter.check()
+        # the reference input: what previews and statistics render against
+        rec.input_path = staged[rec.input_paths[0][0]]
+        return staged
+
     def _dispatch(self) -> None:
         while True:
             with self._cv:
@@ -988,7 +1028,7 @@ class LocalExecutor:
                 self._prefetch_next()      # the CPU downloader, parallel to this GPU job
             except Exception:
                 pass
-            pinned_key = None
+            pinned = []
             try:
                 reporter = Reporter.of(progress=lambda p, r=rec: self._on_progress(r, p),
                                        cancel=rec.cancel_token)
@@ -998,36 +1038,40 @@ class LocalExecutor:
                     reporter.check()
                     rec.state = "done"
                     raise _PrepareDone
-                src = rec.source[0] if rec.source else {"kind": "upload"}
-                kind = src.get("kind", "upload")
-                if kind != "upload":
-                    ident = src.get("id") or src.get("crdc_series_uuid")
-                    key = f"{kind}:{ident}"
-                    self.series_cache.pin(key)
-                    pinned_key = key
-                    if self.series_cache.has(key):
-                        reporter.stage("fetch", "cached")
-                    elif self.series_cache.staging(key):
-                        reporter.stage("fetch", "prefetched")
-                    else:
-                        reporter.stage("fetch", ident[:13])
-                    rec.input_path = self.series_cache.get_or_fetch(
-                        key, check=reporter.check,
-                        credentials=(rec.source_tokens or {}).get(kind))
-                    reporter.check()
-                    preread = self.read_ahead.pop(key)
-                    if preread is not None:
-                        reporter.stage("read", "preread")
-                        inp = preread
-                    else:
-                        inp = rec.input_path
+                entries = rec.source or [{"kind": "upload"}]
+                if len(entries) > 1:
+                    inp = self._stage_many(rec, entries, reporter, pinned)
                 else:
-                    preread = self.read_ahead.pop(rec.id)
-                    if preread is not None:
-                        reporter.stage("read", "preread")
-                        inp = preread
+                    src = entries[0]
+                    kind = src.get("kind", "upload")
+                    if kind != "upload":
+                        ident = src.get("id") or src.get("crdc_series_uuid")
+                        key = f"{kind}:{ident}"
+                        self.series_cache.pin(key)
+                        pinned.append(key)
+                        if self.series_cache.has(key):
+                            reporter.stage("fetch", "cached")
+                        elif self.series_cache.staging(key):
+                            reporter.stage("fetch", "prefetched")
+                        else:
+                            reporter.stage("fetch", ident[:13])
+                        rec.input_path = self.series_cache.get_or_fetch(
+                            key, check=reporter.check,
+                            credentials=(rec.source_tokens or {}).get(kind))
+                        reporter.check()
+                        preread = self.read_ahead.pop(key)
+                        if preread is not None:
+                            reporter.stage("read", "preread")
+                            inp = preread
+                        else:
+                            inp = rec.input_path
                     else:
-                        inp = rec.input_path
+                        preread = self.read_ahead.pop(rec.id)
+                        if preread is not None:
+                            reporter.stage("read", "preread")
+                            inp = preread
+                        else:
+                            inp = rec.input_path
                 seg = self._segment(inp, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
                 rec.labels_path = Path(seg.save(rec.dir / RESULT_NAME))
@@ -1100,8 +1144,8 @@ class LocalExecutor:
                         rec.cache_key, (None,))[0] == rec.id):
                     self._artifacts_pending.pop(rec.cache_key, None)   # failed after pending add
             finally:
-                if pinned_key is not None:
-                    self.series_cache.unpin(pinned_key)
+                for key in pinned:
+                    self.series_cache.unpin(key)
                 rec.finished = time.time()
                 with self._cv:
                     self._done_order.append(rec.id)
@@ -1144,6 +1188,12 @@ class LocalExecutor:
             nxt = self._jobs.get(self._pending[0]) if self._pending else None
             if nxt is None or nxt.state != "queued" or nxt.kind == "prepare":
                 return                         # prepare has no input to stage
+        if len(nxt.input_paths) > 1:
+            # A multi-input job. The read-ahead holds ONE volume, so pre-reading
+            # a fraction of this job's inputs would evict a useful entry to save
+            # a fraction of one job's read; _stage_many deliberately never pops
+            # it, and a pre-read nobody claims is pure waste.
+            return
         src = nxt.source[0] if nxt.source else {"kind": "upload"}
         kind = src.get("kind", "upload")
         ident = src.get("id") or src.get("crdc_series_uuid")
@@ -1704,34 +1754,57 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # answer is already in hand - not deep inside a worker minutes later, and
         # never in silence (an option we do not know is a typo or a stale client,
         # and accepting it leaves the caller believing a knob was turned).
-        _validate_request(seg, task, src, opts)
+        binding = _validate_request(seg, task, src, opts)
         if not executor.accepting:
             raise HTTPException(429, "queue is full, retry later",
                                 headers={"Retry-After": "30"})
         jid, jdir = executor.new_job_dir()
-        if kind == "upload":
-            if file is None:
-                raise HTTPException(422, "source kind 'upload' needs a multipart file "
-                                         "part named 'file'")
-            if src[0].get("part", "file") != "file":
-                raise HTTPException(422, "only the multipart part name 'file' is "
-                                         "supported for now")
+        multi = len(binding) > 1
+        # Only a multi-input job needs to look past the declared `file` part;
+        # re-parsing the form for the single case would change nothing and
+        # re-read the body.
+        form = await request.form() if multi else None
+
+        async def _save(upload, role: str) -> tuple:
+            """Stream one upload to the job dir, hashing as it goes."""
             import contextlib
             import hashlib
             h = hashlib.sha256()
-            name = Path(file.filename or "input.nii.gz").name
-            input_path = jdir / f"input_{name}"
+            name = Path(getattr(upload, "filename", None) or "input.nii.gz").name
+            dest = jdir / (f"input_{role}_{name}" if multi else f"input_{name}")
             # executors backed by a snapshot-consistent volume expose a guard:
             # a concurrent reload elsewhere would discard this uncommitted write
             guard = getattr(executor, "volume_guard", None) or contextlib.nullcontext()
-            with guard, open(input_path, "wb") as f:
-                while chunk := await file.read(1 << 20):
+            with guard, open(dest, "wb") as f:
+                while chunk := await upload.read(1 << 20):
                     h.update(chunk)
                     f.write(chunk)
-            identity = (f"sha256:{h.hexdigest()}",)
-        else:
-            if file is not None:
+            return dest, f"sha256:{h.hexdigest()}"
+
+        staged, idents = [], []
+        for role, entry in binding:
+            # the CANONICAL role - the model's own spelling, whatever the client
+            # sent - so dispatch and the cache key agree on one name
+            if multi:
+                entry["role"] = role
+            kind = entry.get("kind", "upload")
+            if kind == "upload":
+                part = entry.get("part") or ("file" if not multi else role)
+                upload = file if (part == "file" and file is not None) else (
+                    form.get(part) if form is not None else None)
+                if upload is None or not hasattr(upload, "read"):
+                    raise HTTPException(422, {
+                        "code": "missing_part",
+                        "message": f"source kind 'upload' needs a multipart part "
+                                   f"named {part!r}", "part": part})
+                dest, digest = await _save(upload, role)
+                staged.append((role, dest))
+                idents.append(digest)
+                continue
+            if file is not None and not any(
+                    e.get("kind", "upload") == "upload" for _, e in binding):
                 raise HTTPException(422, f"unexpected file upload with a {kind!r} source")
+            src_entry = entry
             if kind == "idc":
                 # Explicit identifier fields, no format sniffing: the two IDC
                 # identifiers MEAN different things. crdc_series_uuid is the storage
@@ -1739,22 +1812,22 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 # SeriesInstanceUID names the series in DICOM space and can resolve to
                 # different crdc uuids across IDC data releases; accepting it is a
                 # resolution step, which is /v1/resolve's job when it lands.
-                if "series_instance_uid" in src[0]:
+                if "series_instance_uid" in src_entry:
                     raise HTTPException(422, "series_instance_uid (+ optional idc_version, "
                                              "default latest) is not supported yet; "
                                              "resolution arrives with /v1/resolve - "
                                              "today pass crdc_series_uuid")
-                if "series" in src[0]:
+                if "series" in src_entry:
                     raise HTTPException(422, "ambiguous field 'series': be explicit - "
                                              "crdc_series_uuid (IDC storage id, "
                                              "8-4-4-4-12 hex), or series_instance_uid "
                                              "(+ optional idc_version) once /v1/resolve "
                                              "lands")
-                if "idc_version" in src[0]:
+                if "idc_version" in src_entry:
                     raise HTTPException(422, "idc_version goes with series_instance_uid; "
                                              "a crdc_series_uuid is already pinned to one "
                                              "IDC data release")
-            ident = str(src[0].get("id") or src[0].get("crdc_series_uuid") or "").strip()
+            ident = str(src_entry.get("id") or src_entry.get("crdc_series_uuid") or "").strip()
             ident = ident.lower() if kind == "idc" else ident
             if not ident:
                 need = "crdc_series_uuid" if kind == "idc" else "id"
@@ -1763,12 +1836,22 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 hint = (" (expected 8-4-4-4-12 hex; a dotted value would be a DICOM "
                         "SeriesInstanceUID, which needs /v1/resolve)") if kind == "idc" else ""
                 raise HTTPException(422, f"{ident!r} is not a valid {kind} identifier" + hint)
-            src[0]["id"] = ident
-            input_path, identity = None, (sources[kind].identity(ident),)
+            src_entry["id"] = ident
+            staged.append((role, None))
+            idents.append(sources[kind].identity(ident))
+        # Canonical identity. For one input it stays the bare identity it has
+        # always been, so every cached result keeps its key. For several, each is
+        # tagged with its role and the pairs are SORTED, which makes the key a
+        # pure function of the request: permuting the source list cannot split a
+        # key, and rebinding the same files to different roles must not merge
+        # two - the output bytes differ.
+        identity = (tuple(sorted(f"{role}={i}" for (role, _), i in zip(staged, idents)))
+                    if multi else (idents[0],))
         try:
-            executor.submit(jid, jdir, input_path, task, opts,
+            executor.submit(jid, jdir, staged[0][1], task, opts,
                             source=src, identity=identity, no_cache=no_cache,
-                            source_tokens=source_tokens_of(request))
+                            source_tokens=source_tokens_of(request),
+                            inputs=tuple(staged) if multi else ())
         except QueueFull as e:
             import shutil
             shutil.rmtree(jdir, ignore_errors=True)
