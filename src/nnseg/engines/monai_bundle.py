@@ -15,6 +15,20 @@ had one known conform to drive; that does not generalize to a whole zoo.
 
 Labels come from the installed bundle's own ``metadata.json``
 (``network_data_format.outputs.pred.channel_def``) - the bundle is the spec.
+
+**Restore fidelity is the bundle's choice, not ours, and it varies.** A bundle's
+postprocessing inverts its own spacing transform, and the order matters: spleen,
+swin_unetr_btcv and wholeBrainSeg run ``Invertd(nearest_interp=False)`` BEFORE
+``AsDiscreted(argmax=True)`` - resampling probabilities and arguing after, which is
+the graded restore this project implements everywhere else. But
+``wholeBody_ct_segmentation`` argmaxes FIRST and inverts the labelmap with
+``nearest_interp=True``, so its output is a nearest-neighbour label resample, with
+the blocky boundaries that implies on small structures. We do not override it: the
+whole point of running the bundle's own config is that its authors test that chain,
+and rewriting the postprocessing per bundle is the fragility this engine exists to
+avoid. It is recorded here because it explains real quality differences between
+bundles, and because the alternative - silently "fixing" someone else's model - is
+worse than a documented limitation.
 """
 from __future__ import annotations
 
@@ -41,6 +55,22 @@ def label_names(bundle_dir) -> dict[int, str]:
     channel_def = ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
     return {int(k): str(v) for k, v in channel_def.items()
             if str(v).lower() != "background"}
+
+
+def inference_config(bundle_dir):
+    """The bundle's inference config. Not every bundle spells it the same way -
+    pancreas_ct_dints ships `inference.yaml` where spleen ships `inference.json` -
+    and hardcoding one extension is a failure that only shows up on the bundle you
+    have not run yet."""
+    from pathlib import Path
+
+    for name in ("inference.json", "inference.yaml", "inference.yml"):
+        p = Path(bundle_dir) / "configs" / name
+        if p.is_file():
+            return p
+    have = sorted(x.name for x in (Path(bundle_dir) / "configs").glob("*"))
+    raise FileNotFoundError(
+        f"no inference config in {bundle_dir}/configs (have: {', '.join(have)})")
 
 
 def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
@@ -75,7 +105,7 @@ def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
     }
     t0 = time.perf_counter()
     workflow = create_workflow(
-        workflow_name=None, config_file=str(bundle_dir / "configs" / "inference.json"),
+        workflow_name=None, config_file=str(inference_config(bundle_dir)),
         workflow_type="inference", **overrides)
     workflow.initialize()
     if timings is not None:

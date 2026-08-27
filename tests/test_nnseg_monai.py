@@ -119,3 +119,24 @@ def test_the_shipped_manifest_is_curated_and_servable():
         assert entry.get("source") in ("huggingface_hub", "monaihosting", "github"), \
             f"{name} has no resolvable hosting source"
         assert entry.get("version"), f"{name} has no version"
+
+
+def test_the_inference_config_is_found_whatever_it_is_called(tmp_path):
+    """Bundles do not agree on the extension - spleen ships inference.json,
+    pancreas_ct_dints ships inference.yaml - and hardcoding one is a failure that
+    only appears on the bundle nobody has run yet."""
+    from nnseg.engines.monai_bundle import inference_config
+    cfg = tmp_path / "configs"; cfg.mkdir()
+    (cfg / "metadata.json").write_text("{}")
+    (cfg / "inference.yaml").write_text("{}")
+    assert inference_config(tmp_path).name == "inference.yaml"
+    (cfg / "inference.json").write_text("{}")
+    assert inference_config(tmp_path).name == "inference.json"   # json wins when both
+
+
+def test_a_bundle_with_no_inference_config_says_what_it_has(tmp_path):
+    from nnseg.engines.monai_bundle import inference_config
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "train.yaml").write_text("{}")
+    with pytest.raises(FileNotFoundError, match="train.yaml"):
+        inference_config(tmp_path)
