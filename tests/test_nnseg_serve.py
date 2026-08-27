@@ -3019,7 +3019,10 @@ def test_a_hostile_archive_cannot_escape_or_explode(tmp_path):
     body = client.post("/v1/inputs",
                        files={"archive": ("evil.zip", z.read_bytes())}).json()
     where = ex.content.resolve(body["digest"])
-    assert sorted(p.name for p in where.iterdir()) == ["IM1.dcm", "passwd"]
+    # Two members, flattened, and named from their own bytes - neither the
+    # traversal path nor the basename the archive chose survives into the store.
+    assert len(list(where.iterdir())) == 2
+    assert all(len(p.name) == 32 and p.suffix == "" for p in where.iterdir())
     assert not (tmp_path / "etc").exists()
 
 
@@ -3088,3 +3091,98 @@ def test_promoting_a_job_that_does_not_exist_says_so(tmp_path):
     _, _, client = make(tmp_path)
     r = client.post("/v1/inputs", data={"from_job": "nosuchjob"})
     assert r.status_code == 404 and r.json()["detail"]["code"] == "no_job"
+
+
+def test_a_client_may_name_its_part_in_its_own_vocabulary(tmp_path, monkeypatch):
+    """Binding accepts an alias (t1ce for T1c), so the part must be findable
+    under the spelling the CLIENT used - otherwise the alias table works for
+    matching and breaks the upload it exists to enable."""
+    seg, client = _multi(tmp_path, monkeypatch)
+    parts = {"t1ce": b"a", "T1": b"b", "T2": b"c", "FLAIR": b"d"}
+    r = client.post("/v1/jobs",
+                    files={k: (f"{k}.nii.gz", v) for k, v in parts.items()},
+                    data={"task": "total_fast",
+                          "source": json.dumps(
+                              [{"kind": "upload", "role": "t1ce"}]
+                              + [{"kind": "upload", "role": x}
+                                 for x in ("T1", "T2", "FLAIR")])})
+    assert r.status_code == 202, r.text
+    s = wait_state(client, r.json()["id"], ("done",))
+    got = seg.inputs[0]
+    assert set(got) == set(ROLES)                      # bound under CANONICAL names
+    assert Path(got["T1c"]).read_bytes() == b"a"       # from the aliased part
+
+
+def test_a_missing_part_lists_the_spellings_it_would_accept(tmp_path, monkeypatch):
+    seg, client = _multi(tmp_path, monkeypatch)
+    r = client.post("/v1/jobs", files={"T1": ("T1.nii.gz", b"b")},
+                    data={"task": "total_fast",
+                          "source": json.dumps([{"kind": "upload", "role": "t1ce"},
+                                                {"kind": "upload", "role": "T1"},
+                                                {"kind": "upload", "role": "T2"},
+                                                {"kind": "upload", "role": "FLAIR"}])})
+    assert r.status_code == 422
+    assert r.json()["detail"]["accepted"] == ["t1ce", "T1c"]
+
+
+def test_the_reference_image_is_the_first_declared_channel(tmp_path, monkeypatch):
+    """Both executors take 'the first source' as the image artifacts render
+    against, so the stored source order must be the model's channel order and
+    not whatever order the client listed."""
+    from nnseg.serve import reference_input
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    r = _post_multi(client, blobs, order=["FLAIR", "T2", "T1", "T1c"])
+    wait_state(client, r.json()["id"], ("done",))
+    staged = seg.inputs[0]
+    assert Path(reference_input(staged)).read_bytes() == blobs["T1c"]  # channel 0
+
+
+def test_a_task_whose_metadata_is_unreadable_still_reaches_the_worker(tmp_path):
+    """A truncated dataset.json or half-written bundle makes describe() raise.
+    That must stay the worker's error to report, with its context - not an opaque
+    500 from submit, which is what an unguarded empty binding produced (and it
+    leaked a job directory per attempt)."""
+    seg = FakeSegmenter()
+
+    def boom(task):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+    seg.describe = boom
+    ex = LocalExecutor(seg, workdir=tmp_path)
+    client = TestClient(create_app(ex))
+    r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", b"\x1f\x8bd")},
+                    data={"task": "total_fast"})
+    assert r.status_code == 202, r.text
+    assert wait_state(client, r.json()["id"], ("done",))["state"] == "done"
+
+
+def test_a_refused_submit_leaves_no_job_directory_behind(tmp_path, monkeypatch):
+    """A multi-input refusal used to strand every already-streamed volume: three
+    full uploads on disk, in a directory no record knows about, so nothing ever
+    reaped it - and on Modal /scratch is a persistent volume."""
+    seg, client = _multi(tmp_path, monkeypatch)
+    before = {p.name for p in tmp_path.iterdir()}
+    r = client.post("/v1/jobs",
+                    files={r: (f"{r}.nii.gz", b"x" * 1024) for r in ROLES[:3]},
+                    data={"task": "total_fast",
+                          "source": json.dumps([{"kind": "upload", "role": x}
+                                                for x in ROLES])})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "missing_part"
+    assert {p.name for p in tmp_path.iterdir()} == before
+
+
+def test_both_doors_refuse_the_same_options(tmp_path):
+    """The path surface initiates a compute too. Validating on only one door let
+    a task refused at POST /v1/jobs still run from a GET."""
+    _, _, client = make(tmp_path)
+    bad = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+                      data={"task": "total_fast",
+                            "options": json.dumps({"device": "cuda"})})
+    assert bad.status_code == 422 and bad.json()["detail"]["code"] == "unknown_parameter"
+    # the same rejection must hold on the addressed surface, which computes too
+    from nnseg.serve import _validate_request
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        _validate_request(FakeSegmenter(), "total_fast",
+                          [{"kind": "idc", "id": "x"}], {"device": "cuda"})
+    assert e.value.detail["code"] == "unknown_parameter"

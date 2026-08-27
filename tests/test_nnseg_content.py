@@ -74,15 +74,39 @@ def test_resolve_hands_back_a_file_for_a_blob_and_a_directory_for_a_tree(tmp_pat
     assert store.resolve(store.put_dir(d)).is_dir()
 
 
-def test_tree_members_are_flattened_to_basenames(tmp_path, store):
-    """An archive member may name any path it likes, including one with `..` in
-    it. A store keyed by content has no business reproducing someone's layout."""
+def test_tree_members_are_stored_under_content_derived_names(tmp_path, store):
+    """Flattened, and named from the BYTES rather than from the request.
+
+    Two containers writing this entry must write the same directory: the volume
+    behind it is not POSIX-coherent, and the justification for having no
+    cross-container mutex is that identical bytes produce identical writes. Names
+    taken from arrival order or from whatever a zip carried made that false for
+    the directory even while it held for each file."""
     d = tmp_path / "nested"; (d / "sub").mkdir(parents=True)
     _file(d / "sub", "IM0.dcm", b"a")
     _file(d, "IM1.dcm", b"b")
     where = store.resolve(store.put_dir(d))
-    assert sorted(p.name for p in where.iterdir()) == ["IM0.dcm", "IM1.dcm"]
-    assert not (where / "sub").exists()
+    names = sorted(p.name for p in where.iterdir())
+    assert len(names) == 2 and not (where / "sub").exists()
+    assert names == sorted(digest_file(x).split(":")[1][:32]
+                           for x in (d / "sub" / "IM0.dcm", d / "IM1.dcm"))
+
+
+def test_the_same_series_stores_identically_however_it_arrived(tmp_path, store):
+    """The invariant the cross-container design rests on: same content in, same
+    directory out - whatever the members were called or what order they came."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    for i, data in enumerate([b"s1", b"s2", b"s3"]):
+        _file(a, f"IM_{i}.dcm", data)
+    for i, data in enumerate([b"s3", b"s1", b"s2"]):
+        _file(b, f"{i}_whatever", data)
+    da, db = store.put_dir(a), ContentStore(
+        SeriesCache(tmp_path / "other", lambda k, e: None)).put_dir(b)
+    assert da == db
+    listing = lambda st, dg: sorted(p.name for p in st.resolve(dg).iterdir())
+    assert listing(store, da) == listing(
+        ContentStore(SeriesCache(tmp_path / "other", lambda k, e: None)), db)
 
 
 def test_is_digest_separates_content_keys_from_source_ids():

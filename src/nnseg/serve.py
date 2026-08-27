@@ -155,10 +155,19 @@ def _validate_request(seg, task, sources: list, options: dict) -> list:
     try:
         desc = seg.describe(task) or {}
     except Exception:
-        return []
+        # A task whose own metadata is unreadable - a truncated dataset.json, a
+        # half-written bundle. Fall through to the pre-existing contract (one
+        # image, no option schema to check against) so the job dispatches and the
+        # WORKER reports the real error with its context, which is what this
+        # function's docstring promises. Returning an empty binding instead made
+        # submit die on idents[0] with an opaque 500, and leaked the job dir.
+        desc, unknown = {}, True
+    else:
+        unknown = False
     eng = ENGINES.get(desc.get("engine") or NNUNETV2) or ENGINES[NNUNETV2]
     try:
-        validate_options(wire_params(eng.parameters, eng.processing_knobs), options)
+        if not unknown:
+            validate_options(wire_params(eng.parameters, eng.processing_knobs), options)
         return bind_sources(sources, declared_inputs(desc),
                             multi_input=eng.multi_input, task=task)
     except RequestError as e:
@@ -655,6 +664,39 @@ class ResultCache:
 
 class QueueFull(NnsegError):
     """The pending queue is at its bound; the caller should retry later."""
+
+
+def _write_guard(executor):
+    """The guard a write into the job directory must hold.
+
+    An executor backed by a snapshot-consistent volume exposes one: a concurrent
+    reload elsewhere discards uncommitted writes, so a partially written file can
+    be truncated under us - and this store then hashes the truncation. Hoisted
+    into one helper because it was documented as mandatory on the upload path and
+    then quietly skipped by the two new ingest routes.
+    """
+    import contextlib
+    return getattr(executor, "volume_guard", None) or contextlib.nullcontext()
+
+
+def _discard(jdir) -> None:
+    """Drop a job directory nothing owns yet."""
+    import shutil
+    shutil.rmtree(jdir, ignore_errors=True)
+
+
+def reference_input(staged):
+    """The one image a multi-input job's artifacts render against.
+
+    A preview and a statistics table need ONE image, and the sensible choice is
+    the task's first declared channel. Shared with the Modal worker rather than
+    written twice: the two sides had already picked differently (declared order
+    here, client source order there), so the same request previewed a different
+    channel depending on where it ran.
+    """
+    if isinstance(staged, dict):
+        return next(iter(staged.values()), None)
+    return staged
 
 
 def result_payload(seg, labels_path) -> dict:
@@ -1225,7 +1267,7 @@ class LocalExecutor:
                     segmenter=self.segmenter, task=rec.task,
                     identity=rec.input_identity, options=rec.options,
                     cache_key=rec.cache_key, labels_path=rec.labels_path,
-                    input_image=inp, artifacts=self.artifacts,
+                    input_image=reference_input(inp), artifacts=self.artifacts,
                     cache_enabled=self.cache is not None,
                     migrate_key=_migrate,
                     set_pending=_set_pending,
@@ -1723,7 +1765,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             os.close(fd)
             tmp = Path(tmp)
             h = hashlib.sha256()
-            with open(tmp, "wb") as f:
+            with _write_guard(executor), open(tmp, "wb") as f:
                 async for chunk in request.stream():
                     h.update(chunk)
                     f.write(chunk)
@@ -1817,17 +1859,24 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             staged.mkdir()
             for i, up in enumerate(uploads):
                 name = Path(getattr(up, "filename", None) or f"part{i}").name
-                with open(staged / f"{i}_{name}", "wb") as f:
+                with _write_guard(executor), open(staged / f"{i}_{name}", "wb") as f:
                     while chunk := await up.read(1 << 20):
                         f.write(chunk)
             files = sorted(staged.iterdir())
             # One zip is an ARCHIVE of members, not a member itself - unpack it
             # unless the caller explicitly asked for a blob.
-            if len(files) == 1 and kind != "blob" and \
-                    files[0].read_bytes()[:4] == b"PK\x03\x04":
+            def _is_zip(path):
+                # four bytes, not the whole upload: this runs on every
+                # single-part POST, on an async route, against a file that may
+                # sit on a network volume
+                with open(path, "rb") as f:
+                    return f.read(4) == b"PK\x03\x04"
+
+            if len(files) == 1 and kind != "blob" and _is_zip(files[0]):
                 unpacked = work / "unpacked"
                 try:
-                    files = sorted(content.extract_zip(files[0], unpacked))
+                    with _write_guard(executor):
+                        files = sorted(content.extract_zip(files[0], unpacked))
                 except content.ArchiveError as e:
                     raise HTTPException(422, {"code": "bad_archive",
                                               "message": str(e)}) from e
@@ -2075,6 +2124,24 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             raise HTTPException(429, "queue is full, retry later",
                                 headers={"Retry-After": "30"})
         jid, jdir = executor.new_job_dir()
+        # From here the directory has an owner: this handler, until submit()
+        # hands it to a JobRecord. Every refusal below - a missing part, a bad
+        # digest, an evicted input, an invalid identifier - used to abandon it,
+        # and a multi-input refusal abandoned up to N-1 already-streamed volumes
+        # with it. Nothing reaps a directory that no record knows about, and on
+        # Modal /scratch is a persistent Volume, so those were permanent.
+        try:
+            return await _accept(request, jid, jdir, binding, task, opts, src,
+                                 file, no_cache, executor, seg)
+        except QueueFull as e:
+            _discard(jdir)
+            raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
+        except BaseException:
+            _discard(jdir)                 # 422/410, a client disconnect, a bug
+            raise
+
+    async def _accept(request, jid, jdir, binding, task, opts, src, file,
+                      no_cache, executor, seg):
         multi = len(binding) > 1
         # Only a multi-input job needs to look past the declared `file` part;
         # re-parsing the form for the single case would change nothing and
@@ -2090,8 +2157,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             dest = jdir / (f"input_{role}_{name}" if multi else f"input_{name}")
             # executors backed by a snapshot-consistent volume expose a guard:
             # a concurrent reload elsewhere would discard this uncommitted write
-            guard = getattr(executor, "volume_guard", None) or contextlib.nullcontext()
-            with guard, open(dest, "wb") as f:
+            with _write_guard(executor), open(dest, "wb") as f:
                 while chunk := await upload.read(1 << 20):
                     h.update(chunk)
                     f.write(chunk)
@@ -2107,20 +2173,36 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
         staged, idents = [], []
         for role, entry in binding:
+            sent_as = str(entry.get("role") or "")   # the client's own spelling
             # the CANONICAL role - the model's own spelling, whatever the client
             # sent - so dispatch and the cache key agree on one name
             if multi:
                 entry["role"] = role
             kind = entry.get("kind", "upload")
             if kind == "upload":
-                part = entry.get("part") or ("file" if not multi else role)
-                upload = file if (part == "file" and file is not None) else (
-                    form.get(part) if form is not None else None)
-                if upload is None or not hasattr(upload, "read"):
+                # The client named its PART in its own vocabulary. Binding
+                # accepts an alias (t1ce for T1c), so looking the part up under
+                # the canonical name alone would let a request bind and then fail
+                # to find its own upload - the alias table would work for
+                # matching and break the transport it exists to enable.
+                declared = entry.get("part")
+                names = ([declared] if declared
+                         else ["file"] if not multi
+                         else [n for n in (sent_as, role) if n])
+                upload = None
+                for cand in names:
+                    upload = file if (cand == "file" and file is not None) else (
+                        form.get(cand) if form is not None else None)
+                    if upload is not None and hasattr(upload, "read"):
+                        part = cand
+                        break
+                    upload = None
+                if upload is None:
                     raise HTTPException(422, {
                         "code": "missing_part",
-                        "message": f"source kind 'upload' needs a multipart part "
-                                   f"named {part!r}", "part": part})
+                        "message": "source kind 'upload' needs a multipart part "
+                                   f"named {' or '.join(repr(n) for n in names)}",
+                        "part": names[0], "accepted": names})
                 dest, digest = await _save(upload, role)
                 staged.append((role, dest))
                 idents.append(digest)
@@ -2194,15 +2276,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         # two - the output bytes differ.
         identity = (tuple(sorted(f"{role}={i}" for (role, _), i in zip(staged, idents)))
                     if multi else (idents[0],))
-        try:
+        if True:
             executor.submit(jid, jdir, staged[0][1], task, opts,
-                            source=src, identity=identity, no_cache=no_cache,
+                            # in the model's declared channel order, not the
+                            # order the client happened to list them: both
+                            # executors take "the first source" as the reference
+                            # image, and that must mean channel 0 either way
+                            source=[e for _, e in binding],
+                            identity=identity, no_cache=no_cache,
                             source_tokens=source_tokens_of(request),
                             inputs=tuple(staged) if multi else ())
-        except QueueFull as e:
-            import shutil
-            shutil.rmtree(jdir, ignore_errors=True)
-            raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
         return executor.status_of(jid)
 
     @app.get("/v1/jobs")
@@ -2473,10 +2556,16 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                         raise HTTPException(404, "not materialized, and this server cannot "
                                                  f"fetch {prefix} data (missing dependency)")
                     initiated = True
-                    jid, jdir = executor.new_job_dir()
                     srcdict = {"kind": prefix, "id": ident}
                     if prefix == "idc":
                         srcdict["crdc_series_uuid"] = ident
+                    # The same door check submit does. This surface initiates a
+                    # compute too, so validating on only one of them lets the two
+                    # disagree about what is acceptable - a task refused at
+                    # POST /v1/jobs would still run from here. Before
+                    # new_job_dir(), so a refusal allocates nothing.
+                    _validate_request(seg, task, [srcdict], dict(gopts))
+                    jid, jdir = executor.new_job_dir()
                     try:
                         executor.submit(jid, jdir, None, task, dict(gopts),
                                         source=[srcdict],
@@ -2643,10 +2732,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if not _source_enabled(srcobj):
                     raise HTTPException(404, "not materialized, and this server "
                                              f"cannot fetch {prefix} data")
-                jid, jdir = executor.new_job_dir()
                 srcdict = {"kind": prefix, "id": ident}
                 if prefix == "idc":
                     srcdict["crdc_series_uuid"] = ident
+                # the same door check submit does - this surface initiates a
+                # compute too, and validating on only one door lets them disagree
+                _validate_request(seg, task, [srcdict], dict(opts))
+                jid, jdir = executor.new_job_dir()
                 try:
                     executor.submit(jid, jdir, None, task, dict(opts),
                                     source=[srcdict],

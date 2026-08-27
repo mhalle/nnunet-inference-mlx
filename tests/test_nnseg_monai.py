@@ -248,3 +248,37 @@ def test_a_region_head_is_caught_even_when_its_values_look_plausible(tmp_path):
     names, prov = resolve_label_names(root, [1, 2])
     assert names == {1: "label 1", 2: "label 2"}
     assert prov["labels_unnamed"] is True
+
+
+def _installed(tmp_path, channel_def, name="b", version="1.0"):
+    import json as _json
+    d = tmp_path / "monai" / f"{name}_v{version}" / "configs"
+    d.mkdir(parents=True)
+    (d / "metadata.json").write_text(_json.dumps({"network_data_format": {
+        "inputs": {"image": {"modality": "CT", "num_channels": 1}},
+        "outputs": {"pred": {"channel_def": channel_def}}}}))
+    (d / "inference.json").write_text(_json.dumps({"postprocessing": {"transforms": []}}))
+    m = tmp_path / "man.json"
+    m.write_text(_json.dumps({"bundles": {name: {"version": version, "modality": "CT",
+                                                 "in_channels": 1, "n_labels":
+                                                 len(channel_def)}}}))
+    return MonaiEcosystem(manifest=m), name
+
+
+def test_describe_does_not_advertise_region_names_as_structures(tmp_path):
+    """describe() and the result path must agree about what those names mean.
+    A client rendering `structures` for a region head would label a result that
+    reports raw voxel values 1/2/4 as Tumor core / Whole tumor / Enhancing."""
+    eco, name = _installed(tmp_path, {"0": "Tumor core", "1": "Whole tumor",
+                                      "2": "Enhancing tumor"})
+    d = eco.describe_task(name, tmp_path)
+    assert d["structures"] == []
+    assert d["regions"] == ["Tumor core", "Whole tumor", "Enhancing tumor"]
+    assert d["behavior"]["labels"]["mode"] == "regions"
+
+
+def test_a_labelmap_bundle_still_advertises_structures(tmp_path):
+    eco, name = _installed(tmp_path, {"0": "background", "1": "spleen"})
+    d = eco.describe_task(name, tmp_path)
+    assert d["structures"] == ["spleen"] and "regions" not in d
+    assert "labels" not in d["behavior"]

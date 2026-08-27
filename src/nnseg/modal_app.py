@@ -521,19 +521,6 @@ def _content_store():
                         lock=_INPUTS_LOCK)
 
 
-def _reference(staged):
-    """The one image artifacts render against.
-
-    A multi-input job has no single input, but a preview and a statistics table
-    do: they show the segmentation over an image, and the sensible choice is the
-    task's FIRST declared channel - the reference the model's own channel order
-    puts first.
-    """
-    if isinstance(staged, dict):
-        return next(iter(staged.values()))
-    return staged
-
-
 def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
     """The engine-agnostic job body shared by every worker: fetch/stage/
     read, then ctx._ensure + ctx._compute (the engine), then save +
@@ -644,7 +631,7 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
                 with ctx._vol_lock:
                     scratch_vol.reload()
                 input_path = next(jdir.glob("input_*"))
-        from nnseg.serve import RESULT_NAME, ResultCache
+        from nnseg.serve import RESULT_NAME, ResultCache, reference_input
         s = ctx._compute(input_path, meta, on_progress, token)
         with ctx._vol_lock:
             s.save(jdir / RESULT_NAME)
@@ -694,7 +681,7 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
             identity=tuple(meta.get("input_identity") or ()),
             options=meta.get("options") or {},
             cache_key=meta.get("cache_key"),
-            labels_path=jdir / RESULT_NAME, input_image=_reference(input_path),
+            labels_path=jdir / RESULT_NAME, input_image=reference_input(input_path),
             artifacts=ARTIFACTS, cache_enabled=True,
             migrate_key=_migrate, set_pending=_set_pending,
             clear_pending=_clear_pending, put=_put,

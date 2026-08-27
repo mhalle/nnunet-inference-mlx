@@ -76,6 +76,30 @@ def digest_dir(path) -> str:
     return tree_digest(digest_file(p) for p in Path(path).rglob("*") if p.is_file())
 
 
+def _stored_name(path, fallback=None) -> str:
+    """The name a member is stored under - derived from CONTENT, not the request.
+
+    This has to be a function of the bytes alone. The backing store is a Modal
+    Volume, which is not POSIX-coherent across containers, and the justification
+    for running without a cross-container mutex is that "two writers of the same
+    digest write identical bytes". That is true of each FILE and was false of the
+    DIRECTORY: the four write paths named identical bytes differently
+    (`input_<file>` from a submit, the client's `?filename=` from a PUT,
+    `guess_name` from a promotion, `{i}_{name}` from a tree), so two containers
+    could merge one digest's entry into a multi-file directory - loud for a blob
+    ("holds 2 files"), and SILENT for a tree, where a 3-slice series becomes 6
+    files handed to the DICOM reader.
+
+    Sniffing the format gives a name that two containers agree on without
+    talking. The fallback keeps only the caller's SUFFIX (never its stem) for
+    content we cannot identify - which PUT refuses at the door anyway.
+    """
+    guessed = guess_name(path)
+    if guessed:
+        return guessed
+    return "content" + ("".join(Path(fallback).suffixes) if fallback else "")
+
+
 class DigestMismatch(ValueError):
     """The bytes that arrived are not the ones the caller said they were."""
 
@@ -166,7 +190,7 @@ class ContentStore:
         digest = computed or digest_file(staged)
         if expect and expect != digest:
             raise DigestMismatch(expect, digest)
-        self._adopt(digest, [(Path(staged), name or Path(staged).name)])
+        self._adopt(digest, [(Path(staged), _stored_name(staged, name))])
         return digest
 
     def put_dir(self, staged, *, expect: str | None = None) -> str:
@@ -174,13 +198,21 @@ class ContentStore:
         members = sorted(p for p in Path(staged).rglob("*") if p.is_file())
         if not members:
             raise FileNotFoundError(f"{staged} holds no files")
-        digest = tree_digest(digest_file(p) for p in members)
+        per_member = [(p, digest_file(p)) for p in members]
+        digest = tree_digest(d for _, d in per_member)
         if expect and expect != digest:
             raise DigestMismatch(expect, digest)
-        # Flattened to basenames on purpose: an archive member may name any path
-        # it likes, and a store keyed by content has no business reproducing
-        # someone's directory layout - let alone one with `..` in it.
-        self._adopt(digest, [(p, p.name) for p in members])
+        # Each member is stored under its OWN digest, so the stored directory is
+        # a function of the content and nothing else - not of arrival order, not
+        # of the names a zip happened to carry. Two containers writing this entry
+        # therefore write the same directory, which is what the missing
+        # cross-container mutex is traded against. Flattening also removes the
+        # traversal class outright rather than validating against it.
+        #
+        # No extension: GDCM identifies DICOM by content, and a series of
+        # extensionless files reads correctly (verified against a real 30-slice
+        # series).
+        self._adopt(digest, [(p, d.split(":", 1)[1][:32]) for p, d in per_member])
         return digest
 
     def _adopt(self, digest: str, members) -> None:
@@ -245,10 +277,17 @@ def guess_name(path) -> str | None:
         try:
             with gzip.open(path, "rb") as g:
                 inner = _inner_name(g.read(512))
-        except OSError:
+        except Exception:
+            # Any failure to decompress means "cannot identify" - never a raised
+            # exception. A truncated gzip raises EOFError, not OSError, and this
+            # runs on EVERY stored blob, so a narrow except turns a malformed
+            # upload into a 500 far from the cause.
             return None
         return inner + ".gz" if inner else None
-    return _inner_name(head)
+    try:
+        return _inner_name(head)
+    except Exception:
+        return None
 
 
 #: A zip is transport, not identity - so extraction is where the hostile cases

@@ -632,9 +632,20 @@ class MonaiEcosystem(EngineEcosystem):
         fmt = (self.bundle_metadata(task, root).get("network_data_format") or {})
         inp = (fmt.get("inputs") or {}).get("image") or {}
         channel_def = ((fmt.get("outputs") or {}).get("pred") or {}).get("channel_def") or {}
-        out = {"structures": [str(v) for k, v in sorted(channel_def.items(),
-                                                        key=lambda kv: int(kv[0]))
-                              if str(v).lower() != "background"]}
+        names = [str(v) for k, v in sorted(channel_def.items(),
+                                           key=lambda kv: int(kv[0]))
+                 if str(v).lower() != "background"]
+        # The same structural signal the result path uses (see
+        # monai_bundle.resolve_label_names): a labelmap declares a `background`
+        # entry because value 0 needs a name; a REGION head does not, because no
+        # channel is background. Publishing a region head's channel names as
+        # `structures` would have a client render "Tumor core" over a result that
+        # reports label 1/2/4 - describe and the result must not disagree about
+        # what those names mean.
+        if any(str(v).lower() == "background" for v in channel_def.values()):
+            out = {"structures": names}
+        else:
+            out = {"structures": [], "regions": names}
         modality = str(inp["modality"]) if inp.get("modality") else None
         if modality:
             out["modality"] = modality
@@ -659,6 +670,12 @@ class MonaiEcosystem(EngineEcosystem):
                           f"{len(roles)}; nnseg will not bind inputs by position"}
             out["channel_names"] = roles or [f"channel_{i}" for i in range(n_in)]
         out["behavior"] = {"restore": self._restore_fact(task, root)}
+        if out.get("regions"):
+            out["behavior"]["labels"] = {
+                "mode": "regions", "owner": "bundle",
+                "note": "this bundle emits overlapping regions as output "
+                        "channels, not mutually exclusive labels; nnseg reports "
+                        "the voxel values it wrote and does not name them"}
         if out.get("inputs") and len(out["inputs"]) > 1:
             out["behavior"]["alignment"] = dict(ASSUMED_PREREGISTERED)
         return out
