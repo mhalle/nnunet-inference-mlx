@@ -120,7 +120,7 @@ class Segmenter:
         ``dataset.json`` is there to read. All best-effort: an unconfigured weights
         root reports ``installed: false`` rather than raising.
         """
-        from .pipeline import _resolve_spec
+        from .tasks import _resolve_spec           # torch-free: describe must not need torch
         info = None
         if isinstance(task, str) and hasattr(self.catalog, "info"):
             try:
@@ -180,7 +180,7 @@ class Segmenter:
 
         Returns how many are resident afterwards. Only useful with ``cache_models >= 1``.
         """
-        from .pipeline import _is_native, _resolve_spec
+        from .tasks import _is_native, _resolve_spec
         spec = _resolve_spec(task, self.catalog)
         store = as_store(self.policy["weights"],
                          ecosystem="nnunet" if _is_native(spec) else "totalsegmentator")

@@ -237,3 +237,18 @@ def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmen
     raise ModelNotFound(
         f"no runnable configuration in {matches[0].name}; have {sorted(by_config)}"
         + (f" - unsupported: {why}" if why else "") + ". Pass configuration=... to choose.")
+
+
+def _resolve_spec(task, catalog) -> "TaskSpec":
+    """A TaskSpec, a catalog name, or a path to a stock nnU-Net model folder. Lives here
+    (torch-free) rather than in pipeline so `describe()` and the serve front-end can resolve
+    a task without importing the inference stack (torch)."""
+    if isinstance(task, TaskSpec):
+        return task
+    if isinstance(task, Path) or (isinstance(task, str) and Path(task).expanduser().is_dir()):
+        return TaskSpec.from_model_folder(task)
+    return catalog.get(task)
+
+
+def _is_native(spec) -> bool:
+    return spec.source == "nnunet"

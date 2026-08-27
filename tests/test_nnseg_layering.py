@@ -127,6 +127,10 @@ class TestLayering(unittest.TestCase):
             "assert 'torch' not in sys.modules, 'import nnseg pulled torch'\n"
             "_ = (nnseg.Segmenter, nnseg.ModelCache, nnseg.TaskCatalog, nnseg.io)\n"
             "assert 'torch' not in sys.modules, 'the front-end API surface pulled torch'\n"
+            # the serve front-end path: build a Segmenter + list + describe a task, all torch-free\n"
+            "s = nnseg.Segmenter(device='cpu'); ts = s.tasks(); assert ts\n"
+            "s.describe(ts[0])\n"
+            "assert 'torch' not in sys.modules, 'the describe/front-end path pulled torch'\n"
             "_ = nnseg.segment\n"
             "assert 'torch' in sys.modules, 'lazy inference symbol failed to load torch'\n"
         )

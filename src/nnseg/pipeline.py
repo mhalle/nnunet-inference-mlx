@@ -14,7 +14,8 @@ from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel, available_folds
-from .tasks import ModelNotFound, TaskCatalog, TaskSpec, resolve_model_folder
+from .tasks import (ModelNotFound, TaskCatalog, TaskSpec, _is_native, _resolve_spec,
+                    resolve_model_folder)
 from .cache import ModelCache
 from .result import Segmentation
 from .progress import Reporter
@@ -37,19 +38,6 @@ def _warm_restore_kernel(device: str) -> None:
     if not triton_gpu.available():
         return
     threading.Thread(target=triton_gpu.warmup, daemon=True).start()
-
-
-def _resolve_spec(task, catalog) -> TaskSpec:
-    """A TaskSpec, a catalog name, or a path to a stock nnU-Net model folder."""
-    if isinstance(task, TaskSpec):
-        return task
-    if isinstance(task, Path) or (isinstance(task, str) and Path(task).expanduser().is_dir()):
-        return TaskSpec.from_model_folder(task)
-    return catalog.get(task)
-
-
-def _is_native(spec) -> bool:
-    return spec.source == "nnunet"
 
 
 def _lut(K: int, remap: dict | None) -> np.ndarray:
