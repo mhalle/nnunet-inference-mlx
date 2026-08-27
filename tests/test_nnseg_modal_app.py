@@ -177,3 +177,43 @@ def test_execute_job_and_hooks_exist():
     assert callable(modal_app._execute_job) and callable(modal_app._spawn_worker)
     for h in ("_ensure", "_compute", "_prepare"):
         assert callable(getattr(modal_app.Worker, h))
+
+
+def test_all_engine_workers_build_with_the_shared_base():
+    """The three @app.cls workers inherit setup/_artifact_worker/run_job from
+    _WorkerBase, so Modal must collect those across the MRO. CI never sets the
+    engine env vars and never constructs a worker, so this runs the decorated
+    class bodies in a subprocess with both engines enabled - the only local
+    coverage that the inheritance actually holds together."""
+    import subprocess
+    import sys
+    code = (
+        "import nnseg.modal_app as M\n"
+        "ws = M._worker_classes()\n"
+        "assert sorted(ws) == ['fastsurfer', 'nnunetv2', 'synthstrip'], sorted(ws)\n"
+        # every worker exposes the full hook set, inherited or not
+        "for name, cls in ws.items():\n"
+        "    for m in ('setup', 'preload', 'run_job', '_compute', '_prepare', '_ensure'):\n"
+        "        assert hasattr(cls, m), (name, m)\n"
+        # the engine shim reports the registry's identity, which is what keys the cache
+        "from nnseg.engines import registry as R\n"
+        "for e in ('fastsurfer', 'synthstrip'):\n"
+        "    got = M._EngineShim(e).describe('x')['weights_installed']\n"
+        "    assert got == R.ENGINES[e].weights_identity(), (e, got)\n"
+    )
+    env = {"NNSEG_FASTSURFER": "1", "NNSEG_SYNTHSTRIP": "1", "NNSEG_PROXY_AUTH": "0"}
+    import os
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env={**os.environ, **env})
+    assert r.returncode == 0, r.stderr[-1500:]
+
+
+def test_spawn_worker_routes_by_engine_not_by_task_prefix():
+    """Dispatch is a registry lookup: an nnU-Net ecosystem (any of ts/moose/custom)
+    routes to the default engine without naming any of them."""
+    from nnseg import modal_app
+    from nnseg.engines import registry as R
+    assert R.engine_for_task("ts:total_fast").name == R.NNUNETV2
+    assert R.engine_for_task("custom:mine").name == R.NNUNETV2
+    assert R.engine_for_task("fastsurfer:brain").name == "fastsurfer"
+    assert modal_app._WORKER_CLASSES.keys() == R.ENGINES.keys()

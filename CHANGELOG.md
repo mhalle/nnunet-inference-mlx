@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **Engine / Ecosystem split (nnseg).** The two ideas that one class used to carry
+  are now separate: an **ecosystem** is the user-facing *catalog* (`ts`, `moose`,
+  `custom`, `fastsurfer`, `synthstrip`, keeping the `eco:task@version` grammar) and
+  an **engine** is the *runtime* that runs it (`nnunetv2`, `fastsurfer`,
+  `synthstrip`) - many ecosystems to one engine. A static registry
+  (`nnseg.engines.registry`) is now the single source of truth for dispatch,
+  enablement, knob forwarding, and the weights identity that keys the result cache;
+  the engine ecosystems stop faking a `TaskSpec`, the per-engine describe shims are
+  gone, `_spawn_worker` routes by grammar instead of hardcoded task prefixes, and
+  the three Modal workers share one base class. Adding an engine is now a registry
+  row plus a worker class that declares its image and compute. `/v1/tasks` reports
+  `engine` per task and `/v1/version` lists the engines a deployment can run.
+- **Renames that came with it** (nothing is deployed, so no aliases): the `native`
+  ecosystem is now **`custom`**; `TaskSpec.source` is now **`lineage`** with value
+  `nnunet` -> `nnunetv2` (freeing "source", which already meant *data source* on the
+  wire); `WeightsStore(ecosystem=)` is now **`layout=`** with values
+  `totalsegmentator`/`nnunet` -> `ts`/`nnunetv2` (it selects a weights tree, not a
+  catalog); and `_is_native` is now `_uses_nnunet_preprocessing`, which is what it
+  actually selects. Upstream names (`TOTALSEG_WEIGHTS_PATH`, `nnUNet_results`) are
+  untouched.
+
 - **All-GPU forward pipeline: reorient + resample on Metal.** `to_model_frame`
   gains `interpolation="auto"` (now the default): a per-axis Metal resampler
   (`resample_volume_mlx`) — factor-scaled, clamped anti-aliased cubic on

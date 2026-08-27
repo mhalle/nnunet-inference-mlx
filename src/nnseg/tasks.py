@@ -17,12 +17,18 @@ from typing import Mapping
 
 WeightsId = int | str
 
-# Where each ecosystem keeps its weights: (env vars, default root). The layout under the root
-# is nnU-Net's own: ``Dataset<id>_<name>/<trainer>__<plans>__<config>/``.
-ECOSYSTEMS = {
-    "totalsegmentator": (("TOTALSEG_WEIGHTS_PATH", "nnUNet_results"),
-                         Path("~/.totalsegmentator/nnunet/results")),
-    "nnunet": (("nnUNet_results",), None),
+# Where each weights LAYOUT keeps its models: (env vars, default root). A layout is not an
+# ecosystem (a catalog) and not an engine (a runtime) - it is just which install tree the
+# weights live in. The names match the vocabulary used everywhere else: ``ts`` is
+# TotalSegmentator's own tree, ``nnunetv2`` is a stock nnU-Net results tree. The layout
+# *under* either root is nnU-Net's own:
+# ``Dataset<id>_<name>/<trainer>__<plans>__<config>/``.
+# The env vars and default path are TotalSegmentator's and nnU-Net's, so they keep their
+# upstream spelling.
+LAYOUTS = {
+    "ts": (("TOTALSEG_WEIGHTS_PATH", "nnUNet_results"),
+           Path("~/.totalsegmentator/nnunet/results")),
+    "nnunetv2": (("nnUNet_results",), None),
 }
 
 
@@ -54,7 +60,11 @@ class CascadeStep:
 @dataclass(frozen=True)
 class TaskSpec:
     name: str
-    source: str = "ts"
+    #: Which preprocessing lineage the model was trained under - "ts"
+    #: (TotalSegmentator: corner convention, no crop) or "nnunetv2" (stock
+    #: nnU-Net: center convention, crop-to-nonzero). NOT the ecosystem that
+    #: lists the task, and NOT the engine that runs it.
+    lineage: str = "ts"
     modality: str = "CT"
     shape: str = "single"
     single: WeightsId | None = None
@@ -79,7 +89,8 @@ class TaskSpec:
                 f"{f.name}: region-based labels (a label mapping to several values) are not "
                 "supported yet - nnseg takes the argmax of a softmax head")
         chan = ds.get("channel_names") or ds.get("modality") or {"0": "unknown"}
-        return cls(name=name or f.parent.name, source="nnunet", modality=str(next(iter(chan.values()))),
+        return cls(name=name or f.parent.name, lineage="nnunetv2",
+                   modality=str(next(iter(chan.values()))),
                    shape="single", single=str(f),
                    label_map={int(v): str(k) for k, v in labels.items() if int(v) != 0})
 
@@ -106,17 +117,17 @@ class TaskSpec:
 class TaskCatalog:
     """The named tasks of an ecosystem, from its registry JSON."""
 
-    def __init__(self, ecosystem: str = "totalsegmentator", path: str | Path | None = None):
-        self.ecosystem = ecosystem
+    def __init__(self, layout: str = "ts", path: str | Path | None = None):
+        self.layout = layout
         self._specs: dict[str, TaskSpec] = {}
-        self._load(Path(path) if path else self._builtin(ecosystem))
+        self._load(Path(path) if path else self._builtin(layout))
 
     @staticmethod
-    def _builtin(ecosystem: str) -> Path:
+    def _builtin(layout: str) -> Path:
         here = Path(__file__).parent / "data"
-        name = {"totalsegmentator": "ts_tasks.json", "ts": "ts_tasks.json"}.get(ecosystem)
+        name = {"ts": "ts_tasks.json"}.get(layout)
         if name is None:
-            raise ValueError(f"no built-in task registry for ecosystem {ecosystem!r}")
+            raise ValueError(f"no built-in task registry for layout {layout!r}")
         return here / name
 
     def _load(self, path: Path) -> None:
@@ -134,21 +145,21 @@ class TaskCatalog:
                                         crop_from_task=st.get("crop_from_task"))
                             for st in d.get("cascade") or ())
             self._specs[d["name"]] = TaskSpec(
-                name=d["name"], source=d.get("source", "ts"), modality=d.get("modality", "CT"),
+                name=d["name"], lineage=d.get("lineage", "ts"), modality=d.get("modality", "CT"),
                 shape=d.get("shape", "single"), single=d.get("single"), union=union,
                 cascade=cascade,
                 label_map={int(k): str(v) for k, v in (d.get("label_map") or {}).items()})
 
     def get(self, name) -> TaskSpec:
-        """A task by name (or the source-qualified ``ts:total`` form); a TaskSpec passes through."""
+        """A task by name (or the lineage-qualified ``ts:total`` form); a TaskSpec passes through."""
         if isinstance(name, TaskSpec):
             return name
         if name in self._specs:
             return self._specs[name]
         if ":" in name:
-            source, _, bare = name.partition(":")
+            lineage, _, bare = name.partition(":")
             spec = self._specs.get(bare)
-            if spec is not None and spec.source == source:
+            if spec is not None and spec.lineage == lineage:
                 return spec
         try:
             return self._specs[name]
@@ -168,17 +179,17 @@ class TaskCatalog:
         return len(self._specs)
 
 
-def weights_root(ecosystem: str = "totalsegmentator", explicit=None) -> Path:
-    """Explicit argument, then environment, then the ecosystem's default location."""
+def weights_root(layout: str = "ts", explicit=None) -> Path:
+    """Explicit argument, then environment, then the layout's default location."""
     if explicit is not None:
         return Path(explicit).expanduser()
-    env_vars, default = ECOSYSTEMS.get(ecosystem, ((), None))
+    env_vars, default = LAYOUTS.get(layout, ((), None))
     for var in env_vars:
         v = os.environ.get(var)
         if v:
             return Path(v).expanduser()
     if default is None:
-        raise ModelNotFound(f"no weights root for {ecosystem!r}; pass model_root or set {env_vars}")
+        raise ModelNotFound(f"no weights root for layout {layout!r}; pass model_root or set {env_vars}")
     return default.expanduser()
 
 
@@ -202,7 +213,7 @@ def _dataset_dirs(root: Path, weights_id) -> list[Path]:
     return list(seen.values()) or sorted(root.glob(str(weights_id)))
 
 
-def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmentator", model_root=None,
+def resolve_model_folder(weights_id: WeightsId, *, layout: str = "ts", model_root=None,
                          configuration: str | None = None) -> Path:
     """``Dataset<id>_*`` under the weights root -> its ``trainer__plans__config`` folder.
 
@@ -214,7 +225,7 @@ def resolve_model_folder(weights_id: WeightsId, *, ecosystem: str = "totalsegmen
     p = Path(str(weights_id)).expanduser()
     if p.is_dir() and p.name.count("__") == 2:
         return p
-    root = Path(p) if p.is_dir() else weights_root(ecosystem, model_root)
+    root = Path(p) if p.is_dir() else weights_root(layout, model_root)
     matches = ([root] if p.is_dir() else _dataset_dirs(root, weights_id))
     if not matches:
         raise ModelNotFound(f"no Dataset{weights_id}_* under {root}")
@@ -250,5 +261,5 @@ def _resolve_spec(task, catalog) -> "TaskSpec":
     return catalog.get(task)
 
 
-def _is_native(spec) -> bool:
-    return spec.source == "nnunet"
+def _uses_nnunet_preprocessing(spec) -> bool:
+    return spec.lineage == "nnunetv2"

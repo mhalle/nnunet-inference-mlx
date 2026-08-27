@@ -6,7 +6,7 @@ from nnseg.tasks import TaskCatalog, CascadeStep
 
 
 def test_lung_vessels_is_a_two_stage_cascade():
-    s = TaskCatalog("totalsegmentator").get("lung_vessels")
+    s = TaskCatalog("ts").get("lung_vessels")
     assert s.shape == "cascade" and len(s.cascade) == 2
     coarse, fine = s.cascade
     assert coarse.weights_id == 297 and coarse.crop_to_classes == (10, 11, 12, 13, 14)
@@ -15,14 +15,14 @@ def test_lung_vessels_is_a_two_stage_cascade():
 
 
 def test_weights_ids_skips_crop_from_task_stages():
-    s = TaskCatalog("totalsegmentator").get("teeth")
+    s = TaskCatalog("ts").get("teeth")
     # one stage crops from another task, not a model; it must not appear as a weights id
     assert all(isinstance(i, int) for i in s.weights_ids)
     assert any(st.crop_from_task for st in s.cascade)
 
 
 def test_parts_directs_cascades_to_the_cascade_field():
-    s = TaskCatalog("totalsegmentator").get("lung_vessels")
+    s = TaskCatalog("ts").get("lung_vessels")
     with pytest.raises(NotImplementedError):
         s.parts
 
@@ -59,6 +59,6 @@ def test_catalog_get_and_segment_accept_a_taskspec():
     """Passing a constructed TaskSpec (not a name) must not try to hash it - regression for the
     mode-B oracle, which builds a synthetic single-model spec."""
     from nnseg.tasks import TaskCatalog, TaskSpec
-    c = TaskCatalog("totalsegmentator")
+    c = TaskCatalog("ts")
     spec = TaskSpec(name="lv_solo", shape="single", single=117, label_map={1: "a", 2: "b"})
     assert c.get(spec) is spec            # passes through, no hashing

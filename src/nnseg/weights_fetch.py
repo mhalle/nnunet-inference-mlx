@@ -197,7 +197,7 @@ def ensure_task_weights(task, root, *, catalog=None, progress=None, tag=None,
     task that crops from another task (teeth <- craniofacial_structures) pulls that chain too.
     Idempotent."""
     from .tasks import TaskCatalog
-    cat = catalog or TaskCatalog("totalsegmentator")
+    cat = catalog or TaskCatalog("ts")
     spec = cat.get(task) if isinstance(task, str) else task
     seen = _seen if _seen is not None else set()
     paths = [fetch_one(i, root, tag=tag, progress=progress) for i in spec.weights_ids]
@@ -380,7 +380,7 @@ def coverage(catalog=None) -> dict:
     caller (or a UI) should be able to tell them apart.
     """
     from .tasks import TaskCatalog
-    cat = catalog or TaskCatalog("totalsegmentator")
+    cat = catalog or TaskCatalog("ts")
     have = _manifest()
     ok, licensed, missing = [], {}, {}
     for name in cat.names():

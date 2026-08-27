@@ -141,6 +141,10 @@ def test_version_self_report(tmp_path):
     assert v["packages"].get("torch", {}).get("version")
     # weights map is present (empty with the FakeSegmenter, which has no catalog)
     assert isinstance(v["weights"], dict)
+    # every engine is listed with whether this deployment can run it
+    assert set(v["engines"]) == {"nnunetv2", "fastsurfer", "synthstrip"}
+    assert v["engines"]["nnunetv2"]["enabled"] is True        # the default engine
+    assert v["engines"]["fastsurfer"]["enabled"] is False     # not enabled in tests
 
 
 # -- queue semantics ---------------------------------------------------------

@@ -20,16 +20,21 @@ import os
 
 import numpy as np
 
-WEIGHTS_ID = "synthstrip"
-WEIGHTS_VERSION = "v1"                       # synthstrip.1.pt (MGH, 2022-04-28)
+from . import registry as _registry
+from .geometry import resample_affine as _resample_affine
+
+ENGINE = "synthstrip"
+
+# One literal, in the registry - see the note in engines/fastsurfer.py.
+WEIGHTS_ID = ENGINE
+WEIGHTS_VERSION = _registry.ENGINES[ENGINE].weights_identity()[0]["version"]
 BRAIN_LABEL = 1
 
 
 def weights_installed() -> list[dict]:
-    """The engine's weights identity for the result-cache key - one source of
-    truth for both the API-side describe and the worker re-key (same contract as
-    :func:`nnseg.engines.fastsurfer.weights_installed`)."""
-    return [{"id": WEIGHTS_ID, "version": WEIGHTS_VERSION}]
+    """The engine's weights identity for the result-cache key (from the registry) -
+    one source of truth for both the API-side describe and the worker re-key."""
+    return _registry.ENGINES[ENGINE].weights_identity()
 
 
 def _get_model(device: str):
@@ -40,20 +45,6 @@ def _get_model(device: str):
 
     return synthstrip_torch.load_model(
         path=os.environ.get("NNSEG_SYNTHSTRIP_MODEL"), device=device)
-
-
-def _resample_affine(source_ref, target_ref):
-    """3x3 A and offset t mapping a TARGET voxel index (x,y,z) to the continuous
-    SOURCE voxel index (x,y,z), composing both SimpleITK grids' transforms (same
-    derivation as the FastSurfer restore; source direction is orthonormal)."""
-    O_s = np.asarray(source_ref.GetOrigin(), dtype=np.float64)
-    O_t = np.asarray(target_ref.GetOrigin(), dtype=np.float64)
-    D_s = np.asarray(source_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
-    D_t = np.asarray(target_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
-    S_s = np.asarray(source_ref.GetSpacing(), dtype=np.float64)
-    S_t = np.asarray(target_ref.GetSpacing(), dtype=np.float64)
-    inv_s = np.diag(1.0 / S_s) @ D_s.T
-    return inv_s @ D_t @ np.diag(S_t), inv_s @ (O_t - O_s)
 
 
 def restore_sdt_gpu(sdt, source_ref, target_ref, device="cuda", outside=100.0):

@@ -138,7 +138,7 @@ def test_every_policy_key_is_accepted_as_an_override(monkeypatch):
 def test_describe_reports_a_task_without_running_it():
     seg = Segmenter()
     d = seg.describe("total_fast")
-    assert d["source"] == "ts" and d["modality"] == "CT"
+    assert d["lineage"] == "ts" and d["modality"] == "CT"
     assert d["n_structures"] == len(d["structures"]) > 100
     assert "liver" in d["structures"] and d["weights"] == ["297"]
 
@@ -208,7 +208,7 @@ def test_a_model_folder_path_bypasses_the_store_layout(tmp_path):
 def test_no_download_source_for_nnunet_says_so_clearly(tmp_path):
     from nnseg import errors
     from nnseg.weights import WeightsStore
-    s = WeightsStore(tmp_path, ecosystem="nnunet")
+    s = WeightsStore(tmp_path, layout="nnunetv2")
     with pytest.raises(errors.ModelNotFound, match="no download source|has no download source"):
         s.resolve(500)
 

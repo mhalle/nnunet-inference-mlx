@@ -170,7 +170,7 @@ def main(argv=None) -> int:
         say = lambda m: print(m, file=sys.stderr, flush=True)
         if args.wcmd == "fetch":
             from .tasks import weights_root
-            root = args.root or weights_root("totalsegmentator")
+            root = args.root or weights_root("ts")
             paths = wfm.ensure_task_weights(args.task, root, progress=lambda m: say(f"  {m}"))
             print(f"{len(paths)} model(s) under {root}")
         elif args.wcmd == "coverage":

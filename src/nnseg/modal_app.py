@@ -61,8 +61,24 @@ ARTIFACTS = set(filter(None, os.environ.get("NNSEG_ARTIFACTS",
 RESULTS_KEEP = int(os.environ.get("NNSEG_RESULTS_KEEP", "500"))
 WEIGHTS_ROOT, JOBS_ROOT, CACHE_ROOT = "/weights", "/jobs", "/cache"
 PUBLIC = os.environ.get("NNSEG_PUBLIC", "0") not in ("0", "false", "no", "")
-FASTSURFER = os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", "")
-SYNTHSTRIP = os.environ.get("NNSEG_SYNTHSTRIP", "0") not in ("0", "false", "no", "")
+
+
+def _engine_registry():
+    """The engine registry, imported the same way the rest of nnseg is (mounted
+    package, with the sys.path shim applied first)."""
+    try:
+        from nnseg.engines import registry
+    except ImportError:
+        sys.path.insert(0, "/root/pkg")
+        from nnseg.engines import registry
+    return registry
+
+
+_engines = _engine_registry()
+# Which engines this deployment runs. Snapshotted at import because Modal
+# resolves the @app.cls decorators now; the registry reads the same env vars.
+FASTSURFER = _engines.enabled("fastsurfer")
+SYNTHSTRIP = _engines.enabled("synthstrip")
 
 
 def _pkg_dir() -> Path:
@@ -85,7 +101,7 @@ _RUNTIME_KNOBS = ("NNSEG_SHM_CACHE_GB", "NNSEG_JOBS_TTL_H", "NNSEG_RESULTS_KEEP"
                   # forwarded, its PUBLIC is False, the attribute never
                   # exists, and every request 303s while the runner crash-
                   # loops on AttributeError (hit live 2026-08-25).
-                  "NNSEG_PUBLIC", "NNSEG_FASTSURFER", "NNSEG_SYNTHSTRIP")
+                  "NNSEG_PUBLIC", *_engines.engine_env_vars())
 
 # Base image (the ASGI api container + the nnU-Net GPU Worker). uv-NATIVE: the nnU-Net
 # worker's deps come from pyproject extras - `torch` (torch/nnunetv2/scipy/scikit-image),
@@ -570,35 +586,26 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
             _release_inflight(meta["cache_key"], jid)
 
 
-@app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
-         max_containers=MAX_CONTAINERS,
-         volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
-         enable_memory_snapshot=SNAPSHOT, **_cls_extra)
-class Worker:
-    def _gpu_setup(self):
-        os.environ["TOTALSEG_WEIGHTS_PATH"] = WEIGHTS_ROOT
-        from nnseg import Segmenter
-        self.seg = Segmenter(device="cuda", weights=WEIGHTS_ROOT, cache_models=5)
-        self._ensured = set()            # tasks whose weights this container verified
+class _WorkerBase:
+    """Everything every worker does regardless of engine: the source registry +
+    shared caches, the artifact overlap, and the job entry point.
 
-    @modal.enter(snap=SNAPSHOT)
-    def preload(self):
-        """The import bill, paid once per deploy: Modal snapshots memory after this
-        and boots later cold containers from the snapshot. With classic snapshots
-        CUDA must not be touched here - plain imports only. With the experimental
-        GPU snapshot (NNSEG_GPU_SNAPSHOT=1) the CUDA state itself is captured, so
-        the Segmenter is built and WARM_TASK's model loaded ONTO the GPU before the
-        snapshot - a restored cold container then starts with a loaded model."""
-        _pkg_dir()
-        import nnunetv2  # noqa: F401
-        import torch     # noqa: F401
-        import nnseg     # noqa: F401 - pulls the pipeline import chain
-        if GPU_SNAPSHOT:
-            from nnseg.weights_fetch import ensure_task_weights
-            self._gpu_setup()
-            ensure_task_weights(WARM_TASK, WEIGHTS_ROOT, progress=None)
-            self.seg.warm(WARM_TASK)
-            self._ensured.add(WARM_TASK)
+    A plain (undecorated) base class - Modal collects ``@modal.enter`` /
+    ``@modal.method`` across the MRO, so the three decorated workers below
+    inherit these; the base itself must NOT be decorated or it becomes a
+    ``modal.Cls`` instance that cannot be subclassed. What stays per-worker is
+    exactly what differs: ``preload`` (its body IS the image's import set, and it
+    runs pre-snapshot), the engine hooks, and the decorator's image/memory.
+    """
+
+    #: The registry engine this worker runs (a plain string: Modal harvests
+    #: class attributes, so never hold the Engine object itself here).
+    engine: str = _engines.NNUNETV2
+
+    def _engine_setup(self) -> None:
+        """Per-engine construction, after the shared setup. The nnU-Net worker
+        builds a Segmenter; engine workers attach a describe-only shim."""
+        self.seg = _EngineShim(self.engine)
 
     @modal.enter()
     def setup(self):
@@ -619,8 +626,13 @@ class Worker:
                                         budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
         self.read_ahead = ReadAhead()
         self._vol_lock = threading.Lock()    # scan-thread reload vs save+commit
+        # Never reset: under the GPU snapshot `preload` already ran and recorded
+        # WARM_TASK here, and wiping it costs a redundant prepare + a multi-GB
+        # weights_vol.commit() on the first job of every restored container.
+        if not hasattr(self, "_ensured"):
+            self._ensured = set()        # tasks whose weights this container verified
         if not hasattr(self, "seg"):
-            self._gpu_setup()
+            self._engine_setup()
 
     def _artifact_worker(self, pair, cache_key: str, jid: str, task: str) -> None:
         """Post-done artifacts via the shared overlap body; this side's place
@@ -653,7 +665,61 @@ class Worker:
                          statistics_out=Path("/dev/shm") / f"stats_{jid}.json",
                          place=_place, finish=_finish)
 
-    # -- engine hooks (nnU-Net); _execute_job calls these ------------------
+    # -- engine hooks; _execute_job calls these. Engines that ship their weights
+    # in their image have nothing to install, so these are the defaults.
+    def _prepare(self, task: str) -> dict:
+        return {"engine": self.engine, "task": task,
+                "note": "weights ship with the engine image"}
+
+    def _ensure(self, task: str) -> None:
+        return None
+
+    def _compute(self, input_path, meta, on_progress, token):
+        raise NotImplementedError
+
+    @modal.method()
+    def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
+        _execute_job(self, jid, source_tokens)
+
+
+@app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
+         max_containers=MAX_CONTAINERS,
+         volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
+         enable_memory_snapshot=SNAPSHOT, **_cls_extra)
+class Worker(_WorkerBase):
+    """The nnU-Net worker: runs every ecosystem whose engine is ``nnunetv2``
+    (ts, moose, custom) through the Segmenter."""
+
+    engine = _engines.NNUNETV2
+
+    def _engine_setup(self):
+        os.environ["TOTALSEG_WEIGHTS_PATH"] = WEIGHTS_ROOT
+        from nnseg import Segmenter
+        self.seg = Segmenter(device="cuda", weights=WEIGHTS_ROOT, cache_models=5)
+
+    _gpu_setup = _engine_setup          # legacy name used by the snapshot path
+
+    @modal.enter(snap=SNAPSHOT)
+    def preload(self):
+        """The import bill, paid once per deploy: Modal snapshots memory after this
+        and boots later cold containers from the snapshot. With classic snapshots
+        CUDA must not be touched here - plain imports only. With the experimental
+        GPU snapshot (NNSEG_GPU_SNAPSHOT=1) the CUDA state itself is captured, so
+        the Segmenter is built and WARM_TASK's model loaded ONTO the GPU before the
+        snapshot - a restored cold container then starts with a loaded model."""
+        _pkg_dir()
+        import nnunetv2  # noqa: F401
+        import torch     # noqa: F401
+        import nnseg     # noqa: F401 - pulls the pipeline import chain
+        if GPU_SNAPSHOT:
+            from nnseg.weights_fetch import ensure_task_weights
+            self._engine_setup()
+            ensure_task_weights(WARM_TASK, WEIGHTS_ROOT, progress=None)
+            self.seg.warm(WARM_TASK)
+            self._ensured = {WARM_TASK}
+
+    # -- engine hooks (nnU-Net): unlike the image-baked engines, weights install
+    # into the shared volume, so these do real work.
     def _prepare(self, task: str) -> dict:
         r = self.seg.prepare(task)
         weights_vol.commit()
@@ -664,7 +730,7 @@ class Worker:
         if task not in self._ensured:
             # Volume.commit scans the whole multi-GB weights tree, so ensure+
             # commit once per container, not per job. seg.prepare is catalog-
-            # aware: ts, moose, native all install through it.
+            # aware: ts, moose, custom all install through it.
             self.seg.prepare(task)
             weights_vol.commit()
             self._ensured.add(task)
@@ -673,28 +739,19 @@ class Worker:
         return self.seg.segment(input_path, meta["task"], progress=on_progress,
                                 cancel=token, **(meta.get("options") or {}))
 
-    @modal.method()
-    def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
-        _execute_job(self, jid, source_tokens)
 
+class _EngineShim:
+    """A Segmenter-shaped stand-in for engine workers, so ``publish_completion``'s
+    re-key (weights_versions_of -> describe) reports the same weights identity the
+    API-side describe does. Both read the registry, so they cannot drift - the
+    divergence that once made every bare read 404 a cached result."""
 
-class _FastSurferShim:
-    """A Segmenter-shaped stand-in so publish_completion's re-key
-    (weights_versions_of -> describe) has a stable FastSurfer version."""
+    def __init__(self, engine: str):
+        self._engine = engine
+
     def describe(self, task):
-        from nnseg.engines.fastsurfer import weights_installed
-        return {"weights_installed": weights_installed()}
-
-    def resolve_task(self, t):
-        return t
-
-
-class _SynthStripShim:
-    """Segmenter-shaped stand-in giving publish_completion's re-key a stable
-    SynthStrip weights version (same role as _FastSurferShim)."""
-    def describe(self, task):
-        from nnseg.engines.synthstrip import weights_installed
-        return {"weights_installed": weights_installed()}
+        identity = _engines.ENGINES[self._engine].weights_identity
+        return {"weights_installed": identity() if identity else []}
 
     def resolve_task(self, t):
         return t
@@ -705,56 +762,27 @@ if FASTSURFER:
              max_containers=MAX_CONTAINERS, image=fs_image,
              volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
-    class FastSurferWorker:
-        """The FastSurfer engine worker: same _execute_job scheduler as Worker,
-        different image + compute. Reuses nnseg serve-core (fetch/stage/cache/
-        publish/artifacts) mounted into the FastSurfer image."""
+    class FastSurferWorker(_WorkerBase):
+        """The FastSurfer engine worker: the shared scheduler + serve-core from
+        _WorkerBase, with FastSurfer's image and compute."""
+
+        engine = "fastsurfer"
 
         @modal.enter(snap=SNAPSHOT)
         def preload(self):
             """Heavy imports paid once per deploy, before the memory snapshot; later
-            cold containers restore from it (the same win the base Worker gets). Classic
-            snapshot => imports only, no CUDA. With NNSEG_GPU_SNAPSHOT the model is built
-            onto the GPU here so a restored container starts model-ready."""
+            cold containers restore from it. Stays per-worker because its body IS this
+            image's import set. Classic snapshot => imports only, no CUDA; with
+            NNSEG_GPU_SNAPSHOT the model is built onto the GPU so a restored container
+            starts model-ready."""
             _pkg_dir()
             import torch  # noqa: F401
             import FastSurferCNN.run_prediction  # noqa: F401 - the CNN import graph
             import nnseg  # noqa: F401
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             if GPU_SNAPSHOT:
                 from nnseg.engines import fastsurfer
                 fastsurfer._get_runner("cuda", 8)
-
-        @modal.enter()
-        def setup(self):
-            _pkg_dir()                              # nnseg on the path
-            # FastSurferCNN is now a pip-installed package (fastsurfer-lean) - no
-            # /opt/FastSurfer clone, no sys.path/FASTSURFER_HOME. Checkpoints still
-            # self-download at first run relative to the installed package.
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            from nnseg.serve import ReadAhead, SeriesCache
-            from nnseg.sources import registry
-            self._sources = registry(None)
-
-            def fetch_source(key, entry, credentials=None):
-                prefix, ident = key.split(":", 1)
-                if credentials is not None:
-                    return self._sources[prefix].fetch(ident, entry, credentials=credentials)
-                return self._sources[prefix].fetch(ident, entry)
-
-            self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
-                                            budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
-            self.read_ahead = ReadAhead()
-            self._vol_lock = threading.Lock()
-            self._ensured = set()
-            self.seg = _FastSurferShim()
-
-        _artifact_worker = Worker._artifact_worker   # identical overlap logic
-
-        def _prepare(self, task: str) -> dict:
-            return {"engine": "fastsurfer", "task": task, "note": "checkpoints self-provision"}
-
-        def _ensure(self, task: str) -> None:
-            return None                              # FastSurfer downloads on first run
 
         def _compute(self, input_path, meta, on_progress, token):
             from nnseg.engines import fastsurfer
@@ -763,19 +791,17 @@ if FASTSURFER:
             # and writes no temp files (model is cached across jobs on this worker).
             return fastsurfer.segment(input_path, device="cuda")
 
-        @modal.method()
-        def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
-            _execute_job(self, jid, source_tokens)
-
 
 if SYNTHSTRIP:
     @app.cls(gpu=GPU, timeout=3600, memory=32768, scaledown_window=SCALEDOWN,
              max_containers=MAX_CONTAINERS, image=synthstrip_image,
              volumes={WEIGHTS_ROOT: weights_vol, JOBS_ROOT: jobs_vol, CACHE_ROOT: cache_vol},
              enable_memory_snapshot=SNAPSHOT, **_cls_extra)
-    class SynthStripWorker:
-        """The SynthStrip engine worker: same _execute_job scheduler as Worker, a slim
-        image + the standalone synthstrip-torch package. Reuses nnseg serve-core."""
+    class SynthStripWorker(_WorkerBase):
+        """The SynthStrip engine worker: the shared scheduler + serve-core, with
+        the slim synthstrip image and the standalone synthstrip-torch package."""
+
+        engine = "synthstrip"
 
         @modal.enter(snap=SNAPSHOT)
         def preload(self):
@@ -784,38 +810,10 @@ if SYNTHSTRIP:
             import torch  # noqa: F401
             import synthstrip_torch  # noqa: F401 - model class + torch
             import nnseg  # noqa: F401
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             if GPU_SNAPSHOT:
                 from nnseg.engines import synthstrip
                 synthstrip._get_model("cuda")
-
-        @modal.enter()
-        def setup(self):
-            _pkg_dir()                              # nnseg on the path
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            from nnseg.serve import ReadAhead, SeriesCache
-            from nnseg.sources import registry
-            self._sources = registry(None)
-
-            def fetch_source(key, entry, credentials=None):
-                prefix, ident = key.split(":", 1)
-                if credentials is not None:
-                    return self._sources[prefix].fetch(ident, entry, credentials=credentials)
-                return self._sources[prefix].fetch(ident, entry)
-
-            self.series_cache = SeriesCache(Path("/dev/shm/series_cache"), fetch_source,
-                                            budget_bytes=int(SHM_CACHE_GB * (1 << 30)))
-            self.read_ahead = ReadAhead()
-            self._vol_lock = threading.Lock()
-            self._ensured = set()
-            self.seg = _SynthStripShim()
-
-        _artifact_worker = Worker._artifact_worker   # identical overlap logic
-
-        def _prepare(self, task: str) -> dict:
-            return {"engine": "synthstrip", "task": task, "note": "weights baked in image"}
-
-        def _ensure(self, task: str) -> None:
-            return None                              # weights are in the image
 
         def _compute(self, input_path, meta, on_progress, token):
             from nnseg.engines import synthstrip
@@ -823,26 +821,49 @@ if SYNTHSTRIP:
             # segment() takes both and writes no temp files (model cached per worker).
             return synthstrip.segment(input_path, device="cuda")
 
-        @modal.method()
-        def run_job(self, jid: str, source_tokens: dict | None = None) -> None:
-            _execute_job(self, jid, source_tokens)
+
+#: engine name -> the worker class defined for it. Engine workers are defined
+#: conditionally (Modal resolves the decorators at import, so an image is built
+#: only where its engine is enabled), hence the lookup by name.
+_WORKER_CLASSES = {_engines.NNUNETV2: "Worker",
+                   "fastsurfer": "FastSurferWorker",
+                   "synthstrip": "SynthStripWorker"}
+assert set(_WORKER_CLASSES) == set(_engines.ENGINES), (
+    "every engine needs a worker class (and vice versa): "
+    f"{sorted(_WORKER_CLASSES)} vs {sorted(_engines.ENGINES)}")
+
+
+def _worker_classes() -> dict:
+    """engine name -> worker class, for the engines this deployment can run.
+
+    Read from module globals on each call rather than frozen at import, so the
+    enable flags stay patchable in tests and the map cannot drift from what was
+    actually defined."""
+    out = {}
+    for engine, cls_name in _WORKER_CLASSES.items():
+        cls = globals().get(cls_name)
+        env = _engines.ENGINES[engine].enabled_env
+        # the flag global mirrors the env var (NNSEG_FASTSURFER -> FASTSURFER)
+        on = True if env is None else bool(globals().get(env[len("NNSEG_"):], False))
+        if cls is not None and on:
+            out[engine] = cls
+    return out
 
 
 def _spawn_worker(task: str, jid: str, source_tokens=None):
-    """Dispatch to the engine that owns this task. ``fastsurfer:*`` and
-    ``synthstrip:*`` -> their engine workers (if enabled); everything else -> the
-    nnU-Net Worker."""
-    if str(task).startswith("fastsurfer:"):
-        if not FASTSURFER:
-            raise RuntimeError("the fastsurfer engine is not enabled on this "
-                               "deployment (set NNSEG_FASTSURFER=1 at deploy)")
-        return FastSurferWorker().run_job.spawn(jid, source_tokens=source_tokens)
-    if str(task).startswith("synthstrip:"):
-        if not SYNTHSTRIP:
-            raise RuntimeError("the synthstrip engine is not enabled on this "
-                               "deployment (set NNSEG_SYNTHSTRIP=1 at deploy)")
-        return SynthStripWorker().run_job.spawn(jid, source_tokens=source_tokens)
-    return Worker().run_job.spawn(jid, source_tokens=source_tokens)
+    """Dispatch to the worker for this task's engine.
+
+    Routes on the *grammar* - every wire form is canonicalized to ``eco:task``
+    before it gets here - through the engine registry, so a new engine needs no
+    branch: one registry row plus a worker class. An ecosystem with no engine
+    entry (every nnU-Net catalog) falls through to the default engine."""
+    engine = _engines.engine_for_task(task).name
+    workers = _worker_classes()
+    if engine not in workers:
+        env = _engines.ENGINES[engine].enabled_env
+        raise RuntimeError(f"the {engine} engine is not enabled on this "
+                           f"deployment (set {env}=1 at deploy)")
+    return workers[engine]().run_job.spawn(jid, source_tokens=source_tokens)
 
 
 class ModalExecutor:

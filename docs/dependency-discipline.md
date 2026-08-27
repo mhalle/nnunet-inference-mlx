@@ -58,7 +58,7 @@ the predict methods), and `segmenter.py` (pipeline in `segment()`) are written.
 ## Rule 3 — the front-end (describe) path stays in torch-free modules
 
 `describe()` powers the serve `/v1/tasks/{task}` endpoint, so it must be torch-free. It uses
-`_resolve_spec` / `_is_native`, which live in **`tasks.py`** (torch-free), not in
+`_resolve_spec` / `_uses_nnunet_preprocessing`, which live in **`tasks.py`** (torch-free), not in
 `pipeline.py` (torch). They were moved there for exactly this reason — do not move task
 resolution helpers back into a torch module, and route new describe-time helpers through
 torch-free modules (`tasks`, `weights`, `values`, `errors`).

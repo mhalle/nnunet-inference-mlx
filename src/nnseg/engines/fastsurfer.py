@@ -25,24 +25,28 @@ from pathlib import Path
 
 import numpy as np
 
+from . import registry as _registry
+from .geometry import resample_affine as _resample_affine
+
 _LUT_PATH = Path(__file__).resolve().parent.parent / "data" / "fastsurfer_lut.json"
 
-WEIGHTS_ID = "fastsurfer"
-WEIGHTS_VERSION = "vinn-v2"
+ENGINE = "fastsurfer"
+
+# The weights identity lives in the engine registry, which the API-side describe
+# and the worker-side re-key both read - one literal, so the key a worker stores
+# a result under and the key a plain GET computes cannot diverge. (They did once:
+# worker keyed `fastsurfer=vinn-v2`, API keyed `unknown`, and every bare read
+# 404'd a result that was actually cached. Bug found 2026-08-26.)
+WEIGHTS_ID = ENGINE
+WEIGHTS_VERSION = _registry.ENGINES[ENGINE].weights_identity()[0]["version"]
 
 
 def weights_installed() -> list[dict]:
-    """The engine's weights identity for the result-cache key.
+    """The engine's weights identity for the result-cache key (from the registry).
 
-    FastSurfer bakes its checkpoints into the worker image (not nnseg's weights
-    volume), so this is a fixed version string, not read from an install
-    sidecar. It is the ONE source of truth: the API-side describe
-    (:meth:`ecosystems.FastSurferEcosystem.info`) and the worker-side re-key
-    (``modal_app._FastSurferShim``) must both return this, or the key the worker
-    stores a finished result under and the key a plain GET computes diverge -
-    and every bare read then 404s a result that is actually cached. (Bug found
-    2026-08-26: worker keyed ``fastsurfer=vinn-v2``, API keyed ``unknown``.)"""
-    return [{"id": WEIGHTS_ID, "version": WEIGHTS_VERSION}]
+    FastSurfer bakes its checkpoints into the worker image rather than nnseg's
+    weights volume, so this is a fixed version, not an install sidecar read."""
+    return _registry.ENGINES[ENGINE].weights_identity()
 
 
 def load_lut() -> dict[int, dict]:
@@ -131,24 +135,6 @@ def restore_logits(logit_zyx, source_ref, target_ref):
         best[up] = native[up]
         idx[up] = k
     return idx
-
-
-def _resample_affine(source_ref, target_ref):
-    """The 3x3 matrix A and offset t that map a TARGET voxel index (x,y,z) to the
-    continuous SOURCE voxel index (x,y,z), composing SimpleITK's physical-space
-    transforms of both grids (identity transform between them, like
-    ``restore_logits``). physical = origin + direction @ (spacing * index); the
-    source direction is orthonormal so its inverse is its transpose."""
-    O_s = np.asarray(source_ref.GetOrigin(), dtype=np.float64)
-    O_t = np.asarray(target_ref.GetOrigin(), dtype=np.float64)
-    D_s = np.asarray(source_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
-    D_t = np.asarray(target_ref.GetDirection(), dtype=np.float64).reshape(3, 3)
-    S_s = np.asarray(source_ref.GetSpacing(), dtype=np.float64)
-    S_t = np.asarray(target_ref.GetSpacing(), dtype=np.float64)
-    inv_s = np.diag(1.0 / S_s) @ D_s.T
-    A = inv_s @ D_t @ np.diag(S_t)
-    t = inv_s @ (O_t - O_s)
-    return A, t
 
 
 def restore_logits_gpu(logits_in, source_ref, target_ref, device="cuda"):

@@ -90,7 +90,7 @@ def test_negative_labels_do_not_crash(tmp_path):
 
 def test_statistics_tsv_sanitizes_names():
     """A structure name with a tab/newline must not shift columns or split
-    the row (moose/native names are third-party dataset.json data)."""
+    the row (moose/custom names are third-party dataset.json data)."""
     stats = {"units": {"intensity": "hu"}, "structures": [
         {"structure": "liver\twith\ttabs", "label": 1, "voxels": 3,
          "volume_ml": 1.0, "mean": 1, "std": 0, "min": 1, "max": 1,

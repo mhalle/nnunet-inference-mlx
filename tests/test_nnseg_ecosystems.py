@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from nnseg.ecosystems import (EcosystemCatalog, MooseEcosystem, NativeEcosystem,
+from nnseg.ecosystems import (EcosystemCatalog, MooseEcosystem, CustomEcosystem,
                               TSEcosystem, registry)
 
 
@@ -66,9 +66,9 @@ def test_moose_materialized_spec_reads_checkpoint(tmp_path):
     assert info["materialized"] and info["structures"] == ["organ_a", "organ_b"]
 
 
-def test_native_ecosystem_serves_local_folders(tmp_path):
+def test_custom_ecosystem_serves_local_folders(tmp_path):
     folder = _fake_model_folder(tmp_path)
-    eco = NativeEcosystem({"my_model": folder})
+    eco = CustomEcosystem({"my_model": folder})
     assert eco.tasks() == ["my_model"]
     spec = eco.spec("my_model", None)
     assert spec.name == "my_model" and len(spec.label_map) == 2
@@ -76,15 +76,15 @@ def test_native_ecosystem_serves_local_folders(tmp_path):
 
 def test_catalog_federates_and_reports(tmp_path):
     folder = _fake_model_folder(tmp_path)
-    cat = EcosystemCatalog([TSEcosystem(), NativeEcosystem({"mine": folder})],
+    cat = EcosystemCatalog([TSEcosystem(), CustomEcosystem({"mine": folder})],
                            root=tmp_path)
-    assert "ts:total_fast" in cat.names() and "native:mine" in cat.names()
-    assert cat.info("mine")["ecosystem"] == "native"
-    assert cat.info("mine")["name"] == "native:mine"       # canonical everywhere
+    assert "ts:total_fast" in cat.names() and "custom:mine" in cat.names()
+    assert cat.info("mine")["ecosystem"] == "custom"
+    assert cat.info("mine")["name"] == "custom:mine"       # canonical everywhere
     assert cat.info("ts:total_fast")["materialized"] is True
-    spec = cat.get("native:mine")
-    assert spec.name == "native:mine" and spec.label_map[1] == "organ_a"
-    assert cat.get("mine").name == "native:mine"           # short form converges
+    spec = cat.get("custom:mine")
+    assert spec.name == "custom:mine" and spec.label_map[1] == "organ_a"
+    assert cat.get("mine").name == "custom:mine"           # short form converges
     with pytest.raises(LookupError):
         cat.info("nope")
 
@@ -93,14 +93,14 @@ def test_version_selector_pins_installs(tmp_path):
     """@version installs the pinned release or refuses - never a silent
     wrong-version serve."""
     folder = _fake_model_folder(tmp_path)
-    cat = EcosystemCatalog([NativeEcosystem({"mine": folder})], root=tmp_path)
+    cat = EcosystemCatalog([CustomEcosystem({"mine": folder})], root=tmp_path)
     with pytest.raises(Exception, match="no version metadata"):
-        cat.get("native:mine@v9")
+        cat.get("custom:mine@v9")
     from nnseg.weights_fetch import _write_sidecar
     _write_sidecar(folder, "mine", "v9", {"url": "local"}, None)
-    assert cat.get("native:mine@v9").name == "native:mine"  # matching pin passes
+    assert cat.get("custom:mine@v9").name == "custom:mine"  # matching pin passes
     with pytest.raises(Exception, match="records"):
-        cat.get("native:mine@v8")
+        cat.get("custom:mine@v8")
 
     moose = MooseEcosystem()
     with pytest.raises(Exception, match="offers tag"):
@@ -187,7 +187,8 @@ def test_fastsurfer_ecosystem_lists_but_refuses_spec(tmp_path):
     cat = EcosystemCatalog([FastSurferEcosystem()], root=tmp_path)
     assert cat.resolve("fastsurfer:brain")[2] == "fastsurfer:brain"
     assert cat.resolve("brain")[2] == "fastsurfer:brain"
-    assert cat.info("fastsurfer:brain")["engine"] is True
+    fs_info = cat.info("fastsurfer:brain")
+    assert fs_info["engine"] == "fastsurfer" and fs_info["task_spec"] is False
     with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
         cat.get("fastsurfer:brain")
 
@@ -201,7 +202,7 @@ def test_synthstrip_ecosystem_lists_but_refuses_spec(tmp_path):
     assert cat.resolve("synthstrip:mask")[2] == "synthstrip:mask"
     assert cat.resolve("mask")[2] == "synthstrip:mask"
     info = cat.info("synthstrip:mask")
-    assert info["engine"] is True
+    assert info["engine"] == "synthstrip" and info["task_spec"] is False
     assert info["weights_installed"] == [{"id": "synthstrip", "version": "v1"}]
     with pytest.raises(UnsupportedModel, match="engine, not an nnU-Net task"):
         cat.get("synthstrip:mask")

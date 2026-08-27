@@ -14,8 +14,8 @@ from .frame import Frame
 from .mapping import Mapping
 from .restore import to_labels
 from .network import TorchModel, available_folds
-from .tasks import (ModelNotFound, TaskCatalog, TaskSpec, _is_native, _resolve_spec,
-                    resolve_model_folder)
+from .tasks import (ModelNotFound, TaskCatalog, TaskSpec, _resolve_spec,
+                    _uses_nnunet_preprocessing, resolve_model_folder)
 from .cache import ModelCache
 from .result import Segmentation
 from .progress import Reporter
@@ -125,20 +125,20 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     # nnU-Net-native models were trained on their own preprocessing: skimage's half-pixel
     # ("center") resample and crop-to-nonzero. TS bypasses both (corner-aligned change_spacing,
     # no crop). Getting this backwards is a silent geometry error, so it follows the task's
-    # ecosystem unless the caller is explicit. See docs/resampler-parity-finding.md.
-    native = _is_native(spec)
-    store = as_store(weights, ecosystem="nnunet" if native else "totalsegmentator")
+    # lineage unless the caller is explicit. See docs/resampler-parity-finding.md.
+    nnunet_preproc = _uses_nnunet_preprocessing(spec)
+    store = as_store(weights, layout="nnunetv2" if nnunet_preproc else "ts")
     if convention == "auto":
-        convention = "center" if native else "corner"
-    crop_nonzero = native
+        convention = "center" if nnunet_preproc else "corner"
+    crop_nonzero = nnunet_preproc
     # Orientation follows the model's own reader. TS canonicalizes to RAS; nnU-Net's default
     # SimpleITKIO/NibabelIO do NOT - only the *WithReorient variants do - so a native model
     # expects its acquisition orientation. Reorienting it anyway mirrors left/right.
     reorient = True
-    if native and spec.single is not None:
+    if nnunet_preproc and spec.single is not None:
         reorient = nio.reader_reorients(store.resolve(spec.single, configuration=configuration))
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
-    prov = {"task": spec.name, "source": spec.source, "device": device, "dtype": dtype,
+    prov = {"task": spec.name, "lineage": spec.lineage, "device": device, "dtype": dtype,
             "convention": convention, "reoriented_to_ras": reorient, "interp": interp,
             "envelope_mm": envelope_mm, "resampling_order": resampling_order, "models": [],
             "weights_store": store.describe(),

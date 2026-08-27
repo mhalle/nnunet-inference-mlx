@@ -7,7 +7,12 @@ The rule learned from the stale total_mr class map applies throughout:
 **the checkpoint is the spec** - a catalog holds only what the checkpoint
 cannot know (where to download it, and how to compose multiple models).
 
-Three ecosystems ship:
+**An ecosystem is a catalog, not a runtime.** What runs a task is an *engine*
+(:mod:`nnseg.engines.registry`), named by ``ModelEcosystem.engine``; many
+ecosystems map to one engine. The three nnU-Net catalogs below all run on
+``nnunetv2``; FastSurfer and SynthStrip each bring a catalog *and* an engine.
+
+The nnU-Net catalogs:
 
 - ``ts`` - the TotalSegmentator catalog. Its tasks are *compositions* (unions,
   cascades, remaps) that exist only as application logic, so it carries a full
@@ -15,7 +20,10 @@ Three ecosystems ship:
 - ``moose`` - MOOSE/moosez models. Bare, self-describing nnU-Net checkpoints
   on public release assets: the manifest holds name -> url + folder, and the
   spec is read from the installed checkpoint's own dataset.json.
-- ``native`` - local model folders the operator registers explicitly.
+- ``custom`` - local model folders the operator registers explicitly.
+
+Engine catalogs (present only where their engine is enabled, so the catalog can
+never list a task no worker can run): ``fastsurfer``, ``synthstrip``.
 
 An :class:`EcosystemCatalog` federates a registry of ecosystems behind the
 same interface :class:`nnseg.tasks.TaskCatalog` exposes, so ``Segmenter`` and
@@ -36,17 +44,38 @@ import json
 import re
 from pathlib import Path
 
-from .errors import InputError, ModelNotFound
+from .engines import registry as _registry
+from .errors import InputError, ModelNotFound, UnsupportedModel
 from .tasks import TaskCatalog, TaskSpec
 
 MOOSE_MANIFEST = Path(__file__).parent / "data" / "moose_weights.json"
 
 
 class ModelEcosystem:
-    """One model repository: task names, weight installation, spec loading."""
+    """One model catalog: task names, weight installation, spec loading.
+
+    An ecosystem is what the *user* selects. What actually runs its tasks is an
+    :mod:`~nnseg.engines.registry` engine, named by :attr:`engine` - many
+    ecosystems map to one engine (``ts``, ``moose`` and ``custom`` are three
+    catalogs of nnU-Net models, all run by ``nnunetv2``).
+
+    An ecosystem whose engine has no :class:`~nnseg.tasks.TaskSpec` - FastSurfer
+    and SynthStrip run their own networks - sets :attr:`has_task_spec` to False
+    and inherits the whole interface below unchanged; it does not need to
+    override anything to refuse.
+    """
 
     name: str = ""
     description: str = ""
+    #: Which registry engine runs this ecosystem's tasks.
+    engine: str = _registry.NNUNETV2
+    #: False when tasks are run by an engine's own network rather than an
+    #: nnU-Net TaskSpec (drives ``spec()`` and the ``task_spec`` info flag).
+    has_task_spec: bool = True
+    #: Pre-install metadata for ecosystems that cannot read it from a checkpoint
+    #: (engines know their own modality and label set statically).
+    modality: str | None = None
+    structures: list | None = None
 
     def tasks(self) -> list:
         raise NotImplementedError
@@ -63,15 +92,43 @@ class ModelEcosystem:
 
     def spec(self, task: str, root) -> TaskSpec:
         """The task's spec; requires materialized() unless the ecosystem
-        carries composition data of its own."""
+        carries composition data of its own.
+
+        Refuses with :class:`UnsupportedModel` when the ecosystem has no
+        TaskSpec at all (an engine's own network), and with
+        ``NotImplementedError`` otherwise - a half-written ecosystem must keep
+        looking like a bug, not like an unsupported model.
+        """
+        if not self.has_task_spec:
+            env = _registry.ENGINES[self.engine].enabled_env
+            raise UnsupportedModel(
+                f"{self.name} is an engine, not an nnU-Net task: it runs on the "
+                f"{self.engine} engine, which has no TaskSpec. This server runs "
+                f"nnU-Net models in-process; deploy with "
+                f"{env}=1 to serve it from an engine worker.")
         raise NotImplementedError
 
     def info(self, task: str, root) -> dict:
-        """Cheap metadata that never downloads: ecosystem, materialized, and
-        whatever is knowable pre-install."""
-        out = {"name": task, "ecosystem": self.name,
+        """Cheap metadata that never downloads: ecosystem, engine, materialized,
+        and whatever is knowable pre-install.
+
+        Uniform for every ecosystem, engines included - one shape for clients.
+        ``structures`` is always a list; ``weights_installed`` appears when the
+        engine carries a constant weights identity (engines bake their weights
+        into their image), and is otherwise computed per task from the spec's
+        install sidecars by :meth:`nnseg.segmenter.Segmenter.describe`.
+        """
+        out = {"name": task, "ecosystem": self.name, "engine": self.engine,
+               "task_spec": self.has_task_spec,
                "materialized": self.materialized(task, root)}
-        if out["materialized"]:
+        if self.modality is not None:
+            out["modality"] = self.modality
+        if self.structures is not None:
+            out["structures"] = list(self.structures)
+        identity = _registry.ENGINES[self.engine].weights_identity
+        if identity is not None:
+            out["weights_installed"] = identity()
+        if out["materialized"] and self.has_task_spec:
             spec = self.spec(task, root)
             out["modality"] = spec.modality
             out["structures"] = sorted(spec.label_map.values())
@@ -88,7 +145,7 @@ class TSEcosystem(ModelEcosystem):
     description = "TotalSegmentator task catalog"
 
     def __init__(self):
-        self._catalog = TaskCatalog("totalsegmentator")
+        self._catalog = TaskCatalog("ts")
 
     def tasks(self) -> list:
         return self._catalog.names()
@@ -194,12 +251,12 @@ class MooseEcosystem(ModelEcosystem):
         return out
 
 
-class NativeEcosystem(ModelEcosystem):
-    """Local model folders registered by the operator: always materialized,
-    nothing to install. The folder is read through from_model_folder, so the
-    checkpoint's dataset.json is the spec here too."""
+class CustomEcosystem(ModelEcosystem):
+    """The operator's own model folders: always materialized, nothing to install.
+    The folder is read through from_model_folder, so the checkpoint's
+    dataset.json is the spec here too."""
 
-    name = "native"
+    name = "custom"
     description = "operator-registered local nnU-Net model folders"
 
     def __init__(self, models: dict | None = None):
@@ -213,14 +270,14 @@ class NativeEcosystem(ModelEcosystem):
 
     def ensure(self, task: str, root, progress=None, version=None) -> None:
         if not self.materialized(task, root):
-            raise ModelNotFound(f"native task {task!r}: folder "
+            raise ModelNotFound(f"custom task {task!r}: folder "
                                 f"{self._models.get(task)} does not exist")
         if version is not None:
             from .weights_fetch import installed_version
             rec = installed_version(self._models[task]) or {}
             if rec.get("tag") != version:
                 raise ModelNotFound(
-                    f"{task}@{version}: native folder records "
+                    f"{task}@{version}: custom folder records "
                     f"{rec.get('tag') or 'no version metadata'}")
 
     def spec(self, task: str, root) -> TaskSpec:
@@ -282,38 +339,53 @@ def _download_and_extract_zip(url: str, dest_parent: Path, *, progress=None,
         shutil.rmtree(staging, ignore_errors=True)
 
 
-class FastSurferEcosystem(ModelEcosystem):
-    """FastSurfer whole-brain parcellation as an ENGINE (2.5D view-aggregation,
-    not nnU-Net). It appears in the catalog so ``fastsurfer:brain`` resolves,
-    lists and describes; it self-provisions its checkpoints at run time, and
-    ``spec()`` refuses because there is no TaskSpec - the FastSurfer worker runs
-    it through :mod:`nnseg.engines.fastsurfer`, not the nnU-Net pipeline."""
+class EngineEcosystem(ModelEcosystem):
+    """An ecosystem whose tasks are run by an engine's own network rather than an
+    nnU-Net TaskSpec. It exists in the catalog so ``eco:task`` resolves, lists and
+    describes; the weights ship with the engine's image, so there is nothing to
+    install and nothing to materialize.
 
-    name = "fastsurfer"
-    description = "FastSurfer whole-brain parcellation (engine)"
+    Subclasses declare data only - name, engine, tasks, modality, structures.
+    """
+
+    has_task_spec = False
+
+    #: Task names this engine offers.
+    task_names: tuple = ()
 
     def tasks(self) -> list:
-        return ["brain"]
+        return list(self.task_names)
 
     def materialized(self, task: str, root) -> bool:
-        return True                      # checkpoints self-download on first run
+        return True                      # weights ship with the engine's image
 
     def ensure(self, task: str, root, progress=None, version=None) -> None:
         return None
 
-    def spec(self, task: str, root):
-        from .errors import UnsupportedModel
-        raise UnsupportedModel(
-            "fastsurfer is an engine, not an nnU-Net task; it runs on a "
-            "FastSurfer-enabled worker via nnseg.engines.fastsurfer, not a TaskSpec")
 
-    def info(self, task: str, root) -> dict:
-        # weights_installed is the result-cache key's model component; it must
-        # match the worker's re-key (see engines.fastsurfer.weights_installed).
-        from .engines.fastsurfer import weights_installed
-        return {"ecosystem": "fastsurfer", "engine": True, "modality": "MR (T1)",
-                "structures": "~95 FreeSurfer aparc+aseg (DKTatlas)",
-                "weights_installed": weights_installed()}
+class FastSurferEcosystem(EngineEcosystem):
+    """FastSurfer whole-brain parcellation (2.5D view-aggregation, not nnU-Net).
+    Its checkpoints are baked into the FastSurfer worker image."""
+
+    name = "fastsurfer"
+    engine = "fastsurfer"
+    description = "FastSurfer whole-brain parcellation (engine)"
+    task_names = ("brain",)
+    modality = "MR (T1)"
+
+    @property
+    def structures(self) -> list:
+        """The real DKTatlas label names, from the engine's own LUT - so a client
+        can enumerate them like any other task's."""
+        from .engines.fastsurfer import load_lut
+        return sorted(v["name"] for v in load_lut().values())
+
+
+def engine_of(ecosystem) -> str:
+    """The engine name an ecosystem declares. Ecosystems are duck-typed here (an
+    object with ``name``/``tasks()``/``spec()`` is enough), so one that predates
+    the engine layer - or a test stand-in - falls back to the default engine."""
+    return getattr(ecosystem, "engine", _registry.NNUNETV2)
 
 
 def registry(ecosystems=None) -> dict:
@@ -325,50 +397,41 @@ def registry(ecosystems=None) -> dict:
     for e in (default_ecosystems() if ecosystems is None else list(ecosystems)):
         if not e.name or ":" in e.name or e.name in out:
             raise ValueError(f"bad or duplicate ecosystem name {e.name!r}")
+        # An unknown engine would route silently to the default worker at spawn;
+        # catching the typo here keeps "which engine runs this?" answerable.
+        if engine_of(e) not in _registry.ENGINES:
+            raise ValueError(f"ecosystem {e.name!r} declares unknown engine "
+                             f"{engine_of(e)!r}; known: {sorted(_registry.ENGINES)}")
         out[e.name] = e
     return out
 
 
-class SynthStripEcosystem(ModelEcosystem):
-    """SynthStrip brain extraction (skull-strip) as an ENGINE - a contrast-agnostic
-    learned brain-mask UNet, not nnU-Net. Appears in the catalog so
-    ``synthstrip:mask`` resolves/lists/describes; runs on a SynthStrip-enabled
-    worker via :mod:`nnseg.engines.synthstrip`, not the nnU-Net pipeline."""
+class SynthStripEcosystem(EngineEcosystem):
+    """SynthStrip brain extraction (skull-strip): a contrast-agnostic learned
+    brain-mask UNet, not nnU-Net. Weights are baked into the worker image."""
 
     name = "synthstrip"
+    engine = "synthstrip"
     description = "SynthStrip brain extraction / skull-strip (engine)"
+    task_names = ("mask",)
+    modality = "MR (any contrast)"
+    structures = ["Brain"]
 
-    def tasks(self) -> list:
-        return ["mask"]
 
-    def materialized(self, task: str, root) -> bool:
-        return True                      # weights are baked into the worker image
-
-    def ensure(self, task: str, root, progress=None, version=None) -> None:
-        return None
-
-    def spec(self, task: str, root):
-        from .errors import UnsupportedModel
-        raise UnsupportedModel(
-            "synthstrip is an engine, not an nnU-Net task; it runs on a "
-            "SynthStrip-enabled worker via nnseg.engines.synthstrip, not a TaskSpec")
-
-    def info(self, task: str, root) -> dict:
-        # weights_installed is the result-cache key's model component; it must
-        # match the worker's re-key (see engines.synthstrip.weights_installed).
-        from .engines.synthstrip import weights_installed
-        return {"ecosystem": "synthstrip", "engine": True, "modality": "MR (any contrast)",
-                "structures": "brain mask (1 label)",
-                "weights_installed": weights_installed()}
+#: The ecosystems each engine contributes when its engine is enabled. The
+#: nnU-Net catalogs are always present; engine catalogs appear only where their
+#: engine does, so the catalog can never list a task no worker can run.
+_ENGINE_ECOSYSTEMS = {"fastsurfer": FastSurferEcosystem,
+                      "synthstrip": SynthStripEcosystem}
 
 
 def default_ecosystems() -> list:
-    import os
+    """The catalogs this deployment serves: the nnU-Net ones, plus one per
+    enabled engine. Enablement is the registry's answer (read from the
+    environment per call), so the catalog and the workers cannot disagree."""
     ecos = [TSEcosystem(), MooseEcosystem()]
-    if os.environ.get("NNSEG_FASTSURFER", "0") not in ("0", "false", "no", ""):
-        ecos.append(FastSurferEcosystem())
-    if os.environ.get("NNSEG_SYNTHSTRIP", "0") not in ("0", "false", "no", ""):
-        ecos.append(SynthStripEcosystem())
+    ecos += [cls() for engine, cls in _ENGINE_ECOSYSTEMS.items()
+             if _registry.enabled(engine)]
     return ecos
 
 
@@ -439,6 +502,13 @@ class EcosystemCatalog:
             return self.resolve(name)[0]
         except LookupError:
             return None
+
+    def engine_of(self, name: str) -> str | None:
+        """Which engine runs ``name`` - the catalog-side answer to the question
+        the Modal dispatcher answers from the task's grammar. ``None`` if the
+        name does not resolve."""
+        eco = self.ecosystem_of(name)
+        return None if eco is None else engine_of(eco)
 
     def get(self, name) -> TaskSpec:
         if isinstance(name, TaskSpec):

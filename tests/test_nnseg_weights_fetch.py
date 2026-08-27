@@ -9,7 +9,7 @@ def test_manifest_covers_the_core_tasks():
     """The manifest is a partial snapshot - newer datasets may need a refresh - but the tasks
     people actually run must resolve to fetchable weights."""
     m = _manifest()
-    cat = TaskCatalog("totalsegmentator")
+    cat = TaskCatalog("ts")
     for name in ("total", "total_fast", "total_fastest", "body", "lung_vessels"):
         spec = cat.get(name)
         ids = ([spec.single] if spec.single is not None else []) + [p.weights_id for p in spec.union]

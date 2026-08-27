@@ -1439,8 +1439,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                         weights[t] = wi
                 except Exception:
                     pass
+        from .engines import registry as _engines
+        engines = {n: {"enabled": _engines.enabled(n),
+                       "description": _engines.ENGINES[n].description}
+                   for n in _engines.ENGINES}
         return {"name": "nnseg", "contract": CONTRACT_VERSION, "version": _version(),
-                "started_at": _started_at, "packages": pkgs, "weights": weights}
+                "started_at": _started_at, "engines": engines,
+                "packages": pkgs, "weights": weights}
 
     @app.get("/v1/tasks")
     def tasks():

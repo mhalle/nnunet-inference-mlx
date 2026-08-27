@@ -125,7 +125,7 @@ def test_a_model_folder_passes_straight_through(tmp_path):
 def test_taskspec_from_model_folder_reads_dataset_json(tmp_path):
     ds = _model_tree(tmp_path, ["3d_fullres"], labels={"background": 0, "femur": 7, "tibia": 8})
     spec = TaskSpec.from_model_folder(ds)
-    assert spec.source == "nnunet" and spec.shape == "single"
+    assert spec.lineage == "nnunetv2" and spec.shape == "single"
     assert spec.label_map == {7: "femur", 8: "tibia"}     # background dropped
     assert spec.modality == "MRI"
     assert resolve_model_folder(spec.single).name.endswith("__3d_fullres")

@@ -133,13 +133,24 @@ class Segmenter:
                 return {**info, "folds_default": list(self.policy["folds"]),
                         "hint": "structures are read from the checkpoint once "
                                 "installed; prepare() or first use installs it"}
-            if info is not None and info.get("engine"):
-                # an engine (e.g. FastSurfer) has no nnU-Net TaskSpec, so
-                # _resolve_spec would raise; its describe IS its info - and it
-                # carries weights_installed, which the result-cache key needs.
+            if info is not None and not info.get("task_spec", True):
+                # This ecosystem's tasks have no nnU-Net TaskSpec (an engine runs
+                # its own network), so _resolve_spec would raise; its describe IS
+                # its info - and it carries weights_installed, which the
+                # result-cache key needs. Branch on `task_spec`, never on the
+                # `engine` key: every ecosystem names an engine, so a truthy test
+                # on `engine` would take this path for every task and silently
+                # drop structures/weights from describe - which moves every
+                # result-cache key and re-splits the API and worker keys.
                 return {**info, "folds_default": list(self.policy["folds"])}
         spec = _resolve_spec(task, self.catalog)
-        d = {"name": spec.name, "source": spec.source, "modality": spec.modality,
+        from .engines.registry import NNUNETV2
+        d = {"name": spec.name, "lineage": spec.lineage, "modality": spec.modality,
+             # Which runtime would run this. A TaskSpec or a model folder resolves
+             # to the default engine by definition; a catalog task reports what its
+             # ecosystem declared. Reported for every task so a client never has to
+             # infer it from the name.
+             "engine": (info or {}).get("engine", NNUNETV2),
              "shape": spec.shape, "n_structures": len(spec.label_map),
              "structures": [spec.label_map[k] for k in sorted(spec.label_map)],
              "weights": [str(w) for w in spec.weights_ids],
@@ -180,10 +191,10 @@ class Segmenter:
 
         Returns how many are resident afterwards. Only useful with ``cache_models >= 1``.
         """
-        from .tasks import _is_native, _resolve_spec
+        from .tasks import _resolve_spec, _uses_nnunet_preprocessing
         spec = _resolve_spec(task, self.catalog)
         store = as_store(self.policy["weights"],
-                         ecosystem="nnunet" if _is_native(spec) else "totalsegmentator")
+                         layout="nnunetv2" if _uses_nnunet_preprocessing(spec) else "ts")
         for wid in spec.weights_ids:
             folder = store.resolve(wid, configuration=self.policy["configuration"])
             self.models.get(folder, folds=self.policy["folds"], device=self.policy["device"],
