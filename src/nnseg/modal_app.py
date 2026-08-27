@@ -481,6 +481,19 @@ def _emit(jid: str, update: dict) -> None:
 _cls_extra = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
 
 
+def _reference(staged):
+    """The one image artifacts render against.
+
+    A multi-input job has no single input, but a preview and a statistics table
+    do: they show the segmentation over an image, and the sensible choice is the
+    task's FIRST declared channel - the reference the model's own channel order
+    puts first.
+    """
+    if isinstance(staged, dict):
+        return next(iter(staged.values()))
+    return staged
+
+
 def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
     """The engine-agnostic job body shared by every worker: fetch/stage/
     read, then ctx._ensure + ctx._compute (the engine), then save +
@@ -507,7 +520,7 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
 
     token = CancelToken()
     started = time.time()
-    pinned_key = None
+    pinned = []
     _emit(jid, {"state": "running", "started": started})
     prefetch_stop = threading.Event()
     _prefetch_next(jid, prefetch_stop, ctx.series_cache,
@@ -520,14 +533,41 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
             _emit(jid, {"state": "done", "finished": time.time(), "result": result})
             return
         ctx._ensure(meta["task"])   # per-container weights provisioning (engine's own)
-        src = (meta.get("source") or [{"kind": "upload"}])[0]
-        kind = src.get("kind", "upload")
-        if kind != "upload":
+        entries = meta.get("source") or [{"kind": "upload"}]
+        if len(entries) > 1:
+            # A multi-input task. Everything needed is already on `source`: each
+            # entry carries the CANONICAL role the wire bound it to, uploads were
+            # written to the job dir under that role, and remote siblings fetch
+            # exactly like a single-input job through the same pinned cache.
+            rep = Reporter.of(on_progress, cancel=token)
+            with ctx._vol_lock:
+                jobs_vol.reload()
+            staged = {}
+            for entry in entries:
+                role = entry.get("role") or "image"
+                kind = entry.get("kind", "upload")
+                if kind == "upload":
+                    staged[role] = next(jdir.glob(f"input_{role}_*"))
+                    continue
+                ident = str(entry.get("id") or entry.get("crdc_series_uuid") or "")
+                key = f"{kind}:{ident}"
+                ctx.series_cache.pin(key)
+                pinned.append(key)
+                rep.stage("fetch", f"{role} {ident[:8]}")
+                t_f = time.time()
+                staged[role] = ctx.series_cache.get_or_fetch(
+                    key, check=rep.check,
+                    credentials=(source_tokens or {}).get(kind))
+                print(f"[fetch] {role} {ident[:13]} {time.time() - t_f:.1f}s", flush=True)
+                rep.check()
+            input_path = staged
+        elif (kind := entries[0].get("kind", "upload")) != "upload":
+            src = entries[0]
             rep = Reporter.of(on_progress, cancel=token)
             ident = src.get("id") or src.get("crdc_series_uuid")
             key = f"{kind}:{ident}"
             ctx.series_cache.pin(key)
-            pinned_key = key
+            pinned.append(key)
             if ctx.series_cache.has(key):
                 how = "cached"
             elif ctx.series_cache.staging(key):
@@ -610,7 +650,7 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
             identity=tuple(meta.get("input_identity") or ()),
             options=meta.get("options") or {},
             cache_key=meta.get("cache_key"),
-            labels_path=jdir / RESULT_NAME, input_image=input_path,
+            labels_path=jdir / RESULT_NAME, input_image=_reference(input_path),
             artifacts=ARTIFACTS, cache_enabled=True,
             migrate_key=_migrate, set_pending=_set_pending,
             clear_pending=_clear_pending, put=_put,
@@ -626,8 +666,8 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
                     "error": f"{type(e).__name__}: {e}\n--- traceback ---\n{tb[-1600:]}"})
         _clear_own_artifacts_marker(jid, meta)   # a put that failed after
     finally:                                     # set_pending must not 202
-        if pinned_key is not None:               # until the sweep
-            ctx.series_cache.unpin(pinned_key)
+        for key in pinned:                       # until the sweep
+            ctx.series_cache.unpin(key)
         prefetch_stop.set()            # end the scan loop with the run
         with ctx._vol_lock:
             _bound_jobs_store(jid)

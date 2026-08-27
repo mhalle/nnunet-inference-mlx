@@ -106,13 +106,21 @@ def test_spec_refuses_because_a_bundle_is_not_an_nnunet_task(eco, tmp_path):
 
 
 def test_the_shipped_manifest_is_curated_and_servable():
-    """Guards the generator's two jobs: 3D segmentation only, and nothing
-    multi-channel (the job wire takes one input and refuses multi-channel)."""
+    """Guards the generator's two jobs: 3D segmentation only, and nothing that
+    cannot be served.
+
+    Servable now means single-input OR multi-input with every channel NAMED -
+    the wire binds inputs by name, so a bundle that declares four channels and
+    names one (renalStructures_CECT) cannot be bound at all and has no business
+    in the catalog."""
     eco = MonaiEcosystem()
     assert eco.tasks(), "the shipped manifest is empty"
     for name in eco.tasks():
         entry = eco._entry(name)
-        assert int(entry.get("in_channels") or 1) == 1, f"{name} needs multiple channels"
+        n_in = int(entry.get("in_channels") or 1)
+        named = len(entry.get("channel_def") or {})
+        assert n_in == 1 or named == n_in, \
+            f"{name} declares {n_in} channels but names {named}: not bindable"
         assert int(entry.get("n_labels") or 0) >= 2, f"{name} has no labels"
         # the zoo moved hosting; what we need is the host monai.bundle.download
         # resolves, not an archive URL we fetch ourselves
@@ -140,3 +148,58 @@ def test_a_bundle_with_no_inference_config_says_what_it_has(tmp_path):
     (tmp_path / "configs" / "train.yaml").write_text("{}")
     with pytest.raises(FileNotFoundError, match="train.yaml"):
         inference_config(tmp_path)
+
+
+def _bundle_with_channels(root, channel_def, name="multi", version="1.0"):
+    """A synthetic installed bundle declaring `channel_def` input channels."""
+    import json as _json
+    d = root / "monai" / f"{name}_v{version}" / "configs"
+    d.mkdir(parents=True)
+    (d / "metadata.json").write_text(_json.dumps({"network_data_format": {
+        "inputs": {"image": {"modality": "MR", "num_channels": len(channel_def),
+                             "channel_def": channel_def}},
+        "outputs": {"pred": {"channel_def": {"0": "background", "1": "Tumor"}}}}}))
+    return d.parent
+
+
+def _img(size=(4, 5, 6), spacing=(1.0, 1.0, 1.0)):
+    import SimpleITK as sitk
+    im = sitk.Image(*size, sitk.sitkFloat32)
+    im.SetSpacing(spacing)
+    return im
+
+
+def test_channels_are_stacked_in_the_bundles_order_not_the_callers(tmp_path):
+    """The request may name its inputs in any order; the tensor's channel order
+    is the bundle's to declare. This is the difference that makes MONAI's BraTS
+    (T1c first) and nnU-Net's BraTS (FLAIR first) incompatible as positions."""
+    from nnseg.engines.monai_bundle import _stack_inputs, input_roles
+    root = _bundle_with_channels(tmp_path, {"0": "T1c", "1": "T1", "2": "T2",
+                                            "3": "FLAIR"})
+    assert input_roles(root) == ["T1c", "T1", "T2", "FLAIR"]
+    supplied = {"FLAIR": _img(), "T1": _img(), "T2": _img(), "T1c": _img()}
+    ordered = _stack_inputs(supplied, root, "multi", lambda x: x)
+    assert [role for role, _ in ordered] == ["T1c", "T1", "T2", "FLAIR"]
+
+
+def test_inputs_on_different_grids_are_refused_with_the_reason(tmp_path):
+    """nnseg does not register images - Slicer does that upstream. What nnseg
+    owes the caller is a clear refusal instead of a shape error from inside
+    someone else's transform chain."""
+    from nnseg.engines.monai_bundle import _stack_inputs
+    from nnseg.errors import InputError
+    root = _bundle_with_channels(tmp_path, {"0": "T1c", "1": "FLAIR"})
+    supplied = {"T1c": _img(), "FLAIR": _img(spacing=(0.86, 0.86, 1.0))}
+    with pytest.raises(InputError) as e:
+        _stack_inputs(supplied, root, "multi", lambda x: x)
+    assert "not on the same grid" in str(e.value)
+    assert "does not register images" in str(e.value)
+
+
+def test_a_missing_channel_is_named(tmp_path):
+    from nnseg.engines.monai_bundle import _stack_inputs
+    from nnseg.errors import InputError
+    root = _bundle_with_channels(tmp_path, {"0": "T1c", "1": "FLAIR"})
+    with pytest.raises(InputError) as e:
+        _stack_inputs({"T1c": _img(), "T2": _img()}, root, "multi", lambda x: x)
+    assert "FLAIR" in str(e.value)

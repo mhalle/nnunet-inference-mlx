@@ -644,6 +644,19 @@ class MonaiEcosystem(EngineEcosystem):
                           f"{len(roles)}; nnseg will not bind inputs by position"}
             out["channel_names"] = roles or [f"channel_{i}" for i in range(n_in)]
         out["behavior"] = {"restore": self._restore_fact(task, root)}
+        if out.get("inputs") and len(out["inputs"]) > 1:
+            # Say plainly whose job registration is. A multi-channel network
+            # consumes ONE tensor, so its channels must already share a grid -
+            # and producing that is a registration step that belongs upstream,
+            # where the caller can see and check it. Slicer registers before it
+            # ever calls us; doing it silently here would be a geometry decision
+            # taken on someone else's behalf.
+            out["behavior"]["alignment"] = {
+                "mode": "assumed-preregistered", "owner": "caller",
+                "note": "channels are stacked in the bundle's declared order and "
+                        "must already be co-registered on a common grid; nnseg "
+                        "does not register or resample them, and refuses inputs "
+                        "whose grids differ"}
         return out
 
     def _restore_fact(self, task: str, root) -> dict:

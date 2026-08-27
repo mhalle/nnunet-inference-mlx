@@ -155,6 +155,10 @@ ENGINES: dict[str, Engine] = {
         enabled_env="NNSEG_MONAI",
         weights_identity=None,          # per bundle - see MonaiEcosystem
         processing_knobs=False,
+        # The first engine that can be handed more than one image. Which bundles
+        # actually want that is per task and read from each bundle's declared
+        # input channels; this only says the runtime knows what to do with them.
+        multi_input=True,
         # no `behavior` constant: each bundle's own postprocessing decides
         # whether it inverts probabilities or a labelmap, so the fact is per task
         # and read from the installed bundle - see MonaiEcosystem.describe_task

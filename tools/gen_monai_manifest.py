@@ -45,12 +45,13 @@ CURATED = (
     "pancreas_ct_dints_segmentation",
     "swin_unetr_btcv_segmentation",
     "wholeBrainSeg_Large_UNEST_segmentation",
+    "brats_mri_segmentation",             # 4 MR channels - the multi-input case
 )
-# Deliberately NOT curated: brats_mri_segmentation wants 4 co-registered MR
-# channels, and the job wire takes a single input and refuses multi-channel at
-# submit. A bundle we cannot serve is not a task worth listing. The ecosystem
-# still reports `channel_names`, so if a multi-channel bundle is curated later it
-# is refused at submit with a clear message rather than deep inside the model.
+# brats_mri_segmentation is the first multi-input task the wire can carry: it
+# declares its four channels (T1c/T1/T2/FLAIR) in its own metadata, the wire
+# binds sources to those names, and the engine stacks them in the bundle's
+# order. Its inputs must already be co-registered onto one grid - nnseg does not
+# register images, and says so in the task's `behavior.alignment`.
 
 
 def fetch_json(url: str):
@@ -89,6 +90,11 @@ def segmentation_facts(meta: dict) -> dict | None:
         return None                                  # not volumetric
     return {"modality": inp.get("modality"),
             "in_channels": inp.get("num_channels"),
+            # the INPUT channel names, when the bundle names them: what a client
+            # needs to plan a multi-input request BEFORE the weights are
+            # installed. Derived from the bundle's own metadata, never
+            # hand-written, and re-read from the installed bundle at run time.
+            "channel_def": inp.get("channel_def") or {},
             "n_labels": len(channel_def),
             "task": (meta.get("task") or "").strip(),
             "monai_version": meta.get("monai_version"),

@@ -9,6 +9,9 @@
    "checksum": "",
    "modality": "CT",
    "in_channels": 1,
+   "channel_def": {
+    "0": "image"
+   },
    "n_labels": 2,
    "task": "Automated Spleen Segmentation in CT Images",
    "monai_version": "1.4.0",
@@ -25,6 +28,9 @@
    "checksum": "",
    "modality": "CT",
    "in_channels": 1,
+   "channel_def": {
+    "0": "image"
+   },
    "n_labels": 105,
    "task": "Multi-organ Segmentation in Whole Body CT Scans",
    "monai_version": "1.4.0",
@@ -42,6 +48,9 @@
    "checksum": "",
    "modality": "CT",
    "in_channels": 1,
+   "channel_def": {
+    "0": "image"
+   },
    "n_labels": 3,
    "task": "Pancreas and Pancreatic Tumor Segmentation in CT Images",
    "monai_version": "1.4.0",
@@ -61,6 +70,9 @@
    "checksum": "",
    "modality": "CT",
    "in_channels": 1,
+   "channel_def": {
+    "0": "image"
+   },
    "n_labels": 14,
    "task": "Multi-organ Segmentation in Abdominal CT Scans",
    "monai_version": "1.4.0",
@@ -79,6 +91,9 @@
    "checksum": "",
    "modality": "MRI",
    "in_channels": 1,
+   "channel_def": {
+    "0": "image"
+   },
    "n_labels": 133,
    "task": "Whole Brain Segmentation in T1W MRI",
    "monai_version": "1.4.0",
@@ -89,6 +104,29 @@
     "fire": "0.6.0",
     "timm": "0.6.7",
     "torchvision": "0.19.0",
+    "tensorboard": "2.17.0"
+   }
+  },
+  "brats_mri_segmentation": {
+   "version": "0.5.4",
+   "source": "monaihosting",
+   "url": "https://huggingface.co/MONAI/brats_mri_segmentation/tree/0.5.4",
+   "checksum": "",
+   "modality": "MR",
+   "in_channels": 4,
+   "channel_def": {
+    "0": "T1c",
+    "1": "T1",
+    "2": "T2",
+    "3": "FLAIR"
+   },
+   "n_labels": 3,
+   "task": "Multimodal Brain Tumor Subregion Segmentation",
+   "monai_version": "1.4.0",
+   "required_packages": {
+    "nibabel": "5.2.1",
+    "pytorch-ignite": "0.4.11",
+    "scikit-learn": "1.5.1",
     "tensorboard": "2.17.0"
    }
   }

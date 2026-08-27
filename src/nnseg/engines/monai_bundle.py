@@ -57,6 +57,74 @@ def label_names(bundle_dir) -> dict[int, str]:
             if str(v).lower() != "background"}
 
 
+def input_roles(bundle_dir) -> list:
+    """The bundle's declared INPUT channel names, in channel order.
+
+    The same ``channel_def`` idea as the label map, on the other side of the
+    network. This is the order the stacked tensor must be in, and it is the
+    bundle's to declare - MONAI's BraTS bundle wants T1c first where nnU-Net's
+    own BraTS convention puts FLAIR there, which is exactly why the wire binds
+    by name and the ORDER is read from here rather than from the request.
+    """
+    import json
+    from pathlib import Path
+
+    meta = json.loads((Path(bundle_dir) / "configs" / "metadata.json").read_text())
+    inp = (((meta.get("network_data_format") or {}).get("inputs") or {})
+           .get("image") or {})
+    cd = inp.get("channel_def") or {}
+    try:
+        return [str(v) for _, v in sorted(cd.items(), key=lambda kv: int(kv[0]))]
+    except (TypeError, ValueError):
+        return []
+
+
+def _same_grid(a, b, tol: float = 1e-4) -> bool:
+    return (a.GetSize() == b.GetSize()
+            and all(abs(x - y) < tol for x, y in zip(a.GetSpacing(), b.GetSpacing()))
+            and all(abs(x - y) < tol for x, y in zip(a.GetOrigin(), b.GetOrigin()))
+            and all(abs(x - y) < tol for x, y in zip(a.GetDirection(), b.GetDirection())))
+
+
+def _stack_inputs(image_input, bundle_dir, bundle: str, read):
+    """Order a ``{role: image}`` mapping into the bundle's channel order.
+
+    **Co-registration is assumed, not performed.** A multi-channel network
+    consumes one tensor, so its channels must already share a grid; producing
+    that is a registration step, and registration belongs upstream - Slicer does
+    it before it ever calls us, and doing it silently inside an inference call
+    would be a geometry decision made on the caller's behalf, which is the
+    failure mode this project has been bitten by three times. What we DO owe the
+    caller is to check the assumption and say so plainly when it does not hold,
+    rather than letting a shape mismatch surface from inside someone else's
+    transform chain.
+    """
+    from ..errors import InputError
+
+    roles = input_roles(bundle_dir)
+    if len(roles) != len(image_input):
+        raise InputError(
+            f"monai bundle {bundle!r} declares {len(roles)} input channels "
+            f"({', '.join(roles) or 'unnamed'}) but {len(image_input)} were "
+            "supplied")
+    missing = [r for r in roles if r not in image_input]
+    if missing:
+        raise InputError(f"monai bundle {bundle!r} is missing input(s): "
+                         + ", ".join(missing))
+    images = [(role, read(image_input[role])) for role in roles]
+    ref_role, ref = images[0]
+    for role, img in images[1:]:
+        if not _same_grid(ref, img):
+            raise InputError(
+                f"input {role!r} is not on the same grid as {ref_role!r} "
+                f"({img.GetSize()} @ {tuple(round(s, 4) for s in img.GetSpacing())} "
+                f"vs {ref.GetSize()} @ {tuple(round(s, 4) for s in ref.GetSpacing())}). "
+                "A multi-channel model stacks its inputs into one tensor, so they "
+                "must be co-registered and resampled to a common grid before "
+                "submission; nnseg does not register images.")
+    return images
+
+
 def inference_config(bundle_dir):
     """The bundle's inference config. Not every bundle spells it the same way -
     pancreas_ct_dints ships `inference.yaml` where spleen ships `inference.json` -
@@ -96,10 +164,13 @@ def _run_bundle(bundle_dir, image_path, out_dir, device: str, progress=None,
 
     from monai.bundle import create_workflow
 
+    # One case either way: a single path, or the ordered list of channel files
+    # that MONAI's loader stacks into multi-channel data.
+    paths = image_path if isinstance(image_path, list) else [image_path]
     overrides = {
         "bundle_root": str(bundle_dir),
-        "dataset_dir": str(image_path.parent),
-        "datalist": [str(image_path)],
+        "dataset_dir": str(paths[0].parent),
+        "datalist": [[str(p) for p in paths] if len(paths) > 1 else str(paths[0])],
         "output_dir": str(out_dir),
         "device": device,
     }
@@ -147,8 +218,14 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
     eco.ensure(bundle, root, progress=progress, version=version)
     bundle_dir = eco.bundle_root(bundle, root)
 
-    img = image_input if isinstance(image_input, sitk.Image) else \
-        nio.read_image(str(image_input))
+    def _read(x):
+        return x if isinstance(x, sitk.Image) else nio.read_image(str(x))
+
+    if isinstance(image_input, dict):
+        channels = _stack_inputs(image_input, bundle_dir, bundle, _read)
+        img = channels[0][1]              # the reference grid: channel 0
+    else:
+        channels, img = None, _read(image_input)
 
     timings: dict[str, float] = {}
     # Staging is a real cost, so pay as little of it as possible. A bundle's own
@@ -163,10 +240,22 @@ def segment(image_input, bundle: str, *, root, version: str | None = None,
     parent = str(shm) if shm.is_dir() else None
     with tempfile.TemporaryDirectory(dir=parent) as td:
         td = Path(td)
-        in_path, out_path = td / "input.nii", td / "out"
+        out_path = td / "out"
         out_path.mkdir()
         _t = time.perf_counter()
-        sitk.WriteImage(img, str(in_path), False)      # useCompression=False
+        if channels is None:
+            in_path = td / "input.nii"
+            sitk.WriteImage(img, str(in_path), False)   # useCompression=False
+        else:
+            # One file per channel, IN THE BUNDLE'S ORDER. MONAI's LoadImage
+            # stacks a list of filenames into multi-channel data, so the datalist
+            # item is the list - which keeps the bundle's own loader in charge,
+            # the whole reason this engine runs their config instead of ours.
+            in_path = []
+            for i, (role, image) in enumerate(channels):
+                p = td / f"input_{i}_{role}.nii"
+                sitk.WriteImage(image, str(p), False)
+                in_path.append(p)
         timings["stage"] = time.perf_counter() - _t
 
         report.tick(0, 1)
