@@ -1273,10 +1273,11 @@ def test_segmentations_listing_shape(tmp_path, monkeypatch):
     assert e["links"]["labels"] == f"/v1/idc/{u}/total_fast/labels.seg.nrrd"
 
 
-def test_slashed_identifiers_hash_into_the_cache(tmp_path):
-    """Identifiers that cannot be directory names (slashes, dot names) map to
-    deterministic hashed entries inside the root - safe by construction, and
-    sources with DOI-style ids need no special casing."""
+def test_awkward_identifiers_stay_inside_the_root(tmp_path):
+    """Identifiers that cannot be directory names verbatim - slashes, colons,
+    dot names - become legal components inside the root, safe by construction,
+    so sources with DOI-style ids need no special casing. A traversal attempt is
+    encoded into an inert literal name rather than being interpreted."""
     from nnseg.serve import SeriesCache
     from nnseg.sources import registry
 
@@ -1295,8 +1296,9 @@ def test_slashed_identifiers_hash_into_the_cache(tmp_path):
         got = sc.get_or_fetch(weird)
         assert got.resolve().is_relative_to(root.resolve())   # never escapes
         assert sc.has(weird)
-        assert sc._entry(weird).name.startswith("h_")
-        assert (sc._entry(weird) / ".key").read_text() == weird
+        name = sc._entry(weird).name
+        assert "/" not in name and ":" not in name and name not in (".", "..")
+        assert (sc._entry(weird) / ".key").read_text() == weird   # round-trips
     assert sc.get_or_fetch("doi:10.1234/abc.def") and len(fetched) == 4  # cached
 
     class Doi:
