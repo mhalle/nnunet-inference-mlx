@@ -231,3 +231,35 @@ def test_the_two_executors_speak_the_same_submit_signature():
     modal_ = inspect.signature(ModalExecutor.submit).parameters
     assert set(local) - {"self"} <= set(modal_), \
         f"ModalExecutor.submit is missing {sorted(set(local) - set(modal_))}"
+
+
+def test_the_engine_shim_reports_the_weights_identity_the_api_reports(monkeypatch):
+    """The API keys a job at submit; the WORKER re-keys it at publish. If those
+    two disagree the finished result lands in a slot nothing looks up, and every
+    job of that engine misses its cache forever - silently, because the job
+    itself succeeds.
+
+    That is exactly what MONAI did: its identity is per BUNDLE rather than a
+    per-engine constant, and the shim answered [] for engines with no constant,
+    which weights_versions_of turns into "unknown".
+    """
+    for var in ("NNSEG_FASTSURFER", "NNSEG_SYNTHSTRIP", "NNSEG_VOXTELL", "NNSEG_MONAI"):
+        monkeypatch.setenv(var, "1")
+    from nnseg import Segmenter
+    from nnseg.ecosystems import default_ecosystems
+    from nnseg.modal_app import _EngineShim
+    from nnseg.serve import weights_versions_of
+
+    seg = Segmenter()
+    checked = 0
+    for eco in default_ecosystems():
+        if eco.engine == "nnunetv2":
+            continue                       # keyed by the real Segmenter, not a shim
+        for task in eco.tasks()[:2]:
+            name = f"{eco.name}:{task}"
+            worker = weights_versions_of(_EngineShim(eco.engine), name)
+            api = weights_versions_of(seg, name)
+            assert worker == api, f"{name}: worker {worker} != api {api}"
+            assert worker != ["unknown"], f"{name}: no weights identity at all"
+            checked += 1
+    assert checked, "no engine ecosystems were checked"

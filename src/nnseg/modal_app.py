@@ -884,12 +884,32 @@ class _EngineShim:
     API-side describe does. Both read the registry, so they cannot drift - the
     divergence that once made every bare read 404 a cached result."""
 
+    _catalog = None
+
     def __init__(self, engine: str):
         self._engine = engine
 
     def describe(self, task):
         identity = _engines.ENGINES[self._engine].weights_identity
-        return {"weights_installed": identity() if identity else []}
+        if identity is not None:
+            return {"weights_installed": identity()}
+        # An engine whose identity is PER TASK rather than constant - a CATALOG
+        # like MONAI, where two bundles must not collide on one cached result.
+        # `weights_identity=None` means "the ecosystem answers", so ask it, the
+        # same way the API-side describe does. Returning [] here instead (which
+        # this did until 2026-08-27) degrades weights_versions_of to "unknown",
+        # and publish_completion then re-keys the finished result onto a key the
+        # API never computes - so every job of that engine published into a slot
+        # nothing would ever look up, and none of them ever hit the cache.
+        cls = type(self)
+        if cls._catalog is None:
+            from nnseg.ecosystems import EcosystemCatalog
+            cls._catalog = EcosystemCatalog(root=WEIGHTS_ROOT)
+        try:
+            info = cls._catalog.info(task) or {}
+        except Exception:
+            return {"weights_installed": []}
+        return {"weights_installed": info.get("weights_installed") or []}
 
     def resolve_task(self, t):
         return t
