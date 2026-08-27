@@ -179,45 +179,54 @@ def test_two_members_that_flatten_onto_one_name_both_survive(tmp_path):
     assert sorted(p.read_bytes() for p in out.iterdir()) == [b"one", b"three", b"two"]
 
 
-# -- Windows: every key we generate contains a colon ------------------------
+# -- path components: legal everywhere, on every platform ------------------
 
-def test_the_colon_is_reserved_on_windows_and_not_on_posix():
-    """Every key the stores are handed contains a colon - idc:<uuid>,
-    sha256:<hex>, sha256-tree:<hex> - and on Windows that is the Alternate Data
-    Stream separator, illegal in a filename. Platform-conditional so POSIX
-    layouts (and the deployed caches keyed by them) do not move."""
-    from nnseg.serve import unsafe_path_chars
-    assert ":" in unsafe_path_chars("nt")
-    assert ":" not in unsafe_path_chars("posix")
-    for c in '<>:"|?*':
-        assert c in unsafe_path_chars("nt")
-
-
-def test_every_key_grammar_we_generate_is_a_legal_windows_directory(tmp_path,
-                                                                    monkeypatch):
-    """The bug this guards: the store turns keys straight into directory names,
-    and its safe-check screened separators and NUL but never the colon."""
-    from nnseg.serve import SeriesCache, unsafe_path_chars
-    monkeypatch.setattr(SeriesCache, "_UNSAFE", unsafe_path_chars("nt"))
+def test_every_key_grammar_we_generate_is_a_legal_filename(tmp_path):
+    """The store turns keys straight into directory names, and its safe-check
+    screened separators and NUL but never the COLON - which every key contains
+    (idc:<uuid>, sha256:<hex>, sha256-tree:<hex>) and which Windows reserves as
+    the Alternate Data Stream separator. The store layer could not have worked
+    there."""
+    from nnseg.serve import RESERVED_PATH_CHARS, SeriesCache
     cache = SeriesCache(tmp_path / "c", lambda k, e: None)
     keys = [BLOB + "a" * 64, TREE + "b" * 64,
             "idc:a05fb365-dfd2-4116-ab8e-a7262d2c169c",
             "tcia:1.3.6.1.4.1.14519.5.2.1", "zenodo:10.5281/zenodo.123"]
-    names = set()
     for k in keys:
         name = cache._entry(k).name
-        assert not any(c in name for c in unsafe_path_chars("nt")), \
-            f"{k!r} -> {name!r} is not a legal Windows path component"
-        names.add(name)
-    assert len(names) == len(keys)          # and still collision-free
+        assert not any(c in name for c in RESERVED_PATH_CHARS), f"{k!r} -> {name!r}"
+    assert len({cache._entry(k).name for k in keys}) == len(keys)
 
 
-def test_posix_layout_is_unchanged(tmp_path):
-    """Guards against fixing Windows by invalidating every deployed cache
-    entry: on POSIX a colon key must keep its readable verbatim name."""
-    from nnseg.serve import SeriesCache, unsafe_path_chars
-    if unsafe_path_chars() != unsafe_path_chars("posix"):
-        pytest.skip("this assertion describes POSIX hosts")
+def test_the_encoding_is_injective_including_a_literal_percent(tmp_path):
+    """`%` is escaped first, or a key containing a literal `%3A` and a key
+    containing a real colon would land on one entry - two different inputs
+    sharing a cache slot."""
+    from nnseg.serve import safe_path_component
+    assert safe_path_component("a:b") != safe_path_component("a%3Ab")
+    assert safe_path_component("a%3Ab") == "a%253Ab"
+
+
+def test_names_are_readable_because_finding_a_bad_entry_by_eye_is_real(tmp_path):
+    """Hashing would have been simpler. It also would have made `modal volume ls`
+    useless for matching a stored entry against a digest the API reported, which
+    is how a poisoned entry was actually found and removed."""
+    from nnseg.serve import safe_path_component
+    assert safe_path_component(BLOB + "2549be").startswith("sha256%3A2549be")
+
+
+def test_the_layout_does_not_depend_on_the_host(tmp_path):
+    """A per-platform rule would make one key map to different paths on
+    different hosts, so a copied volume or a restored backup would stop
+    resolving. The encoding takes no platform argument, by construction."""
+    import inspect
+
+    from nnseg.serve import safe_path_component
+    assert not inspect.signature(safe_path_component).parameters.get("os_name")
+    assert len(inspect.signature(safe_path_component).parameters) == 1
+
+
+def test_an_absurdly_long_key_still_falls_back_to_a_hash(tmp_path):
+    from nnseg.serve import SeriesCache
     cache = SeriesCache(tmp_path / "c", lambda k, e: None)
-    assert cache._entry(BLOB + "abc").name == BLOB + "abc"
-    assert cache._entry("idc:a05fb365").name == "idc:a05fb365"
+    assert cache._entry("idc:" + "x" * 400).name.startswith("h_")

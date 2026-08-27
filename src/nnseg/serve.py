@@ -233,22 +233,32 @@ def weights_versions_of(segmenter, task) -> list:
         return ["unknown"]
 
 
-def unsafe_path_chars(os_name: str | None = None) -> str:
-    """Characters that cannot appear in a path component on this platform.
+#: Reserved in a path component on SOME platform, so reserved on ALL of them.
+#: POSIX forbids only the separator and NUL; Windows adds ``< > : " | ? *`` - and
+#: the colon is the one that matters, because every key these stores are handed
+#: contains one (``idc:<uuid>``, ``sha256:<hex>``, ``sha256-tree:<hex>``). There it
+#: is the Alternate Data Stream separator and illegal in a filename, so the store
+#: layer could never have worked on Windows.
+#:
+#: Applied uniformly rather than per-platform on purpose. A conditional rule makes
+#: the same key map to different paths on different hosts, which quietly costs the
+#: store its portability - a copied volume, a restored backup, a bind mount from
+#: another OS. "Works on my machine" should not be a property of a layout.
+RESERVED_PATH_CHARS = '<>:"|?*\\/\x00'
 
-    POSIX forbids only the separator and NUL. Windows additionally reserves
-    ``< > : " | ? *`` - and the COLON is the one that matters, because every key
-    the stores are given contains one: ``idc:<uuid>``, ``sha256:<hex>``,
-    ``sha256-tree:<hex>``. There it is the Alternate Data Stream separator and is
-    illegal in a filename, so the whole store layer would fail on Windows. That
-    has simply never been exercised - everything runs on macOS and Linux.
 
-    Platform-conditional on purpose: making ``:`` universally unsafe would
-    re-path every existing entry on POSIX and invalidate the deployed caches to
-    fix a platform they are not on. Takes ``os_name`` so the rule itself is
-    testable from a machine that is not Windows.
+def safe_path_component(key: str) -> str:
+    """``key`` as a filename that is legal on every platform we target.
+
+    Percent-encoded rather than hashed, so the cache stays one you can ``ls``:
+    finding a poisoned entry by eye and removing it by name is a real debugging
+    move that hashed names would take away. Reversible and injective - ``%`` is
+    escaped first, or a literal ``%3A`` and an encoded ``:`` would collide.
     """
-    return "/\\\x00" + ('<>:"|?*' if (os_name or os.name) == "nt" else "")
+    out = key.replace("%", "%25")
+    for c in RESERVED_PATH_CHARS:
+        out = out.replace(c, "%%%02X" % ord(c))
+    return out
 
 
 class SeriesCache:
@@ -273,9 +283,6 @@ class SeriesCache:
         self._lock = threading.Lock()          # eviction + pin bookkeeping
         self._pins: dict = {}                  # entry name -> refcount
 
-    #: see :func:`unsafe_path_chars` - the colon is why this exists
-    _UNSAFE = unsafe_path_chars()
-
     def _entry(self, series: str) -> Path:
         # Keys become directory names. Filesystem-safe keys keep their readable
         # verbatim name (a cache you can ls); anything else - separators, dot
@@ -283,10 +290,9 @@ class SeriesCache:
         # a deterministic hash, so identifiers with slashes (DOIs, org/name ids)
         # or colons (every content digest) are safe by construction rather than
         # forbidden.
-        safe = (not any(c in series for c in self._UNSAFE)
-                and series not in (".", "..") and 0 < len(series) <= 200)
-        if safe:
-            return self.root / series
+        name = safe_path_component(series)
+        if name not in (".", "..") and 0 < len(name) <= 200:
+            return self.root / name
         import hashlib
         d = self.root / ("h_" + hashlib.sha256(series.encode()).hexdigest()[:32])
         return d
