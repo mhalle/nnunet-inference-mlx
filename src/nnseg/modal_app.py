@@ -649,11 +649,8 @@ def _execute_job(ctx, jid: str, source_tokens: dict | None = None) -> None:
         with ctx._vol_lock:
             s.save(jdir / RESULT_NAME)
             scratch_vol.commit()
-        result = {"names": {int(k): v for k, v in s.schema.names.items()},
-                  "volumes_ml": {k: round(float(v), 2)
-                                 for k, v in s.volumes_ml().items()},
-                  "timings": {k: round(float(v), 3) for k, v in (s.timings or {}).items()},
-                  "provenance": s.provenance}
+        from nnseg.serve import result_payload
+        result = result_payload(s, jdir / RESULT_NAME)
         # The publication order (re-key, pair load, pending marker,
         # cache put, done, overlap start) lives in one place -
         # nnseg.serve.publish_completion; this side supplies the Dict

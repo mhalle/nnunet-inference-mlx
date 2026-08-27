@@ -1585,7 +1585,14 @@ def test_grid_variant_1mm_is_a_distinct_addressable_resource(tmp_path, monkeypat
     assert r1.status_code == 200
     assert seg.calls[-1][2] == {"grid": 1.0}             # the variant's options
     assert len(seg.calls) == 2                           # two distinct computes
-    assert r0.headers["etag"] != r1.headers["etag"]      # two distinct resources
+    # Distinct RESOURCES - distinct URLs, distinct options, distinct computes,
+    # asserted above. Not distinct ETags: the tag is now the CONTENT digest, and
+    # this fake returns the same bytes for both. That is correct HTTP - a
+    # validator is compared per-URL, and two representations that really are
+    # byte-identical share one - and it is the point of the change: a weights
+    # bump that leaves the output unchanged no longer forces a re-download.
+    assert r0.headers["etag"].startswith('"sha256:')
+    assert r0.headers["etag"] == r1.headers["etag"]      # identical fake bytes
 
     # jobs-API convergence: {"grid": 1} (int) lands on the same key -> no recompute
     j = client.post("/v1/jobs", data={"task": "total_fast",
@@ -3014,3 +3021,70 @@ def test_a_hostile_archive_cannot_escape_or_explode(tmp_path):
     where = ex.content.resolve(body["digest"])
     assert sorted(p.name for p in where.iterdir()) == ["IM1.dcm", "passwd"]
     assert not (tmp_path / "etc").exists()
+
+
+def test_a_client_that_already_holds_a_result_gets_304(tmp_path):
+    """We advertised an ETag and then ignored If-None-Match, so a Slicer client
+    re-downloaded megabytes of labels it already had."""
+    _, _, client = make(tmp_path)
+    jid = submit(client)
+    wait_state(client, jid, ("done",))
+    url = f"/v1/jobs/{jid}/result"
+    first = client.get(url)
+    assert first.status_code == 200 and first.content
+    etag = first.headers["etag"]
+    assert etag.startswith('"sha256:')
+    again = client.get(url, headers={"If-None-Match": etag})
+    assert again.status_code == 304
+    assert again.headers["etag"] == etag
+    assert not again.content
+
+
+def test_a_finished_job_reports_the_digest_of_what_it_produced(tmp_path):
+    """The symmetric counterpart of input_identity: a client can tell whether it
+    already holds this result, and one job's output can become another's input
+    without the bytes routing through the client."""
+    _, _, client = make(tmp_path)
+    jid = submit(client)
+    s = wait_state(client, jid, ("done",))
+    outputs = s["result"]["outputs"]
+    assert [o["name"] for o in outputs] == ["labels"]
+    assert outputs[0]["sha256"].startswith("sha256:") and outputs[0]["bytes"] > 0
+
+
+def test_one_jobs_output_becomes_another_jobs_input(tmp_path):
+    """Chaining without a round trip through the client: promote a finished
+    result into the input store and refer to it by digest. The digest is the one
+    the producing job already published in `outputs` - same bytes, same address."""
+    _, _, client = make(tmp_path)
+    first = submit(client)
+    produced = wait_state(client, first, ("done",))["result"]["outputs"][0]["sha256"]
+
+    body = client.post("/v1/inputs", data={"from_job": first}).json()
+    assert body["digest"] == produced, "promotion must not re-address the bytes"
+
+    r = client.post("/v1/jobs", data={
+        "task": "total", "source": json.dumps([{"kind": "input",
+                                                "sha256": produced}])})
+    assert r.status_code == 202, r.text
+    second = wait_state(client, r.json()["id"], ("done",))
+    assert second["input_identity"] == [produced]
+
+
+def test_promoting_an_unfinished_job_is_refused(tmp_path):
+    import threading
+    gate = threading.Event()
+    _, _, client = make(tmp_path, gate=gate)
+    jid = submit(client)
+    try:
+        r = client.post("/v1/inputs", data={"from_job": jid})
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "not_done"
+    finally:
+        gate.set()
+
+
+def test_promoting_a_job_that_does_not_exist_says_so(tmp_path):
+    _, _, client = make(tmp_path)
+    r = client.post("/v1/inputs", data={"from_job": "nosuchjob"})
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "no_job"

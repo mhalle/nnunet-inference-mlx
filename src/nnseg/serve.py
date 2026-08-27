@@ -19,7 +19,12 @@ contract is deliberately small:
     GET    /v1/inputs/{digest}     whether this server already holds that content
     POST   /v1/inputs             store a multi-file input (a DICOM series) as
                                    one tree - several parts, or a zip; returns
-                                   its digest
+                                   its digest. `from_job=<id>` instead promotes
+                                   that job's result into the store, so one job's
+                                   output can be another's input without the
+                                   bytes routing through the client
+    A finished job reports `outputs` - the content digest of what it produced -
+    and that digest is the ETag on the result, so If-None-Match gets a 304.
     PUT    /v1/inputs/{digest}     store it (preload). The digest in the URL is
                                    CHECKED against the bytes, never trusted; a
                                    source may then be {"kind":"input","sha256":...}
@@ -652,6 +657,68 @@ class QueueFull(NnsegError):
     """The pending queue is at its bound; the caller should retry later."""
 
 
+def result_payload(seg, labels_path) -> dict:
+    """A finished job's public result, built ONCE for both executors.
+
+    They had drifted already - the Modal side reported `timings` and the local
+    side did not - which is the same shape as the bug where an engine worker and
+    the API disagreed about weights identity: two hand-written copies of one
+    thing.
+
+    `outputs` is new: the content digest of what the job produced. It is what
+    lets a client skip re-downloading a result it already holds (it IS the
+    ETag), and what lets one job's output become another's input without the
+    bytes taking a round trip out through the client and back.
+    """
+    from .content import digest_file
+    out = {"names": {int(k): v for k, v in seg.schema.names.items()},
+           "volumes_ml": {k: round(float(v), 2) for k, v in seg.volumes_ml().items()},
+           "provenance": seg.provenance}
+    timings = getattr(seg, "timings", None)
+    if timings:
+        out["timings"] = {k: round(float(v), 3) for k, v in timings.items()}
+    p = Path(labels_path)
+    if p.exists():
+        out["outputs"] = [{"name": "labels", "sha256": digest_file(p),
+                           "bytes": p.stat().st_size}]
+    return out
+
+
+def etag_of(key: str, result=None) -> str:
+    """The validator for a stored result.
+
+    The CONTENT digest when we know it, so a client holding those exact bytes
+    gets a 304 - and so two runs that produce identical bytes are identical to a
+    cache. Falls back to the request key, which is what this always used to be:
+    a fine validator for "the same request", but it changes when a weights
+    version bumps even if the output does not.
+    """
+    outs = (result or {}).get("outputs") or []
+    digest = outs[0].get("sha256") if outs else None
+    return f'"{digest}"' if digest else f'"{key[:32]}"'
+
+
+def not_modified(request, etag: str):
+    """A 304 when the client already holds this exact content, else None.
+
+    RFC 9110 conditional GET - the other half of an ETag we have been sending
+    but never acting on. A label volume is megabytes and a Slicer client asks
+    for the same one repeatedly.
+    """
+    from fastapi.responses import Response
+    raw = ""
+    try:
+        raw = request.headers.get("if-none-match") or ""
+    except Exception:
+        return None
+    if not raw:
+        return None
+    tags = {t.strip() for t in raw.split(",")}
+    if etag in tags or "*" in tags:
+        return Response(status_code=304, headers={"ETag": etag})
+    return None
+
+
 def publish_completion(*, segmenter, task, identity, options, cache_key,
                        labels_path, input_image, artifacts, cache_enabled,
                        migrate_key, set_pending, clear_pending, put,
@@ -1118,11 +1185,7 @@ class LocalExecutor:
                 seg = self._segment(inp, rec.task, progress=reporter,
                                     cancel=rec.cancel_token, **rec.options)
                 rec.labels_path = Path(seg.save(rec.dir / RESULT_NAME))
-                rec.result = {
-                    "names": {int(k): v for k, v in seg.schema.names.items()},
-                    "volumes_ml": {k: round(float(v), 2) for k, v in seg.volumes_ml().items()},
-                    "provenance": seg.provenance,
-                }
+                rec.result = result_payload(seg, rec.labels_path)
                 (rec.dir / "result.json").write_text(json.dumps(rec.result))
 
                 def _migrate(old_key: str, new_key: str) -> None:
@@ -1707,6 +1770,34 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         require_auth(request)              # anonymous never computes, and never stores
         store = _store_or_404()
         form = await request.form()
+        from_job = form.get("from_job")
+        if from_job:
+            # One job's output becomes another's input, without the bytes taking
+            # a round trip out through the client and back. The digest returned
+            # is the one the producing job already published in `outputs` - same
+            # bytes, same address - so a client can predict it.
+            #
+            # Copied in ON REQUEST rather than for every result: outputs are
+            # re-derivable and inputs are not, so filling the input store with
+            # results nobody chains would evict the irreplaceable to keep the
+            # reproducible.
+            #
+            # What a downstream task DOES with a labelmap is a separate question:
+            # `inputs[].kind` is "image" everywhere today, and a task that
+            # consumes a mask would have to declare so before this composes into
+            # anything meaningful.
+            state, path = executor.result_file(str(from_job))
+            if state is None:
+                raise HTTPException(404, {"code": "no_job",
+                                          "message": f"no job {from_job!r}"})
+            if state != "done" or path is None:
+                raise HTTPException(409, {
+                    "code": "not_done",
+                    "message": f"job {from_job!r} is {state}; nothing to promote"})
+            name = content.guess_name(path) or Path(path).name
+            digest = store.put_file(path, expect=expect, name=Path(name).name)
+            return {"digest": digest, "kind": "blob", "members": 1, "stored": True,
+                    "bytes": Path(path).stat().st_size, "from_job": str(from_job)}
         # multi_items(), not values(): a form is a MULTIdict, and several
         # parts sharing one name - which is how a client sends a series -
         # collapse to a single value through the dict-shaped accessor.
@@ -2230,8 +2321,18 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             return FileResponse(out, media_type="application/gzip", filename=out.name,
                                 background=BackgroundTask(shutil.rmtree, tmpd,
                                                           ignore_errors=True))
+        # The route a client uses for results that are NOT path-addressable -
+        # uploads, and every multi-input job - so this is where revalidation
+        # actually saves a download. The validator is the content digest the job
+        # already published in `outputs`; no re-hashing per request.
+        status = executor.status_of(jid) or {}
+        etag = etag_of(jid, status.get("result"))
+        fresh = not_modified(request, etag)
+        if fresh is not None:
+            return fresh
         return FileResponse(path, media_type="application/octet-stream",
-                            filename=f"{stem}_{jid}.seg.nrrd")
+                            filename=f"{stem}_{jid}.seg.nrrd",
+                            headers={"ETag": etag})
 
     @app.delete("/v1/jobs/{jid}")
     def cancel(request: Request, jid: str):
@@ -2245,18 +2346,18 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
 
 
     # -- the IDC path surface: results addressed like the source data ---------
-    def _resource_headers(key: str) -> dict:
+    def _resource_headers(key: str, result=None) -> dict:
         # Vary: the 200s differ (Preference-Applied) by the Prefer header,
         # and these are the public-cacheable responses
         return {"Cache-Control": "public, max-age=3600",
-                "ETag": f'"{key[:32]}"', "Vary": "Prefer"}
+                "ETag": etag_of(key, result), "Vary": "Prefer"}
 
-    def _pref_headers(request, key: str) -> dict:
+    def _pref_headers(request, key: str, result=None) -> dict:
         """Resource headers + the RFC 7240 echo of the token the client
         SENT (respond-async is echoed as itself, never rewritten to
         wait=0); applied uniformly - labels and artifacts, waits and
         cache hits alike (a hit trivially satisfies wait=N)."""
-        h = _resource_headers(key)
+        h = _resource_headers(key, result)
         for raw in request.headers.getlist("prefer"):
             for token in raw.split(","):
                 token = token.strip().lower()
@@ -2346,9 +2447,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     not engine_serves_from_cache(task)
                 hit = None if skip else executor.cache_get(key)
                 if hit is not None:
+                    headers = _pref_headers(request, key, hit[1])
+                    # the client may already hold these exact bytes
+                    fresh = not_modified(request, headers["ETag"])
+                    if fresh is not None:
+                        return fresh
                     return FileResponse(hit[0], media_type="application/octet-stream",
-                                        filename=fname,
-                                        headers=_pref_headers(request, key))
+                                        filename=fname, headers=headers)
                 jid = executor.find_inflight(key)  # single flight: ride an existing run
                 is_authed = authed(request)
                 if not is_authed and jid is None:
@@ -2401,10 +2506,13 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 if snap.get("state") == "done" or hit is not None:
                     # a hit wins even against a failed/cancelled marker:
                     # under duplicate flights the sibling may have published
-                    headers = _pref_headers(request, key)
+                    headers = _pref_headers(request, key, hit[1] if hit else None)
                     src_path = hit[0] if hit else executor.result_file(jid)[1]
                     if src_path is None:       # evicted between done and read
                         raise HTTPException(404, "not materialized")
+                    fresh = not_modified(request, headers["ETag"])
+                    if fresh is not None:
+                        return fresh
                     return FileResponse(src_path, media_type="application/octet-stream",
                                         filename=fname, headers=headers)
                 if snap.get("state") == "failed":
