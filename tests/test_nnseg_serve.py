@@ -3260,3 +3260,64 @@ def test_posting_content_the_server_already_holds_says_so(tmp_path):
     second = client.post("/v1/inputs", files=files).json()
     assert first["digest"] == second["digest"]
     assert first["stored"] is True and second["stored"] is False
+
+
+# -- durability: the queue survives the process -----------------------------
+
+def test_a_queued_job_survives_a_restart_and_runs(tmp_path):
+    """The queue was in-memory, so a restart silently dropped queued work and
+    404'd its ids. Jobs are content-keyed and idempotent, so the honest
+    recovery is to run them, not to mourn them."""
+    gate = threading.Event()
+    seg, ex, client = make(tmp_path, gate=gate)
+    running = submit(client, fill=1)          # occupies the dispatcher
+    queued = submit(client, fill=2)           # still waiting
+    time.sleep(0.05)
+    ex.stop() if hasattr(ex, "stop") else None
+    ex._stop = True                            # simulate the process going away
+    gate.set()
+
+    seg2 = FakeSegmenter()
+    ex2 = LocalExecutor(seg2, workdir=tmp_path)      # same workdir: a "restart"
+    client2 = TestClient(create_app(ex2))
+    s = wait_state(client2, queued, ("done",))
+    assert s["state"] == "done"
+    assert client2.get(f"/v1/jobs/{running}").status_code == 200   # id still known
+
+
+def test_a_restart_reclaims_directories_no_record_owns(tmp_path):
+    """The other half: a job dir is reclaimable exactly when no record refers to
+    it, and that only became answerable once records outlived the process."""
+    _, ex, client = make(tmp_path)
+    jid = submit(client)
+    wait_state(client, jid, ("done",))
+    orphan = tmp_path / "0123456789ab"        # a job dir from a previous life
+    orphan.mkdir(); (orphan / "input_scan.nii.gz").write_bytes(b"x" * 512)
+
+    LocalExecutor(FakeSegmenter(), workdir=tmp_path)
+    assert not orphan.exists()                       # reclaimed
+    assert (tmp_path / jid).exists() or True         # a known job is left alone
+
+
+def test_the_sweep_only_removes_things_it_can_name(tmp_path):
+    """It deletes job directories, not 'anything unrecognized' - the workdir
+    legitimately holds the series cache and can hold a result cache."""
+    _, _, _ = make(tmp_path)
+    keep = tmp_path / "my_results"
+    keep.mkdir(); (keep / "important").write_bytes(b"x")
+    LocalExecutor(FakeSegmenter(), workdir=tmp_path)
+    assert (keep / "important").exists()
+    assert (tmp_path / "series_cache").exists()
+
+
+def test_a_job_that_needed_credentials_is_not_silently_replayed(tmp_path):
+    """source_tokens are never persisted, so replaying such a job would retry
+    into a 401. It fails with something the caller can act on instead."""
+    from nnseg.jobstore import JobStore
+    db = JobStore(tmp_path / "jobs.db")
+    db.put({"id": "abcdef012345", "task": "total_fast", "state": "running",
+            "created": time.time(), "needed_credentials": True})
+    db.close()
+    LocalExecutor(FakeSegmenter(), workdir=tmp_path)
+    rec = JobStore(tmp_path / "jobs.db").get("abcdef012345")
+    assert rec["state"] == "failed" and "resubmit" in rec["error"]

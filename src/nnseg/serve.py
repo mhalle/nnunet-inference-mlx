@@ -90,6 +90,7 @@ from pathlib import Path
 
 from . import content
 from .content import ContentStore, is_digest
+from .jobstore import JobStore
 from .errors import Cancelled, InputError, NnsegError, ResourceError
 from .progress import CancelToken, Reporter
 
@@ -983,7 +984,7 @@ class LocalExecutor:
                  keep_finished: int = 50, segment_fn=None, fetch_idc_fn=None,
                  cache_dir=None, keep_cached: int = 500,
                  input_cache_bytes: int = 8 << 30, read_fn=None, sources=None,
-                 artifacts=("preview", "statistics")):
+                 artifacts=("preview", "statistics"), jobs_ttl_h: float = 24.0):
         self.segmenter = segmenter
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1009,8 +1010,83 @@ class LocalExecutor:
         self._jobs: dict[str, JobRecord] = {}
         self._done_order: deque[str] = deque()
         self._stop = False
+        # Durable records. The in-memory structures above stay as the RUNTIME
+        # view - they hold live objects (cancel tokens, SSE subscriber queues)
+        # that cannot be written down - but they are derived: rebuilt from the
+        # store at startup, and every mutation writes both inside one `_cv`
+        # block so they move together. The store is authoritative across
+        # restarts, memory within a run, and reconcile() is the defined point
+        # where the two are reconciled rather than trusted to agree.
+        self.jobs_db = JobStore(self.workdir / "jobs.db")
+        self.jobs_ttl_s = float(jobs_ttl_h) * 3600.0
+        self._restore()
         self._thread = threading.Thread(target=self._dispatch, name="nnseg-serve", daemon=True)
         self._thread.start()
+
+    # -- durability ---------------------------------------------------------
+    def _persisted(self, rec: JobRecord) -> dict:
+        """The writable view of a record.
+
+        Three fields never go: `cancel_token` and `subscribers` are live
+        objects, and `source_tokens` are per-request credentials the record
+        itself marks "never serialized". What IS recorded is whether the job
+        had any, because that decides whether it can be replayed after a
+        restart or has to fail asking the caller to resubmit.
+        """
+        return {"id": rec.id, "task": rec.task, "state": rec.state, "kind": rec.kind,
+                "options": rec.options, "cache_key": rec.cache_key,
+                "created": rec.created, "started": rec.started,
+                "finished": rec.finished, "error": rec.error, "result": rec.result,
+                "cached": rec.cached, "source": rec.source,
+                "input_identity": list(rec.input_identity),
+                "input_path": str(rec.input_path) if rec.input_path else None,
+                "input_paths": [[r, str(p) if p else None] for r, p in rec.input_paths],
+                "labels_path": str(rec.labels_path) if rec.labels_path else None,
+                "needed_credentials": bool(rec.source_tokens)}
+
+    def _persist(self, rec: JobRecord) -> None:
+        try:
+            self.jobs_db.put(self._persisted(rec))
+        except Exception:
+            pass            # a bookkeeping failure must not fail a running job
+
+    def _restore(self) -> None:
+        """Rebuild the runtime view from the store, then delete what nothing owns.
+
+        Two halves that only work together: a job directory is reclaimable
+        exactly when no record refers to it, and that question is only
+        answerable now that records survive the process. Before this, every
+        directory from a previous run was stranded - nothing in memory knew it
+        existed and nothing scanned the disk.
+        """
+        import shutil
+        try:
+            resumable = self.jobs_db.reconcile()
+            known = {r["id"] for r in self.jobs_db.all(limit=10_000)}
+        except Exception:
+            return
+        for r in resumable:
+            rec = JobRecord(id=r["id"], task=r["task"], options=r.get("options") or {},
+                            dir=self.workdir / r["id"],
+                            input_path=Path(r["input_path"]) if r.get("input_path") else None,
+                            kind=r.get("kind") or "segment",
+                            source=r.get("source") or [],
+                            input_identity=tuple(r.get("input_identity") or ()),
+                            input_paths=tuple((a, Path(b) if b else None)
+                                              for a, b in (r.get("input_paths") or [])),
+                            cache_key=r.get("cache_key"), created=r.get("created") or time.time())
+            self._jobs[rec.id] = rec
+            self._pending.append(rec.id)
+        # Positively identify a job directory before removing it, rather than
+        # removing whatever is not recognized. The workdir legitimately holds
+        # other things - the series cache, and a result cache when one is
+        # configured under it - and a deny-list deleted the result cache the
+        # first time this ran. Never delete what you cannot name.
+        import re
+        looks_like_a_job = re.compile(r"[0-9a-f]{12}\Z")      # new_job_dir()'s ids
+        for d in self.workdir.iterdir():
+            if d.is_dir() and looks_like_a_job.match(d.name) and d.name not in known:
+                shutil.rmtree(d, ignore_errors=True)
 
     def _fetch_source(self, key: str, entry, credentials=None):
         """Series-cache fetch dispatcher: keys are ``<prefix>:<identifier>``.
@@ -1050,6 +1126,7 @@ class LocalExecutor:
                 if hit is not None:
                     rec.labels_path, rec.result = Path(hit[0]), hit[1]
                     rec.state, rec.cached = "done", True
+                    self._persist(rec)
                     rec.started = rec.finished = time.time()
                     with self._cv:
                         self._jobs[jid] = rec
@@ -1064,6 +1141,9 @@ class LocalExecutor:
             self._pending.append(jid)
             if rec.cache_key:
                 self._inflight[rec.cache_key] = jid
+            # written inside the same _cv block as the in-memory insert, so the
+            # durable record and the runtime view move together
+            self._persist(rec)
             busy = any(r.state == "running" for r in self._jobs.values())
             self._cv.notify()
         self._emit(rec)
@@ -1146,6 +1226,7 @@ class LocalExecutor:
             if rec.state == "queued":
                 self._pending.remove(jid)
                 rec.state, rec.finished = "cancelled", time.time()
+                self._persist(rec)
                 self._done_order.append(jid)
                 # compare-and-pop, same rule as the dispatcher's finally:
                 # under duplicate flights the marker names the LATEST job
@@ -1259,6 +1340,7 @@ class LocalExecutor:
                 jid = self._pending.popleft()
                 rec = self._jobs[jid]
                 rec.state, rec.started = "running", time.time()
+                self._persist(rec)
             try:                           # nothing before the handler may kill
                 self._emit(rec)            # the ONLY dispatcher thread
                 self._requeue_positions()
@@ -1274,6 +1356,7 @@ class LocalExecutor:
                     rec.result = self.segmenter.prepare(rec.task)
                     reporter.check()
                     rec.state = "done"
+                    self._persist(rec)
                     raise _PrepareDone
                 entries = rec.source or [{"kind": "upload"}]
                 if len(entries) > 1:
@@ -1327,6 +1410,7 @@ class LocalExecutor:
 
                 def _mark_done() -> None:
                     rec.state = "done"
+                    self._persist(rec)
 
                 def _set_pending(key: str) -> None:
                     # refuse-if-present: a duplicate flight must not ACQUIRE
@@ -1369,11 +1453,13 @@ class LocalExecutor:
                 pass
             except Cancelled:
                 rec.state = "cancelled"
+                self._persist(rec)
                 if (rec.cache_key and self._artifacts_pending.get(
                         rec.cache_key, (None,))[0] == rec.id):
                     self._artifacts_pending.pop(rec.cache_key, None)
             except Exception as e:             # noqa: BLE001 - reported to the client
                 rec.state = "failed"
+                self._persist(rec)
                 rec.error = f"{type(e).__name__}: {e}"
                 if (rec.cache_key and self._artifacts_pending.get(
                         rec.cache_key, (None,))[0] == rec.id):
