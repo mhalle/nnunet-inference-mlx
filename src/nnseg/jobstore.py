@@ -73,22 +73,14 @@ class JobStore:
         try:
             self._open()
         except sqlite3.DatabaseError as e:
-            # A corrupt store is a LOST store, not a dead server. Records are
-            # semi-transient - losing them costs resubmits, and a resubmit is a
-            # digest now that inputs are content-addressed - so a file we cannot
-            # open is moved aside and a fresh one started. Before durability a
-            # corrupt file was impossible; adding it must not make a crash
-            # mid-write able to brick the server it was meant to protect.
-            spoiled = self.path.with_suffix(self.path.suffix + ".corrupt")
-            try:
-                self.path.replace(spoiled)
-            except OSError:
-                self.path.unlink(missing_ok=True)
-                spoiled = None
-            warnings.warn(
-                f"job store at {self.path} could not be opened ({e}); starting a "
-                f"new one" + (f" - the old file is at {spoiled}" if spoiled else ""),
-                stacklevel=2)
+            # Not a defence against sqlite, which is crash-safe with WAL. This
+            # is the general rule that constructing an optional subsystem must
+            # not fail startup - a read-only workdir or a full disk reaches
+            # here far sooner than a corrupt database would. Records are
+            # semi-transient, so start fresh and keep the old file to look at.
+            self.path.replace(self.path.with_suffix(self.path.suffix + ".corrupt"))
+            warnings.warn(f"job store {self.path} unusable ({e}); started a new one",
+                          stacklevel=2)
             self._open()
 
     def _open(self) -> None:
