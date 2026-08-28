@@ -31,8 +31,10 @@ def test_a_blob_keeps_exactly_the_identity_uploads_have_always_had(tmp_path, sto
 
 
 def test_storing_the_same_bytes_twice_costs_one_entry(tmp_path, store):
-    a = _file(tmp_path, "a.nii.gz", b"identical")
-    b = _file(tmp_path, "b.nii.gz", b"identical")      # different name, same content
+    """Three files, one upload: the name is not part of the identity."""
+    data = _real_volume(tmp_path, "original.nii.gz").read_bytes()
+    a = _file(tmp_path, "patient_A.nii.gz", data)
+    b = _file(tmp_path, "anonymised.nii.gz", data)     # different name, same content
     assert store.put_file(a) == store.put_file(b)
 
 
@@ -62,12 +64,12 @@ def test_a_tree_and_a_blob_of_the_same_bytes_are_different_things(tmp_path, stor
     """One member is still a tree if it was sent as one - the grammar says what
     the reader gets handed, and a directory means DICOM series to SimpleITK."""
     d = tmp_path / "one"; d.mkdir()
-    p = _file(d, "only.dcm", b"solo")
+    p = _real_volume(d, "only.nii.gz")
     assert store.put_dir(d) != store.put_file(p)
 
 
 def test_resolve_hands_back_a_file_for_a_blob_and_a_directory_for_a_tree(tmp_path, store):
-    p = _file(tmp_path, "scan.nii.gz", b"volume")
+    p = _real_volume(tmp_path, "scan.nii.gz")
     d = tmp_path / "series"; d.mkdir()
     _file(d, "IM0.dcm", b"a"); _file(d, "IM1.dcm", b"b")
     assert store.resolve(store.put_file(p)).is_file()
@@ -347,3 +349,16 @@ def test_a_crash_leftover_is_never_served_as_the_decoded_copy(tmp_path):
     assert got.name == DECODED_NAME
     sitk = pytest.importorskip("SimpleITK")
     assert sitk.ReadImage(str(got)).GetSize()          # and it is readable
+
+
+def test_content_we_cannot_identify_is_never_stored(tmp_path, store):
+    """A blob whose format we cannot determine is one nothing can open later -
+    SimpleITK dispatches its reader on the extension - so accepting it only
+    defers the failure from the upload to the job. The sniffer is the
+    accept-list; adding a format means teaching it a magic number, never
+    trusting a name the caller supplied."""
+    from nnseg.content import UnidentifiedContent
+    junk = _file(tmp_path, "looks_legit.nii.gz", b"\x1f\x8bnot really a volume")
+    with pytest.raises(UnidentifiedContent):
+        store.put_file(junk)
+    assert not any(store.cache.root.iterdir()) if store.cache.root.exists() else True

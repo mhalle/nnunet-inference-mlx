@@ -83,7 +83,7 @@ def digest_dir(path) -> str:
     return tree_digest(digest_file(p) for p in Path(path).rglob("*") if p.is_file())
 
 
-def _stored_name(path, fallback=None) -> str:
+def _stored_name(path) -> str:
     """The name a member is stored under - derived from CONTENT, not the request.
 
     This has to be a function of the bytes alone. The backing store is a Modal
@@ -98,13 +98,33 @@ def _stored_name(path, fallback=None) -> str:
     files handed to the DICOM reader.
 
     Sniffing the format gives a name that two containers agree on without
-    talking. The fallback keeps only the caller's SUFFIX (never its stem) for
-    content we cannot identify - which PUT refuses at the door anyway.
+    talking - and it is the ONLY input, so nothing the caller sent can reach the
+    stored layout. An earlier version fell back to the caller's suffix when
+    sniffing failed, which let two clients sending identical bytes with
+    different filenames write different directories: exactly what naming by
+    content exists to prevent.
     """
     guessed = guess_name(path)
-    if guessed:
-        return guessed
-    return "content" + ("".join(Path(fallback).suffixes) if fallback else "")
+    if not guessed:
+        raise UnidentifiedContent(path)
+    return guessed
+
+
+class UnidentifiedContent(ValueError):
+    """The bytes are not a medical image this server can read.
+
+    Refused at ingest rather than stored. A blob whose format we cannot
+    determine is one nothing can open later - SimpleITK dispatches its reader on
+    the extension - so accepting it only defers the failure from the upload to
+    the job, minutes later and further from the cause. The sniffer is therefore
+    the accept-list: adding a format means teaching :func:`guess_name` its magic
+    number, never trusting a name the caller supplied.
+    """
+
+    def __init__(self, path):
+        super().__init__(
+            f"cannot identify {Path(path).name} as a medical image (expected "
+            "NIfTI, NRRD, MetaImage or DICOM); nothing was stored")
 
 
 class DigestMismatch(ValueError):
@@ -233,7 +253,7 @@ class ContentStore:
         self.cache.unpin(digest)
 
     def put_file(self, staged, *, expect: str | None = None,
-                 name: str | None = None, computed: str | None = None) -> str:
+                 computed: str | None = None) -> str:
         """Adopt an already-written file, returning the digest it is stored under.
 
         ``staged`` is a path the caller has finished writing (an upload streamed
@@ -248,7 +268,7 @@ class ContentStore:
         digest = computed or digest_file(staged)
         if expect and expect != digest:
             raise DigestMismatch(expect, digest)
-        self._adopt(digest, [(Path(staged), _stored_name(staged, name))])
+        self._adopt(digest, [(Path(staged), _stored_name(staged))])
         return digest
 
     def put_dir(self, staged, *, expect: str | None = None) -> str:

@@ -27,7 +27,10 @@ contract is deliberately small:
                                    bytes routing through the client
     A finished job reports `outputs` - the content digest of what it produced -
     and that digest is the ETag on the result, so If-None-Match gets a 304.
-    PUT    /v1/inputs/{digest}     store it (preload). The digest in the URL is
+    PUT    /v1/inputs/{digest}     store it (preload). Content whose format
+                                   cannot be identified is REFUSED, not stored:
+                                   a blob nothing can open is a job that was
+                                   always going to fail, so it fails here. The digest in the URL is
                                    CHECKED against the bytes, never trusted; a
                                    source may then be {"kind":"input","sha256":...}
                                    instead of re-sending. No route hands input
@@ -1826,8 +1829,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 "bytes": sum(p.stat().st_size for p in files)}
 
     @app.put("/v1/inputs/{digest}")
-    async def put_input(digest: str, request: Request,
-                        filename: str | None = None):
+    async def put_input(digest: str, request: Request):
         """Store content under the digest of its own bytes - the preload call.
 
         The digest in the URL is what the caller CLAIMS. It is checked against
@@ -1866,19 +1868,17 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                     "code": "digest_mismatch", "declared": digest, "actual": actual,
                     "message": "the bytes are not the ones you said they were; "
                                "nothing was stored"})
-            # The store keeps bytes, but SimpleITK chooses its reader from the
-            # EXTENSION - so an entry has to land under a name that names its
-            # format, or it is unreadable however correct its digest is. The
-            # caller may say; otherwise it is read out of the content.
-            name = filename or content.guess_name(tmp)
-            if not name:
-                raise HTTPException(422, {
-                    "code": "unknown_format",
-                    "message": "could not identify this content (expected NIfTI, "
-                               "NRRD, MetaImage or DICOM); pass ?filename= to "
-                               "name it explicitly"})
-            store.put_file(tmp, computed=actual, name=Path(name).name)
-            return {"digest": actual, "stored": True, "stored_as": Path(name).name,
+            # The store names entries from the CONTENT and refuses what it
+            # cannot identify - no `?filename=` escape hatch, because a name the
+            # caller asserts is not evidence, and a blob nothing can open is not
+            # worth storing.
+            try:
+                store.put_file(tmp, computed=actual)
+            except content.UnidentifiedContent as e:
+                raise HTTPException(422, {"code": "unknown_format",
+                                          "message": str(e)}) from e
+            return {"digest": actual, "stored": True,
+                    "stored_as": content.guess_name(tmp),
                     "bytes": tmp.stat().st_size}
         finally:
             _discard(work)
@@ -1926,8 +1926,7 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
                 raise HTTPException(409, {
                     "code": "not_done",
                     "message": f"job {from_job!r} is {state}; nothing to promote"})
-            name = content.guess_name(path) or Path(path).name
-            digest = store.put_file(path, expect=expect, name=Path(name).name)
+            digest = store.put_file(path, expect=expect)
             return {"digest": digest, "kind": "blob", "members": 1, "stored": True,
                     "bytes": Path(path).stat().st_size, "from_job": str(from_job)}
         # multi_items(), not values(): a form is a MULTIdict, and several
@@ -1972,17 +1971,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
             as_tree = kind == "tree" or (kind is None and len(files) > 1) or \
                 staged.name == "unpacked"
             if not as_tree:
-                name = Path(getattr(uploads[0], "filename", "") or "").name \
-                    or content.guess_name(files[0])
-                if not name:
-                    raise HTTPException(422, {
-                        "code": "unknown_format",
-                        "message": "could not identify this content; name the "
-                                   "part or pass kind=tree"})
                 digest = content.digest_file(files[0])
                 already = store.has(digest)     # honest about a no-op adopt
-                store.put_file(files[0], expect=expect, name=Path(name).name,
-                               computed=digest)
+                store.put_file(files[0], expect=expect, computed=digest)
                 return {"digest": digest, "kind": "blob", "members": 1,
                         "stored": not already, "bytes": files[0].stat().st_size}
             # Refuse a mixed folder rather than pick a series out of it: reading
@@ -2006,6 +1997,9 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         except content.DigestMismatch as e:
             raise HTTPException(422, {"code": "digest_mismatch",
                                       "declared": e.expected, "actual": e.actual,
+                                      "message": str(e)}) from e
+        except content.UnidentifiedContent as e:
+            raise HTTPException(422, {"code": "unknown_format",
                                       "message": str(e)}) from e
         finally:
             _discard(work)
@@ -2228,6 +2222,12 @@ def create_app(executor: LocalExecutor, *, token: str | None = None,
         except QueueFull as e:
             _discard(jdir)
             raise HTTPException(429, str(e), headers={"Retry-After": "30"}) from e
+        except content.UnidentifiedContent as e:
+            # Fail here, not thirty seconds later inside a worker: a volume
+            # nothing can open is a job that was never going to succeed.
+            _discard(jdir)
+            raise HTTPException(422, {"code": "unknown_format",
+                                      "message": str(e)}) from e
         except BaseException:
             _discard(jdir)                 # 422/410, a client disconnect, a bug
             raise

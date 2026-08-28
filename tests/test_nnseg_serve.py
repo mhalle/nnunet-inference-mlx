@@ -6,6 +6,7 @@ in milliseconds. The real pipeline behind the same seam is exercised by the CUDA
 harness, not here.
 """
 import hashlib
+import itertools
 import json
 import threading
 import time
@@ -22,6 +23,43 @@ from nnseg.progress import Reporter
 from nnseg.serve import LocalExecutor, QueueFull, create_app
 
 
+
+
+def _as_file(tmp_path, data: bytes, name="probe.nii.gz"):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return p
+
+
+_VOL_CACHE: dict = {}
+
+
+def volume_bytes(fill: int = 0) -> bytes:
+    """A real (tiny) gzipped NIfTI, cached per fill value.
+
+    The store refuses content it cannot identify, because a blob nothing can
+    open is a job that was always going to fail - so it fails at the door
+    instead. These tests therefore upload real volumes rather than a gzip magic
+    number followed by nothing.
+
+    That is not bookkeeping. A suite whose fixtures the real system could never
+    READ is a suite that cannot catch a bug in reading, and this one did not:
+    the store spent a day writing preloaded blobs under a nameless temp file,
+    unreadable however correct their digests, and every test passed. A live
+    Modal run found it. Distinct `fill` values give distinct bytes - and so
+    distinct digests - for tests that need inputs to be told apart.
+    """
+    if fill not in _VOL_CACHE:
+        sitk = pytest.importorskip("SimpleITK")
+        import tempfile
+        img = sitk.GetImageFromArray(np.full((4, 8, 8), fill, np.int16))
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "v.nii.gz"
+            sitk.WriteImage(img, str(f), True)
+            _VOL_CACHE[fill] = f.read_bytes()
+    return _VOL_CACHE[fill]
+
+
 class FakeSeg:
     """Duck-typed Segmentation: enough for the dispatcher's result handling."""
 
@@ -36,7 +74,7 @@ class FakeSeg:
 
     def save(self, path):
         with open(path, "wb") as f:
-            f.write(b"\x1f\x8b" + b"fake-nifti")
+            f.write(volume_bytes() + b"fake-nifti")
         return path
 
 
@@ -78,8 +116,19 @@ def make(tmp_path, **kw):
     return seg, ex, TestClient(create_app(ex))
 
 
-def submit(client, task="total_fast", options=None):
-    r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", b"\x1f\x8bdata")},
+_SUBMIT_N = itertools.count(1)
+
+
+def submit(client, task="total_fast", options=None, fill=None):
+    """Distinct content per call by default.
+
+    Identical bytes are now the SAME input - one digest, one entry, and a second
+    submit of them is a cache hit rather than a queued job. A test that wants
+    two jobs has to send two volumes."""
+    r = client.post("/v1/jobs",
+                    files={"file": ("scan.nii.gz",
+                                    volume_bytes(next(_SUBMIT_N) if fill is None
+                                                 else fill))},
                     data={"task": task, "options": json.dumps(options or {})})
     assert r.status_code == 202, r.text
     return r.json()["id"]
@@ -118,7 +167,7 @@ def test_submit_run_result_roundtrip(tmp_path):
     assert seg.calls[0][1] == "total_fast"
     assert seg.calls[0][2] == {"interp": "nearest"}
     r = client.get(f"/v1/jobs/{jid}/result")
-    assert r.status_code == 200 and r.content.startswith(b"\x1f\x8b")
+    assert r.status_code == 200 and r.content.startswith(volume_bytes())
 
 
 def test_health_and_tasks(tmp_path):
@@ -166,9 +215,13 @@ def test_fifo_order_and_positions(tmp_path):
     gate.set()
     for jid in (a, b, c):
         wait_state(client, jid, ("done",))
-    order = [call[0] for call in seg.calls]
-    assert [a in p for p in order] == [True, False, False]  # a ran first...
-    assert [c in p for p in order] == [False, False, True]  # ...and c last
+    # FIFO asserted on when each job STARTED, not by finding its id in the path
+    # it was handed: with real volumes the pre-reader now succeeds, so a queued
+    # job may arrive as an already-decoded image rather than as a path. With junk
+    # bytes the read always failed, and this path never ran in a test at all.
+    started = [client.get(f"/v1/jobs/{j}").json()["started"] for j in (a, b, c)]
+    assert started == sorted(started)
+    assert len(seg.calls) == 3
 
 
 def test_queue_bound_gives_429(tmp_path):
@@ -177,7 +230,7 @@ def test_queue_bound_gives_429(tmp_path):
     submit(client)                                         # running (gated)
     time.sleep(0.05)
     submit(client); submit(client)                         # fills the 2-slot queue
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast"})
     assert r.status_code == 429
     assert r.headers["retry-after"] == "30"
@@ -239,7 +292,7 @@ def test_eviction_bounds_finished_jobs(tmp_path):
 
 def test_bad_options_and_unknown_job(tmp_path):
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "t", "options": "[1,2]"})
     assert r.status_code == 422
     assert client.get("/v1/jobs/nope").status_code == 404
@@ -285,7 +338,7 @@ def test_executor_queuefull_raises(tmp_path):
 
 def test_unknown_task_is_404_with_examples(tmp_path):
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "/etc/passwd"})
     assert r.status_code == 404
     assert "total_fast" in r.json()["detail"]      # examples, not just a refusal
@@ -295,7 +348,7 @@ def test_source_descriptor_validation(tmp_path):
     _, _, client = make(tmp_path)
 
     def post(source, with_file=True):
-        files = {"file": ("x.nii.gz", b"d")} if with_file else None
+        files = {"file": ("x.nii.gz", volume_bytes())} if with_file else None
         return client.post("/v1/jobs", files=files,
                            data={"task": "total_fast", "source": json.dumps(source)})
 
@@ -312,9 +365,9 @@ def test_source_descriptor_validation(tmp_path):
 def test_upload_identity_is_sha256(tmp_path):
     import hashlib
     _, _, client = make(tmp_path)
-    jid = submit(client)
+    jid = submit(client, fill=0)
     s = wait_state(client, jid, ("done",))
-    want = "sha256:" + hashlib.sha256(b"\x1f\x8bdata").hexdigest()
+    want = "sha256:" + hashlib.sha256(volume_bytes(0)).hexdigest()
     assert s["input_identity"] == [want]
 
 
@@ -350,7 +403,7 @@ def test_multichannel_model_rejected_at_submit(tmp_path):
     seg.describe = lambda task: {"name": task, "channel_names": {"0": "T1", "1": "T2"}}
     ex = LocalExecutor(seg, workdir=tmp_path)
     client = TestClient(create_app(ex))
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast"})
     assert r.status_code == 422
     detail = r.json()["detail"]
@@ -393,7 +446,7 @@ def test_an_option_we_do_not_know_is_refused_at_submit(tmp_path):
     """Silence is the worst answer: accepting an unknown key leaves the caller
     believing a knob was turned."""
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast", "options": json.dumps({"gird": 1.5})})
     assert r.status_code == 422
     detail = r.json()["detail"]
@@ -403,7 +456,7 @@ def test_an_option_we_do_not_know_is_refused_at_submit(tmp_path):
 
 def test_deployment_policy_cannot_be_set_by_a_request(tmp_path):
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast",
                           "options": json.dumps({"device": "cuda"})})
     assert r.status_code == 422
@@ -413,7 +466,7 @@ def test_deployment_policy_cannot_be_set_by_a_request(tmp_path):
 def test_a_documented_option_still_goes_through(tmp_path):
     """The tightening must not cost the wire option that is actually documented."""
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast", "options": json.dumps({"grid": 1.0})})
     assert r.status_code == 202, r.text
 
@@ -429,7 +482,7 @@ def test_a_role_on_a_single_input_task_is_checked_not_ignored(tmp_path, role, st
     entry = {"kind": "upload"}
     if role is not None:
         entry["role"] = role
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast", "source": json.dumps([entry])})
     assert r.status_code == status, r.text
     if status == 422:
@@ -438,7 +491,7 @@ def test_a_role_on_a_single_input_task_is_checked_not_ignored(tmp_path, role, st
 
 def test_two_sources_for_a_one_input_task_say_so(tmp_path):
     _, _, client = make(tmp_path)
-    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                     data={"task": "total_fast",
                           "source": json.dumps([{"kind": "upload"}, {"kind": "upload"}])})
     assert r.status_code == 422
@@ -480,7 +533,7 @@ def test_four_inputs_are_staged_and_handed_to_the_engine_by_role(tmp_path, monke
     here is clinically meaningful - the question is only whether four sources
     survive submit, staging and dispatch as four named inputs."""
     seg, client = _multi(tmp_path, monkeypatch)
-    same = b"\x1f\x8bidentical"
+    same = volume_bytes(7)
     r = _post_multi(client, dict.fromkeys(ROLES, same),
                     order=["FLAIR", "T2", "T1", "T1c"])     # deliberately permuted
     assert r.status_code == 202, r.text
@@ -499,7 +552,7 @@ def test_four_inputs_are_staged_and_handed_to_the_engine_by_role(tmp_path, monke
 def test_the_source_order_a_client_happens_to_use_cannot_split_a_cache_key(
         tmp_path, monkeypatch):
     seg, client = _multi(tmp_path, monkeypatch)
-    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    blobs = {r: volume_bytes(i + 1) for i, r in enumerate(ROLES)}
     a = wait_state(client, _post_multi(client, blobs).json()["id"], ("done",))
     b = wait_state(client, _post_multi(client, blobs,
                                        order=["T2", "FLAIR", "T1c", "T1"]
@@ -512,7 +565,7 @@ def test_binding_the_same_files_to_different_roles_is_a_different_result(
     """Swapping T1c and FLAIR is a different request: the output bytes differ, so
     the key must too. This is the failure that positional binding would hide."""
     seg, client = _multi(tmp_path, monkeypatch)
-    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    blobs = {r: volume_bytes(i + 1) for i, r in enumerate(ROLES)}
     straight = wait_state(client, _post_multi(client, blobs).json()["id"], ("done",))
     swapped = dict(blobs, T1c=blobs["FLAIR"], FLAIR=blobs["T1c"])
     crossed = wait_state(client, _post_multi(client, swapped).json()["id"], ("done",))
@@ -522,7 +575,7 @@ def test_binding_the_same_files_to_different_roles_is_a_different_result(
 def test_a_missing_part_names_the_part_it_wanted(tmp_path, monkeypatch):
     seg, client = _multi(tmp_path, monkeypatch)
     r = client.post("/v1/jobs",
-                    files={r: (f"{r}.nii.gz", b"d") for r in ("T1c", "T1", "T2")},
+                    files={r: (f"{r}.nii.gz", volume_bytes()) for r in ("T1c", "T1", "T2")},
                     data={"task": "total_fast",
                           "source": json.dumps([{"kind": "upload", "role": r}
                                                 for r in ROLES])})
@@ -533,7 +586,7 @@ def test_a_missing_part_names_the_part_it_wanted(tmp_path, monkeypatch):
 
 def test_multi_input_errors_name_what_was_wrong(tmp_path, monkeypatch):
     seg, client = _multi(tmp_path, monkeypatch)
-    blobs = {r: b"d" for r in ROLES}
+    blobs = {r: volume_bytes() for r in ROLES}
     cases = {
         "missing_role": [{"kind": "upload", "role": r} for r in ROLES[:3]],
         "duplicate_role": [{"kind": "upload", "role": "T1c"}] * 4,
@@ -642,15 +695,15 @@ def make_cached(tmp_path, **kw):
 
 def test_result_cache_hit_skips_compute(tmp_path):
     seg, ex, client = make_cached(tmp_path)
-    a = submit(client)
+    a = submit(client, fill=0)
     wait_state(client, a, ("done",))
-    b = submit(client)                        # identical upload -> identical identity
+    b = submit(client, fill=0)                        # identical upload -> identical identity
     s = client.get(f"/v1/jobs/{b}").json()
     assert s["state"] == "done" and s["cached"] is True
     assert s["result"]["volumes_ml"] == {"spleen": 210.0}
     assert len(seg.calls) == 1                # computed once, served twice
     r = client.get(f"/v1/jobs/{b}/result")
-    assert r.status_code == 200 and r.content.startswith(b"\x1f\x8b")
+    assert r.status_code == 200 and r.content.startswith(volume_bytes())
 
 
 def test_no_cache_forces_recompute_and_options_key(tmp_path):
@@ -671,7 +724,7 @@ def test_idc_path_surface_blocking_and_cache(tmp_path, monkeypatch):
     seg = FakeSegmenter(steps=3)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -682,7 +735,7 @@ def test_idc_path_surface_blocking_and_cache(tmp_path, monkeypatch):
                    headers={"Prefer": "wait=10"})
     assert r.status_code == 200, r.text                 # blocked through the compute
     assert r.headers["preference-applied"] == "wait=10"
-    assert "etag" in r.headers and r.content.startswith(b"\x1f\x8b")
+    assert "etag" in r.headers and r.content.startswith(volume_bytes())
     r2 = client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd")
     assert r2.status_code == 200 and len(seg.calls) == 1    # second read: pure cache
     meta = client.get(f"/v1/idc/{u}/total_fast/meta.json")
@@ -696,7 +749,7 @@ def test_idc_path_wait_zero_gives_202(tmp_path, monkeypatch):
     seg = FakeSegmenter(gate=gate)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -722,7 +775,7 @@ def test_token_tiering_local(tmp_path, monkeypatch):
     seg = FakeSegmenter(steps=2)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -732,7 +785,7 @@ def test_token_tiering_local(tmp_path, monkeypatch):
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
     # anonymous: health/tasks fine, jobs and compute-on-miss are not
     assert client.get("/v1/health").status_code == 200
-    assert client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    assert client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                        data={"task": "total_fast"}).status_code == 401
     assert client.get(f"/v1/idc/{u}/total_fast/labels.seg.nrrd").status_code == 404
     assert len(seg.calls) == 0                          # the miss spent nothing
@@ -750,7 +803,7 @@ def test_public_app_is_read_only_by_construction(tmp_path):
     cache = ResultCache(tmp_path / "c")
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
     key_fn = lambda identity, task, opts=None: result_key((identity,), task, opts or {}, ["w=1"])
-    src = tmp_path / "labels.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
+    src = tmp_path / "labels.seg.nrrd"; src.write_bytes(volume_bytes())
     cache.put(key_fn(f"idc:{u}", "total_fast"), src, {"volumes_ml": {"spleen": 1.0}}, {})
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
     client = TestClient(app)
@@ -768,7 +821,7 @@ def test_idc_delete_evicts_and_cancels_inflight(tmp_path, monkeypatch):
     seg = FakeSegmenter(gate=gate, steps=2)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -816,7 +869,7 @@ def test_head_probe_never_computes_and_distinguishes_states(tmp_path, monkeypatc
     seg = FakeSegmenter(gate=gate, steps=2)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -852,7 +905,7 @@ def test_anonymous_watches_authorized_flight(tmp_path, monkeypatch):
     seg = FakeSegmenter(gate=gate, steps=2)
 
     def fake_fetch(series, jobdir):
-        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(b"d")
+        d = jobdir / "series"; d.mkdir(exist_ok=True); (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(seg, workdir=tmp_path / "w", cache_dir=tmp_path / "c",
@@ -896,7 +949,7 @@ def test_public_app_shows_inflight_and_waits(tmp_path):
     assert r.status_code == 202
     assert r.json()["progress"]["stage"] == "predict"
     assert client.head(url).status_code == 202
-    src = tmp_path / "l.seg.nrrd"; src.write_bytes(b"\x1f\x8bx")
+    src = tmp_path / "l.seg.nrrd"; src.write_bytes(volume_bytes())
     cache.put(key_fn(f"idc:{u}", "total_fast"), src, {}, {})
     assert client.get(url).status_code == 200              # materialized mid-watch
 
@@ -1004,7 +1057,7 @@ def test_prefetch_failure_falls_back_to_inline_fetch(tmp_path, monkeypatch):
 
 # -- SeriesCache: the evicting LRU input cache -------------------------------
 
-def _cache(tmp_path, fetched, payload=b"x" * 100, delay=0.0, fail_on=()):
+def _cache(tmp_path, fetched, payload=volume_bytes(), delay=0.0, fail_on=()):
     from nnseg.serve import SeriesCache
 
     def fetch(series, entry):
@@ -1161,10 +1214,10 @@ def test_prefetch_prereads_next_upload(tmp_path, monkeypatch):
     seg = FakeSegmenter(gate=gate)
     ex = LocalExecutor(seg, workdir=tmp_path, read_fn=fake_read)
     client = TestClient(create_app(ex))
-    a = client.post("/v1/jobs", files={"file": ("a.nii.gz", b"\x1f\x8baaaa")},
+    a = client.post("/v1/jobs", files={"file": ("a.nii.gz", volume_bytes(11))},
                     data={"task": "total_fast"}).json()["id"]
     wait_state(client, a, ("running",))
-    b = client.post("/v1/jobs", files={"file": ("b.nii.gz", b"\x1f\x8bbbbb")},
+    b = client.post("/v1/jobs", files={"file": ("b.nii.gz", volume_bytes(12))},
                     data={"task": "total_fast"}).json()["id"]
 
     t0 = time.time()                       # A is gated: B's read must land now
@@ -1205,7 +1258,7 @@ class ToySource:
     def fetch(self, ident, dest_dir):
         d = dest_dir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "img.nii.gz").write_bytes(b"\x1f\x8b" + ident.encode())
+        (d / "img.nii.gz").write_bytes(volume_bytes() + ident.encode())
         self.fetched.append(ident)
         return d
 
@@ -1250,7 +1303,7 @@ def test_segmentations_listing_shape(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -1366,7 +1419,7 @@ def test_openneuro_is_a_data_only_source(tmp_path, monkeypatch):
 
     def fake_open(url, timeout=0):
         seen["url"] = url
-        return FakeResp(b"\x1f\x8bmri")
+        return FakeResp(volume_bytes())
 
     monkeypatch.setattr("nnseg.sources._OPENER", type("O", (), {"open": staticmethod(fake_open)})())
     got = src.fetch("ds000001/sub-01/anat/sub-01_T1w.nii.gz", tmp_path)
@@ -1452,7 +1505,7 @@ def test_all_task_name_forms_converge_to_one_cache_key(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -1570,7 +1623,7 @@ def test_grid_variant_1mm_is_a_distinct_addressable_resource(tmp_path, monkeypat
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -1905,7 +1958,7 @@ def test_query_params_cannot_inject_key_material(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -1940,7 +1993,7 @@ def test_public_twin_variant_urls_key_on_variant_options(tmp_path):
     key_fn = lambda identity, task, opts=None: result_key((identity,), task,
                                                           opts or {}, ["w=1"])
     src = tmp_path / "labels.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bdefault")
+    src.write_bytes(volume_bytes(13))
     cache.put(key_fn(f"idc:{u}", "total_fast"), src, {"names": {}}, {})
     app = create_public_app(key_fn, cache.get, lambda: ["total_fast"])
     client = TestClient(app)
@@ -1949,10 +2002,10 @@ def test_public_twin_variant_urls_key_on_variant_options(tmp_path):
     assert client.head(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd").status_code == 404
     # and the variant serves once its OWN entry exists
     v = tmp_path / "v.seg.nrrd"
-    v.write_bytes(b"\x1f\x8bvariant")
+    v.write_bytes(volume_bytes())
     cache.put(key_fn(f"idc:{u}", "total_fast", {"grid": 1.0}), v, {"names": {}}, {})
     r = client.get(f"/v1/idc/{u}/total_fast/labels_res-1mm.seg.nrrd")
-    assert r.status_code == 200 and r.content == b"\x1f\x8bvariant"
+    assert r.status_code == 200 and r.content == volume_bytes()
 
 
 def test_pinned_entries_survive_eviction_and_live_writers_survive_timeouts(tmp_path):
@@ -1969,7 +2022,7 @@ def test_pinned_entries_survive_eviction_and_live_writers_survive_timeouts(tmp_p
     def fetch(key, entry):
         d = entry / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "f").write_bytes(b"x" * 120)
+        (d / "f").write_bytes(volume_bytes())
         fetched.append(key)
         return d
 
@@ -2031,7 +2084,7 @@ def test_first_install_rekeys_at_completion(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     class InstallingSeg(FakeSegmenter):
@@ -2178,7 +2231,7 @@ def test_queuefull_cleans_job_dir(tmp_path):
         submit(client)                         # running (blocked on the gate)
         submit(client)                         # fills the pending bound
         before = {d.name for d in tmp_path.iterdir() if d.is_dir()}
-        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                         data={"task": "total_fast"})
         assert r.status_code == 429
         r2 = client.post("/v1/tasks/total_fast/prepare")
@@ -2199,7 +2252,7 @@ def test_preference_applied_only_with_prefer(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -2231,7 +2284,7 @@ def test_task_names_with_path_separators_refused(tmp_path):
     seg, ex, client = make(tmp_path)
     u = "0be27d1c-9410-47ff-9c9f-a44b26a4bd55"
     for bad in ("../weights", "a/b", "..", ".hidden", "a\\b", "ts:", "@v1", ""):
-        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                         data={"task": bad})
         assert r.status_code in (404, 422), (bad, r.status_code)
         # the path surface swallows slashes into {ident:path}, so a slashed
@@ -2255,7 +2308,7 @@ def test_public_twin_full_parity(tmp_path):
         (identity,), task, opts or {}, ["w=1"])
     key = key_fn(f"idc:{u}", "total_fast")
     src = tmp_path / "labels.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bx")
+    src.write_bytes(volume_bytes())
     cache.put(key, src, {"names": {"1": "spleen"}}, {"identity": [f"idc:{u}"],
                                                      "task": "total_fast"})
     png = tmp_path / "p.png"
@@ -2318,12 +2371,12 @@ def test_task_allowlist_is_load_bearing_for_identity_fallback(tmp_path):
     ex = LocalExecutor(seg, workdir=tmp_path)
     client = TestClient(create_app(ex))
     for bad in ("../weights", "..", ".hidden", "a\\b", "/etc/passwd"):
-        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+        r = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                         data={"task": bad})
         assert r.status_code in (404, 422), (bad, r.status_code)
     assert len(seg.calls) == 0
     # and a legitimate name still flows through the same resolver
-    ok = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    ok = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                      data={"task": "total_fast"})
     assert ok.status_code == 202
 
@@ -2357,7 +2410,7 @@ def test_add_artifact_overwrite_is_atomic(tmp_path):
     from nnseg.serve import ResultCache
     rc = ResultCache(tmp_path / "rc", keep=5)
     src = tmp_path / "l.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bx")
+    src.write_bytes(volume_bytes())
     rc.put("k", src, {}, {})
     a1 = tmp_path / "p1.png"
     a1.write_bytes(b"OLDPNG" * 50)
@@ -2385,7 +2438,7 @@ def test_cache_only_status_rechecks_cache_before_failed(tmp_path):
         return None if calls["n"] == 1 else cache.get(key)
 
     src = tmp_path / "l.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bx")
+    src.write_bytes(volume_bytes())
     cache.put("K", src, {}, {})
     ex = CacheOnlyExecutor(get_flip, lambda i, t, o=None: "K",
                            lambda: ["total_fast"], inflight_fn=lambda k: None)
@@ -2428,7 +2481,7 @@ def test_preference_applied_on_artifact_200(tmp_path, monkeypatch):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = FakeSegmenter()
@@ -2496,7 +2549,7 @@ def _idc_app(tmp_path, monkeypatch, seg=None):
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     seg = seg or FakeSegmenter()
@@ -2567,7 +2620,7 @@ def test_listing_advertises_only_resolvable_links(tmp_path, monkeypatch):
     seg, ex, client = _idc_app(tmp_path, monkeypatch)
     u = "5be27d1c-9410-47ff-9c9f-a44b26a4bd55"
     src = tmp_path / "l.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bx")
+    src.write_bytes(volume_bytes())
     good = result_key((f"idc:{u}",), "total_fast", {},
                       weights_versions_of(seg, "total_fast"))
     ex.cache.put(good, src, {}, {"identity": [f"idc:{u}"], "task": "total_fast",
@@ -2602,7 +2655,7 @@ def test_result_cache_temp_names_unique_per_writer(tmp_path, monkeypatch):
     from nnseg.serve import ResultCache
     rc = ResultCache(tmp_path / "rc", keep=5)
     src = tmp_path / "l.seg.nrrd"
-    src.write_bytes(b"\x1f\x8bx")
+    src.write_bytes(volume_bytes())
     seen = []
     import os as _os
     real = _os.replace
@@ -2720,7 +2773,7 @@ def test_a_job_hands_back_its_key_and_the_urls_for_everything_it_made(tmp_path, 
     def fake_fetch(series, jobdir):
         d = jobdir / "series"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "s.dcm").write_bytes(b"d")
+        (d / "s.dcm").write_bytes(volume_bytes())
         return d
 
     ex = LocalExecutor(FakeSegmenter(), workdir=tmp_path, cache_dir=tmp_path / "rc",
@@ -2764,7 +2817,7 @@ def test_cache_control_no_cache_forces_a_recompute(tmp_path):
     client = TestClient(create_app(ex))
 
     def post(**headers):
-        r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", b"\x1f\x8bdata")},
+        r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", volume_bytes())},
                         data={"task": "total_fast", "options": "{}"}, headers=headers)
         assert r.status_code == 202, r.text
         return wait_state(client, r.json()["id"])
@@ -2807,7 +2860,7 @@ def test_an_engine_can_decline_to_be_served_from_cache(monkeypatch):
 
 # -- the input store: send once, refer by digest ---------------------------
 
-BLOB = b"\x1f\x8bsome-volume-bytes"
+BLOB = volume_bytes()
 BLOB_SHA = "sha256:" + hashlib.sha256(BLOB).hexdigest()
 
 
@@ -2845,9 +2898,9 @@ def test_preload_then_submit_without_sending_bytes(tmp_path):
     task, so submit carries no payload at all."""
     _, _, client = make(tmp_path)
     assert client.get(f"/v1/inputs/{BLOB_SHA}").status_code == 404
-    put = client.put(f"/v1/inputs/{BLOB_SHA}?filename=scan.nii.gz", content=BLOB)
+    put = client.put(f"/v1/inputs/{BLOB_SHA}", content=BLOB)
     assert put.status_code == 200 and put.json()["stored"] is True
-    assert client.put(f"/v1/inputs/{BLOB_SHA}?filename=scan.nii.gz",
+    assert client.put(f"/v1/inputs/{BLOB_SHA}",
                       content=BLOB).json()["stored"] is False
 
     r = client.post("/v1/jobs", data={
@@ -2881,12 +2934,11 @@ def test_four_channels_can_be_sent_once_and_reused_by_role(tmp_path, monkeypatch
     """Where this pays off: four volumes uploaded once, then bound to roles for
     any number of later tasks without re-sending a byte."""
     seg, client = _multi(tmp_path, monkeypatch)
-    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    blobs = {r: volume_bytes(i + 1) for i, r in enumerate(ROLES)}
     digests = {}
     for role, b in blobs.items():
         d = "sha256:" + hashlib.sha256(b).hexdigest()
-        assert client.put(f"/v1/inputs/{d}?filename={role}.nii.gz",
-                          content=b).json()["stored"] is True
+        assert client.put(f"/v1/inputs/{d}", content=b).json()["stored"] is True
         digests[role] = d
     r = client.post("/v1/jobs", data={
         "task": "total_fast",
@@ -2897,7 +2949,11 @@ def test_four_channels_can_be_sent_once_and_reused_by_role(tmp_path, monkeypatch
     assert s["input_identity"] == sorted(f"{k}={v}" for k, v in digests.items())
     got = seg.inputs[0]
     assert set(got) == set(ROLES)
-    assert Path(got["T1c"]).read_bytes() == blobs["T1c"]      # right bytes per role
+    # the store may hand over its decoded copy rather than the original bytes,
+    # so the invariant is that the right VOLUME reached the right role
+    sitk = pytest.importorskip("SimpleITK")
+    want = sitk.GetArrayFromImage(sitk.ReadImage(str(_as_file(tmp_path, blobs["T1c"]))))
+    assert np.array_equal(sitk.GetArrayFromImage(sitk.ReadImage(str(got["T1c"]))), want)
 
 
 def test_content_that_names_no_format_is_refused_at_preload(tmp_path):
@@ -3100,7 +3156,8 @@ def test_a_client_may_name_its_part_in_its_own_vocabulary(tmp_path, monkeypatch)
     under the spelling the CLIENT used - otherwise the alias table works for
     matching and breaks the upload it exists to enable."""
     seg, client = _multi(tmp_path, monkeypatch)
-    parts = {"t1ce": b"a", "T1": b"b", "T2": b"c", "FLAIR": b"d"}
+    parts = {n: volume_bytes(i + 1)
+             for i, n in enumerate(("t1ce", "T1", "T2", "FLAIR"))}
     r = client.post("/v1/jobs",
                     files={k: (f"{k}.nii.gz", v) for k, v in parts.items()},
                     data={"task": "total_fast",
@@ -3112,12 +3169,14 @@ def test_a_client_may_name_its_part_in_its_own_vocabulary(tmp_path, monkeypatch)
     s = wait_state(client, r.json()["id"], ("done",))
     got = seg.inputs[0]
     assert set(got) == set(ROLES)                      # bound under CANONICAL names
-    assert Path(got["T1c"]).read_bytes() == b"a"       # from the aliased part
+    sitk = pytest.importorskip("SimpleITK")
+    want = sitk.GetArrayFromImage(sitk.ReadImage(str(_as_file(tmp_path, parts["t1ce"]))))
+    assert np.array_equal(sitk.GetArrayFromImage(sitk.ReadImage(str(got["T1c"]))), want)       # from the aliased part
 
 
 def test_a_missing_part_lists_the_spellings_it_would_accept(tmp_path, monkeypatch):
     seg, client = _multi(tmp_path, monkeypatch)
-    r = client.post("/v1/jobs", files={"T1": ("T1.nii.gz", b"b")},
+    r = client.post("/v1/jobs", files={"T1": ("T1.nii.gz", volume_bytes(1))},
                     data={"task": "total_fast",
                           "source": json.dumps([{"kind": "upload", "role": "t1ce"},
                                                 {"kind": "upload", "role": "T1"},
@@ -3133,7 +3192,7 @@ def test_the_reference_image_is_the_first_declared_channel(tmp_path, monkeypatch
     not whatever order the client listed."""
     from nnseg.serve import reference_input
     seg, client = _multi(tmp_path, monkeypatch)
-    blobs = {r: f"scan-{r}".encode() for r in ROLES}
+    blobs = {r: volume_bytes(i + 1) for i, r in enumerate(ROLES)}
     r = _post_multi(client, blobs, order=["FLAIR", "T2", "T1", "T1c"])
     wait_state(client, r.json()["id"], ("done",))
     staged = seg.inputs[0]
@@ -3152,7 +3211,7 @@ def test_a_task_whose_metadata_is_unreadable_still_reaches_the_worker(tmp_path):
     seg.describe = boom
     ex = LocalExecutor(seg, workdir=tmp_path)
     client = TestClient(create_app(ex))
-    r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", b"\x1f\x8bd")},
+    r = client.post("/v1/jobs", files={"file": ("scan.nii.gz", volume_bytes())},
                     data={"task": "total_fast"})
     assert r.status_code == 202, r.text
     assert wait_state(client, r.json()["id"], ("done",))["state"] == "done"
@@ -3165,7 +3224,7 @@ def test_a_refused_submit_leaves_no_job_directory_behind(tmp_path, monkeypatch):
     seg, client = _multi(tmp_path, monkeypatch)
     before = {p.name for p in tmp_path.iterdir()}
     r = client.post("/v1/jobs",
-                    files={r: (f"{r}.nii.gz", b"x" * 1024) for r in ROLES[:3]},
+                    files={r: (f"{r}.nii.gz", volume_bytes()) for r in ROLES[:3]},
                     data={"task": "total_fast",
                           "source": json.dumps([{"kind": "upload", "role": x}
                                                 for x in ROLES])})
@@ -3177,7 +3236,7 @@ def test_both_doors_refuse_the_same_options(tmp_path):
     """The path surface initiates a compute too. Validating on only one door let
     a task refused at POST /v1/jobs still run from a GET."""
     _, _, client = make(tmp_path)
-    bad = client.post("/v1/jobs", files={"file": ("x.nii.gz", b"d")},
+    bad = client.post("/v1/jobs", files={"file": ("x.nii.gz", volume_bytes())},
                       data={"task": "total_fast",
                             "options": json.dumps({"device": "cuda"})})
     assert bad.status_code == 422 and bad.json()["detail"]["code"] == "unknown_parameter"
