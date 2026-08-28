@@ -743,6 +743,31 @@ def _discard(jdir) -> None:
     shutil.rmtree(jdir, ignore_errors=True)
 
 
+def decode_for_fast_read(src, dst_dir):
+    """Write a raw (uncompressed) NRRD beside a stored input, for fast re-reads.
+
+    NRRD raw, not NIfTI: measured fastest of the four formats (4 888 MB/s vs
+    3 435), it carries direction cosines without NIfTI's 80-character
+    limitations, and it is what the rest of this service already writes.
+
+    Written to a temp name and renamed, so a reader either sees a complete file
+    or none - a half-written decode must never be picked up as the fast path.
+    Compression is deliberately OFF here and deliberately ON for results: labels
+    compress ~52x and get FASTER to write, intensity images ~1.8x and pay 10-16x
+    to read. The rule is about entropy, not about direction.
+    """
+    import SimpleITK as sitk
+
+    from . import io as nio
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dst_dir / ".partial.nrrd"
+    final = dst_dir / "content.nrrd"
+    sitk.WriteImage(nio.read_image(str(src)), str(tmp), False)
+    os.replace(tmp, final)
+    return final
+
+
 def reference_input(staged):
     """The one image a multi-input job's artifacts render against.
 
@@ -970,7 +995,8 @@ class LocalExecutor:
         # Uploads addressed by their own bytes, sharing the series cache's root,
         # budget and pin discipline - an entry is an entry whether a client sent
         # it or the server fetched it.
-        self.content = ContentStore(self.series_cache)
+        self.content = ContentStore(self.series_cache,
+                                    decode=decode_for_fast_read)
         self.artifacts = set(artifacts or ())
         self._artifacts_pending: dict = {}   # cache_key -> (owner jid, set at)
         self.cache = ResultCache(cache_dir, keep=keep_cached) if cache_dir else None
@@ -1181,7 +1207,7 @@ class LocalExecutor:
         digest = str(entry.get("id") or entry.get("sha256") or "")
         self.content.pin(digest)
         pinned.append(digest)
-        return self.content.resolve(digest)
+        return self.content.fast_path(digest)     # decoded copy when there is one
 
     def _stage_many(self, rec, entries, reporter, pinned: list) -> dict:
         """Stage every input of a multi-input job; returns ``{role: path}``.

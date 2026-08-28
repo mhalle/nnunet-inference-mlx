@@ -230,3 +230,100 @@ def test_an_absurdly_long_key_still_falls_back_to_a_hash(tmp_path):
     from nnseg.serve import SeriesCache
     cache = SeriesCache(tmp_path / "c", lambda k, e: None)
     assert cache._entry("idc:" + "x" * 400).name.startswith("h_")
+
+
+# -- the decoded fast path --------------------------------------------------
+
+def _decoder():
+    from nnseg.serve import decode_for_fast_read
+    return decode_for_fast_read
+
+
+def _real_volume(tmp_path, name="scan.nii.gz"):
+    sitk = pytest.importorskip("SimpleITK")
+    import numpy as np
+    p = tmp_path / name
+    sitk.WriteImage(sitk.GetImageFromArray(
+        np.random.randint(-1000, 2000, (8, 64, 64), np.int16)), str(p), True)
+    return p
+
+
+def test_the_decoded_copy_never_changes_what_the_digest_addresses(tmp_path):
+    """The digest is over the bytes the client sent. A faster copy may sit
+    beside them; it may not replace them, or a client could no longer compute
+    the digest it is meant to refer to."""
+    from nnseg.serve import SeriesCache
+    src = _real_volume(tmp_path)
+    store = ContentStore(SeriesCache(tmp_path / "s", lambda k, e: None),
+                         decode=_decoder())
+    d = store.put_file(src)
+    fast = store.fast_path(d)
+    assert fast != store.resolve(d)                       # a different file
+    assert digest_file(store.resolve(d)) == d             # originals untouched
+    assert digest_file(src) == d
+
+
+def test_the_decoded_copy_reads_back_identically(tmp_path):
+    sitk = pytest.importorskip("SimpleITK")
+    import numpy as np
+    from nnseg.serve import SeriesCache
+    src = _real_volume(tmp_path)
+    store = ContentStore(SeriesCache(tmp_path / "s", lambda k, e: None),
+                         decode=_decoder())
+    d = store.put_file(src)
+    a = sitk.GetArrayFromImage(sitk.ReadImage(str(store.resolve(d))))
+    b = sitk.GetArrayFromImage(sitk.ReadImage(str(store.fast_path(d))))
+    assert np.array_equal(a, b)
+
+
+def test_it_is_materialized_once_and_lazily(tmp_path):
+    """Lazy, so a preloaded input nobody runs never pays for a decode; once, so
+    the second reader gets it free."""
+    from nnseg.serve import SeriesCache
+    calls = []
+
+    def counting(src, dst):
+        calls.append(src)
+        return _decoder()(src, dst)
+
+    src = _real_volume(tmp_path)
+    store = ContentStore(SeriesCache(tmp_path / "s", lambda k, e: None),
+                         decode=counting)
+    d = store.put_file(src)
+    assert calls == []                                    # nothing on ingest
+    first, second = store.fast_path(d), store.fast_path(d)
+    assert first == second and len(calls) == 1
+
+
+def test_a_store_without_a_decoder_just_reads_the_original(tmp_path):
+    from nnseg.serve import SeriesCache
+    src = _real_volume(tmp_path)
+    store = ContentStore(SeriesCache(tmp_path / "s", lambda k, e: None))
+    d = store.put_file(src)
+    assert store.fast_path(d) == store.resolve(d)
+
+
+def test_a_failing_decode_degrades_to_the_original(tmp_path):
+    """It is a cache. Anything that goes wrong costs a re-decode, never an
+    answer."""
+    from nnseg.serve import SeriesCache
+
+    def boom(src, dst):
+        raise RuntimeError("no")
+
+    src = _real_volume(tmp_path)
+    store = ContentStore(SeriesCache(tmp_path / "s", lambda k, e: None), decode=boom)
+    d = store.put_file(src)
+    assert store.fast_path(d) == store.resolve(d)
+
+
+def test_the_lru_budget_can_see_the_decoded_copy(tmp_path):
+    """An eviction policy that cannot see half of what it stores is not one."""
+    from nnseg.serve import SeriesCache
+    cache = SeriesCache(tmp_path / "s", lambda k, e: None)
+    store = ContentStore(cache, decode=_decoder())
+    d = store.put_file(_real_volume(tmp_path))
+    entry = cache.path(d).parent
+    before = int((entry / cache.MARKER).read_text())
+    store.fast_path(d)
+    assert int((entry / cache.MARKER).read_text()) > before
