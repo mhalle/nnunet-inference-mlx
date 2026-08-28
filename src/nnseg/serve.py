@@ -762,7 +762,7 @@ def decode_for_fast_read(src, dst_dir):
     dst_dir = Path(dst_dir)
     dst_dir.mkdir(parents=True, exist_ok=True)
     tmp = dst_dir / ".partial.nrrd"
-    final = dst_dir / "content.nrrd"
+    final = dst_dir / content.DECODED_NAME      # the name the reader looks up
     sitk.WriteImage(nio.read_image(str(src)), str(tmp), False)
     os.replace(tmp, final)
     return final

@@ -327,3 +327,23 @@ def test_the_lru_budget_can_see_the_decoded_copy(tmp_path):
     before = int((entry / cache.MARKER).read_text())
     store.fast_path(d)
     assert int((entry / cache.MARKER).read_text()) > before
+
+
+def test_a_crash_leftover_is_never_served_as_the_decoded_copy(tmp_path):
+    """The decoder writes to a temp name and renames, so the rename is what
+    makes a complete file visible. Finding the copy by SCANNING the directory
+    defeats that: a `.partial` left by a crash mid-write gets handed to a reader
+    as though it were the whole volume."""
+    from nnseg.content import DECODED_NAME
+    from nnseg.serve import SeriesCache
+    cache = SeriesCache(tmp_path / "s", lambda k, e: None)
+    store = ContentStore(cache, decode=_decoder())
+    d = store.put_file(_real_volume(tmp_path))
+    leftover = cache.path(d).parent / "decoded" / ".partial.nrrd"
+    leftover.parent.mkdir(parents=True, exist_ok=True)
+    leftover.write_bytes(b"TRUNCATED")
+
+    got = store.fast_path(d)
+    assert got.name == DECODED_NAME
+    sitk = pytest.importorskip("SimpleITK")
+    assert sitk.ReadImage(str(got)).GetSize()          # and it is readable

@@ -36,6 +36,13 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+#: The decoded copy's filename. Looked up BY NAME, never by scanning the
+#: directory: the decoder writes to a temp name and renames, so a scan would
+#: happily return a `.partial` left by a crash mid-write - handing a truncated
+#: volume to a reader as though it were complete, and defeating the atomic
+#: rename that exists to prevent exactly that.
+DECODED_NAME = "content.nrrd"
+
 BLOB = "sha256:"
 TREE = "sha256-tree:"
 _CHUNK = 1 << 20
@@ -192,14 +199,12 @@ class ContentStore:
         if self._decode is None:
             return original
         entry = self.cache.path(digest).parent
-        decoded = entry / "decoded"
+        decoded = entry / "decoded" / DECODED_NAME
         try:
-            existing = next((p for p in decoded.iterdir() if p.is_file()), None) \
-                if decoded.is_dir() else None
-            if existing is not None:
-                return existing
+            if decoded.is_file():
+                return decoded
             with self._lock:
-                made = self._decode(original, decoded)
+                made = self._decode(original, decoded.parent)
             if made is not None:
                 self._restamp(entry)
                 return Path(made)
