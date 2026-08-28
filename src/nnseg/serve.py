@@ -52,8 +52,14 @@ Jobs run through :class:`LocalExecutor`: a **bounded FIFO** ahead of one dispatc
 thread per server. The per-device lock in :mod:`nnseg.job` already makes concurrent
 runs safe; what it does not give is order (lock wake-ups are not FIFO), bounds,
 introspection, or instant cancel-while-queued - the queue exists for those four
-things and nothing more. It is in-memory by design: a restart drops queued jobs, and
-re-submission is cheap for the caller. Progress events are idempotent state
+things and nothing more. Its records are **durable** (:mod:`nnseg.jobstore`, a sqlite
+file in the workdir): a restart re-queues work rather than dropping it, because a job
+is content-keyed and idempotent, and it reclaims the directories no record owns -
+which is only answerable because records now outlive the process. `keep_finished`
+bounds what memory holds; `jobs_ttl_h` bounds how long a record lasts. Live objects -
+cancel tokens, SSE subscriber queues - stay in memory and are rebuilt from the store
+at startup. Read the store without a server using ``tools/jobs.py``.
+Progress events are idempotent state
 snapshots, which is what makes the SSE stream robust - a dropped connection needs no
 replay, just a resubscribe or a fall back to polling the same JSON.
 
@@ -3124,7 +3130,8 @@ def main_serve(args) -> int:
                      or Path(os.environ.get("XDG_CACHE_HOME",
                                             Path.home() / ".cache")) / "nnseg" / "results")
     ex = LocalExecutor(seg, workdir=workdir, max_pending=args.max_pending,
-                       keep_finished=args.keep_finished, cache_dir=cache_dir)
+                       keep_finished=args.keep_finished, cache_dir=cache_dir,
+                       jobs_ttl_h=getattr(args, "jobs_ttl_hours", 24.0))
     app = create_app(ex, token=getattr(args, "token", None))
     print(f"nnseg {_version()} serving on http://{args.host}:{args.port} "
           f"(device={args.device}, workdir={workdir})", flush=True)

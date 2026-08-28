@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **The job queue is durable (nnseg).** Records live in a sqlite `jobs.db` under
+  the server's workdir, so a restart re-queues work instead of dropping it - a job
+  is content-keyed and idempotent, so an interrupted run is re-runnable. It also
+  gives job directories an owner, so the ones a previous run left behind are
+  reclaimed rather than stranded forever holding their uploads. `--jobs-ttl-hours`
+  bounds how long a record lasts (`--keep-finished` bounds memory and files).
+  `tools/jobs.py` reads the store without a running server.
+
 - **Named inputs, typed parameters, introspection (nnseg).** A task now publishes
   what it takes: `describe()` carries `inputs` (roles), `parameters` grouped by
   owner (the algorithm's knobs vs ours, as real JSON Schema), and `behavior` -

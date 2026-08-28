@@ -47,6 +47,9 @@ def main(argv=None) -> int:
     sv.add_argument("--model-root", default=None)
     sv.add_argument("--max-pending", type=int, default=16, help="queue bound; past it POST returns 429")
     sv.add_argument("--keep-finished", type=int, default=50, help="finished jobs (and files) retained")
+    sv.add_argument("--jobs-ttl-hours", type=float, default=24.0,
+                    help="how long a job RECORD lasts (keep-finished bounds memory "
+                         "and files; this bounds the durable record)")
     sv.add_argument("--workdir", default=None, help="job storage (default: a temp directory)")
     sv.add_argument("--cache-dir", default=None,
                     help="result cache (default: ~/.cache/nnseg/results; durable, unlike the workdir)")
