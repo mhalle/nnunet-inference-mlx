@@ -27,7 +27,7 @@ KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuf
 PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope",
             "weights_fetch", "trainers", "result", "cache", "segmenter", "weights", "progress", "job",
             "serve", "client", "modal_app", "sources", "ecosystems", "preview", "statistics",
-            "schemas", "content"}
+            "schemas", "content", "jobstore"}
 # errors.py is deliberately dependency-free (stdlib only) so either layer may raise from it.
 SHARED = {"errors"}
 FORBIDDEN_FOR_KERNEL = {"nnunetv2", "SimpleITK", "nibabel", "scipy", "mlx", "totalsegmentator",
