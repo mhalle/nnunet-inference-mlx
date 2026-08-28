@@ -1063,7 +1063,15 @@ class LocalExecutor:
         try:
             resumable = self.jobs_db.reconcile()
             known = {r["id"] for r in self.jobs_db.all(limit=10_000)}
-        except Exception:
+        except Exception as e:
+            # Booting matters more than restoring, so this is swallowed - but
+            # not silently. Skipping restore also skips the sweep below, so a
+            # store that cannot be read looks exactly like an empty one while
+            # job directories quietly accumulate. Say so.
+            import warnings
+            warnings.warn(f"could not restore jobs from {self.jobs_db.path} ({e}); "
+                          "queued work from the previous run is lost and orphaned "
+                          "job directories were not reclaimed", stacklevel=2)
             return
         for r in resumable:
             rec = JobRecord(id=r["id"], task=r["task"], options=r.get("options") or {},

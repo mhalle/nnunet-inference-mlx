@@ -89,3 +89,31 @@ def test_counts_by_state(store):
     store.put(_rec("a", "queued")); store.put(_rec("b", "queued"))
     store.put(_rec("c", "done"))
     assert store.counts() == {"queued": 2, "done": 1}
+
+
+def test_a_corrupt_store_is_a_lost_store_not_a_dead_server(tmp_path):
+    """Durability must not make a crash mid-write able to brick the server it
+    was added to protect. Records are semi-transient - losing them costs
+    resubmits, and a resubmit is a digest now that inputs are content-addressed
+    - so an unopenable file is moved aside and a fresh one started."""
+    import warnings
+    p = tmp_path / "jobs.db"
+    p.write_bytes(b"not a database, but what a crash mid-write leaves behind")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        store = JobStore(p)
+    store.put(_rec("j"))
+    assert store.get("j") is not None                     # it works
+    assert caught and "could not be opened" in str(caught[0].message)
+    assert p.with_suffix(".db.corrupt").exists()          # and the evidence is kept
+
+
+def test_the_corrupt_file_is_preserved_rather_than_deleted(tmp_path):
+    """Whatever went wrong is worth more as a file than as free disk."""
+    p = tmp_path / "jobs.db"
+    p.write_bytes(b"CORRUPT-MARKER")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        JobStore(p)
+    assert p.with_suffix(".db.corrupt").read_bytes() == b"CORRUPT-MARKER"

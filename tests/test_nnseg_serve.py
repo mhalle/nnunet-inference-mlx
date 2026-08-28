@@ -3379,3 +3379,45 @@ def test_a_broken_job_store_does_not_fail_a_job(tmp_path):
     ex.jobs_db = Broken()
     jid = submit(client)
     assert wait_state(client, jid, ("done",))["state"] == "done"
+
+
+def test_a_server_boots_when_its_job_store_cannot_be_read(tmp_path):
+    """Two failures, one swallow: restore is skipped AND so is the orphan
+    sweep, so an unreadable store looks exactly like an empty one while job
+    directories accumulate. Booting still wins - but it warns."""
+    import warnings
+    _, ex, client = make(tmp_path)
+    wait_state(client, submit(client), ("done",))
+
+    class Unreadable:
+        path = tmp_path / "jobs.db"
+        def reconcile(self): raise RuntimeError("disk went away")
+        def all(self, limit=0): raise RuntimeError("disk went away")
+        def put(self, rec): pass
+        def drop(self, jid): pass
+        def reap(self, ttl): return []
+
+    orphan = tmp_path / "0123456789ab"
+    orphan.mkdir()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ex2 = LocalExecutor(FakeSegmenter(), workdir=tmp_path)
+        ex2.jobs_db = Unreadable()
+        ex2._restore()
+    assert caught and "could not restore jobs" in str(caught[-1].message)
+    client2 = TestClient(create_app(ex2))
+    assert client2.get("/v1/health").status_code == 200      # still serving
+
+
+def test_a_corrupt_job_store_does_not_stop_the_server_starting(tmp_path):
+    """The bug this closes: JobStore was constructed outside the try, so a
+    corrupt jobs.db raised DatabaseError straight out of __init__ and the
+    server would not start at all."""
+    import warnings
+    (tmp_path / "jobs.db").write_bytes(b"not a database")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ex = LocalExecutor(FakeSegmenter(), workdir=tmp_path)
+    client = TestClient(create_app(ex))
+    assert client.get("/v1/health").status_code == 200
+    assert wait_state(client, submit(client), ("done",))["state"] == "done"
