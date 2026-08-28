@@ -99,33 +99,45 @@ class JobStore:
             self._db.commit()
 
     # -- reading ------------------------------------------------------------
+    # All of these take the same lock the writers do. Python's sqlite3 is
+    # usually built SERIALIZED (threadsafety 3), which would make sharing one
+    # connection between the dispatcher thread and the ASGI threads safe - but
+    # that is a property of how the interpreter was compiled, not of this code,
+    # and at a few operations per second the lock costs nothing.
     def get(self, jid: str) -> dict | None:
-        row = self._db.execute("SELECT payload FROM jobs WHERE id = ?", (jid,)).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM jobs WHERE id = ?", (jid,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
     def all(self, limit: int = 500) -> list:
-        rows = self._db.execute(
-            "SELECT payload FROM jobs ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT payload FROM jobs ORDER BY created DESC LIMIT ?",
+                (limit,)).fetchall()
         return [json.loads(r["payload"]) for r in rows]
 
     def in_state(self, states) -> list:
         q = ",".join("?" * len(states))
-        rows = self._db.execute(
-            f"SELECT payload FROM jobs WHERE state IN ({q}) ORDER BY created", states
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT payload FROM jobs WHERE state IN ({q}) ORDER BY created",
+                tuple(states)).fetchall()
         return [json.loads(r["payload"]) for r in rows]
 
     def inflight(self, cache_key: str) -> str | None:
         """The live job already computing this key - single-flight dedup, as a
         query rather than a dict kept in step with three others."""
-        row = self._db.execute(
-            "SELECT id FROM jobs WHERE cache_key = ? AND state IN (?,?)"
-            " ORDER BY created LIMIT 1", (cache_key, *LIVE)).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id FROM jobs WHERE cache_key = ? AND state IN (?,?)"
+                " ORDER BY created LIMIT 1", (cache_key, *LIVE)).fetchone()
         return row["id"] if row else None
 
     def counts(self) -> dict:
-        rows = self._db.execute(
-            "SELECT state, COUNT(*) n FROM jobs GROUP BY state").fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT state, COUNT(*) n FROM jobs GROUP BY state").fetchall()
         return {r["state"]: r["n"] for r in rows}
 
     # -- lifecycle ----------------------------------------------------------

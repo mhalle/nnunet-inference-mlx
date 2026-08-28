@@ -3321,3 +3321,61 @@ def test_a_job_that_needed_credentials_is_not_silently_replayed(tmp_path):
     LocalExecutor(FakeSegmenter(), workdir=tmp_path)
     rec = JobStore(tmp_path / "jobs.db").get("abcdef012345")
     assert rec["state"] == "failed" and "resubmit" in rec["error"]
+
+
+def test_the_ttl_reaper_actually_runs(tmp_path):
+    """`jobs_ttl_h` was accepted, stored, and never used - the store grew
+    forever while a knob claimed otherwise. Dead configuration is worse than
+    none: it reads as a decision that was made."""
+    from nnseg.jobstore import JobStore
+    seg = FakeSegmenter()
+    ex = LocalExecutor(seg, workdir=tmp_path, jobs_ttl_h=0.001)   # ~3.6 s
+    client = TestClient(create_app(ex))
+    db = JobStore(tmp_path / "jobs.db")
+    stale = "aaaaaaaaaaaa"
+    (tmp_path / stale).mkdir()
+    db.put({"id": stale, "task": "total_fast", "state": "done",
+            "created": time.time() - 3600, "finished": time.time() - 3600})
+    db.close()
+
+    wait_state(client, submit(client), ("done",))       # any job triggers a reap
+    assert JobStore(tmp_path / "jobs.db").get(stale) is None
+    assert not (tmp_path / stale).exists()              # and its directory went
+
+
+def test_keep_finished_bounds_memory_the_ttl_bounds_disk(tmp_path):
+    """Two different questions once records outlive the process: a server
+    restarted daily never exceeds its in-memory bound and would still
+    accumulate records forever."""
+    from nnseg.jobstore import JobStore
+    _, ex, client = make(tmp_path, keep_finished=1)
+    for i in range(3):
+        wait_state(client, submit(client, fill=100 + i), ("done",))
+    # memory kept 1; the store kept all three, because none is past its TTL
+    assert len(JobStore(tmp_path / "jobs.db").all()) == 3
+
+
+def test_a_multi_input_job_round_trips_through_the_store(tmp_path, monkeypatch):
+    """input_paths is a tuple of (role, Path) - the one record field that needs
+    real serialization rather than passing through json untouched."""
+    from nnseg.jobstore import JobStore
+    seg, client = _multi(tmp_path, monkeypatch)
+    blobs = {r: volume_bytes(i + 20) for i, r in enumerate(ROLES)}
+    jid = _post_multi(client, blobs).json()["id"]
+    wait_state(client, jid, ("done",))
+    rec = JobStore(tmp_path / "jobs.db").get(jid)
+    assert [r for r, _ in rec["input_paths"]] == list(ROLES)
+    assert all(p for _, p in rec["input_paths"])
+
+
+def test_a_broken_job_store_does_not_fail_a_job(tmp_path):
+    """Bookkeeping must not be able to take down the work it books."""
+    _, ex, client = make(tmp_path)
+
+    class Broken:
+        def put(self, rec): raise RuntimeError("disk on fire")
+        def drop(self, jid): raise RuntimeError("disk on fire")
+        def reap(self, ttl): raise RuntimeError("disk on fire")
+    ex.jobs_db = Broken()
+    jid = submit(client)
+    assert wait_state(client, jid, ("done",))["state"] == "done"

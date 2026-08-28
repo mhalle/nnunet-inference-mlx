@@ -1550,7 +1550,27 @@ class LocalExecutor:
                 if rec is not None:
                     victims.append(rec)
         for rec in victims:
-            self._rm(rec)
+            self._rm(rec)          # its bytes; the RECORD outlives them
+        self._reap()
+
+    def _reap(self) -> None:
+        """Drop terminal records past the TTL and the directories they owned.
+
+        `keep_finished` bounds what MEMORY holds, and evicting from memory takes
+        the job's bytes with it. This bounds how long the RECORD lasts, which is
+        a different question - dropping the record on memory eviction would have
+        made a busy server forget jobs within seconds, defeating the durability
+        it just gained. So an evicted job keeps answering `/v1/jobs/{id}` from
+        the store, with its result reported as gone rather than the id 404ing.
+        Runs after each job, the same place and cadence as Modal's
+        `_bound_jobs_store`.
+        """
+        import shutil
+        try:
+            for jid in self.jobs_db.reap(self.jobs_ttl_s):
+                shutil.rmtree(self.workdir / jid, ignore_errors=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _rm(rec: JobRecord) -> None:
