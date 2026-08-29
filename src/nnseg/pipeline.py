@@ -22,7 +22,7 @@ from .progress import Reporter
 from .weights import as_store
 from .cache import ModelCache
 from .values import LabelSchema
-from .preprocess import to_model_frame
+from .preprocess import normalization_fingerprint, normalize_for, to_model_grid
 
 
 def _version() -> str:
@@ -157,7 +157,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     labels = None
     out_grid = None
     frame: Frame | None = None
-    cached = {}                                   # model spacing -> (x, frame)
+    cached = {}                                   # resample key -> ResampledGrid (NOT normalized)
 
     def load(wid):
         folder = store.resolve(wid, configuration=configuration)
@@ -178,12 +178,21 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         return m
 
     def model_frame(model):
-        key = model.spacing_zyx
+        """This model's network input, sharing the resample with other models at its spacing.
+
+        Only the crop+resample is cached. Normalization is nnU-Net's, and it is PER MODEL - each
+        reads its own dataset's foreground statistics - so sharing a normalized array between the
+        parts of a multi-model task silently runs parts 2..N on part 1's statistics. Caching the
+        normalization-free grid and normalizing per model keeps the one resample per spacing that
+        the cache is for, without that.
+        """
+        key = (tuple(model.spacing_zyx), convention, resampling_order, crop_nonzero, str(device))
         if key not in cached:
-            cached[key] = to_model_frame(data_zyx, geometry, model, convention=convention, device=device,
-                                         order=resampling_order, original_orientation=orientation,
-                                         crop_to_nonzero=crop_nonzero)
-        return cached[key]
+            cached[key] = to_model_grid(data_zyx, geometry, model.spacing_zyx, convention=convention,
+                                        device=device, order=resampling_order,
+                                        original_orientation=orientation, crop_to_nonzero=crop_nonzero)
+        grid = cached[key]
+        return normalize_for(grid, model), grid.frame
 
     def crop_on_model_grid(model, x, frame, *, use_body, roi_mm):
         """A voxel box on this model's grid: the body envelope (optional) intersected with a
@@ -220,6 +229,15 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         return worth_cropping(Envelope(tuple(lo), tuple(hi), shape))
 
     def predict_into(model, x, frame, ogrid, env, *, lut, paint, out):
+        # tripwire: `x` must carry THIS model's normalization. Several models share one resample,
+        # and feeding one model's normalization to another is silent and severe - the organs
+        # model's CT clip at +276 HU flattens all bone for the parts that follow it.
+        stamped = getattr(x, "_nnseg_normalization", None)
+        if stamped != normalization_fingerprint(model):
+            raise RuntimeError(
+                "network input was normalized for a different model than the one consuming it "
+                f"(input {stamped!r}, model {normalization_fingerprint(model)!r}). Normalization "
+                "is per-model; share the resampled grid, not the normalized array.")
         crop = x[(slice(None), *env.slices)] if not env.is_whole() else x
         logits = model.predict_logits(crop, report=report).to(device)
         mapping = frame.mapping(ogrid)
