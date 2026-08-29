@@ -119,14 +119,21 @@ def test_fingerprints_match_for_models_that_normalize_identically():
     assert normalization_fingerprint(a) == normalization_fingerprint(b)
 
 
-def test_zscore_models_without_statistics_are_interchangeable():
-    """Why total_mr was never harmed: ZScoreNormalization is a per-image transform reading no
-    dataset statistics, so its parts genuinely do produce the same array."""
-    a = _Model({}, scheme="ZScoreNormalization")
-    b = _Model({}, scheme="ZScoreNormalization")
-    assert normalization_fingerprint(a) == normalization_fingerprint(b)
+def test_zscore_models_are_interchangeable_despite_differing_statistics():
+    """Why total_mr was never harmed - and the fingerprint is a coarser thing than it looks.
+
+    ZScoreNormalization is a per-image transform that reads no dataset statistics, so two such
+    models produce the same array whatever their plans say. Real total_mr parts DO carry
+    different foreground intensity properties (verified against the installed weights), so
+    their fingerprints differ while their output does not. The fingerprint therefore answers
+    "which model normalized this", not "what normalization was applied". That is deliberate:
+    it can only over-trigger, and under-triggering is the direction that hurts."""
+    a = _Model({"mean": -370.0, "std": 436.6}, scheme="ZScoreNormalization")
+    b = _Model({"mean": 292.0, "std": 261.5}, scheme="ZScoreNormalization")
+    assert normalization_fingerprint(a) != normalization_fingerprint(b)      # differ...
     _, grid = _grid()
-    np.testing.assert_array_equal(normalize_for(grid, a).numpy(), normalize_for(grid, b).numpy())
+    np.testing.assert_array_equal(normalize_for(grid, a).numpy(),
+                                  normalize_for(grid, b).numpy())            # ...output does not
 
 
 # --- the same property, through segment() ------------------------------------------------
