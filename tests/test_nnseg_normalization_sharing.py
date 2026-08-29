@@ -127,3 +127,123 @@ def test_zscore_models_without_statistics_are_interchangeable():
     assert normalization_fingerprint(a) == normalization_fingerprint(b)
     _, grid = _grid()
     np.testing.assert_array_equal(normalize_for(grid, a).numpy(), normalize_for(grid, b).numpy())
+
+
+# --- the same property, through segment() ------------------------------------------------
+#
+# The tests above pin `normalize_for`. The defect was not there: it was in segment()'s cache,
+# which shared an already-normalized tensor between the parts of a multi-model task. A test
+# that never runs segment() would have passed throughout the bug's life, so this drives the
+# real path with stub models - no weights, no network.
+
+class _StubModel(_Model):
+    """A model just real enough for segment(): it records the input it is asked to predict on."""
+
+    def __init__(self, props, K=3):
+        super().__init__(props)
+        self.K = K
+        self.transpose_forward = (0, 1, 2)
+        self.accumulate_choice = {"on_device": False}
+        self.received = None
+
+    def predict_logits(self, crop, report=None):
+        import torch
+        self.received = crop.clone()
+        logits = torch.zeros((self.K, *crop.shape[1:]), dtype=torch.float32)
+        logits[0] = 1.0                       # everything background; labels are not the point
+        return logits
+
+
+def _two_part_task(tmp_path, parts):
+    """A union task over two models at one spacing, with stub weights and model caches."""
+    from nnseg.tasks import TaskSpec, UnionPart
+    folder = tmp_path / "Dataset000_stub" / "trainer__plans__3d_fullres"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "fold_0").mkdir(exist_ok=True)      # provenance reads available_folds
+
+    class _Store:
+        root = folder.parent.parent
+
+        def resolve(self, weights_id, *, configuration=None):
+            return folder
+
+        def describe(self, *a, **k):
+            return {}
+
+    class _Cache:
+        def __init__(self):
+            self.order = list(parts)
+
+        def get(self, folder, **kw):
+            return self.order.pop(0)
+
+        def release(self, model):
+            pass
+
+    spec = TaskSpec(name="stub_union", shape="union",
+                    union=(UnionPart(weights_id=1, label_remap={1: 1}, name="first"),
+                           UnionPart(weights_id=2, label_remap={1: 2}, name="second")),
+                    label_map={1: "a", 2: "b"})
+    return spec, _Store(), _Cache()
+
+
+def _write_ct(tmp_path, shape=(12, 14, 16)):
+    import SimpleITK as sitk
+    hu = _ct(shape)
+    img = sitk.GetImageFromArray(hu.astype("int16"))
+    img.SetSpacing((float(SPACING[2]), float(SPACING[1]), float(SPACING[0])))
+    p = tmp_path / "ct.nii.gz"
+    sitk.WriteImage(img, str(p))
+    return p
+
+
+def test_segment_gives_each_part_of_a_multi_model_task_its_own_normalization(tmp_path, monkeypatch):
+    """The regression test for the defect itself.
+
+    Two models at one spacing with different intensity statistics. Before the fix both parts
+    were handed the tensor the first part normalized, so `received` would be identical.
+    """
+    pytest.importorskip("SimpleITK")
+    from nnseg import pipeline
+
+    organs, ribs = _StubModel(ORGANS._props), _StubModel(RIBS._props)
+    spec, store, cache = _two_part_task(tmp_path, [organs, ribs])
+    monkeypatch.setattr(pipeline, "as_store", lambda *a, **k: store)
+    pipeline.segment(str(_write_ct(tmp_path)), spec, models=cache, device="cpu",
+                     envelope_mm=None, convention="corner", folds=(0,))
+
+    assert organs.received is not None and ribs.received is not None
+    a, b = organs.received.numpy()[0], ribs.received.numpy()[0]
+    assert not np.allclose(a, b), "both parts received the same normalized volume"
+
+    # Stronger than "they differ": the second part must have re-normalized the SAME underlying
+    # volume with its own statistics. CT normalization is invertible wherever it did not clip,
+    # so recover the HU from the first part's input and predict what the second should have got.
+    # Comparing this way says nothing about orientation, which the pipeline is free to change.
+    o, r = ORGANS.intensity_properties(0), RIBS.intensity_properties(0)
+    hu = a * o["std"] + o["mean"]
+    unclipped = (hu > o["percentile_00_5"] + 1) & (hu < o["percentile_99_5"] - 1)
+    assert unclipped.any(), "nothing survived the first model's clip; the fixture proves nothing"
+    expected = (np.clip(hu, r["percentile_00_5"], r["percentile_99_5"]) - r["mean"]) / r["std"]
+    np.testing.assert_allclose(b[unclipped], expected[unclipped], atol=1e-4)
+
+
+def test_segment_still_resamples_once_for_models_that_share_a_spacing(tmp_path, monkeypatch):
+    """The cache has to keep earning its place: the fix splits what is cached, it does not
+    resample per part."""
+    pytest.importorskip("SimpleITK")
+    from nnseg import pipeline
+
+    calls = []
+    real = pipeline.to_model_grid
+
+    def counting(*a, **k):
+        calls.append(a[2])                    # the target spacing
+        return real(*a, **k)
+
+    monkeypatch.setattr(pipeline, "to_model_grid", counting)
+    spec, store, cache = _two_part_task(tmp_path, [_StubModel(ORGANS._props), _StubModel(RIBS._props)])
+    monkeypatch.setattr(pipeline, "as_store", lambda *a, **k: store)
+    pipeline.segment(str(_write_ct(tmp_path)), spec, models=cache, device="cpu",
+                     envelope_mm=None, convention="corner", folds=(0,))
+    assert len(calls) == 1, f"resampled {len(calls)} times for two models at one spacing"
