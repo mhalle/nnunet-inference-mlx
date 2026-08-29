@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Fixed: multi-model tasks ran on one model's normalization (nnseg).** `segment()`
+  cached the preprocessed frame by spacing alone, but the cached tensor had nnU-Net's
+  **per-model** normalization baked in, so any task running several models at one
+  spacing handed models 2..N the first model's intensity statistics. For `total` that
+  meant the organs model's CT clip at +276 HU applied to vertebrae, cardiac, muscles
+  and ribs, collapsing every bone density above it: on CT_Abdo, ribs 273 -> 412.9 mL,
+  sternum 12.1 -> 59.6, costal cartilage 5.8 -> 128.6. `to_model_frame` is now
+  `to_model_grid` (crop + resample, model-independent and therefore shareable, and a
+  different type from a network input so it cannot be fed to one) plus `normalize_for`
+  (per-model, fresh tensor), and the input carries a normalization fingerprint the
+  consumer checks. **`__version__` is bumped to 0.2.0, which invalidates every cached
+  serve result** - `total` results cached before this are degraded. Unaffected:
+  `total_mr` (ZScoreNormalization reads no dataset statistics), single-model tasks,
+  and the engines layer.
+
 - **The job queue is durable (nnseg).** Records live in a sqlite `jobs.db` under
   the server's workdir, so a restart re-queues work instead of dropping it - a job
   is content-keyed and idempotent, so an interrupted run is re-runnable. It also
