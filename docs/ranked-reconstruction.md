@@ -461,8 +461,12 @@ Four rules for building it:
 
 ### 8.5 The decode reduces to one operation
 
-```
-decode(groups, spacing) -> one uint8 margin field per group
+Built, as `nnseg.ranked`:
+
+```python
+resident = ranked.to_device(code, "cuda")            # upload the planes once
+fields   = ranked.decode_groups(resident, groups,    # expand only what was asked for
+                                quantize=True)       # (G, Z, Y, X) uint8, 128 = surface
 ```
 
 Grouping is a `max` while walking the rank planes; resolution is the target grid handed to
@@ -470,6 +474,36 @@ Grouping is a `max` while walking the rank planes; resolution is the target grid
 "ten groups at 1 mm", or "two groups at 6 mm" with no re-encoding — which is what lets a
 viewer toggle *show lobes separately* against *show lungs* as a half-second re-extraction
 rather than a different artifact.
+
+**Resampling is deliberately not in the decode.** It belongs to the restore, and taking a
+`spacing` here would bake a grid into an operation whose whole point is that no grid is baked
+in. The earlier sketch of this signature said `decode(groups, spacing)`; that was wrong.
+
+#### Residency: the small thing persists, the large thing does not
+
+`to_device` exists because the encoded planes are what should live on the GPU, and the fields
+they stand for should not. On the organs part:
+
+| form | size | holds |
+|---|---|---|
+| compressed store (disk, wire) | 2 MB | every class |
+| **decompressed, still encoded, resident** | **126 MB** | every class |
+| the fp16 K-channel field it represents | 574 MB | the same thing, expanded |
+| four expanded groups, uint8 | 46 MB | only what was asked for |
+
+So the resident form is **4.6× smaller than the field it stands for** while still carrying
+all 25 classes, and any grouping expands out of it transiently (~0.3 s, four groups). That
+inverts the pipeline as it stands, where the gigabyte logit field is alive during the run and
+nothing survives it.
+
+Without `to_device`, `decode_groups` re-uploads 126 MB on *every* call — which is precisely
+the interactive case this is for. The measured win was only **1.13× on MPS**, where unified
+memory makes an upload nearly free; on a discrete GPU across PCIe it should be larger, and
+that is not measured here.
+
+⚠ A resident code is for `decode_groups`. `margin`, `deficit` and `probabilities` read the
+host arrays and raise rather than indexing a tensor with numpy semantics; `to_device` does
+not consume its argument, so the host form stays usable alongside.
 
 ### 8.6 Gradients: saturation, not quantization, and which stencil
 
@@ -732,11 +766,14 @@ rather than names, so a part legitimately called `composite` collides with nothi
   holds.
 - **A conservative bound is not implemented.** §8.2 needs a max-pooled, 1-bit-per-structure
   hierarchy; the per-chunk presence index of §11 is the same object and is also unbuilt.
-- **Group extraction is not in the API.** `nnseg.ranked` exposes `margin` and `deficit` per
-  channel; the union field of §8.4 (`max` over members minus `max` over the rest, in one pass)
-  has only been written as a scratch function.
-- **Uint8 group output.** §8.4 wants quantized margin textures, not float32 volumes; the
-  quantization is the same as the store's but the API returns floats.
+- ~~**Group extraction is not in the API.**~~ Closed: `ranked.decode_groups` (§8.5), with
+  `ranked.to_device` for residency.
+- ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
+  128-is-the-boundary convention `encode_regions` stores.
+- **Depth is two defaults, not one.** §8.4 measures depth 3 and depth 6 giving *identical*
+  group masks on real data while the liver's p95 margin error goes 0.0149 → 0.2969. A
+  labelmap consumer can take the shallow store; a consumer sampling the field for an opacity
+  ramp cannot. The single `DEFAULT_DEPTH` does not express that.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
