@@ -51,9 +51,9 @@ That is not merely tidier. It buys three things:
   would waste resolution near 0 and 1 where nothing interesting happens.
 - **Correct interpolation.** The linear interpolant of a logit difference is right; the linear
   interpolant of a softmax output is not, and the discrepancy is worst exactly at boundaries.
-  This is the same lemma the fused restore rests on, which is why a boundary recovered from
-  interpolated margins lands on the same sub-voxel surface as `to_labels` and as the
-  SurfaceNets mesher.
+  This is the same lemma the fused restore rests on. It holds for a difference taken against a
+  reference *shared by all channels* — see `deficit` below, and the trap that the per-structure
+  `margin` is a different quantity that must not be substituted here.
 - **No softmax at all.** The gaps *are* logit differences, so `topk` on the logits yields
   ranks and gaps directly. No exponentials, no normalization, no `log` round trip. Only the
   tail needs a normalizer, and that is one `logsumexp`-shaped pass, not a K-channel volume.
@@ -178,18 +178,37 @@ Slabbing bounds peak memory to one slab promoted to fp32, not the whole volume. 
 performance-neutral in practice (32/64/128 measured within noise on an L40S), so it is a
 memory knob, not a tuning knob.
 
-Decoding is the inverse, and the *only* read most consumers need is the **signed margin
-field** for one structure:
+Decoding is the inverse, and it yields **two different fields from the same bytes**. They
+agree at voxel centers and diverge under interpolation, which is exactly the kind of
+difference that hides in testing — so which one to use is not a matter of taste.
 
 ```
-m_c = +gap        where c is the winner        (its lead over the runner-up)
-      -gap_j      where c ranks j-th           (its deficit behind the winner)
-      -clip       where c is absent
+margin   m_c = +gap      where c wins      (its lead over the runner-up)
+                -gap_j   where c ranks j   (its deficit behind the winner)
+                -clip    where c is absent
+
+deficit  d_c =  0        where c wins      ( = m_c with the lead removed )
+                -gap_j   where c ranks j
+                -clip    where c is absent
 ```
 
-Positive inside, zero **on** the boundary, negative outside. Because it is built from
-within-voxel differences, its zero crossing is the same sub-voxel surface the fused restore
-and the mesher compute. `nnseg.ranked.margin(code, channel)` returns exactly this.
+**`deficit` is the field a restore must interpolate.** It is `l_c - max_j l_j`, which differs
+from the logits by a per-voxel constant *shared by every channel* — a gauge transformation —
+so interpolating it and taking the argmax is exactly interpolating the logits and taking the
+argmax. `nnseg.ranked.deficit(code, channel)`.
+
+**`margin` is the field a renderer or mesher wants.** It is `l_c - max_{j != c} l_j`: positive
+inside by however much `c` leads, zero *on* `c`'s surface, negative outside. It has an
+interior gradient to shade with and a non-degenerate zero level set, which `deficit` (flat
+zero throughout the interior) does not. `nnseg.ranked.margin(code, channel)`.
+
+The trap is that `margin` is **not** gauge-equivalent: it adds the lead to one channel only,
+which is channel-dependent. At a voxel center the winner still wins, so an argmax over
+margins looks correct; once a trilinear stencil mixes voxels with *different* winners, it is
+not. Measured on a real K=118 case, restoring through `margin` agrees with the logits on
+99.43 % of sub-voxel samples and only **84 %** of near-tie samples, against 99.98 % / 99.4 %
+through `deficit`. Nearest-neighbour restore cannot see the difference at all, because it
+never mixes voxels — which is precisely how such a bug survives.
 
 `nnseg.ranked.probabilities(code)` is the head-specific decode: `p_j = exp(-g_j) / Z` with
 `Z = Z_top / (1 - tail)`, exact when exhaustive. Where a rank holds the sentinel the class is
@@ -262,32 +281,42 @@ sub-grid, the model shape and spacing, the convention, the original orientation,
 placement (origin plus direction cosines). Dropping any of it produces a frame that still
 looks valid and silently shifts every restored label — the crop offset especially.
 
-Measured on CT_Abdo `total_fast` (K = 118, depth 6, clip 8), re-restored from the code alone
-and compared against fresh `segment()` runs at each target:
+Measured on CT_Abdo, re-restored from the stored parts alone and compared against fresh
+`segment()` runs at the same target. The five-part `total` onto a **1 mm isotropic** grid:
 
-| target | agreement |
+| restore | agreement |
 |---|---|
-| the run's own input grid | 99.643 % |
-| 2 mm, linear | 99.650 % |
-| 2 mm, **nearest** | **99.9993 %** |
-| 5 mm, linear | 99.629 % |
+| nearest | 99.992 % |
+| linear, decoded through `margin` | 99.650 % |
+| linear, decoded through `deficit` | **99.869 %** |
 
-Nearest is essentially exact because it only consults the local ordering, which the ranks
-store exactly. Linear's ~0.35 % comes from the **clip**, not from the 8-bit step: interpolating
-toward a neighbor where a class truly sits 20 logits behind but is stored at −8 moves the
-zero crossing. Widening the clip confirms it, and exposes the trade:
+The gap between the last two is the decode field, not the format. Decomposing it on sampled
+sub-voxel points against ground truth (interpolating the raw logits) separates every
+candidate source:
 
-| clip | 2 mm linear | 2 mm nearest |
+| what varies | agreement (all points) | (near-tie points) |
 |---|---|---|
-| 8 | 99.650 % | 99.9993 % |
-| 20 | 99.797 % | 99.973 % |
-| 40 | 99.798 % | 99.941 % |
+| exact margins, all 118 classes, no clip — sanity | 100.000 % | — |
+| `margin` field, depth 6, clip 8, uint8 | 99.431 % | 84.4 % |
+| `deficit` field, depth 6, clip 8, uint8 | 99.736 % | 92.3 % |
+| `deficit` field, depth 6, clip 20, uint8 | **99.985 %** | **99.4 %** |
+| `deficit` field, depth 12, clip 20, uint8 | 99.987 % | 99.5 % |
 
-A wider clip reaches further for interpolation but, with 255 fixed levels, coarsens the step
-near ties (31 → 157 mlogit), which is exactly where nearest and every local decision live. It
-saturates by 20, so the residual 0.2 % is depth and quantization, not reach. If both mattered
-at once the answer is a **companded** support — fine near zero, coarse near the clip — rather
-than a different constant.
+Three things fall out. **Quantization is not the limit** — exact float gaps score 99.738 %
+against uint8's 99.736 %, a difference of 0.002 %. **Depth is not the limit** — 6, 12, 24 and
+all 118 are indistinguishable. What remains is the **decode field** (the largest single term)
+and then the **clip**, whose floor at `-clip` lets a far-behind class compete once a stencil
+reaches a voxel where it was truncated. Widening the clip to 20 removes most of what is left.
+
+That also corrects an earlier, wrong reading of the same numbers: nearest looked near-exact
+and linear looked deficient, which invited blaming the clip. Nearest was simply immune to a
+bug in the decode.
+
+Companding — spending the 255 levels non-uniformly to get fine resolution near a tie — was
+tried and is **worse**: 99.35 % at gamma 2 against 99.65 % linear, despite a 100x finer step
+near zero. Linear interpolation runs between a voxel where a class leads and one where it
+trails, so the accuracy of *large* margins matters as much as small ones, and companding buys
+the latter by destroying the former. Uniform support with a wider clip is the right shape.
 
 Beyond a different grid, the same machinery re-decides the interpolation (so one store yields
 both the TS-parity nearest labelmap and the logit-grade linear one), the label mapping, and
@@ -380,10 +409,18 @@ A `probabilities` artifact should be **opt-in per request**, like preview and st
 
 ## Consumer contract
 
-`margin(code, channel) -> field` is the canonical read. It unifies softmax and sigmoid heads
-behind one shape — zero is the boundary, positive is inside, the field interpolates linearly —
-so a renderer, a mesher and the restore all consume the same thing without knowing which head
-produced it. Two consumers already want it:
+Two reads, and the choice follows from what you are producing, not from taste:
+
+- **`deficit(code, channel)` — when the answer is a label map.** Gauge-equivalent to the
+  logits, so interpolate then argmax.
+- **`margin(code, channel)` — when the answer is a surface.** Signed, zero on the boundary,
+  with an interior gradient. Both unify softmax and region heads behind one shape, so a
+  renderer or mesher never learns which head produced a file.
+
+Substituting one for the other is silent: they agree at voxel centers and diverge only under
+interpolation, and nearest-neighbour restore never notices at all.
+
+Two consumers already want the surface field:
 
 - **Volume rendering.** Decode per-structure margins to uint8 textures and ray-march them. The
   ramp must be in **millimeters** (`m / |grad m|`), not logits: a fixed logit ramp is sub-voxel

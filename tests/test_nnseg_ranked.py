@@ -177,3 +177,52 @@ class TestRegions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGauge(unittest.TestCase):
+    """Which decoded field may be interpolated before an argmax.
+
+    `deficit` is the logits shifted by a per-voxel constant shared by all channels, so it is
+    restore-equivalent. `margin` adds the winner's lead to one channel only - fine at voxel
+    centers, wrong once a stencil mixes voxels with different winners. Nearest-neighbour
+    restore cannot see the difference, which is exactly how it stays hidden.
+    """
+
+    def _sample(self, stack, n=20000, seed=0):
+        import torch.nn.functional as F
+        g = torch.Generator().manual_seed(seed)
+        pts = (torch.rand(n, 3, generator=g) * 2 - 1).view(1, 1, 1, n, 3)
+        return F.grid_sample(stack[None], pts, mode="bilinear",
+                             align_corners=True)[0, :, 0, 0].argmax(0)
+
+    def test_deficit_is_the_logits_up_to_a_per_voxel_constant(self):
+        lg = _logits(K=6)
+        code = ranked.encode(lg, depth=6, clip=40.0)          # exhaustive + generous clip
+        d = np.stack([ranked.deficit(code, c) for c in range(6)])
+        shift = lg.numpy() - d                                 # must be constant across c
+        np.testing.assert_allclose(shift.max(0), shift.min(0), atol=0.2)
+
+    def test_interpolating_deficit_reproduces_interpolating_logits(self):
+        lg = _logits(K=6)
+        code = ranked.encode(lg, depth=6, clip=40.0)
+        d = torch.from_numpy(np.stack([ranked.deficit(code, c) for c in range(6)]))
+        agree = float((self._sample(d) == self._sample(lg)).float().mean())
+        self.assertGreater(agree, 0.995, "deficit must be restore-equivalent to the logits")
+
+    def test_margin_is_not_restore_equivalent_and_that_is_expected(self):
+        """Pinned so nobody 'simplifies' the restore path back onto margin: the two agree at
+        voxel centers, so only an interpolating comparison catches the swap."""
+        lg = _logits(K=6)
+        code = ranked.encode(lg, depth=6, clip=40.0)
+        m = torch.from_numpy(np.stack([ranked.margin(code, c) for c in range(6)]))
+        d = torch.from_numpy(np.stack([ranked.deficit(code, c) for c in range(6)]))
+        np.testing.assert_array_equal(m.argmax(0).numpy(), d.argmax(0).numpy())   # centers agree
+        self.assertLess(float((self._sample(m) == self._sample(lg)).float().mean()),
+                        float((self._sample(d) == self._sample(lg)).float().mean()))
+
+    def test_margin_keeps_the_winners_lead_and_deficit_zeroes_it(self):
+        lg = torch.zeros(3, 1, 1, 1); lg[0] = 5.0
+        code = ranked.encode(lg, depth=3, clip=8.0)
+        self.assertAlmostEqual(float(ranked.margin(code, 0).ravel()[0]), 5.0, places=1)
+        self.assertEqual(float(ranked.deficit(code, 0).ravel()[0]), 0.0)
+        self.assertAlmostEqual(float(ranked.deficit(code, 1).ravel()[0]), -5.0, places=1)

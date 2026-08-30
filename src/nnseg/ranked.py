@@ -34,10 +34,17 @@ whole regions become uniform - which is what makes depth nearly free and lets a 
 skip empty blocks entirely. Precision and range trade against each other here: a smaller
 clip quantizes finer AND stores smaller, at the cost of dynamic range for the tail.
 
-The decoded object is one signed margin field per structure, ``m_c = l_c - max l_j``:
-positive inside, zero ON the boundary, negative outside. That is the form a renderer, a
-mesher and the fused restore all want, and because it is built from within-voxel
-differences its zero crossing is the same sub-voxel surface all three would compute.
+Two fields fall out of the same bytes, and they are not interchangeable:
+
+``deficit`` (``l_c - max_j l_j``, zero where c wins) differs from the logits by a per-voxel
+constant shared by every channel - a gauge transformation - so interpolating it and taking
+the argmax is exactly interpolating the logits. **That is the field a restore must use.**
+
+``margin`` (``l_c - max_{j != c} l_j``, positive inside by c's lead) is the signed "is c
+winning" field whose zero level set is c's surface, with an interior gradient to shade and
+mesh. **That is the field a renderer wants** - and it is NOT gauge-equivalent, because the
+lead is added to one channel only, so an argmax over interpolated margins is not an argmax
+over interpolated logits.
 
 Region (sigmoid) heads have no winner and no normalizer, so ranking buys nothing there -
 but their logit IS already such a margin, referenced to the decision threshold. That is
@@ -58,8 +65,8 @@ ZERO_LEVEL = 128      # regions only: the level the decision boundary lands on e
 TAIL_MAX = 255
 DEFAULT_DEPTH = 6
 
-__all__ = ["CLIP", "DEFAULT_DEPTH", "RankedCode", "RankedSpec", "encode", "encode_regions",
-           "margin", "probabilities"]
+__all__ = ["CLIP", "DEFAULT_DEPTH", "RankedCode", "RankedSpec", "deficit", "encode",
+           "encode_regions", "margin", "probabilities"]
 
 
 @dataclass(frozen=True)
@@ -206,12 +213,42 @@ def encode_regions(logits: torch.Tensor, *, clip: float = CLIP, threshold: float
     })
 
 
-def margin(code: RankedCode, channel: int) -> np.ndarray:
-    """Signed margin field for one channel, in logits: the canonical read.
+def deficit(code: RankedCode, channel: int) -> np.ndarray:
+    """``l_c - max_j l_j`` for one channel: zero where it wins, negative behind.
 
-    Positive inside, zero on the boundary, ``-clip`` where the channel is absent. Whether
-    the code came from a softmax or a region head, this returns the same kind of field -
-    which is why a renderer or a mesher can consume either without branching.
+    **This is the field to interpolate when the answer is a label.** It differs from the
+    logits by ``-max_j l_j``, a per-voxel constant shared by EVERY channel, so it is a gauge
+    transformation: interpolating it and taking the argmax is exactly interpolating the
+    logits and taking the argmax.
+
+    :func:`margin` is not interchangeable here, and the difference is not small. It adds the
+    winner's lead to the winning channel only - channel-dependent, so not a gauge - which
+    survives an argmax at voxel centers but not after interpolation, where each corner of the
+    stencil has a different winner. Measured on a real K=118 case, restoring through ``margin``
+    agrees with the logits on 99.43 % of sub-voxel samples and only 84 % of near-tie samples;
+    through ``deficit``, 99.98 % and 99.4 %. Nearest-neighbour restore hides the difference
+    entirely, because it never mixes voxels.
+    """
+    clip = float(code.meta["clip"])
+    out = margin(code, channel)
+    if code.meta.get("mode") == "regions":
+        return out                                            # no winner: nothing to remove
+    won = code.ranks[0] == int(channel) + 1
+    out[won] = 0.0
+    return out
+
+
+def margin(code: RankedCode, channel: int) -> np.ndarray:
+    """``l_c - max_{j != c} l_j`` for one channel: the signed "is c winning" field.
+
+    Positive inside by the amount it leads, zero ON its boundary, negative outside, ``-clip``
+    where the channel is absent. This is the field for rendering and meshing ONE structure:
+    its zero level set is that structure's surface, it has an interior gradient to shade and
+    to place a sub-voxel isosurface with, and it behaves like a signed distance field measured
+    in confidence.
+
+    Do NOT feed it to a restore. Use :func:`deficit` when the output is a label map - see
+    there for why, and for what it costs.
     """
     clip = float(code.meta["clip"])
     if code.meta.get("mode") == "regions":
