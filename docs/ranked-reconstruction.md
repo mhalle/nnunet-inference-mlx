@@ -195,7 +195,27 @@ It also subsumes the clip-tuning problem. A fixed clip is a global constant stan
 per-voxel quantity, which is why clip 8 → 16 mattered so much (see §10). The adaptive floor
 stores the actual value instead.
 
-**Recommendation: store N ranks and N supports.**
+### It matters far more to a renderer than this table shows
+
+The numbers above are *decision* accuracy, which §5 shows converges early for everyone. On the
+criterion that actually governs depth — maximum surface displacement inside the opacity ramp
+(§5, §8.6) — the same configurations separate by two orders of magnitude:
+
+| configuration | planes | ramp max shift | of a voxel |
+|---|---|---|---|
+| depth 3, clip floor (today) | 5 | 3576 µm | 238 % |
+| depth 3 + **adaptive floor** | **6** | **72 µm** | **4.8 %** |
+| depth 6, clip floor (today) | 11 | 45 µm | 3.0 % |
+| depth 6 + adaptive floor | 12 | 45 µm | 3.0 % |
+
+**One plane collapses the tail 50×.** That follows from what the error *is*: the large
+displacements are a group member falling below the deepest stored rank and reading as `-clip`
+rather than at its real level, which is the exact quantity the floor stores. Note it buys
+nothing at depth 6 — its whole value is making a *shallow* read good enough.
+
+**Recommendation: store N ranks and N supports.** Six planes then serve the strictest consumer
+where eleven are needed today — ~80 MB resident against 138 MB, ~0.28 s to decode against
+0.50 s — which is what makes "read every plane provided" (§5) cheap enough to ask for.
 
 ---
 
@@ -805,7 +825,11 @@ rather than names, so a part legitimately called `composite` collides with nothi
 - **Depth defaults.** Depth 3 + adaptive floor matches depth 6 at K = 118, and the parts
   converge sooner. The residual loop (§5) should set it per part; the fixed default should
   move meanwhile.
-- **The adaptive floor is not implemented.** `encode` stores N−1 supports.
+- **The adaptive floor is not implemented.** `encode` stores N−1 supports. This is now the
+  highest-value open item: §4 measures one extra plane collapsing the renderer's ramp error
+  50× (3576 → 72 µm) and letting six planes do eleven planes' work, which is what makes
+  reading every plane affordable. It is a format change — the plane count per depth moves —
+  so it needs a decision, not a drive-by.
 - **Clip.** With an adaptive floor the fixed clip matters much less. Without one, the curve
   peaks at 12–16 for a 3 mm model and *reverses* by 24 (99.43 → 99.18 %) as the coarser step
   costs more than the added reach. Required reach should scale with logit change per voxel,
