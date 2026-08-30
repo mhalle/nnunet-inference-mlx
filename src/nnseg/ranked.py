@@ -65,8 +65,8 @@ ZERO_LEVEL = 128      # regions only: the level the decision boundary lands on e
 TAIL_MAX = 255
 DEFAULT_DEPTH = 6
 
-__all__ = ["CLIP", "DEFAULT_DEPTH", "RankedCode", "RankedSpec", "deficit", "encode",
-           "encode_regions", "margin", "probabilities"]
+__all__ = ["CLIP", "DEFAULT_DEPTH", "RankedCode", "RankedSpec", "decode_groups", "deficit",
+           "emit", "encode", "encode_regions", "margin", "probabilities", "to_device"]
 
 
 @dataclass(frozen=True)
@@ -322,6 +322,7 @@ def margin(code: RankedCode, channel: int) -> np.ndarray:
     Do NOT feed it to a restore. Use :func:`deficit` when the output is a label map - see
     there for why, and for what it costs.
     """
+    _host(code, "margin")
     clip = float(code.meta["clip"])
     if code.meta.get("mode") == "regions":
         q = code.support[int(channel)].astype(np.float32)
@@ -342,6 +343,33 @@ def margin(code: RankedCode, channel: int) -> np.ndarray:
         sel = code.ranks[j] == want
         out[sel] = -_gap(code.support[j - 1][sel], clip)       # rank j trails the winner
     return out
+
+
+def to_device(code: RankedCode, device) -> RankedCode:
+    """Move the encoded planes onto ``device`` once, so repeated decodes do not re-upload.
+
+    This is the residency the design wants: the encoded form is small (a few MB) and stays
+    put; the fields it stands for are large and are materialized transiently by
+    :func:`decode_groups`. Without it every decode ships the planes across again - 126 MB
+    for a 6-deep organs store - which is wasted on the interactive case the whole scheme
+    exists for, where a viewer re-extracts different groups from the same bytes.
+
+    The result is for :func:`decode_groups`. The numpy readers (:func:`margin`,
+    :func:`deficit`, :func:`probabilities`) want the host form and say so rather than
+    failing obscurely.
+    """
+    dev = torch.device(device)
+    mv = (lambda a: None if a is None else torch.from_numpy(np.ascontiguousarray(a)).to(dev))
+    return RankedCode(ranks=mv(code.ranks), support=mv(code.support), tail=mv(code.tail),
+                      meta=dict(code.meta))
+
+
+def _host(code: RankedCode, who: str) -> None:
+    if not isinstance(code.support, np.ndarray):
+        raise TypeError(
+            f"{who}() reads the host arrays, but this code is resident on "
+            f"{code.support.device}. Use decode_groups() for a device-resident code, or "
+            f"keep the original alongside it - to_device() does not consume it.")
 
 
 def decode_groups(code: RankedCode, groups, *, device=None,
@@ -378,13 +406,22 @@ def decode_groups(code: RankedCode, groups, *, device=None,
     clip = float(code.meta["clip"])
     K = int(code.meta["classes"])
     shape = tuple(int(v) for v in code.meta["shape"])
-    dev = torch.device(device) if device is not None else torch.device("cpu")
+    resident = isinstance(code.support, torch.Tensor)
+    if device is not None:
+        dev = torch.device(device)
+    else:                       # an already-resident code decodes where it lives
+        dev = code.support.device if resident else torch.device("cpu")
     groups = [[int(c) for c in g] for g in groups]
     G = len(groups)
 
+    def plane(a):               # upload only if it is not already here
+        if isinstance(a, torch.Tensor):
+            return a if a.device == dev else a.to(dev)
+        return torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+
     if code.meta.get("mode") == "regions":
         # independent Bernoullis: no competitor set, so a union is just max over members
-        sup = torch.from_numpy(code.support).to(dev)
+        sup = plane(code.support)
         out = torch.full((G,) + shape, -clip, dtype=torch.float32, device=dev)
         for g, members in enumerate(groups):
             for c in members:
@@ -394,8 +431,8 @@ def decode_groups(code: RankedCode, groups, *, device=None,
                 torch.maximum(out[g], m, out=out[g])
         return _quantize_margin(out, clip) if quantize else out
 
-    ranks = torch.from_numpy(code.ranks).to(dev)
-    sup = torch.from_numpy(code.support).to(dev)
+    ranks = plane(code.ranks)
+    sup = plane(code.support)
     memb = torch.zeros((G, K + 1), dtype=torch.bool, device=dev)   # indexed BY RANK VALUE
     for g, members in enumerate(groups):
         for c in members:
@@ -437,6 +474,7 @@ def probabilities(code: RankedCode) -> tuple[np.ndarray, np.ndarray]:
     so the probability is zeroed here rather than left as ``exp(-clip)/Z`` for a class that
     is not there. Mask on ``ids >= 0`` before using the ids as indices.
     """
+    _host(code, "probabilities")
     clip = float(code.meta["clip"])
     if code.meta.get("mode") == "regions":
         m = np.stack([margin(code, c) for c in range(code.meta["classes"])])

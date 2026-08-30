@@ -465,3 +465,36 @@ class TestDecodeGroups(unittest.TestCase):
         band = truth.abs() < 8.0 * 0.98
         self.assertLessEqual(float((deep - truth)[band].abs().max()),
                              float((shallow - truth)[band].abs().max()))
+
+    def test_a_resident_code_decodes_without_re_uploading(self):
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else None)
+        if dev is None:
+            self.skipTest("no accelerator")
+        code = ranked.encode(_logits(K=6), depth=5, clip=8.0)
+        res = ranked.to_device(code, dev)
+        self.assertEqual(res.support.device.type, dev)
+        self.assertIsInstance(code.support, np.ndarray)      # the original is not consumed
+        np.testing.assert_allclose(ranked.decode_groups(res, [[0, 1]]).cpu().numpy(),
+                                   ranked.decode_groups(code, [[0, 1]]).numpy(), atol=1e-4)
+
+    def test_a_resident_code_decodes_where_it_lives_by_default(self):
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else None)
+        if dev is None:
+            self.skipTest("no accelerator")
+        res = ranked.to_device(ranked.encode(_logits(K=5), depth=4), dev)
+        self.assertEqual(ranked.decode_groups(res, [[0]]).device.type, dev)
+
+    def test_the_numpy_readers_refuse_a_resident_code_clearly(self):
+        """Rather than indexing a tensor with numpy semantics and returning nonsense."""
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else None)
+        if dev is None:
+            self.skipTest("no accelerator")
+        res = ranked.to_device(ranked.encode(_logits(K=5), depth=4), dev)
+        for fn in (lambda: ranked.margin(res, 0), lambda: ranked.deficit(res, 0),
+                   lambda: ranked.probabilities(res)):
+            with self.assertRaises(TypeError) as cm:
+                fn()
+            self.assertIn("decode_groups", str(cm.exception))
