@@ -149,6 +149,38 @@ pushed to the deeper floor along with everyone else.
 wrong. `ranks[1]` looks free only because at that level the floor is still `−gap₁`, so placing
 the runner-up there is a no-op. Both are load-bearing; neither works alone.
 
+### Store deep, read shallow — the prefix IS the shallow store
+
+A reader stopping early does not get an approximation of a shallower encode; it gets that
+encode. `topk(6)` returns the same leading entries as `topk(3)`, and the gap, the sentinel and
+the quantization are all computed per plane, so the arrays are identical. Verified against
+native shallow encodes on 11.5 M voxels:
+
+| read | rank entries differing | of total | labels differing | nature |
+|---|---|---|---|---|
+| 2 planes deep | 4–79 | 0.00002–0.00034 % | **0** | 100 % exact ties |
+| 3 planes deep | 4–64 | 0.00001–0.00019 % | **0** | 100 % exact ties |
+| 4 planes deep | 0–37 | 0.00008 % | **0** | 100 % exact ties |
+
+The handful that differ are the depth-boundary ties of `_settle_ties` — `topk` choosing
+differently among equals at the cut — so either answer is correct and the label is untouched.
+
+**The adaptive floor comes free as well**: `support[d]` in a deeper store is the gap of rank
+`d+1`, which is exactly what a depth-`d` reader needs as its floor. Measured exact.
+
+⚠ **The `tail` is the one plane that does not truncate.** It stores the mass beyond the top N
+for the N it was written at, so a depth-6 store's tail is not a depth-3 store's. That costs
+nothing in practice: the tail exists for the probability reader (§4), and that reader takes the
+full depth anyway.
+
+So one store serves every consumer as a prefix, with no re-encoding:
+
+| reader | planes | gets |
+|---|---|---|
+| rendering | 1–6 | depth 3 + floor; pixel-identical to depth 6 (§5) |
+| restore / argmax | 1–6 | matches depth 6's decisions (§4) |
+| probabilities, statistics | all 12 + `tail`, floor plane ignored | full accuracy |
+
 ### Why two planes work at all
 
 At a two-class boundary, the runner-up's deficit **is** the margin. For a pair A|B with
