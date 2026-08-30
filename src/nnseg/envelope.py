@@ -25,22 +25,22 @@ AIR_HU = -500.0
 
 @dataclass(frozen=True)
 class Envelope:
-    """Half-open voxel bounds ``[lo, hi)`` on the grid the mask was computed on, (Z, Y, X)."""
+    """Half-open voxel range ``[start, stop)`` on the grid the mask was computed on, (Z, Y, X)."""
 
-    lo: tuple[int, int, int]
-    hi: tuple[int, int, int]
+    start: tuple[int, int, int]
+    stop: tuple[int, int, int]
     shape: tuple[int, int, int]
 
     @property
     def slices(self) -> tuple[slice, slice, slice]:
-        return tuple(slice(int(a), int(b)) for a, b in zip(self.lo, self.hi))
+        return tuple(slice(int(a), int(b)) for a, b in zip(self.start, self.stop))
 
     @property
     def fraction(self) -> float:
-        return float(np.prod(np.array(self.hi) - np.array(self.lo)) / np.prod(self.shape))
+        return float(np.prod(np.array(self.stop) - np.array(self.start)) / np.prod(self.shape))
 
     def is_whole(self) -> bool:
-        return all(a == 0 for a in self.lo) and tuple(self.hi) == tuple(self.shape)
+        return all(a == 0 for a in self.start) and tuple(self.stop) == tuple(self.shape)
 
 
 def body_mask(hu_zyx: np.ndarray, *, threshold: float = AIR_HU, largest_component: bool = True) -> np.ndarray:
@@ -74,9 +74,9 @@ def envelope_of(mask_zyx: np.ndarray, *, margin_voxels) -> Envelope:
         return Envelope((0, 0, 0), shape, shape)
     m = np.broadcast_to(np.asarray(margin_voxels, dtype=np.int64), (3,))
     idx = np.nonzero(mask_zyx)
-    lo = tuple(int(max(0, i.min() - mm)) for i, mm in zip(idx, m))
-    hi = tuple(int(min(n, i.max() + 1 + mm)) for i, n, mm in zip(idx, shape, m))
-    return Envelope(lo, hi, shape)
+    start = tuple(int(max(0, i.min() - mm)) for i, mm in zip(idx, m))
+    stop = tuple(int(min(n, i.max() + 1 + mm)) for i, n, mm in zip(idx, shape, m))
+    return Envelope(start, stop, shape)
 
 
 def worth_cropping(env: Envelope, *, min_saving: float = 0.05) -> Envelope:
@@ -122,14 +122,14 @@ def otsu_threshold(values: np.ndarray, *, bins: int = 256) -> float:
     v = v[np.isfinite(v)]
     if v.size == 0:
         return 0.0
-    lo, hi = float(v.min()), float(v.max())
-    if hi <= lo:
-        return lo
-    hist, edges = np.histogram(v, bins=bins, range=(lo, hi))
+    low, high = float(v.min()), float(v.max())
+    if high <= low:
+        return low
+    hist, edges = np.histogram(v, bins=bins, range=(low, high))
     p = hist.astype(np.float64)
     total = p.sum()
     if total == 0:
-        return lo
+        return low
     p /= total
     mids = 0.5 * (edges[:-1] + edges[1:])
     w0 = np.cumsum(p)                         # weight of the "below" class at each split

@@ -272,7 +272,7 @@ class TestEmit(unittest.TestCase):
         code = ranked.emit(
             spec, "organs", _logits(K=6),
             part="organs", task="ts:total", nnseg="0.2.0", engine="nnunetv2",
-            spacing_zyx=[1.5, 1.5, 1.5], envelope_lo=[0, 0, 0], model_grid=[4, 4, 4],
+            spacing_zyx=[1.5, 1.5, 1.5], envelope={"start": [0, 0, 0], "stop": [4, 4, 4]}, model_grid=[4, 4, 4],
             labels=[0, 1, 2, 3, 4, 5], convention="corner", reoriented_to_ras=True,
             input_orientation="RAS", frame={"source": None})
         self.assertEqual(got[0][0], "organs")

@@ -204,35 +204,35 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         """A voxel box on this model's grid: the body envelope (optional) intersected with a
         physical ROI (optional, from a coarse cascade stage). None means run the whole grid."""
         shape = tuple(int(s) for s in x.shape[1:])
-        lo = [0, 0, 0]
-        hi = list(shape)
+        start = [0, 0, 0]
+        stop = list(shape)
         if use_body and envelope_mm is not None:
             xnp = x[0].numpy()
             thr = body_threshold(xnp, normalization_schemes=model.normalization_schemes,
                                  intensity_properties=model.intensity_properties(0))
             e = envelope_of(body_mask(xnp, threshold=thr),
                             margin_voxels=margin_in_voxels(envelope_mm, model.spacing_zyx))
-            lo = [max(a, b) for a, b in zip(lo, e.lo)]
-            hi = [min(a, b) for a, b in zip(hi, e.hi)]
+            start = [max(a, b) for a, b in zip(start, e.start)]
+            stop = [min(a, b) for a, b in zip(stop, e.stop)]
         if roi_mm is not None:
-            (lo_mm, hi_mm), dil = roi_mm
+            (first_mm, last_mm), dil = roi_mm
             # mm -> index on the grid the resampler actually consumed (== source unless
             # crop-to-nonzero moved its origin), then that grid's index -> model coordinate
             rf = frame.resampled_from
             fr = frame.forward_rule
-            c0 = fr.apply(rf.mm_to_index(lo_mm))
-            c1 = fr.apply(rf.mm_to_index(hi_mm))
+            c0 = fr.apply(rf.mm_to_index(first_mm))
+            c1 = fr.apply(rf.mm_to_index(last_mm))
             dv = margin_in_voxels(dil, model.spacing_zyx)
             for ax in range(3):
                 a, b = sorted((c0[ax], c1[ax]))
-                lo[ax] = max(lo[ax], int(np.floor(a)) - dv[ax])
-                hi[ax] = min(hi[ax], int(np.ceil(b)) + 1 + dv[ax])
-        lo = [max(0, v) for v in lo]
-        hi = [min(n, v) for n, v in zip(shape, hi)]
-        if any(h <= l for l, h in zip(lo, hi)):               # empty -> fall back to whole grid
+                start[ax] = max(start[ax], int(np.floor(a)) - dv[ax])
+                stop[ax] = min(stop[ax], int(np.ceil(b)) + 1 + dv[ax])
+        start = [max(0, v) for v in start]
+        stop = [min(n, v) for n, v in zip(shape, stop)]
+        if any(b <= a for a, b in zip(start, stop)):          # empty -> fall back to whole grid
             return Envelope((0, 0, 0), shape, shape)
         # a box that barely crops only re-tiles the window (churn, ~no speedup): run whole instead
-        return worth_cropping(Envelope(tuple(lo), tuple(hi), shape))
+        return worth_cropping(Envelope(tuple(start), tuple(stop), shape))
 
     def emit_probabilities(model, logits, frame, env, *, lut, part):
         """Encode this part's output distribution while the logits are still here.
@@ -242,7 +242,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         grid, which is where the distribution lives - restoring it to the output grid first
         would inflate it and bake in one interpolation choice.
 
-        Which is exactly why ``frame`` and ``envelope_lo`` go with it: argmax after
+        Which is exactly why ``frame`` and ``envelope`` go with it: argmax after
         interpolation depends only on logit DIFFERENCES, and those are what is stored, so a
         reader holding the spatial extent can redo the restore onto any grid - different
         spacing, nearest instead of linear, a confidence gate - without the network. Without
@@ -254,7 +254,9 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             probabilities, part, logits,
             part=part, task=spec.name, nnseg=_version(), engine="nnunetv2",
             spacing_zyx=[float(v) for v in model.spacing_zyx],
-            envelope_lo=[int(v) for v in env.lo], model_grid=[int(v) for v in env.shape],
+            envelope={"start": [int(v) for v in env.start],          # a range, both ends
+                      "stop": [int(v) for v in env.stop]},
+            model_grid=[int(v) for v in env.shape],
             labels=[int(v) for v in np.asarray(lut).reshape(-1)],   # channel -> global label
             convention=convention, reoriented_to_ras=bool(reorient),
             input_orientation=orientation, frame=frame.to_meta())
@@ -276,7 +278,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             emit_probabilities(model, logits, frame, env, lut=lut, part=part)
         mapping = frame.mapping(ogrid)
         if not env.is_whole():
-            mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
+            mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.start))
         to_labels(logits, ogrid, mapping, interp=interp, outside="background", lut=lut, paint=paint,
                   out=out, backend="auto")
         if device == "cuda":
@@ -329,8 +331,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
                 sub_labels, sub_fr, sub_og = run_task_canonical(catalog.get(step.crop_from_task), f"{tag}:{step.crop_from_task}")
                 e = label_roi(sub_labels.cpu().numpy(), step.crop_to_classes,
                               margin_voxels=margin_in_voxels(step.dilation_mm, sub_og.spacing))
-                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in sub_og.index_to_mm(e.lo)),
-                                                     tuple(float(v) for v in sub_og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
+                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in sub_og.index_to_mm(e.start)),
+                                                     tuple(float(v) for v in sub_og.index_to_mm([h - 1 for h in e.stop]))), step.dilation_mm)
                 report.stage("cascade", f"ROI from {step.crop_from_task!r}: "
                              + ("whole volume" if roi_mm is None else f"{e.fraction * 100:.0f} % of the grid"))
                 continue
@@ -350,8 +352,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             if not last:
                 e = label_roi(out.cpu().numpy(), step.crop_to_classes,
                               margin_voxels=margin_in_voxels(step.dilation_mm, og.spacing))
-                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in og.index_to_mm(e.lo)),
-                                                     tuple(float(v) for v in og.index_to_mm([h - 1 for h in e.hi]))), step.dilation_mm)
+                roi_mm = None if e.is_whole() else ((tuple(float(v) for v in og.index_to_mm(e.start)),
+                                                     tuple(float(v) for v in og.index_to_mm([h - 1 for h in e.stop]))), step.dilation_mm)
                 report.stage("cascade", "ROI: " + ("absent -> whole volume next" if roi_mm is None
                              else f"{e.fraction * 100:.0f} % of the grid, +{step.dilation_mm} mm"))
             models.release(model)

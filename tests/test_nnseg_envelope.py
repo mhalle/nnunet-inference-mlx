@@ -28,7 +28,7 @@ def test_mask_without_component_filter_keeps_everything_above_air():
 
 def test_envelope_is_the_patient_box_plus_margin_clipped():
     env = envelope_of(body_mask(_ct()), margin_voxels=(2, 3, 100))
-    assert env.lo == (2, 5, 0) and env.hi == (18, 27, 40)
+    assert env.start == (2, 5, 0) and env.stop == (18, 27, 40)
     assert env.slices == (slice(2, 18), slice(5, 27), slice(0, 40))
     assert 0 < env.fraction < 1 and not env.is_whole()
 
@@ -44,7 +44,7 @@ def test_speck_does_not_shrink_the_fov():
     hu[4:16, 8:24, 10:32] = -1000.0          # no patient at all: only table + speck remain
     m = body_mask(hu)                        # largest component = the table line
     env = envelope_of(m, margin_voxels=0)
-    assert env.lo[0] == 17 and env.hi[0] == 18
+    assert env.start[0] == 17 and env.stop[0] == 18
 
 
 def test_margin_in_voxels_rounds_up():
@@ -59,9 +59,9 @@ def test_label_roi_boxes_the_requested_classes():
     lab[5:9, 10:14, 12:18] = 3          # class 3 here
     lab[15, 25, 35] = 7                 # class 7 elsewhere
     roi = label_roi(lab, [3], margin_voxels=(1, 1, 1))
-    assert roi.lo == (4, 9, 11) and roi.hi == (10, 15, 19)   # box of class 3 only, +1
+    assert roi.start == (4, 9, 11) and roi.stop == (10, 15, 19)   # box of class 3 only, +1
     both = label_roi(lab, [3, 7], margin_voxels=0)
-    assert both.lo == (5, 10, 12) and both.hi == (16, 26, 36)  # spans both
+    assert both.start == (5, 10, 12) and both.stop == (16, 26, 36)  # spans both
     absent = label_roi(lab, [99], margin_voxels=0)
     assert absent.is_whole()            # missing class -> whole grid, never empty
 
@@ -101,7 +101,7 @@ def test_body_threshold_mr_is_data_driven_and_crops_the_blob():
     assert -1.0 < t < 2.0
     env = envelope_of(body_mask(x, threshold=t), margin_voxels=(1, 1, 1))
     assert not env.is_whole() and env.fraction < 0.5
-    assert env.lo[0] <= 6 and env.hi[0] >= 18   # the blob is fully inside the box
+    assert env.start[0] <= 6 and env.stop[0] >= 18   # the blob is fully inside the box
 
 
 def test_body_threshold_mr_ignores_stray_ct_properties():
