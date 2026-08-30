@@ -344,6 +344,87 @@ def margin(code: RankedCode, channel: int) -> np.ndarray:
     return out
 
 
+def decode_groups(code: RankedCode, groups, *, device=None,
+                  quantize: bool = False) -> torch.Tensor:
+    """Encoded planes -> one signed margin field per GROUP, on ``device``, in one pass.
+
+    The inverse of :func:`encode`, and the operation a renderer or mesher actually wants.
+    Decode on the device the consumer runs on: the stored planes are a few MB, the K-channel
+    field they stand for is gigabytes, so expanding here and uploading would move the large
+    thing to avoid moving the small one.
+
+    ``groups`` is a sequence of sequences of channel indices; one structure is a group of
+    one. Grouping is a decode-time choice - the store keeps every class - so the same bytes
+    answer "118 classes" and "ten groups" with no re-encoding.
+
+    Why one pass suffices: a class at rank ``j`` sits at level ``-gap_j`` relative to the
+    winner (rank 0 is level 0 by construction), and gaps only grow with ``j``, so walking the
+    N rank planes while keeping ``max`` over members and ``max`` over non-members yields
+    ``m_S = d_S - d_notS`` exactly. That is the union's own margin, not ``max`` of the
+    members' margins - which gets the sign right but underestimates the magnitude, and would
+    put a surface at every internal boundary the group is supposed to dissolve.
+
+    Both running maxima start at ``-clip``, the absent floor. Rank 0 is never the sentinel,
+    so one of the two always reaches level 0 and the difference is never a spurious zero.
+
+    ``quantize`` returns uint8 with 128 on the boundary (the convention
+    :func:`encode_regions` stores), which is what a GPU texture wants - ten groups at 1 mm
+    is 1.5 GB as float32 against 386 MB as uint8.
+
+    Memory is two ``(G, Z, Y, X)`` fp32 accumulators; the second is consumed in place. The
+    docs sketch this as ``decode(groups, spacing)`` - resampling is deliberately not here,
+    since that belongs to the restore and would bake a grid into a decode.
+    """
+    clip = float(code.meta["clip"])
+    K = int(code.meta["classes"])
+    shape = tuple(int(v) for v in code.meta["shape"])
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    groups = [[int(c) for c in g] for g in groups]
+    G = len(groups)
+
+    if code.meta.get("mode") == "regions":
+        # independent Bernoullis: no competitor set, so a union is just max over members
+        sup = torch.from_numpy(code.support).to(dev)
+        out = torch.full((G,) + shape, -clip, dtype=torch.float32, device=dev)
+        for g, members in enumerate(groups):
+            for c in members:
+                q = sup[c].to(torch.float32)
+                m = (q - ZERO_LEVEL) / (SUPPORT_MAX - ZERO_LEVEL) * clip
+                m = torch.where(q == 0, torch.full_like(m, -clip), m)
+                torch.maximum(out[g], m, out=out[g])
+        return _quantize_margin(out, clip) if quantize else out
+
+    ranks = torch.from_numpy(code.ranks).to(dev)
+    sup = torch.from_numpy(code.support).to(dev)
+    memb = torch.zeros((G, K + 1), dtype=torch.bool, device=dev)   # indexed BY RANK VALUE
+    for g, members in enumerate(groups):
+        for c in members:
+            memb[g, c + 1] = True                                  # 0 stays False: absent
+
+    d_in = torch.full((G,) + shape, -clip, dtype=torch.float32, device=dev)
+    d_out = torch.full((G,) + shape, -clip, dtype=torch.float32, device=dev)
+    floor = torch.tensor(-clip, dtype=torch.float32, device=dev)
+    for j in range(ranks.shape[0]):
+        rj = ranks[j].long()
+        present = rj != 0
+        if j == 0:
+            level = torch.zeros(shape, dtype=torch.float32, device=dev)
+        else:
+            level = -(1.0 - sup[j - 1].to(torch.float32) / SUPPORT_MAX) * clip
+        mine = memb[:, rj]                                         # (G, Z, Y, X)
+        torch.maximum(d_in, torch.where(mine & present, level, floor), out=d_in)
+        torch.maximum(d_out, torch.where(~mine & present, level, floor), out=d_out)
+        del rj, present, level, mine
+    out = d_in.sub_(d_out)                                         # in place: reuse d_in
+    return _quantize_margin(out, clip) if quantize else out
+
+
+def _quantize_margin(m: torch.Tensor, clip: float) -> torch.Tensor:
+    """Signed margin -> uint8 with 128 exactly on the boundary, 0 reserved as absent."""
+    q = (m / clip).clamp(-1, 1) * (SUPPORT_MAX - ZERO_LEVEL) + ZERO_LEVEL
+    return q.round().clamp(1, SUPPORT_MAX).to(torch.uint8)
+
+
 def probabilities(code: RankedCode) -> tuple[np.ndarray, np.ndarray]:
     """``(class_ids, p)`` for the stored channels - the head-specific decode.
 

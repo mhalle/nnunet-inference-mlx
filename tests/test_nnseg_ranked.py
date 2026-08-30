@@ -343,3 +343,86 @@ class TestTieBreaking(unittest.TestCase):
         kept = int(code.ranks[1].ravel()[0]) - 1
         self.assertIn(kept, (2, 4))              # either is a correct answer to a tie
         self.assertEqual(int(code.ranks[0].ravel()[0]) - 1, 0)   # the winner is not in doubt
+
+
+class TestDecodeGroups(unittest.TestCase):
+    """The inverse of encode, on whatever device the consumer runs on."""
+
+    def test_a_group_of_one_reproduces_the_numpy_margin(self):
+        lg = _logits(K=8)
+        code = ranked.encode(lg, depth=6, clip=8.0)
+        got = ranked.decode_groups(code, [[c] for c in range(8)]).numpy()
+        for c in range(8):
+            np.testing.assert_allclose(got[c], ranked.margin(code, c), atol=1e-5,
+                                       err_msg=f"channel {c}")
+
+    def test_a_union_is_not_the_max_of_member_margins(self):
+        """The whole reason this exists: max() gets the sign right and underestimates the
+        magnitude, so it would put a surface at every internal boundary."""
+        lg = _logits(K=6)
+        code = ranked.encode(lg, depth=6, clip=8.0)
+        union = ranked.decode_groups(code, [[0, 1, 2]])[0].numpy()
+        naive = np.maximum.reduce([ranked.margin(code, c) for c in (0, 1, 2)])
+        np.testing.assert_array_equal(union > 0, naive > 0)          # same mask
+        self.assertGreater(float((union - naive).max()), 0.5)        # bigger magnitude
+        self.assertGreaterEqual(float((union - naive).min()), -1e-5)  # never smaller
+
+    def test_the_union_mask_equals_the_or_of_its_member_labels(self):
+        """Against the stored LABEL, not the sign of each member's margin. A lead smaller
+        than the support quantum (clip/255, so 0.031 logits at the default clip) decodes to
+        zero, so `margin(c) > 0` is not a reliable "c won" test near a boundary - and any
+        residual disagreement must sit exactly there. §8.4 measures the same effect from the
+        other side, at 99.9992 % rather than 100."""
+        lg = _logits(K=7)
+        code = ranked.encode(lg, depth=7, clip=8.0)     # the default the store ships with
+        members = [1, 3, 5]
+        union = ranked.decode_groups(code, [members])[0].numpy()
+        won = np.isin(code.ranks[0].astype(np.int32) - 1, members)
+        off = (union > 0) != won
+        self.assertTrue(bool((code.support[0][off] == ranked.SUPPORT_MAX).all()),
+                        "disagreement outside the dead zone of the support quantum")
+        self.assertLess(float(off.mean()), 0.01)
+
+    def test_internal_boundaries_vanish(self):
+        """Rendering members separately puts a surface between them; the union is one
+        manifold. Count zero crossings along an axis."""
+        lg = _logits(K=5)
+        code = ranked.encode(lg, depth=5, clip=40.0)
+        a, b = ranked.margin(code, 1), ranked.margin(code, 2)
+        union = ranked.decode_groups(code, [[1, 2]])[0].numpy()
+        internal = ((a > 0) & (np.roll(b, -1, axis=0) > 0))[:-1]
+        self.assertTrue(internal.any(), "test needs an internal boundary to be meaningful")
+        crossed = internal & ((union > 0) != (np.roll(union, -1, axis=0) > 0))[:-1]
+        self.assertEqual(int(crossed.sum()), 0)
+
+    def test_quantize_reserves_zero_and_round_trips_within_one_level(self):
+        """Sign agreement is NOT the contract - a margin below one level quantizes onto 128
+        either way. What is promised: 0 stays the absent sentinel, 128 is the boundary, and
+        the value survives to within a level."""
+        lg = _logits(K=5)
+        code = ranked.encode(lg, depth=5, clip=8.0)
+        f = ranked.decode_groups(code, [[0]])[0]
+        q = ranked.decode_groups(code, [[0]], quantize=True)[0]
+        self.assertEqual(q.dtype, torch.uint8)
+        self.assertGreaterEqual(int(q.min()), 1)
+        back = (q.float() - 128.0) / (255.0 - 128.0) * 8.0
+        self.assertLess(float((back - f.clamp(-8.0, 8.0)).abs().max()), 8.0 / 127.0)
+
+    def test_regions_union_is_max_over_members(self):
+        lg = _logits(K=4)
+        code = ranked.encode_regions(lg, clip=8.0, threshold=0.0)
+        got = ranked.decode_groups(code, [[0, 2]])[0].numpy()
+        want = np.maximum(ranked.margin(code, 0), ranked.margin(code, 2))
+        np.testing.assert_allclose(got, want, atol=1e-5)
+
+    def test_decodes_onto_a_device_when_one_is_available(self):
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else None)
+        if dev is None:
+            self.skipTest("no accelerator")
+        code = ranked.encode(_logits(K=6), depth=5, clip=8.0)
+        out = ranked.decode_groups(code, [[0, 1], [2]], device=dev)
+        self.assertEqual(out.device.type, dev)
+        np.testing.assert_allclose(out.cpu().numpy(),
+                                   ranked.decode_groups(code, [[0, 1], [2]]).numpy(),
+                                   atol=1e-4)
