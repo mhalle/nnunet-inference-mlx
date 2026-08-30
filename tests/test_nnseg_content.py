@@ -145,7 +145,7 @@ def test_the_format_is_read_from_the_content_not_the_name(tmp_path, ext):
     assert guess_name(anonymous).endswith(ext)
 
 
-def test_content_we_cannot_identify_is_refused_rather_than_mislabelled(tmp_path):
+def test_content_we_cannot_identify_is_refused_rather_than_mislabeled(tmp_path):
     from nnseg.content import guess_name
     p = tmp_path / "junk"
     p.write_bytes(b"not a medical image at all")

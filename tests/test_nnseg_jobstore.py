@@ -1,6 +1,6 @@
 """The job record store: the queue's bookkeeping, written down once.
 
-What is tested here is the behaviour the five hand-maintained indexes used to
+What is tested here is the behavior the five hand-maintained indexes used to
 provide - FIFO order, single-flight dedup, eviction - now that each is a query,
 plus the one thing they could never provide: surviving the process.
 """

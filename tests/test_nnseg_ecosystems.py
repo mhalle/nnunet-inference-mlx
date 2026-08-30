@@ -225,7 +225,7 @@ def test_engine_ecosystem_does_not_imply_image_baked_weights(tmp_path):
     # the base engine class must NOT decide materialization for its subclasses
     assert "materialized" not in vars(EngineEcosystem)
     assert "ensure" not in vars(EngineEcosystem)
-    # the image-baked flavour is what supplies the always-materialized behaviour
+    # the image-baked flavor is what supplies the always-materialized behavior
     assert vars(ImageBakedEcosystem)["materialized"] is not None
 
     class Catalog(EngineEcosystem):          # no TaskSpec, but installs per task

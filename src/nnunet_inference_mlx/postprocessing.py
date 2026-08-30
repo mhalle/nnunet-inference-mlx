@@ -43,7 +43,7 @@ def remove_small_components(
 ) -> np.ndarray:
     """Drop label-island components smaller than ``min_volume_mm3``.
 
-    Multi-label aware: two neighbouring voxels count as connected only if
+    Multi-label aware: two neighboring voxels count as connected only if
     they share the same nonzero label, so disconnected pieces of the same
     class are filtered independently. The original label IDs are
     preserved — only background (0) replaces removed components.

@@ -184,7 +184,7 @@ class TestGauge(unittest.TestCase):
 
     `deficit` is the logits shifted by a per-voxel constant shared by all channels, so it is
     restore-equivalent. `margin` adds the winner's lead to one channel only - fine at voxel
-    centers, wrong once a stencil mixes voxels with different winners. Nearest-neighbour
+    centers, wrong once a stencil mixes voxels with different winners. Nearest-neighbor
     restore cannot see the difference, which is exactly how it stays hidden.
     """
 

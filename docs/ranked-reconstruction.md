@@ -66,7 +66,7 @@ runner-up at both and truly wins the midpoint. `deficit` reproduces that. `margi
 class 10 half its lead as a bonus (+1.929), and it takes the midpoint. Class 0, having never
 won anywhere, collects nothing.
 
-**Nearest-neighbour restore cannot see this difference at all**, because it never mixes
+**Nearest-neighbor restore cannot see this difference at all**, because it never mixes
 voxels — which is precisely how such a bug survives.
 
 ---
@@ -161,7 +161,7 @@ If *q* is runner-up at A and *p* at B, then `m_A = gap(q at A)` and `m_B = gap(p
 two conditions are **the same inequality**. Exact, with no third-class information.
 
 The premise holds where it matters: **near a boundary (margin < 2) the runner-up is one of the
-six neighbours' winners 85.5 % of the time**, falling to 2.7 % over the whole volume — in the
+six neighbors' winners 85.5 % of the time**, falling to 2.7 % over the whole volume — in the
 interior the runner-up is arbitrary, but there the winner leads by 8 logits and nothing can
 flip. The label plane names the competitor; the margin gives its distance.
 
@@ -362,7 +362,7 @@ organs abut. **Mesh quality is a tail property, so mesh from full depth.**
 
 Sample `margin` trilinearly at ray positions: a signed field whose zero crossing is the
 surface, with a gradient for shading. Everything in §6 applies — margin for surfaces, ramp in
-**millimetres** (`m / |grad m|`) not logits, never interpolate a stored plane.
+**millimeters** (`m / |grad m|`) not logits, never interpolate a stored plane.
 
 Space skipping needs a **conservative** proxy: one that never reports empty where something
 is. The reduction matters, and the intuitive choice is wrong.

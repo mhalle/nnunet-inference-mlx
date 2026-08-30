@@ -226,7 +226,7 @@ def deficit(code: RankedCode, channel: int) -> np.ndarray:
     survives an argmax at voxel centers but not after interpolation, where each corner of the
     stencil has a different winner. Measured on a real K=118 case, restoring through ``margin``
     agrees with the logits on 99.43 % of sub-voxel samples and only 84 % of near-tie samples;
-    through ``deficit``, 99.98 % and 99.4 %. Nearest-neighbour restore hides the difference
+    through ``deficit``, 99.98 % and 99.4 %. Nearest-neighbor restore hides the difference
     entirely, because it never mixes voxels.
     """
     clip = float(code.meta["clip"])

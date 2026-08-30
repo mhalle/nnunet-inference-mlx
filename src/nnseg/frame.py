@@ -118,7 +118,7 @@ class Frame:
     def output_geometry(self, grid: Grid):
         """SimpleITK geometry for labels on ``grid``, in the canonical frame.
 
-        The grid's origin is an offset in the source's local (Z, Y, X) millimetre frame;
+        The grid's origin is an offset in the source's local (Z, Y, X) millimeter frame;
         world position is the canonical origin plus that offset rotated by the direction
         cosines, so an oblique acquisition keeps its orientation.
         """

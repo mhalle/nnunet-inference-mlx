@@ -126,7 +126,7 @@ class TestPredictionAndToLabels:
 
     def test_to_model_frame_resamples_in_float_not_int(self):
         # Decision (Phase 3b): the toolkit resamples in float32 — matching
-        # nnU-Net v2 — NOT the old predict_with_resampling behaviour of
+        # nnU-Net v2 — NOT the old predict_with_resampling behavior of
         # resampling a raw int16 image and rounding interpolated values.
         # On real int16 CT that rounding flipped ~0.03% of boundary voxels at
         # argmax. Guard: resampling an integer-valued volume to a non-aligned
@@ -143,7 +143,7 @@ class TestPredictionAndToLabels:
         assert frac.max() > 1e-3, "model-frame values are integer-rounded; resample is not float"
 
     def test_restore_identity_default(self):
-        # No override → input grid (unchanged behaviour).
+        # No override → input grid (unchanged behavior).
         m = build_model(_make_model_data())
         vol = _volume((24, 24, 24))
         mv, plan = to_model_frame(vol, m.model_data)

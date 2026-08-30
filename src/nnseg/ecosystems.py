@@ -711,7 +711,7 @@ class MonaiEcosystem(EngineEcosystem):
             return {"mode": "unknown", "owner": "bundle", "note": f"not determined ({e})"}
         if invert is None:
             # nothing inverts, so the prediction stays on the model's grid and
-            # nnseg's own nearest-neighbour resample is what the caller gets
+            # nnseg's own nearest-neighbor resample is what the caller gets
             return {"mode": "label-nearest", "owner": "nnseg",
                     "note": "the bundle does not invert its spacing transform; "
                             "nnseg resamples the labelmap to the input grid"}

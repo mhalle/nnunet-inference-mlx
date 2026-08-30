@@ -1,6 +1,6 @@
 """Restrict inference to the body: the largest single speedup available for CT.
 
-On a chest CT the labelled anatomy occupies about a third of the volume; the rest is air and
+On a chest CT the labeled anatomy occupies about a third of the volume; the rest is air and
 table, and nnU-Net's sliding window tiles all of it. A body envelope - the bounding box of the
 patient with a margin - cuts the 1.5 mm patch count from 175 to 42-63 per model on the chest
 measured in docs/backend-decision.md.

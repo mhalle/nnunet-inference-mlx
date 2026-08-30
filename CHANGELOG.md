@@ -119,7 +119,7 @@
   handful of boundary voxels (~4e-5) flip on FMA-contraction rounding,
   negligible next to MLX↔PyTorch divergence. (Supersedes the earlier ~28%
   flattened-`mx.take` gather, an interim win on the now-fallback slab path.)
-- **Fast nearest-neighbour inverse resample (path A), opt-in.** `restore` /
+- **Fast nearest-neighbor inverse resample (path A), opt-in.** `restore` /
   `LoadedModel.segment` / `segment` gain `interpolation`/`output_interpolation`
   (`"linear"` default = logit interpolation, higher fidelity, like nnU-Net;
   `"nearest"` = argmax-at-model-spacing then NN-resample the label map, like TS).
@@ -251,7 +251,7 @@ knobs (mutually exclusive; default = the input grid):
 - `--at-model-spacing` — the model's native training grid (no upsample back).
 
 The labels are rendered **from the logits** at the requested grid (then argmax/
-paint), not nearest-neighbour-resampled from a finished label map — higher
+paint), not nearest-neighbor-resampled from a finished label map — higher
 quality. The output header (spacing/shape/origin/direction) is recomputed over
 the same physical extent, so it still overlays the input; `scaling=1` is a true
 identity. Single-model tasks only for now (cascade/union raise). Downsampling
@@ -789,7 +789,7 @@ Verbose / progress flags don't bust the cache; `step_size`, `use_mirroring`, `ba
 The MOOSE-style cascade pattern (low-res body detector → high-res organ model) and the generalization of TS's FOV-limited inference, as a first-class primitive. Each stage runs `predict_with_resampling`; between stages, the prior stage's output bbox optionally crops the next stage's input.
 
 - **`Bbox`** — frozen dataclass for `(Z, Y, X)` voxel-coordinate boxes. `shape_zyx` / `slices` / `clamped()` / `dilated()` / `compose()` / `Bbox.full()`.
-- **`compute_fg_bbox(labels, *, classes=None, dilation_mm=0, spacing_zyx=None)`** — find FG bbox of a label volume, optionally restricted to specific classes and dilated by a physical margin. Returns `None` when no FG is found, signalling "skip cropping" to workflow callers.
+- **`compute_fg_bbox(labels, *, classes=None, dilation_mm=0, spacing_zyx=None)`** — find FG bbox of a label volume, optionally restricted to specific classes and dilated by a physical margin. Returns `None` when no FG is found, signaling "skip cropping" to workflow callers.
 - **`crop_image(sitk_image, bbox)`** — extract a sub-volume preserving world-coordinate geometry (origin shifts to track the crop).
 - **`paste_segmentation(small_seg, full_shape_zyx, bbox, *, fill=0)`** — paste a cropped-space label volume back into a full-shape canvas.
 - **`Stage`** — `engine + crop_to_classes + dilation_mm + interpolation + peak_working_memory_mb + remove_small_components_mm3`. Default dilation is 10 mm.
@@ -964,7 +964,7 @@ Two small additive changes that close the last gaps for a third-party port (nota
 
 ### Changed — internal cleanup
 
-- **`predict_sliding_window_streaming` dropped** in favour of the simpler `predict_sliding_window` kernel. The streaming variant's rolling-Z accumulator was optimizing peak memory that isn't where TS's pressure actually sits (the 5-models-in-one-process Metal cache, addressed separately by `engine.close()`). `SlidingWindowEngine.predict` now calls the non-streaming kernel; ~231 lines removed from `inference.py`. Test suite runs ~15% faster on the same volumes. No public-API impact — the variant was never exported.
+- **`predict_sliding_window_streaming` dropped** in favor of the simpler `predict_sliding_window` kernel. The streaming variant's rolling-Z accumulator was optimizing peak memory that isn't where TS's pressure actually sits (the 5-models-in-one-process Metal cache, addressed separately by `engine.close()`). `SlidingWindowEngine.predict` now calls the non-streaming kernel; ~231 lines removed from `inference.py`. Test suite runs ~15% faster on the same volumes. No public-API impact — the variant was never exported.
 
 ## [0.5.0] - 2026-05-22
 

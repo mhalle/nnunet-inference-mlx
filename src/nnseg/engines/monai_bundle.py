@@ -22,7 +22,7 @@ swin_unetr_btcv and wholeBrainSeg run ``Invertd(nearest_interp=False)`` BEFORE
 ``AsDiscreted(argmax=True)`` - resampling probabilities and arguing after, which is
 the graded restore this project implements everywhere else. But
 ``wholeBody_ct_segmentation`` argmaxes FIRST and inverts the labelmap with
-``nearest_interp=True``, so its output is a nearest-neighbour label resample, with
+``nearest_interp=True``, so its output is a nearest-neighbor label resample, with
 the blocky boundaries that implies on small structures. We do not override it: the
 whole point of running the bundle's own config is that its authors test that chain,
 and rewriting the postprocessing per bundle is the fragility this engine exists to

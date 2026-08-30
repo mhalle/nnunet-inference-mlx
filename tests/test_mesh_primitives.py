@@ -60,7 +60,7 @@ def _single_quad_mesh(
         normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (4, 1))
     stencils = None
     if with_stencils:
-        # 4 points, each connected to its two cyclic neighbours.
+        # 4 points, each connected to its two cyclic neighbors.
         offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
         connectivity = np.array([1, 3, 0, 2, 1, 3, 0, 2], dtype=np.int32)
         stencils = (offsets, connectivity)

@@ -51,7 +51,7 @@ def test_restore_logits_places_boundary_at_physical_location():
     idx = fs.restore_logits(logit, source, target)
     # find the crossover column per row: first x where idx==1
     mid = idx[idx.shape[0]//2, idx.shape[1]//2, :]
-    cross = np.argmax(mid == 1)                      # first index labelled 1
+    cross = np.argmax(mid == 1)                      # first index labeled 1
     cross_phys = cross * sp_f
     assert abs(cross_phys - xc_phys) <= sp_f + 1e-6, (cross_phys, xc_phys)
 

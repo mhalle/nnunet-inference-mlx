@@ -139,7 +139,7 @@ for i, part in enumerate(spec.union):
 ```
 
 Caveat: each sub-task's mesh has "artifact" background surfaces where
-voxels outside its own classes are labelled 0 (background). E.g. the
+voxels outside its own classes are labeled 0 (background). E.g. the
 organs sub-task draws "rib-shaped background holes" because it doesn't
 know about ribs. The fix (deferred) would composite all 5 logit
 volumes into one 117-channel volume before extraction.

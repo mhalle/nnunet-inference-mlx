@@ -208,7 +208,7 @@ which is channel-dependent. At a voxel center the winner still wins, so an argma
 margins looks correct; once a trilinear stencil mixes voxels with *different* winners, it is
 not. Measured on a real K=118 case, restoring through `margin` agrees with the logits on
 99.43 % of sub-voxel samples and only **84 %** of near-tie samples, against 99.98 % / 99.4 %
-through `deficit`. Nearest-neighbour restore cannot see the difference at all, because it
+through `deficit`. Nearest-neighbor restore cannot see the difference at all, because it
 never mixes voxels — which is precisely how such a bug survives.
 
 `nnseg.ranked.probabilities(code)` is the head-specific decode: `p_j = exp(-g_j) / Z` with
@@ -426,7 +426,7 @@ Two reads, and the choice follows from what you are producing, not from taste:
   renderer or mesher never learns which head produced a file.
 
 Substituting one for the other is silent: they agree at voxel centers and diverge only under
-interpolation, and nearest-neighbour restore never notices at all.
+interpolation, and nearest-neighbor restore never notices at all.
 
 Two consumers already want the surface field:
 

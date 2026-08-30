@@ -8,7 +8,7 @@ and stock nnU-Net does not contain those classes, so a bare install cannot load 
 But those trainers differ from the base only in *training* - loss, augmentation, schedule,
 epoch count. The inference network architecture comes from ``plans.json`` via the base
 ``build_network_architecture``, so for inference a trivial subclass of ``nnUNetTrainer`` is
-behaviourally identical. This writes such a shim for any unresolved trainer name into a cache
+behaviorally identical. This writes such a shim for any unresolved trainer name into a cache
 directory and points ``nnUNet_extTrainer`` at it - generic, so it needs no per-model manifest
 and keeps working as TS adds trainers.
 """

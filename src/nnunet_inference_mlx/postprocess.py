@@ -133,7 +133,7 @@ def restore(
     to the output grid (scheme-aware, argmax/paint fused into the slab loop),
     then reorients back — higher fidelity than resampling a finished label map,
     matching vanilla nnU-Net. ``interpolation="nearest"`` (path A) is the fast
-    TS-style alternative: argmax at the model spacing, then nearest-neighbour
+    TS-style alternative: argmax at the model spacing, then nearest-neighbor
     resample the *integer label map* — single-channel, ~no 117-channel gather, so
     much faster on large grids, at the cost of stair-stepped boundaries.
 
