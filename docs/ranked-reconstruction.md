@@ -206,9 +206,47 @@ Rendered pixels settle it (vertebrae and organs, whole-part and single-structure
 depth 3 is **pixel-identical to depth 6**, and only depth 2 differs at all (16–23/255 on
 31–176 pixels). See §5.
 
-**Recommendation: store N ranks and N supports.** Six planes then serve the strictest consumer
-where eleven are needed today — ~80 MB resident against 138 MB, ~0.28 s to decode against
-0.50 s — which is what makes "read every plane provided" (§5) cheap enough to ask for.
+### ⚠ The floor is decision-only. It makes PROBABILITIES worse.
+
+Measured against the true softmax, max per-class probability error:
+
+| configuration | planes | max \|dp\| | mean \|dp\| |
+|---|---|---|---|
+| depth 3, clip floor | 5 | 0.1460 | 0.000632 |
+| depth 3 + floor | 6 | **0.4394** | 0.000642 |
+| depth 6, clip floor | 11 | **0.0088** | 0.000631 |
+| depth 6 + floor | 12 | 0.0688 | 0.000632 |
+
+The floor gives *every* unnamed class the level of the **best** unnamed one. Only one class is
+actually there; the other K−d sit lower, so their total mass is over-estimated by roughly that
+factor. At a floor of −3 logits, 22 unnamed classes contribute `22·e⁻³ ≈ 1.1` against the
+winner's `1.0`; under the clip floor they contribute `22·e⁻⁸ ≈ 0.007`. Exactly the
+approximation that helps a decision — pull the runner-ups up to something plausible — wrecks a
+normalizer.
+
+**The format already carries the right device for that consumer: the `tail` plane**, which
+stores the mass beyond the top N and is what :func:`probabilities` renormalizes with
+(`max_tail` 0.1619 at depth 3, 0.0150 at depth 6). Floor and tail are different mechanisms for
+different readers; using the floor where the tail belongs is a category error.
+
+Note `mean |dp|` is identical to six figures across every configuration. This lives entirely
+in the tail, so any averaged check would report all of them as equivalent.
+
+### Recommendation, per consumer
+
+**Store N ranks and N supports** — but the floor is not universally an improvement, and the
+depth is not one number:
+
+| consumer | wants | why |
+|---|---|---|
+| rendering | depth 3, floor irrelevant | pixel-identical to depth 6 (§5) |
+| restore / argmax | depth 3 **+ floor** | matches depth 6's decisions, six planes against eleven |
+| probabilities, statistics | depth 6, **no floor**, use the tail | depth 3 is 17× worse; the floor adds 8× on top |
+
+Six planes serve the first two — ~80 MB resident against 138 MB, ~0.28 s to decode against
+0.50 s — which is what makes "read every plane provided" (§5) cheap enough to ask for. A
+statistics reader is the one that genuinely wants the deep store, and should ignore the floor
+plane when it renormalizes.
 
 ---
 
