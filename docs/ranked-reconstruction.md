@@ -218,6 +218,12 @@ Three requirements, each learned the hard way:
 
 - **Decision-based, not value-based.** Measure whether the argmax changes, not whether values
   do. `max_tail` is a proxy and a poor one.
+
+  ⚠ That is the criterion for a **labelmap** consumer, and it converges early for everyone
+  else. §8.4 measures identical group masks at depth 3 and depth 6 while the liver's p95
+  margin error moves 0.0149 → 0.2969 — so this loop would stop at 3 and hand a renderer a
+  field 20× worse in the quantity it samples. A consumer that reads the field rather than the
+  decision needs the value-based test rejected just above. Same loop, different stop.
 - **Sample near boundaries.** Uniform sampling saturates at 99.9 % and stops discriminating;
   every distinction in this document is visible only in the near-tie column.
 - **Terminate on pairs**, per §3.
@@ -770,10 +776,14 @@ rather than names, so a part legitimately called `composite` collides with nothi
   `ranked.to_device` for residency.
 - ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
   128-is-the-boundary convention `encode_regions` stores.
-- **Depth is two defaults, not one.** §8.4 measures depth 3 and depth 6 giving *identical*
-  group masks on real data while the liver's p95 margin error goes 0.0149 → 0.2969. A
-  labelmap consumer can take the shallow store; a consumer sampling the field for an opacity
-  ramp cannot. The single `DEFAULT_DEPTH` does not express that.
+- **The residual loop needs a second criterion.** §5 stops when the interpolated argmax stops
+  changing, and is emphatic that the test be decision-based rather than value-based. That is
+  right for a labelmap and blind to what a renderer needs: §8.4 measures depth 3 and depth 6
+  giving **identical** group masks on real data while the liver's p95 margin error goes
+  0.0149 → 0.2969. So a decision-converged store can be 20× worse in the very field a
+  renderer samples for its opacity ramp, and the loop cannot tell. Dynamic depth is still the
+  answer — but the loop has to know which error it is minimizing, and for the field consumer
+  that is the value-based test §5 rejects for the other one.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
