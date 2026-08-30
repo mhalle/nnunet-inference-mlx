@@ -300,8 +300,39 @@ def _fs_version() -> str:
         return "unknown"
 
 
+def emit_probabilities(spec, logits, source_ref, target_ref, class_labels) -> None:
+    """Hand FastSurfer's pre-argmax logit field to a ranked sink.
+
+    FastSurfer holds a 79-class softmax on its conformed 1 mm grid, which is structurally an
+    nnU-Net part with a different K - so the encoder applies unchanged and this only has to
+    supply the geometry a reader needs to redo the restore. Without both grids the arrays
+    are a picture of the conformed grid and nothing else.
+
+    ``logits`` arrives from ``_capture_logits`` two ways: a torch tensor ``(K, Z, Y, X)`` on
+    the device when the GPU restore is in play, ``(Z, Y, X, K)`` numpy otherwise. The encoder
+    wants the former, and promotes to fp32 per slab itself - so do not cast the whole field
+    here, which would materialize a second copy of the largest array in the run.
+    """
+    import torch
+
+    from .. import __version__, ranked
+    from .geometry import grid_record
+
+    lg = logits if isinstance(logits, torch.Tensor) else torch.from_numpy(
+        np.ascontiguousarray(np.moveaxis(np.asarray(logits), 3, 0)))
+    ranked.emit(
+        spec, "brain", lg,
+        part="brain", engine="fastsurfer", nnseg=__version__,
+        labels=[int(v) for v in np.asarray(class_labels).reshape(-1)],
+        labels_note="channel -> aparc+aseg id; segment() additionally applies "
+                    "split_cortex_labels, which is spatial and not expressible as a LUT",
+        source_grid=grid_record(source_ref),     # the conformed grid the logits live on
+        target_grid=grid_record(target_ref))     # the input grid they restore onto
+
+
 def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8,
-            logit_grade: bool = True, self_check: bool = True, restore: str = "auto"):
+            logit_grade: bool = True, self_check: bool = True, restore: str = "auto",
+            probabilities=None):
     """Segment a T1 with FastSurfer and return an :class:`nnseg.result.Segmentation`
     on the input's grid.
 
@@ -316,6 +347,13 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
     nearest-neighbor resample of FastSurfer's own labelmap. ``self_check``
     verifies (loudly) that argmax at the conformed grid reproduces FastSurfer's
     own labels before trusting the restore.
+
+    ``probabilities`` is a :class:`~nnseg.ranked.RankedSpec`: when given, the captured
+    79-class field is encoded and handed to its sink before the restore consumes it -
+    the same hook the nnU-Net path uses, so the stored form is identical in kind. It runs
+    *after* ``self_check``, so a distribution is never stored that we have just failed to
+    reproduce FastSurfer's own labels from. Off by default; the field is otherwise
+    discarded after the restore.
 
     ``restore`` selects the logit-restore backend: ``"gpu"`` (batched
     ``grid_sample``, fast, needs the whole field on the device), ``"cpu"``
@@ -361,6 +399,13 @@ def segment(t1_input, *, out_dir=None, device: str = "cuda", batch_size: int = 8
         if agree < 0.999:
             raise RuntimeError(f"FastSurfer logit self-check failed: {agree:.4%} "
                                "of conformed voxels match FastSurfer's own labels")
+
+    if probabilities is not None:
+        # After the self-check on purpose: never store a distribution we have just been
+        # unable to reproduce FastSurfer's own labels from.
+        _t = time.perf_counter()
+        emit_probabilities(probabilities, logits, conf_orig, t1_img, class_labels)
+        timings["probabilities"] = time.perf_counter() - _t
 
     def _extent(im):
         import numpy as _np

@@ -166,3 +166,56 @@ def test_sitk_nibabel_sitk_roundtrip_is_geometry_exact():
     assert np.allclose(back.GetOrigin(), im.GetOrigin(), atol=1e-6)
     assert np.allclose(back.GetDirection(), im.GetDirection(), atol=1e-9)
     assert np.array_equal(sitk.GetArrayFromImage(back), arr)
+
+
+def test_emit_probabilities_hands_over_the_field_with_both_grids():
+    """The engine hook: FastSurfer's 79-class field goes through the same encoder as
+    nnU-Net's, carrying enough geometry to redo the restore later."""
+    from nnseg import ranked
+
+    torch = pytest.importorskip("torch")
+    K, Z, Y, X = 6, 4, 5, 6
+    lg = torch.randn(K, Z, Y, X)
+    conf = sitk.GetImageFromArray(np.zeros((Z, Y, X), np.float32))
+    conf.SetSpacing((1.0, 1.0, 1.0)); conf.SetOrigin((-1.5, 2.0, 0.25))
+    tgt = sitk.GetImageFromArray(np.zeros((Z + 1, Y, X), np.float32))
+    tgt.SetSpacing((0.8, 0.9, 1.1)); tgt.SetOrigin((3.0, -4.0, 5.0))
+
+    got = []
+    spec = ranked.RankedSpec(sink=lambda part, code: got.append((part, code)), depth=3)
+    fs.emit_probabilities(spec, lg, conf, tgt, list(range(K)))
+
+    assert len(got) == 1
+    part, code = got[0]
+    assert part == "brain"
+    assert code.meta["engine"] == "fastsurfer"          # a reader must know what made it
+    assert code.meta["labels"] == list(range(K))
+    assert code.meta["source_grid"]["origin_xyz"] == [-1.5, 2.0, 0.25]
+    assert code.meta["target_grid"]["spacing_xyz"] == [0.8, 0.9, 1.1]
+    assert code.meta["source_grid"]["size_xyz"] != code.meta["target_grid"]["size_xyz"]
+
+
+def test_emit_probabilities_accepts_the_cpu_paths_axis_order():
+    """_capture_logits returns (K,Z,Y,X) torch on the GPU path but (Z,Y,X,K) numpy on the
+    CPU one; the encoder only takes the former, so the hook must transpose."""
+    from nnseg import ranked
+
+    pytest.importorskip("torch")
+    K, Z, Y, X = 5, 3, 4, 5
+    rng = np.random.default_rng(0)
+    lg = rng.standard_normal((Z, Y, X, K)).astype(np.float32)
+    ref = sitk.GetImageFromArray(np.zeros((Z, Y, X), np.float32))
+
+    got = []
+    spec = ranked.RankedSpec(sink=lambda part, code: got.append(code), depth=3)
+    fs.emit_probabilities(spec, lg, ref, ref, list(range(K)))
+
+    assert got[0].meta["shape"] == [Z, Y, X]            # not the (Z,Y,X,K) misread
+    assert got[0].meta["classes"] == K
+    # and the winner survives the transpose
+    np.testing.assert_array_equal(got[0].ranks[0] - 1, lg.argmax(axis=3).astype(np.uint8))
+
+
+def test_emit_probabilities_is_a_noop_without_a_spec():
+    ref = sitk.GetImageFromArray(np.zeros((2, 2, 2), np.float32))
+    fs.emit_probabilities(None, np.zeros((2, 2, 2, 3), np.float32), ref, ref, [0, 1, 2])

@@ -226,3 +226,63 @@ class TestGauge(unittest.TestCase):
         self.assertAlmostEqual(float(ranked.margin(code, 0).ravel()[0]), 5.0, places=1)
         self.assertEqual(float(ranked.deficit(code, 0).ravel()[0]), 0.0)
         self.assertAlmostEqual(float(ranked.deficit(code, 1).ravel()[0]), -5.0, places=1)
+
+
+class TestEmit(unittest.TestCase):
+    """The shared hook every engine hands its distribution through."""
+
+    def test_emit_encodes_stamps_and_sinks(self):
+        got = []
+        spec = ranked.RankedSpec(sink=lambda part, code: got.append((part, code)),
+                                 depth=4, clip=6.0)
+        code = ranked.emit(spec, "organs", _logits(K=8), engine="nnunetv2", task="ts:total")
+        self.assertEqual(len(got), 1)
+        part, sunk = got[0]
+        self.assertEqual(part, "organs")
+        self.assertIs(sunk, code)
+        self.assertEqual(code.meta["engine"], "nnunetv2")
+        self.assertEqual(code.meta["task"], "ts:total")
+        self.assertEqual(code.meta["depth"], 4)          # the spec's, not the default
+        self.assertEqual(code.meta["clip"], 6.0)
+
+    def test_emit_is_a_noop_without_a_spec(self):
+        """So a call site can be unconditional rather than guarded - the reason this
+        returns None instead of raising."""
+        self.assertIsNone(ranked.emit(None, "organs", _logits(K=4)))
+
+    def test_emit_does_not_lose_the_encoders_own_meta(self):
+        spec = ranked.RankedSpec(sink=lambda part, code: None, depth=3)
+        code = ranked.emit(spec, "p", _logits(K=5), part="p")
+        for key in ("mode", "classes", "shape", "support_max"):
+            self.assertIn(key, code.meta, f"caller meta must not displace {key}")
+
+    def test_sink_key_is_a_string_even_when_the_caller_passes_an_index(self):
+        got = []
+        spec = ranked.RankedSpec(sink=lambda part, code: got.append(part))
+        ranked.emit(spec, 3, _logits(K=4))
+        self.assertEqual(got, ["3"])
+
+    def test_emit_accepts_the_nnunet_call_sites_full_keyword_set(self):
+        """Mirrors pipeline.emit_probabilities' call. That path needs weights so it is not
+        in the fast suite, and it is the one that stamps `part` INTO meta - which collided
+        with the sink key until the first three params were made positional-only. Without
+        this the collision only shows up on a GPU run."""
+        got = []
+        spec = ranked.RankedSpec(sink=lambda p, c: got.append((p, c)), depth=3)
+        code = ranked.emit(
+            spec, "organs", _logits(K=6),
+            part="organs", task="ts:total", nnseg="0.2.0", engine="nnunetv2",
+            spacing_zyx=[1.5, 1.5, 1.5], envelope_lo=[0, 0, 0], model_grid=[4, 4, 4],
+            labels=[0, 1, 2, 3, 4, 5], convention="corner", reoriented_to_ras=True,
+            input_orientation="RAS", frame={"source": None})
+        self.assertEqual(got[0][0], "organs")
+        self.assertEqual(code.meta["part"], "organs")
+        self.assertEqual(code.meta["engine"], "nnunetv2")
+
+    def test_the_first_three_parameters_stay_positional_only(self):
+        """Pinned structurally, not just by the call above: dropping the `/` would let a
+        caller's `part=` or `logits=` in meta silently become the parameter."""
+        import inspect
+        kinds = [p.kind for p in inspect.signature(ranked.emit).parameters.values()]
+        self.assertEqual(kinds[:3], [inspect.Parameter.POSITIONAL_ONLY] * 3)
+        self.assertEqual(kinds[3], inspect.Parameter.VAR_KEYWORD)

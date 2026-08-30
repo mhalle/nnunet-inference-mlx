@@ -13,6 +13,22 @@ from __future__ import annotations
 import numpy as np
 
 
+def grid_record(ref) -> dict:
+    """Plain JSON for one grid: what a reader needs to redo a restore without the image.
+
+    The counterpart to :func:`resample_affine` - that function consumes two live refs, this
+    one writes either of them down. An engine emitting a stored field has to carry both its
+    own grid and the target's, or the arrays are only a picture of the grid they happened to
+    be computed on and the restore can never be re-decided.
+
+    Duck-typed on the SimpleITK image interface, like the rest of this module.
+    """
+    return {"size_xyz": [int(v) for v in ref.GetSize()],
+            "spacing_xyz": [float(v) for v in ref.GetSpacing()],
+            "origin_xyz": [float(v) for v in ref.GetOrigin()],
+            "direction_xyz": [float(v) for v in ref.GetDirection()]}
+
+
 def resample_affine(source_ref, target_ref):
     """``(A, t)`` mapping a TARGET voxel index ``(x, y, z)`` to the continuous
     SOURCE voxel index ``(x, y, z)``, composing both grids' physical transforms.

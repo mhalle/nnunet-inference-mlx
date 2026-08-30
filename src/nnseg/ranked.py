@@ -213,6 +213,34 @@ def encode_regions(logits: torch.Tensor, *, clip: float = CLIP, threshold: float
     })
 
 
+def emit(spec, part, logits, /, **meta) -> "RankedCode | None":
+    """Encode ``logits`` into ``spec``'s sink, stamping ``meta`` onto the code.
+
+    The one seam every engine hands its output distribution through. It exists because the
+    logits are alive only between the network and the restore, so each engine must do this
+    for itself at its own call site - and four copies would drift, in the depth and clip the
+    spec asked for and in what lands in ``meta``.
+
+    ``spec`` may be ``None``, so a call site can be unconditional rather than guarded.
+
+    The first three are positional-only on purpose: ``meta`` is open-ended and engine-chosen,
+    and the nnU-Net path really does stamp ``part`` into it, so a keyword ``part`` here would
+    collide with the sink key and raise.
+
+    What an engine puts in ``meta`` is its own business - the grids differ, the label
+    mapping differs - but it must be enough to redo the restore later: the grid the field
+    was computed on, the grid it restores onto, and channel -> label. Without that the
+    arrays are only a picture of one run. Stamp ``engine`` too; with more than one engine
+    emitting, a reader cannot otherwise tell what produced the file.
+    """
+    if spec is None:
+        return None
+    code = encode(logits, depth=spec.depth, clip=spec.clip)
+    code.meta.update(meta)
+    spec.sink(str(part), code)
+    return code
+
+
 def deficit(code: RankedCode, channel: int) -> np.ndarray:
     """``l_c - max_j l_j`` for one channel: zero where it wins, negative behind.
 

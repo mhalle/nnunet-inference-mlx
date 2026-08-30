@@ -250,15 +250,14 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         """
         from . import ranked
         t = time.perf_counter()
-        code = ranked.encode(logits, depth=probabilities.depth, clip=probabilities.clip)
-        code.meta.update(
-            part=part, task=spec.name, nnseg=_version(),
+        ranked.emit(
+            probabilities, part, logits,
+            part=part, task=spec.name, nnseg=_version(), engine="nnunetv2",
             spacing_zyx=[float(v) for v in model.spacing_zyx],
             envelope_lo=[int(v) for v in env.lo], model_grid=[int(v) for v in env.shape],
             labels=[int(v) for v in np.asarray(lut).reshape(-1)],   # channel -> global label
             convention=convention, reoriented_to_ras=bool(reorient),
             input_orientation=orientation, frame=frame.to_meta())
-        probabilities.sink(part, code)
         T[f"probabilities:{part}"] = time.perf_counter() - t
 
     def predict_into(model, x, frame, ogrid, env, *, lut, paint, out, part=""):
