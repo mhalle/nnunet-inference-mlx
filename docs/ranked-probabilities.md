@@ -192,7 +192,8 @@ deficit  d_c =  0        where c wins      ( = m_c with the lead removed )
                 -clip    where c is absent
 ```
 
-**`deficit` is the field a restore must interpolate.** It is `l_c - max_j l_j`, which differs
+**`deficit` is the field a restore must interpolate.** (Measured in
+[ranked-reconstruction.md](ranked-reconstruction.md) §1.) It is `l_c - max_j l_j`, which differs
 from the logits by a per-voxel constant *shared by every channel* — a gauge transformation —
 so interpolating it and taking the argmax is exactly interpolating the logits and taking the
 argmax. `nnseg.ranked.deficit(code, channel)`.
@@ -406,6 +407,13 @@ brick — but two things are open:
   a client needs laziness.
 
 A `probabilities` artifact should be **opt-in per request**, like preview and statistics.
+
+## Reconstruction
+
+How a reader gets a segmentation back out — the deficit/margin distinction, progressive
+refinement, the adaptive floor, resampling order, and the measured cost of every derived
+product — is in [ranked-reconstruction.md](ranked-reconstruction.md). It also corrects
+several claims below, which are left in place with pointers rather than silently amended.
 
 ## Consumer contract
 
