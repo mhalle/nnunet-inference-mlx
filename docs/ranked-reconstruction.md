@@ -248,6 +248,28 @@ Three requirements, each learned the hard way:
   displacement := |m_d - m_{d+1}| / |grad m|        # mm, not logits
   stop when  max(displacement) < tau * spacing      # tau a small fraction of a voxel
   ```
+
+  **Use only this test, and let every consumer read every plane.** The decision test converges
+  early *by construction* — an argmax changes only if the top two reorder, which is depth-2
+  information, while a group member can sit at any rank — so the rendering standard is
+  strictly the stricter of the two and satisfying it satisfies the labelmap for free. There is
+  then no depth knob on the consumer side at all, which is one fewer way to hold this wrong.
+
+  What makes that affordable is that **depth is nearly free in the stored bytes** — the deep
+  planes are almost entirely sentinel, so they compress away:
+
+  | depth | zstd-9 | raw | decode (4 groups) | max_tail |
+  |---|---|---|---|---|
+  | 3 | 1.94 MB | 69 MB | 0.25 s | 0.1619 |
+  | 6 | 2.16 MB | 138 MB | 0.50 s | 0.0150 |
+  | 8 | 2.18 MB | 183 MB | 0.67 s | 0.0057 |
+  | 12 | **2.19 MB** | 275 MB | 0.97 s | 0.0011 |
+
+  ⚠ But "free" is only true of the *stored* form. Decompression re-expands the sentinel planes
+  and the decoder walks them, so **raw residency and decode time stay linear in depth** — both
+  double from depth 6 to 12 for a 1.4 % storage saving and a tail nobody can see. Encode as
+  deep as the rendering test asks and no deeper; the saturation in column two is not a license
+  to pick 12.
 - **Sample near boundaries.** Uniform sampling saturates at 99.9 % and stops discriminating;
   every distinction in this document is visible only in the near-tie column.
 - **Terminate on pairs**, per §3.
@@ -800,13 +822,13 @@ rather than names, so a part legitimately called `composite` collides with nothi
   `ranked.to_device` for residency.
 - ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
   128-is-the-boundary convention `encode_regions` stores.
-- **The residual loop needs a second stopping test, and it is a tail.** §5 halts when adding
-  a plane stops changing *which class wins*; the store exists to answer a second question,
-  *by how much*, and the two stop improving at different depths. The renderer's test is
-  written out in §5 — surface displacement in millimeters, taken as a **max** over the ramp,
-  because at p95 depth 3 and depth 6 are indistinguishable (7.6 vs 7.5 µm) and only the tail
-  separates them (238 % of a voxel vs 3 %). Unimplemented; dynamic depth is still right, the
-  loop just has to be told which error it is minimizing.
+- **The residual loop's stopping test should be the renderer's, not the labelmap's.** §5 halts
+  when adding a plane stops changing *which class wins*, which converges early by construction.
+  The test that should govern is written out in §5 — surface displacement in millimeters, as a
+  **max** over the ramp, since at p95 depth 3 and depth 6 are indistinguishable (7.6 vs 7.5 µm)
+  and only the tail separates them (238 % of a voxel against 3 %). It is strictly the stricter
+  of the two, so one criterion serves every consumer and none of them needs a depth knob.
+  Unimplemented.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
