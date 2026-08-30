@@ -125,16 +125,26 @@ does, exactly:
   and up. Verified against the live field on the organs part: **11,464,290 / 11,464,290 voxels
   identical.**
 
-  ⚠ That holds **within a backend**. Encoding the same fp16 logits on an L40S and on its host
-  CPU disagrees at **0.032 %** of voxels, every one of them an exact tie (`max |dv| = 0.0`) —
-  `topk` does not define an order among equals and CUDA's is not the CPU's. Promotion does not
-  help: `encode` casts to fp32 before `topk`, but fp16 -> fp32 is exact, so ties survive it. At
-  fp32 input the two are bit-identical. A tie at the *winner* only flips a label whose margin
-  is ~0 either way; a tie at the *depth boundary* decides which class is kept and which drops
-  to the sentinel, and the dropped one then decodes to `-clip` rather than `-gap` — measured up
-  to 3.5 logits apart on a deliberately tie-heavy field. So the store is reproducible, and
-  content-addressable, only per backend. Breaking ties by class index after `topk` would make
-  it absolute, and would also align `ranks[0]` with `argmax`'s own first-index convention.
+  ⚠ `topk` does not define an order among equal values, and CUDA's is not the CPU's, so
+  without care the stored bytes depend on where they were encoded. Promotion does not help:
+  `encode` casts to fp32 before `topk`, but fp16 -> fp32 is exact, so ties survive it — and
+  fp16 is what the network returns. `_settle_ties` orders equals by ascending class index,
+  which is `argmax`'s own convention (numpy and torch both return the first maximal index),
+  so `ranks[0]` remains exactly the argmax every labelmap in this ecosystem was made with.
+  That inherits argmax's existing bias toward background rather than adding a new one; the
+  bound is **0.155 %** of the worst structure's volume, against ~9 % for the linear-vs-nearest
+  choice already in the pipeline.
+
+  With it, labels are bit-identical across backends (0 of 11,464,290, from 3,669 before).
+  **One residual remains:** ordering the N selected entries cannot change *which* `topk`
+  selected, so a tie straddling the depth boundary is still backend-dependent. On the real
+  organs part at depth 6 that is 194,043 voxels — of which all but **16** are among classes
+  beyond the clip, where both candidates mask to the sentinel and the choice never reaches the
+  stored bytes. For those 16 the contested gap is 6.60–7.97 against a clip of 8, so the worst
+  decoded margin differs by 1.40 logits, on the least-significant plane, for a class already
+  more than 6.5 logits behind. Closing it needs a stable descending sort instead of `topk`
+  (measured 3.4–3.7×) and is not worth it — unless the store is ever content-addressed by
+  checksum, where any difference is a difference.
 - The box a cascade actually consumes is therefore identical. For the five lung lobes that
   `lung_vessels` and `lung_nodules` crop to: `((94,240), (13,116), (52,218))`, 2.55 Mvox, from
   both the live logits and the store.

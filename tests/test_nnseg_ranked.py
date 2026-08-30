@@ -286,3 +286,60 @@ class TestEmit(unittest.TestCase):
         kinds = [p.kind for p in inspect.signature(ranked.emit).parameters.values()]
         self.assertEqual(kinds[:3], [inspect.Parameter.POSITIONAL_ONLY] * 3)
         self.assertEqual(kinds[3], inspect.Parameter.VAR_KEYWORD)
+
+
+class TestTieBreaking(unittest.TestCase):
+    """Ties must resolve the same way everywhere, and the same way argmax does."""
+
+    def test_ranks0_is_exactly_argmax_when_the_top_two_tie(self):
+        lg = torch.zeros(5, 1, 1, 1)
+        lg[3] = lg[1] = 7.0                      # classes 1 and 3 tied for the win
+        code = ranked.encode(lg, depth=4, clip=8.0)
+        self.assertEqual(int(code.ranks[0].ravel()[0]) - 1, int(lg.argmax(0).ravel()[0]))
+        self.assertEqual(int(code.ranks[0].ravel()[0]) - 1, 1)     # the LOWER index
+
+    def test_a_tie_deeper_down_also_orders_by_index(self):
+        """The consequential case: at the depth boundary a tie decides which class is KEPT,
+        so the loser decodes to -clip instead of -gap."""
+        lg = torch.zeros(6, 1, 1, 1)
+        lg[0] = 9.0
+        lg[4] = lg[2] = 3.0                      # tied for second
+        code = ranked.encode(lg, depth=3, clip=8.0)
+        self.assertEqual([int(v) - 1 for v in code.ranks[:2].ravel()], [0, 2])
+
+    def test_a_run_of_three_ties_sorts_fully_not_pairwise(self):
+        """Bubble rather than one adjacent pass - a single sweep would leave 4,2,3."""
+        lg = torch.zeros(6, 1, 1, 1)
+        lg[4] = lg[2] = lg[3] = 5.0
+        code = ranked.encode(lg, depth=3, clip=8.0)
+        self.assertEqual([int(v) - 1 for v in code.ranks.ravel()], [2, 3, 4])
+
+    def test_ties_do_not_disturb_a_strict_ordering(self):
+        lg = torch.tensor([1.0, 9.0, 5.0, 3.0]).view(4, 1, 1, 1)
+        code = ranked.encode(lg, depth=4, clip=40.0)
+        self.assertEqual([int(v) - 1 for v in code.ranks.ravel()], [1, 2, 3, 0])
+
+    def test_encoding_is_deterministic_over_tie_heavy_fp16(self):
+        """fp16 quantized hard so classes collide constantly - the condition that made
+        device and host disagree at 1.2 % of voxels before this."""
+        g = torch.Generator().manual_seed(3)
+        lg = ((torch.rand(9, 6, 7, 8, generator=g) * 6).round() / 2).half()
+        a = ranked.encode(lg, depth=5, clip=8.0)
+        b = ranked.encode(lg.clone(), depth=5, clip=8.0)
+        np.testing.assert_array_equal(a.ranks, b.ranks)
+        np.testing.assert_array_equal(a.support, b.support)
+        np.testing.assert_array_equal(a.ranks[0] - 1, lg.float().argmax(0).numpy())
+
+    def test_a_tie_straddling_the_depth_boundary_is_a_known_residual(self):
+        """Pinned as a LIMIT, not a guarantee: _settle_ties orders what topk selected and
+        cannot change which it selected, so the class kept at the last slot is still topk's
+        call. Measured at 16 voxels in 11.5 M on real data, worst margin 1.40 logits on the
+        least-significant plane. If this ever starts failing because selection became
+        deterministic, delete the test - do not 'fix' it."""
+        lg = torch.zeros(5, 1, 1, 1)
+        lg[0] = 9.0
+        lg[2] = lg[4] = 2.0                      # tied for the LAST kept slot at depth 2
+        code = ranked.encode(lg, depth=2, clip=8.0)
+        kept = int(code.ranks[1].ravel()[0]) - 1
+        self.assertIn(kept, (2, 4))              # either is a correct answer to a tie
+        self.assertEqual(int(code.ranks[0].ravel()[0]) - 1, 0)   # the winner is not in doubt

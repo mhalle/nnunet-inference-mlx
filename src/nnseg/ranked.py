@@ -127,6 +127,49 @@ def _check(logits) -> torch.Tensor:
     return logits
 
 
+def _settle_ties(top: torch.Tensor, idx: torch.Tensor, N: int) -> None:
+    """Order equal-valued entries of ``topk`` by ascending class index, in place.
+
+    ``topk`` leaves the order among EQUAL values undefined, and CUDA's is not the CPU's, so
+    without this the stored bytes depend on where they were encoded. Measured on real fp16
+    logits (which is what the network returns, and which ties far more readily than fp32):
+    0.0033 % of voxels, 85 % of them involving background. Two different costs - a tie at
+    the winner flips a label whose margin is ~0 either way, but a tie at the DEPTH BOUNDARY
+    decides which class is kept and which drops to the sentinel, so the loser decodes to
+    ``-clip`` instead of ``-gap``.
+
+    Lower index wins, which is argmax's own convention - numpy and torch both return the
+    first maximal index - so ``ranks[0]`` remains exactly the argmax that every labelmap in
+    this ecosystem was made with. That inherits argmax's bias toward background rather than
+    introducing a new one; the bound is 0.155 % of the worst structure's volume, against
+    ~9 % for the linear-vs-nearest choice already in the pipeline.
+
+    Bubble, because a tie can in principle run longer than a pair. ``N`` is small and each
+    pass is a few cheap elementwise kernels, so the early-out is deliberately omitted - it
+    would cost a device sync per pass to save less than it costs.
+
+    ⚠ This orders the N entries ``topk`` selected; it cannot change WHICH it selected. A tie
+    straddling the depth boundary - two classes equal at the last kept slot - is still
+    resolved by ``topk``, hence still backend-dependent. Measured on the real organs part at
+    depth 6: 194,043 voxels have a boundary tie, but all except **16** are among classes
+    beyond the clip, where both candidates mask to the zero sentinel and the choice never
+    reaches the stored bytes. For those 16 the contested gap is 6.60-7.97 against a clip of
+    8, so the worst decoded margin differs by 1.40 logits, on the least-significant plane,
+    for a class already >6.5 logits behind the winner.
+
+    Making even that exact needs the SELECTION to be deterministic - a stable descending sort
+    instead of ``topk``, measured at 3.4-3.7x - which is a poor trade against 16 voxels in
+    11.5 M on the path that dominates encode time. Revisit only if the store ever needs to be
+    content-addressed by checksum, where any difference at all is a difference.
+    """
+    for _ in range(N - 1):
+        for j in range(N - 1):
+            swap = (top[j] == top[j + 1]) & (idx[j] > idx[j + 1])
+            lo = torch.where(swap, idx[j + 1], idx[j])
+            hi = torch.where(swap, idx[j], idx[j + 1])
+            idx[j], idx[j + 1] = lo, hi
+
+
 def encode(logits: torch.Tensor, *, depth: int = DEFAULT_DEPTH, clip: float = CLIP,
            slab: int = 32, with_tail: bool = True) -> RankedCode:
     """``(K, Z, Y, X)`` logits -> :class:`RankedCode`, in slabs on the logits' own device.
@@ -154,6 +197,7 @@ def encode(logits: torch.Tensor, *, depth: int = DEFAULT_DEPTH, clip: float = CL
         z1 = min(z0 + max(1, int(slab)), Z)
         lg = lg_all[:, z0:z1].float()
         top, idx = torch.topk(lg, N, dim=0)              # descending; top[0] is the winner
+        _settle_ties(top, idx, N)
         gaps = top[0:1] - top                            # >= 0, and gaps[0] is exactly 0
 
         r = (idx + 1).to(torch.int32)
