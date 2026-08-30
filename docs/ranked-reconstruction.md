@@ -219,11 +219,19 @@ Three requirements, each learned the hard way:
 - **Decision-based, not value-based.** Measure whether the argmax changes, not whether values
   do. `max_tail` is a proxy and a poor one.
 
-  ⚠ That is the criterion for a **labelmap** consumer, and it converges early for everyone
-  else. §8.4 measures identical group masks at depth 3 and depth 6 while the liver's p95
-  margin error moves 0.0149 → 0.2969 — so this loop would stop at 3 and hand a renderer a
-  field 20× worse in the quantity it samples. A consumer that reads the field rather than the
-  decision needs the value-based test rejected just above. Same loop, different stop.
+  ⚠ **This test asks which class wins. The store exists because that is not the only
+  question.** §1 opens with the other one — *by how much* — and the two stop improving at
+  different depths.
+
+  Measured in §8.4: depth 3 and depth 6 give the same group masks, voxel for voxel. So this
+  loop halts at 3, and for a labelmap it is right to. But at depth 3 the liver's margin
+  *values* are 20× further from the truth — p95 error 0.0149 → 0.2969 logits — because a
+  member that falls below the cut reads as absent instead of at its real level.
+
+  A renderer never thresholds. It reads the margin value to set how wide the opacity ramp is
+  (§8.6), so a worse value is a visibly wrong surface. This loop would halt, report success,
+  and hand over that field without noticing, because nothing it measures moved. That consumer
+  needs the value-based test rejected just above. Same loop, different stop.
 - **Sample near boundaries.** Uniform sampling saturates at 99.9 % and stops discriminating;
   every distinction in this document is visible only in the near-tie column.
 - **Terminate on pairs**, per §3.
@@ -776,14 +784,13 @@ rather than names, so a part legitimately called `composite` collides with nothi
   `ranked.to_device` for residency.
 - ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
   128-is-the-boundary convention `encode_regions` stores.
-- **The residual loop needs a second criterion.** §5 stops when the interpolated argmax stops
-  changing, and is emphatic that the test be decision-based rather than value-based. That is
-  right for a labelmap and blind to what a renderer needs: §8.4 measures depth 3 and depth 6
-  giving **identical** group masks on real data while the liver's p95 margin error goes
-  0.0149 → 0.2969. So a decision-converged store can be 20× worse in the very field a
-  renderer samples for its opacity ramp, and the loop cannot tell. Dynamic depth is still the
-  answer — but the loop has to know which error it is minimizing, and for the field consumer
-  that is the value-based test §5 rejects for the other one.
+- **The residual loop needs a second stopping test.** §5 halts when adding a plane stops
+  changing *which class wins*. The store exists to answer a second question — *by how much* —
+  and the two stop improving at different depths: §8.4 measures identical group masks at
+  depth 3 and depth 6 while the liver's p95 margin error moves 0.0149 → 0.2969. A labelmap
+  consumer can take the depth-3 store and lose nothing. A renderer, which reads the value to
+  size its opacity ramp, cannot — and the loop as written cannot tell the two apart. Dynamic
+  depth is still right; the loop just has to be told which error it is minimizing.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
