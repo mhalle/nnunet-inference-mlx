@@ -195,23 +195,16 @@ It also subsumes the clip-tuning problem. A fixed clip is a global constant stan
 per-voxel quantity, which is why clip 8 → 16 mattered so much (see §10). The adaptive floor
 stores the actual value instead.
 
-### It matters far more to a renderer than this table shows
+### ⚠ It does NOT matter more to a renderer — that claim was withdrawn
 
-The numbers above are *decision* accuracy, which §5 shows converges early for everyone. On the
-criterion that actually governs depth — maximum surface displacement inside the opacity ramp
-(§5, §8.6) — the same configurations separate by two orders of magnitude:
+An earlier revision of this section argued the floor mattered far more to a renderer than the
+decision table shows, on a metric that measured surface displacement against truth inside a
+region defined by *truth's* gradient. A renderer has no truth: it samples the decoded field
+and differentiates that. The two regions differ, and the whole effect lived in the gap.
 
-| configuration | planes | ramp max shift | of a voxel |
-|---|---|---|---|
-| depth 3, clip floor (today) | 5 | 3576 µm | 238 % |
-| depth 3 + **adaptive floor** | **6** | **72 µm** | **4.8 %** |
-| depth 6, clip floor (today) | 11 | 45 µm | 3.0 % |
-| depth 6 + adaptive floor | 12 | 45 µm | 3.0 % |
-
-**One plane collapses the tail 50×.** That follows from what the error *is*: the large
-displacements are a group member falling below the deepest stored rank and reading as `-clip`
-rather than at its real level, which is the exact quantity the floor stores. Note it buys
-nothing at depth 6 — its whole value is making a *shallow* read good enough.
+Rendered pixels settle it (vertebrae and organs, whole-part and single-structure groupings):
+depth 3 is **pixel-identical to depth 6**, and only depth 2 differs at all (16–23/255 on
+31–176 pixels). See §5.
 
 **Recommendation: store N ranks and N supports.** Six planes then serve the strictest consumer
 where eleven are needed today — ~80 MB resident against 138 MB, ~0.28 s to decode against
@@ -239,60 +232,32 @@ Three requirements, each learned the hard way:
 - **Decision-based, not value-based.** Measure whether the argmax changes, not whether values
   do. `max_tail` is a proxy and a poor one.
 
-  ⚠ **This test asks which class wins. The store exists because that is not the only
-  question.** §1 opens with the other one — *by how much* — and the two stop improving at
-  different depths.
+  ⚠ **This test asks which class wins, and for a renderer that is enough.** An earlier
+  revision of this section argued at length that a renderer needs its own value-based stop,
+  measured in millimeters of surface displacement. That was built on a metric defined against
+  *truth's* gradient; a renderer has no truth, it differentiates the decoded field, and the
+  entire effect lived in the difference between those two regions.
 
-  Measured in §8.4: depth 3 and depth 6 give the same group masks, voxel for voxel. So this
-  loop halts at 3, and for a labelmap it is right to. A renderer never thresholds — it reads
-  the margin *value* to set how wide the opacity ramp is (§8.6) — so it needs its own stop.
+  **Rendered pixels settle it.** Vertebrae and organs, whole-part and single-structure
+  groupings, identical camera, light and ramp:
 
-  **The right quantity is surface displacement in millimeters, and the right statistic is the
-  tail.** A margin error `dm` moves the drawn surface by `dm / |grad m|`, and logits are not
-  comparable across structures whose confidence slopes differ 2.5–6.9× (§8.6). Measured on
-  the liver, inside the ±0.8 mm ramp a renderer actually integrates (32,409 voxels):
-
-  | | surface shift p95 | max |
-  |---|---|---|
-  | depth 6 | 7.5 µm | 45 µm (3 % of a voxel) |
-  | depth 3 | 7.6 µm | **3576 µm (238 % of a voxel)** |
-
-  ⚠ At p95 the two are *identical*. Within 1 logit of the surface they are identical outright
-  — the error there is pure quantization, and depth cannot touch it. What separates them is a
-  rare tail, so **a quantile-based stop reports depth 3 as converged** and a max-based one does
-  not. This is the section's own "sample near boundaries" lesson arriving statistically rather
-  than spatially: the failure is rare, so any averaging hides it.
-
-  ```
-  sample voxels inside the ramp:  |m| < ramp_mm * |grad m|
-  displacement := |m_d - m_{d+1}| / |grad m|        # mm, not logits
-  stop when  max(displacement) < tau * spacing      # tau a small fraction of a voxel
-  ```
-
-  **Use only this test, and let every consumer read every plane.** The decision test converges
-  early *by construction* — an argmax changes only if the top two reorder, which is depth-2
-  information, while a group member can sit at any rank — so the rendering standard is
-  strictly the stricter of the two and satisfying it satisfies the labelmap for free. There is
-  then no depth knob on the consumer side at all, which is one fewer way to hold this wrong.
-
-  What makes that affordable is that **depth is nearly free in the stored bytes** — the deep
-  planes are almost entirely sentinel, so they compress away:
-
-  | depth | zstd-9 | raw | decode (4 groups) | max_tail |
+  | depth | max |dm| in shell | mask differs | max pixel diff | pixels > 2/255 |
   |---|---|---|---|---|
-  | 3 | 1.94 MB | 69 MB | 0.25 s | 0.1619 |
-  | 6 | 2.16 MB | 138 MB | 0.50 s | 0.0150 |
-  | 8 | 2.18 MB | 183 MB | 0.67 s | 0.0057 |
-  | 12 | **2.19 MB** | 275 MB | 0.97 s | 0.0011 |
+  | 2 | 321–560 µm | 0 | 16–23 | 31–176 |
+  | **3** | **0** | **0** | **0–1** | **0** |
+  | 4 | 0 | 0 | 0–1 | 0 |
 
-  ⚠ But "free" is only true of the *stored* form. Decompression re-expands the sentinel planes
-  and the decoder walks them, so **raw residency and decode time stay linear in depth** — both
-  double from depth 6 to 12 for a 1.4 % storage saving and a tail nobody can see. Encode as
-  deep as the rendering test asks and no deeper; the saturation in column two is not a license
-  to pick 12.
-- **Sample near boundaries.** Uniform sampling saturates at 99.9 % and stops discriminating;
-  every distinction in this document is visible only in the near-tie column.
-- **Terminate on pairs**, per §3.
+  **Depth 3 is a constant, not a criterion.** And there is a proof, not just a table: in the
+  shell, `m_S` is the best member's level minus the best non-member's, every class is one or
+  the other, so no third class can lie between them — **those two are ranks 0 and 1**, and
+  depth 2 already holds the pair exactly. Measured, ranks 0 and 1 straddle the group at
+  98.6–99.6 % of shell voxels. The remaining ~1 % are **triple junctions**, where the deciding
+  class sits at rank 2 — which is precisely what depth 3 adds, and why nothing past it moves a
+  pixel.
+
+  ⚠ So the renderer is the **less** demanding consumer, not the stricter one, reversing what an
+  earlier revision claimed. Depth still separates on the decision metric well past 3 for
+  K = 118 (§3), which is a labelmap and statistics concern. A renderer needs 3.
 
 ---
 
@@ -846,13 +811,11 @@ rather than names, so a part legitimately called `composite` collides with nothi
   `ranked.to_device` for residency.
 - ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
   128-is-the-boundary convention `encode_regions` stores.
-- **The residual loop's stopping test should be the renderer's, not the labelmap's.** §5 halts
-  when adding a plane stops changing *which class wins*, which converges early by construction.
-  The test that should govern is written out in §5 — surface displacement in millimeters, as a
-  **max** over the ramp, since at p95 depth 3 and depth 6 are indistinguishable (7.6 vs 7.5 µm)
-  and only the tail separates them (238 % of a voxel against 3 %). It is strictly the stricter
-  of the two, so one criterion serves every consumer and none of them needs a depth knob.
-  Unimplemented.
+- **The residual loop governs the labelmap, not the renderer.** §5 halts when adding a plane
+  stops changing which class wins, which is the right and only test — rendering needs a fixed
+  depth 3 and no loop at all (§5, verified in pixels). An earlier revision of this list claimed
+  the opposite. Dynamic per-part depth remains unimplemented and still worth having for the
+  restore, where §3 shows convergence genuinely varying by part.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
