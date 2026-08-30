@@ -384,6 +384,35 @@ Probability saturates, so interpolating it displaces the surface: margins of +6.
 the true crossing 98.6 % of the way across, while interpolated probability puts it at 95.2 %.
 It is exact only in the symmetric case, which is the case that flatters the method.
 
+### The `tail` is the exception, and it may be interpolated
+
+`tail` looks like exactly the derived form the rule above forbids — it is a ratio of sums of
+exponentials, the same family as a softmax output — so a careful reader would assume it is
+unsafe. Measured, on a real 64³ block upsampled with trilinear:
+
+| | 2× | 4× |
+|---|---|---|
+| `\|tail_interp − tail_true\|` max | 0.00266 | 0.00302 |
+| resulting `\|dp\|` on the top-6 probabilities | 0.00224 | 0.00261 |
+| for scale — interpolating the softmax directly | **0.549** | **0.587** |
+
+**200× better than the thing it resembles.** Median error is zero, p95 is 2 × 10⁻⁶, and it does
+not grow with the factor. Two of its properties pull opposite ways and the good one wins:
+
+- it is **gauge-invariant** — a ratio, so the winner-reference cancels, exactly as for
+  `deficit`;
+- it is **nonlinear**, so it is not interpolable in the exact sense `deficit` is;
+- but it is **bounded by its own magnitude**. Both the interpolant and the truth lie in
+  `[0, max_tail]`, so the error cannot exceed `max_tail` — 0.0150 at depth 6.
+
+⚠ That bound is worth stating on its own: **`max_tail` in the meta bounds the tail's
+RESAMPLING error, not only its truncation error.** A reader can bound its own probability
+error from the file header without touching the data.
+
+The consequence is that the whole probability path survives a resample: `deficit` interpolates
+exactly (§1), `tail` to ~0.003, so calibrated probabilities are recoverable on any grid rather
+than only the native one.
+
 ### Repeated interpolation
 
 Staged linear upsampling is **exact when each stage's grid contains the previous samples**
