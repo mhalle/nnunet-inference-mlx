@@ -448,6 +448,78 @@ Grouping is a `max` while walking the rank planes; resolution is the target grid
 viewer toggle *show lobes separately* against *show lungs* as a half-second re-extraction
 rather than a different artifact.
 
+### 8.6 Gradients: saturation, not quantization, and which stencil
+
+§8.2 asks for a ramp in millimeters, `m / |grad m|`. Everything hard about that is in the
+divisor.
+
+**Quantization is never the limit.** One support level is `clip/255` logits, which at the
+confidence slopes actually measured on the store is **4.6 um** (sharp boundary, `k` = 6.87
+logits/mm) to **12.3 um** (soft, `k` = 2.55). Three orders of magnitude below a voxel.
+
+**Saturation is the limit.** The field is only informative out to `clip/k`:
+
+| | `k` (logits/mm) | usable band |
+|---|---|---|
+| heart, liver, spleen, stomach | 2.55–3.26 | 3.1 mm ≈ 2.1 voxels |
+| trachea, ribs, esophagus | 5.42–5.64 | ~1.45 mm ≈ 1.0 voxel |
+| aorta, pulmonary vein, vertebrae | 6.11–6.87 | **1.16 mm ≈ 0.78 voxels** |
+
+Bone, vessels and airways — the thin structures where aliasing is worst — are exactly the
+confident ones, and their band is under one voxel. **Do not widen the clip to fix this:**
+clip 8 → 16 takes the organs part from 1.93 MB to **34.56 MB**, because live runner-up slots
+go 2.1 % → 62.3 %. The cost is *sparsity*, not the quantization curve, which is why companding
+recovers only 15 % (29.39 MB) — a different reason from §10's, and both point the same way.
+
+⚠ **Differentiate the signed margin, never `gap1`.** `gap1 = |m_w|` is an absolute value with a
+**crease at the surface**, so a central difference straddling the boundary differences it
+across its own kink and collapses. Medians agree (1.07 versus 1.43 logits/mm) because the
+crease only touches surface voxels — but **19 % of band voxels understate by more than 2x**,
+producing distances at least 2x too large in precisely the anti-aliasing band. Build `m_c`
+(§1), then differentiate.
+
+**Use plain central differences.** Measured on the rib cage against the gradient of the
+*unclipped* field, over the shell that renders (72 % of which has saturation inside its 3×3×3
+neighborhood):
+
+| estimator | median | p95 | > 10° |
+|---|---|---|---|
+| **central** | **0.56°** | **16.28°** | **16.1 %** |
+| sobel `[1 2 1]` | 10.77° | 51.36° | 53.4 % |
+| scharr `[3 10 3]` | 8.63° | 42.02° | 43.0 % |
+| one-sided (avoid saturated) | 0.64° | 60.63° | 32.1 % |
+| masked sobel | 9.81° | 51.39° | 49.1 % |
+
+⚠ Smoothing is the natural reach and it is **15–19x worse**. Anatomy here is one to two voxels
+thick, so a `[1 2 1]` kernel across the perpendicular axes reaches the opposite wall and the
+background and blends them into the direction; masking the saturated samples out does not
+rescue it, because there is no clean material within reach. One-sided differencing fails the
+same way from the other side — on a thin shell the clean neighbor is often *along* the surface,
+so it returns a tangential vector, visible as a crawling speckle. **The rule is minimal
+support.**
+
+**A composite's normal must be recomputed from `m_S`, not inherited.** A per-class normal is
+the gradient of `top1 - top2` — the winner against whoever is runner-up *at that voxel* —
+which is creased wherever the runner-up's identity changes. Along a rib that flips constantly
+between background, the adjacent rib, and cartilage. Shading a union with it:
+
+| | median | p95 | > 10° |
+|---|---|---|---|
+| whole shell | 1.84° | 54.02° | 28.7 % |
+| internal seams (1.08 % of shell) | 28.99° | 79.12° | 85.0 % |
+| exterior only | 1.69° | 53.10° | 28.1 % |
+
+It renders as visible corrugation. Note the exterior disagrees too, although `m_w = m_S`
+holds *pointwise* there — the stencil reaches into neighbors where the competitor identity has
+changed. Regrouping **dissolves** internal competitors, so a union's normal is a different
+field, not a transformation of a stored one. Build `m_S` (§8.4), then differentiate it.
+
+**Why not store the gradient.** The encoder holds unclipped logits and could write it; on the
+band (7.6 % of voxels) that costs +0.79 MB for magnitude (+41 %) or +2.03 MB for an octahedral
+direction (+105 %). Rejected — see §10.
+
+---
+
 ## 9. Compositing across parts
 
 The composite label map is **derived, and worth shipping**: 0.222 MB, 5.8 % of the store,
@@ -467,6 +539,41 @@ The one genuine exception is the contested set, where paint order discarded a co
 claim. Those voxels are self-announcing — median margin 4.49 logits versus 8.00 elsewhere,
 11.7 % below 1 logit versus 2.7 % — and **derivable** from the per-part label maps, so they
 should not be materialized. A cached query result is not information.
+
+### 9.1 The paint order is literally painter's algorithm
+
+Upstream is unambiguous — `TotalSegmentator/totalsegmentator/nnunet.py:601-637`:
+
+```python
+seg_combined[img_part] = np.zeros(img_shape, dtype=np.uint8)   # blank canvas
+for idx, tid in enumerate(task_id):                            # fixed task order
+    mapped_seg = lut[seg]                                      # part labels -> global
+    np.copyto(seg_combined[img_part], mapped_seg, where=mapped_seg != 0)
+```
+
+Blank canvas, parts painted in task order, **last writer wins**, no probability consulted
+anywhere. So deferring the merge to the consumer loses nothing, and gains: a consumer holding
+margins can arbitrate better than task order.
+
+It also barely matters. Of 2,371 k voxels claimed by at least one part, **2,370.6 k (99.96 %)
+are claimed by exactly one**; 0.8 k are contested, all of them organs↔cardiac, at a median
+margin difference of 2.92 logits (21 % within 1 logit).
+
+| part | foreground voxels | |
+|---|---|---|
+| organs | 1,555 k | 13.56 % |
+| muscles | 367 k | 3.20 % |
+| cardiac | 234 k | 2.04 % |
+| vertebrae | 115 k | 1.00 % |
+| ribs | 102 k | 0.89 % |
+
+This is why §8.4's fourth rule holds without costing anything: cross-part groups stay
+per-part, and the arbitration that a shared margin scale would buy applies to 0.04 % of the
+volume.
+
+**For composing across tasks, engines and cascade stages** — what fits the store, what does
+not, and why a pipeline is exact where a composite is heuristic — see
+[ranked-composition.md](ranked-composition.md).
 
 ---
 
@@ -513,6 +620,37 @@ on a downsample-and-restore test) but violates a structural invariant: **59,885 
 deficit > 0**, max +6.2, which says a class beat the maximum. Linear produced exactly zero.
 Staged linear — wider support without the negative lobes — was worse than a single step
 (96.28 %), so width alone is not the benefit.
+
+**A stored gradient plane.** The encoder holds unclipped logits, so it can compute
+`|grad m_w|` before any saturation and write it on the band (7.6 % of voxels), which a decoder
+cannot reconstruct afterward. Priced on the organs part:
+
+| | size | delta |
+|---|---|---|
+| ranks + support (today) | 1.93 MB | — |
+| + magnitude, uint8 | 2.71 MB | +41 % |
+| + octahedral direction, 2 B | 3.96 MB | +105 % |
+| + both | 4.74 MB | +146 % |
+
+Rejected on both counts. **Magnitude**: plain central differences already land at 0.56° median
+against it (§8.6), and the residual is invisible in a rendering. **Direction**: worse than
+unnecessary — a stored normal bakes in a *competitor set*, and since grouping is a decode-time
+choice (§8.4), the one grouping it was encoded with is the least useful one. Measured against
+a union's own normal it disagrees on 28.7 % of the shell. A plane that must be recomputed for
+every composite is dead weight.
+
+**A truncated distance field for all structures.** The ranked layout does not transfer to
+distance. Its premise is that the softmax is peaked — top-6 of 118 captures everything — but
+proximity is not peaked: within 20 mm of a voxel there are a median of 3 structures, p95 **7**,
+max 13 (at 40 mm: 8 / 16 / 27). Depth 4 covers the median and truncates the tail; a complete
+R = 20 mm store needs depth ≈ 13, landing near the size of the logit store it was meant to
+supplement. The distance plane also dominates the bytes (79 %), and it is the plane ranking
+does nothing for — its redundancy is *spatial smoothness*, not class sparsity. Logits are
+sparse in class space and want ranking; distance is smooth in physical space and wants
+multiresolution (a downsampled-then-interpolated SDF is accurate to ~0.10 mm beyond 10 mm at
+4x, 0.15 mm beyond 40 mm at 8x). Different redundancy, different encoder. An SDF store is also
+a **cache**, not source data — 1.7 s per structure to rebuild from labels — where the ranked
+store holds the only record of what the network said.
 
 ---
 
@@ -578,3 +716,7 @@ rather than names, so a part legitimately called `composite` collides with nothi
   quantization is the same as the store's but the API returns floats.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
+
+Questions about composing several stores — cross-part calibration, a codec per layer type,
+graded cascade inputs, stage addressing — are in
+[ranked-composition.md](ranked-composition.md) §8.
