@@ -59,6 +59,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
             envelope_mm: float | None = 20.0, configuration: str | None = None,
             allow_transpose: bool = False,
+            probabilities=None,
             models=None, cancel=None, progress=None):
     """Segment an image with a task from the toolkit's catalog.
 
@@ -88,6 +89,11 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     ``batch_size`` is patches per forward pass: an int, or ``"auto"`` - 1 on Apple silicon
     (measured fastest), 4 on CUDA when the measured working set says it fits (18 % faster
     steady-state on an A10); it only applies when the accumulator is on the device.
+
+    ``probabilities`` is a :class:`~nnseg.ranked.RankedSpec`; when given, each part's output
+    distribution is encoded from its logits (before the restore frees them) and handed to the
+    spec's sink as a :class:`~nnseg.ranked.RankedCode` on that model's own grid. Off by
+    default: labels are a fraction of the size and most callers want only those.
 
     ``cancel`` is a :class:`~nnseg.progress.CancelToken`; the run stops at the next patch
     boundary. ``progress`` is called with a :class:`~nnseg.progress.Progress` snapshot (which
@@ -228,7 +234,29 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         # a box that barely crops only re-tiles the window (churn, ~no speedup): run whole instead
         return worth_cropping(Envelope(tuple(lo), tuple(hi), shape))
 
-    def predict_into(model, x, frame, ogrid, env, *, lut, paint, out):
+    def emit_probabilities(model, logits, frame, env, *, lut, part):
+        """Encode this part's output distribution while the logits are still here.
+
+        Between the network and the restore is the only moment they exist, so this costs
+        one pass and no recomputation. The code is on the model's own (envelope-cropped)
+        grid, which is where the distribution lives - restoring it to the output grid first
+        would inflate it and bake in one interpolation choice. What it takes to place that
+        grid in the world travels in ``meta``, so each part stands alone.
+        """
+        from . import ranked
+        t = time.perf_counter()
+        code = ranked.encode(logits, depth=probabilities.depth, clip=probabilities.clip)
+        code.meta.update(
+            part=part, task=spec.name, nnseg=_version(),
+            spacing_zyx=[float(v) for v in model.spacing_zyx],
+            envelope_lo=[int(v) for v in env.lo], model_grid=[int(v) for v in env.shape],
+            labels=[int(v) for v in np.asarray(lut).reshape(-1)],   # channel -> global label
+            convention=convention, reoriented_to_ras=bool(reorient),
+            input_orientation=orientation)
+        probabilities.sink(part, code)
+        T[f"probabilities:{part}"] = time.perf_counter() - t
+
+    def predict_into(model, x, frame, ogrid, env, *, lut, paint, out, part=""):
         # tripwire: `x` must carry THIS model's normalization. Several models share one resample,
         # and feeding one model's normalization to another is silent and severe - the organs
         # model's CT clip at +276 HU flattens all bone for the parts that follow it.
@@ -240,6 +268,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
                 "is per-model; share the resampled grid, not the normalized array.")
         crop = x[(slice(None), *env.slices)] if not env.is_whole() else x
         logits = model.predict_logits(crop, report=report).to(device)
+        if probabilities is not None:
+            emit_probabilities(model, logits, frame, env, lut=lut, part=part)
         mapping = frame.mapping(ogrid)
         if not env.is_whole():
             mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.lo))
@@ -276,7 +306,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
                 out = torch.zeros(og.shape, dtype=torch.uint8 if max_label <= 255 else torch.uint16, device=device)
             t = time.perf_counter()
             report.stage("predict", pname)
-            predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1, out=out)
+            predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1,
+                         out=out, part=pname)
             report.stage("restore", f"{'device' if model.accumulate_choice['on_device'] else 'host'} accumulator")
             T[f"network:{tag}:{pname}"] = time.perf_counter() - t
             models.release(model)
@@ -309,7 +340,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             og = fr.resolve_grid(grid)
             out = torch.zeros(og.shape, dtype=torch.uint8, device=device)
             t = time.perf_counter()
-            predict_into(model, x, fr, og, env, lut=np.arange(model.K, dtype=np.int32), paint=False, out=out)
+            predict_into(model, x, fr, og, env, lut=np.arange(model.K, dtype=np.int32),
+                         paint=False, out=out, part=f"{tag}:s{i}")
             T[f"network:{tag}:s{i}"] = time.perf_counter() - t
             if not last:
                 e = label_roi(out.cpu().numpy(), step.crop_to_classes,
@@ -334,6 +366,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     T["to input orientation"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
     prov.update(input_orientation=orientation, output_grid=tuple(out_grid.shape),
-                cropped_to_nonzero=frame.model_source is not None)
+                cropped_to_nonzero=frame.model_source is not None,
+                probabilities=(None if probabilities is None else
+                               {"depth": probabilities.depth, "clip": probabilities.clip}))
     return Segmentation(labels=out_img, schema=schema, grid=out_grid, spec=spec,
                         timings=T, provenance=prov)
