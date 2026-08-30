@@ -224,14 +224,30 @@ Three requirements, each learned the hard way:
   different depths.
 
   Measured in §8.4: depth 3 and depth 6 give the same group masks, voxel for voxel. So this
-  loop halts at 3, and for a labelmap it is right to. But at depth 3 the liver's margin
-  *values* are 20× further from the truth — p95 error 0.0149 → 0.2969 logits — because a
-  member that falls below the cut reads as absent instead of at its real level.
+  loop halts at 3, and for a labelmap it is right to. A renderer never thresholds — it reads
+  the margin *value* to set how wide the opacity ramp is (§8.6) — so it needs its own stop.
 
-  A renderer never thresholds. It reads the margin value to set how wide the opacity ramp is
-  (§8.6), so a worse value is a visibly wrong surface. This loop would halt, report success,
-  and hand over that field without noticing, because nothing it measures moved. That consumer
-  needs the value-based test rejected just above. Same loop, different stop.
+  **The right quantity is surface displacement in millimeters, and the right statistic is the
+  tail.** A margin error `dm` moves the drawn surface by `dm / |grad m|`, and logits are not
+  comparable across structures whose confidence slopes differ 2.5–6.9× (§8.6). Measured on
+  the liver, inside the ±0.8 mm ramp a renderer actually integrates (32,409 voxels):
+
+  | | surface shift p95 | max |
+  |---|---|---|
+  | depth 6 | 7.5 µm | 45 µm (3 % of a voxel) |
+  | depth 3 | 7.6 µm | **3576 µm (238 % of a voxel)** |
+
+  ⚠ At p95 the two are *identical*. Within 1 logit of the surface they are identical outright
+  — the error there is pure quantization, and depth cannot touch it. What separates them is a
+  rare tail, so **a quantile-based stop reports depth 3 as converged** and a max-based one does
+  not. This is the section's own "sample near boundaries" lesson arriving statistically rather
+  than spatially: the failure is rare, so any averaging hides it.
+
+  ```
+  sample voxels inside the ramp:  |m| < ramp_mm * |grad m|
+  displacement := |m_d - m_{d+1}| / |grad m|        # mm, not logits
+  stop when  max(displacement) < tau * spacing      # tau a small fraction of a voxel
+  ```
 - **Sample near boundaries.** Uniform sampling saturates at 99.9 % and stops discriminating;
   every distinction in this document is visible only in the near-tie column.
 - **Terminate on pairs**, per §3.
@@ -784,13 +800,13 @@ rather than names, so a part legitimately called `composite` collides with nothi
   `ranked.to_device` for residency.
 - ~~**Uint8 group output.**~~ Closed: `decode_groups(..., quantize=True)`, on the same
   128-is-the-boundary convention `encode_regions` stores.
-- **The residual loop needs a second stopping test.** §5 halts when adding a plane stops
-  changing *which class wins*. The store exists to answer a second question — *by how much* —
-  and the two stop improving at different depths: §8.4 measures identical group masks at
-  depth 3 and depth 6 while the liver's p95 margin error moves 0.0149 → 0.2969. A labelmap
-  consumer can take the depth-3 store and lose nothing. A renderer, which reads the value to
-  size its opacity ramp, cannot — and the loop as written cannot tell the two apart. Dynamic
-  depth is still right; the loop just has to be told which error it is minimizing.
+- **The residual loop needs a second stopping test, and it is a tail.** §5 halts when adding
+  a plane stops changing *which class wins*; the store exists to answer a second question,
+  *by how much*, and the two stop improving at different depths. The renderer's test is
+  written out in §5 — surface displacement in millimeters, taken as a **max** over the ramp,
+  because at p95 depth 3 and depth 6 are indistinguishable (7.6 vs 7.5 µm) and only the tail
+  separates them (238 % of a voxel vs 3 %). Unimplemented; dynamic depth is still right, the
+  loop just has to be told which error it is minimizing.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
 
