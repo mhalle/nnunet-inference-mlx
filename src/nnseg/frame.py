@@ -11,6 +11,17 @@ from .mapping import Mapping
 CONVENTIONS = ("corner", "center")
 
 
+def _grid_meta(g: Grid | None) -> dict | None:
+    return None if g is None else {"shape": [int(v) for v in g.shape],
+                                   "spacing": [float(v) for v in g.spacing],
+                                   "origin": [float(v) for v in g.origin]}
+
+
+def _grid_from(d: dict | None) -> Grid | None:
+    return None if d is None else Grid(shape=tuple(d["shape"]), spacing=tuple(d["spacing"]),
+                                       origin=tuple(d["origin"]))
+
+
 @dataclass(frozen=True)
 class Frame:
     """Everything needed to put labels computed on the model grid onto a caller-chosen grid.
@@ -70,6 +81,39 @@ class Frame:
         if isinstance(grid, Grid):
             return grid
         return Grid.isotropic(float(grid), like=self.source)
+
+    def to_meta(self) -> dict:
+        """Plain JSON for this frame - the spatial extent an artifact has to carry.
+
+        A result computed on the model grid is only re-restorable somewhere else if the
+        reader can rebuild this: without it a stored artifact is a picture of one run, and
+        with it the restore (target grid, interpolation, label mapping, any confidence gate)
+        can be re-decided later without re-running the network. That is worth carrying -
+        linear-vs-nearest interpolation alone moves rib volume ~9 %.
+        """
+        c = self.canonical
+        return {"source": _grid_meta(self.source),
+                "model_source": _grid_meta(self.model_source),   # the crop-to-nonzero sub-grid
+                "model_shape": [int(v) for v in self.model_shape],
+                "model_spacing": [float(v) for v in self.model_spacing],
+                "convention": self.convention,
+                "original_orientation": self.original_orientation,
+                "canonical": {"spacing_zyx": [float(v) for v in c.spacing_zyx],
+                              "shape_zyx": [int(v) for v in c.shape_zyx],
+                              "origin_xyz": [float(v) for v in c.origin_xyz],
+                              "direction_xyz": [float(v) for v in c.direction_xyz]}}
+
+    @classmethod
+    def from_meta(cls, meta: dict) -> "Frame":
+        """Rebuild a frame from :meth:`to_meta`, so ``mapping`` works against a stored result."""
+        from .values import Geometry
+        return cls(source=_grid_from(meta["source"]),
+                   model_shape=tuple(meta["model_shape"]),
+                   model_spacing=tuple(meta["model_spacing"]),
+                   convention=meta["convention"],
+                   canonical=Geometry(**{k: tuple(v) for k, v in meta["canonical"].items()}),
+                   original_orientation=meta.get("original_orientation", "RAS"),
+                   model_source=_grid_from(meta.get("model_source")))
 
     def output_geometry(self, grid: Grid):
         """SimpleITK geometry for labels on ``grid``, in the canonical frame.

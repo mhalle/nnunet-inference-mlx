@@ -136,3 +136,52 @@ def test_torch_reorient_matches_dicomorient_for_every_axis_aligned_orientation(t
                 np.testing.assert_allclose(ggeo.direction_xyz, want.GetDirection(), atol=1e-12)
                 n_checked += 1
     assert n_checked == 96
+
+
+# --- the spatial extent an artifact has to carry -----------------------------------------
+# A result computed on the model grid is only re-restorable somewhere else if a reader can
+# rebuild the frame, so the round trip has to reproduce the MAPPING, not merely the fields.
+
+def _meta_frame(cropped=False):
+    from nnseg.grid import Grid
+    return Frame(
+        source=Grid(shape=(40, 50, 60), spacing=(1.0, 0.8, 0.8), origin=(0.0, 0.0, 0.0)),
+        model_shape=(20, 27, 32), model_spacing=(2.0, 1.5, 1.5), convention="corner",
+        canonical=Geometry(spacing_zyx=(1.0, 0.8, 0.8), shape_zyx=(40, 50, 60),
+                           origin_xyz=(-11.5, 3.25, 7.0),
+                           direction_xyz=(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)),
+        original_orientation="LPS",
+        model_source=(Grid(shape=(36, 44, 52), spacing=(1.0, 0.8, 0.8), origin=(2.0, 3.2, 1.6))
+                      if cropped else None))
+
+
+@pytest.mark.parametrize("cropped", [False, True])
+def test_frame_meta_round_trip_reproduces_the_mapping(cropped):
+    import json
+
+    from nnseg.grid import Grid
+    f = _meta_frame(cropped)
+    back = Frame.from_meta(json.loads(json.dumps(f.to_meta())))      # must survive JSON
+    for grid in (f.source, Grid.isotropic(3.0, like=f.source),
+                 Grid(shape=(7, 9, 11), spacing=(4.0, 3.0, 3.0), origin=(1.5, -2.0, 0.5))):
+        a, b = f.mapping(grid), back.mapping(grid)
+        np.testing.assert_allclose(a.a, b.a, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(a.b, b.b, rtol=0, atol=1e-12)
+
+
+def test_frame_meta_round_trip_preserves_world_placement():
+    from nnseg.grid import Grid
+    f = _meta_frame()
+    back = Frame.from_meta(f.to_meta())
+    g = Grid.isotropic(2.5, like=f.source)
+    assert f.output_geometry(g) == back.output_geometry(g)
+    assert back.original_orientation == "LPS"
+
+
+def test_frame_meta_keeps_the_crop_offset():
+    """model_source carries nnU-Net's crop-to-nonzero offset. Dropping it would shift every
+    restored label by the crop and still look like a perfectly valid frame."""
+    cropped = _meta_frame(cropped=True)
+    assert Frame.from_meta(cropped.to_meta()).model_source is not None
+    g = cropped.source
+    assert tuple(cropped.mapping(g).b) != tuple(_meta_frame(False).mapping(g).b)

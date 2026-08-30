@@ -245,7 +245,58 @@ separate groups of one store:
 What co-location gave for free was *discovery*, which a manifest replaces (the result JSON's
 `links` map already has the slot). Each file is self-describing: `meta` carries the class
 count, depth, clip, dtypes, `max_tail`, the model spacing, the envelope offset and full model
-grid, the channel → global-label map, the orientation and the resampling convention.
+grid, the channel → global-label map, the orientation and the resampling convention — and
+`frame`, the **spatial extent**, which is what the next section is about.
+
+## Re-restoring: a new mask on an arbitrary grid, without the network
+
+Argmax after interpolation depends only on logit *differences*, and differences are exactly
+what is stored. So a stored code is not a picture of one run: rebuild `Frame.from_meta`,
+expand the per-class margin fields, and call the same `to_labels` the pipeline calls. The
+restore becomes a decision that can be *re-made* — which matters because the restore is not a
+minor knob (linear vs nearest moves rib volume ~9 %) while inference is the expensive,
+irreversible half.
+
+`Frame.to_meta()` / `Frame.from_meta()` carry the extent: the source grid, the crop-to-nonzero
+sub-grid, the model shape and spacing, the convention, the original orientation, and the world
+placement (origin plus direction cosines). Dropping any of it produces a frame that still
+looks valid and silently shifts every restored label — the crop offset especially.
+
+Measured on CT_Abdo `total_fast` (K = 118, depth 6, clip 8), re-restored from the code alone
+and compared against fresh `segment()` runs at each target:
+
+| target | agreement |
+|---|---|
+| the run's own input grid | 99.643 % |
+| 2 mm, linear | 99.650 % |
+| 2 mm, **nearest** | **99.9993 %** |
+| 5 mm, linear | 99.629 % |
+
+Nearest is essentially exact because it only consults the local ordering, which the ranks
+store exactly. Linear's ~0.35 % comes from the **clip**, not from the 8-bit step: interpolating
+toward a neighbor where a class truly sits 20 logits behind but is stored at −8 moves the
+zero crossing. Widening the clip confirms it, and exposes the trade:
+
+| clip | 2 mm linear | 2 mm nearest |
+|---|---|---|
+| 8 | 99.650 % | 99.9993 % |
+| 20 | 99.797 % | 99.973 % |
+| 40 | 99.798 % | 99.941 % |
+
+A wider clip reaches further for interpolation but, with 255 fixed levels, coarsens the step
+near ties (31 → 157 mlogit), which is exactly where nearest and every local decision live. It
+saturates by 20, so the residual 0.2 % is depth and quantization, not reach. If both mattered
+at once the answer is a **companded** support — fine near zero, coarse near the clip — rather
+than a different constant.
+
+Beyond a different grid, the same machinery re-decides the interpolation (so one store yields
+both the TS-parity nearest labelmap and the logit-grade linear one), the label mapping, and
+**confidence gating** — floor the background channel at *g* logits and only sufficiently
+confident voxels keep their label, which a labelmap cannot express at all. On this case a
+3-logit gate drops foreground from 2.44 M to 2.10 M voxels while keeping all 87 structures.
+
+One limit: compositing across parts still needs a policy, because margins are not comparable
+between models. Re-restoring replays that decision; it does not improve on it.
 
 ## What it costs — measured
 

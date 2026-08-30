@@ -240,8 +240,13 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         Between the network and the restore is the only moment they exist, so this costs
         one pass and no recomputation. The code is on the model's own (envelope-cropped)
         grid, which is where the distribution lives - restoring it to the output grid first
-        would inflate it and bake in one interpolation choice. What it takes to place that
-        grid in the world travels in ``meta``, so each part stands alone.
+        would inflate it and bake in one interpolation choice.
+
+        Which is exactly why ``frame`` and ``envelope_lo`` go with it: argmax after
+        interpolation depends only on logit DIFFERENCES, and those are what is stored, so a
+        reader holding the spatial extent can redo the restore onto any grid - different
+        spacing, nearest instead of linear, a confidence gate - without the network. Without
+        the extent the same arrays are only a picture of the grid they were computed on.
         """
         from . import ranked
         t = time.perf_counter()
@@ -252,7 +257,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             envelope_lo=[int(v) for v in env.lo], model_grid=[int(v) for v in env.shape],
             labels=[int(v) for v in np.asarray(lut).reshape(-1)],   # channel -> global label
             convention=convention, reoriented_to_ras=bool(reorient),
-            input_orientation=orientation)
+            input_orientation=orientation, frame=frame.to_meta())
         probabilities.sink(part, code)
         T[f"probabilities:{part}"] = time.perf_counter() - t
 
