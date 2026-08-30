@@ -124,6 +124,17 @@ does, exactly:
 - `ranks[0]` **is** the argmax, stored losslessly — the zero sentinel only ever touches ranks 1
   and up. Verified against the live field on the organs part: **11,464,290 / 11,464,290 voxels
   identical.**
+
+  ⚠ That holds **within a backend**. Encoding the same fp16 logits on an L40S and on its host
+  CPU disagrees at **0.032 %** of voxels, every one of them an exact tie (`max |dv| = 0.0`) —
+  `topk` does not define an order among equals and CUDA's is not the CPU's. Promotion does not
+  help: `encode` casts to fp32 before `topk`, but fp16 -> fp32 is exact, so ties survive it. At
+  fp32 input the two are bit-identical. A tie at the *winner* only flips a label whose margin
+  is ~0 either way; a tie at the *depth boundary* decides which class is kept and which drops
+  to the sentinel, and the dropped one then decodes to `-clip` rather than `-gap` — measured up
+  to 3.5 logits apart on a deliberately tie-heavy field. So the store is reproducible, and
+  content-addressable, only per backend. Breaking ties by class index after `topk` would make
+  it absolute, and would also align `ranks[0]` with `argmax`'s own first-index convention.
 - The box a cascade actually consumes is therefore identical. For the five lung lobes that
   `lung_vessels` and `lung_nodules` crop to: `((94,240), (13,116), (52,218))`, 2.55 Mvox, from
   both the live logits and the store.
