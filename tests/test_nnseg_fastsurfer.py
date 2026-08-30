@@ -190,9 +190,9 @@ def test_emit_probabilities_hands_over_the_field_with_both_grids():
     assert part == "brain"
     assert code.meta["engine"] == "fastsurfer"          # a reader must know what made it
     assert code.meta["labels"] == list(range(K))
-    assert code.meta["source_grid"]["origin_xyz"] == [-1.5, 2.0, 0.25]
-    assert code.meta["target_grid"]["spacing_xyz"] == [0.8, 0.9, 1.1]
-    assert code.meta["source_grid"]["size_xyz"] != code.meta["target_grid"]["size_xyz"]
+    assert code.meta["source_grid"]["origin_xyz"] == [-1.5, 2.0, 0.25]   # world: xyz
+    assert code.meta["target_grid"]["spacing_zyx"] == [1.1, 0.9, 0.8]    # array: zyx
+    assert code.meta["source_grid"]["shape_zyx"] != code.meta["target_grid"]["shape_zyx"]
 
 
 def test_emit_probabilities_accepts_the_cpu_paths_axis_order():

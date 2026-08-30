@@ -21,10 +21,15 @@ def grid_record(ref) -> dict:
     own grid and the target's, or the arrays are only a picture of the grid they happened to
     be computed on and the restore can never be re-decided.
 
+    Axis order follows the rule stated on :class:`~nnseg.values.Geometry`: quantities that
+    index the ARRAY are ``_zyx``, quantities in WORLD space are ``_xyz``. SimpleITK reports
+    size and spacing in x, y, z, so those are reversed here; origin and the row-major
+    direction cosines are already world-space and are passed through.
+
     Duck-typed on the SimpleITK image interface, like the rest of this module.
     """
-    return {"size_xyz": [int(v) for v in ref.GetSize()],
-            "spacing_xyz": [float(v) for v in ref.GetSpacing()],
+    return {"shape_zyx": [int(v) for v in reversed(ref.GetSize())],
+            "spacing_zyx": [float(v) for v in reversed(ref.GetSpacing())],
             "origin_xyz": [float(v) for v in ref.GetOrigin()],
             "direction_xyz": [float(v) for v in ref.GetDirection()]}
 
