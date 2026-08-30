@@ -424,6 +424,29 @@ OR of its member labels.
 bit-identical at 3, 1.5 and 1 mm, and **18x faster** at 1 mm (0.17 s vs 3.06 s) because it
 skips a channel of sampling and the argmax.
 
+**Against the uncompressed logits** (not against another decoder), on the real organs part,
+depth 6 / clip 8:
+
+| group | members | Dice | FP | FN | margin err p50 | p95 | max |
+|---|---|---|---|---|---|---|---|
+| liver | 1 | 0.99982 | **0** | 126 | 0.0078 | 0.0149 | 3.24 |
+| kidneys | 2 | 0.99988 | **0** | 23 | 0.0079 | 0.0149 | 3.22 |
+| lungs | 5 | 0.99994 | **0** | 87 | 0.0079 | 0.0149 | 3.33 |
+| gi tract | 5 | 0.99955 | **0** | 264 | 0.0078 | 0.0148 | 2.73 |
+
+**False positives are structurally impossible.** `ranks[0]` is the bit-exact argmax, so the
+store always agrees on *who won*; a member can only fail to be claimed, never be falsely
+claimed. Every loss is the quantization dead zone — a win smaller than one level (clip/255)
+decodes to exactly zero — which is 0.035 % of the liver. The p50/p95 errors are half a
+quantum, the quantizer performing to spec.
+
+⚠ **The max error is depth truncation, and it costs magnitude rather than mask.** A member
+below rank N reads as absent (`-clip`) instead of at its true level, worth up to 3.3 logits.
+Depth 3 and depth 6 give *identical* masks on real data — same Dice, same FP, same FN —
+while the liver's p95 error goes 0.0149 → 0.2969. So **depth is a rendering decision, not a
+labelmap one**: a labelmap consumer can take depth 3, a consumer that samples the field for
+an opacity ramp should not.
+
 Four rules for building it:
 
 - **Group at the model grid, then resample.** The `max` walks the planes once at model

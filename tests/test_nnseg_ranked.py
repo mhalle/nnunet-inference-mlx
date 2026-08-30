@@ -426,3 +426,42 @@ class TestDecodeGroups(unittest.TestCase):
         np.testing.assert_allclose(out.cpu().numpy(),
                                    ranked.decode_groups(code, [[0, 1], [2]]).numpy(),
                                    atol=1e-4)
+
+    def test_a_group_field_matches_the_TRUTH_not_just_the_other_decoder(self):
+        """Every other test here is self-consistency - decode_groups against margin(), both
+        read out of the same code. This one computes m_S from the uncompressed logits.
+
+        False positives are structurally impossible: ranks[0] is the exact argmax, so the
+        store always agrees on who won, and a member can only fail to be claimed. Losses are
+        confined to the quantization dead zone. On the real organs part this is Dice 0.9996
+        to 0.9999 with FP 0 for every group."""
+        lg = _logits(K=9)
+        code = ranked.encode(lg, depth=7, clip=8.0)
+        members = [1, 3, 5]
+        mask = torch.zeros(9, dtype=torch.bool)
+        mask[members] = True
+        truth = lg[mask].amax(0) - lg[~mask].amax(0)
+        got = ranked.decode_groups(code, [members])[0]
+
+        self.assertEqual(int(((got > 0) & (truth <= 0)).sum()), 0, "must never over-claim")
+        band = truth.abs() < 8.0 * 0.98
+        err = (got - truth)[band].abs()
+        self.assertLess(float(err.quantile(0.95)), 8.0 / 255 * 1.5,
+                        "in-band error must stay within the support quantum")
+
+    def test_depth_preserves_the_mask_but_costs_field_MAGNITUDE(self):
+        """Measured on real data: depth 3 and depth 6 give byte-identical group masks, while
+        the liver's p95 margin error goes 0.0149 -> 0.2969. So depth is a rendering decision,
+        not a labelmap one - a member below the cut reads as absent (-clip) rather than at
+        its true level."""
+        lg = _logits(K=10)
+        members = [0, 2, 4]
+        mask = torch.zeros(10, dtype=torch.bool)
+        mask[members] = True
+        truth = lg[mask].amax(0) - lg[~mask].amax(0)
+        deep = ranked.decode_groups(ranked.encode(lg, depth=8, clip=8.0), [members])[0]
+        shallow = ranked.decode_groups(ranked.encode(lg, depth=2, clip=8.0), [members])[0]
+        np.testing.assert_array_equal((deep > 0).numpy(), (shallow > 0).numpy())
+        band = truth.abs() < 8.0 * 0.98
+        self.assertLessEqual(float((deep - truth)[band].abs().max()),
+                             float((shallow - truth)[band].abs().max()))
