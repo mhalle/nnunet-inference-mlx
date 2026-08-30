@@ -192,7 +192,7 @@ One extra plane buys more than a whole rank/support pair (86.7 → 92.3 for one 
 eleven planes to 0.001 points.**
 
 It also subsumes the clip-tuning problem. A fixed clip is a global constant standing in for a
-per-voxel quantity, which is why clip 8 → 16 mattered so much (see §9). The adaptive floor
+per-voxel quantity, which is why clip 8 → 16 mattered so much (see §10). The adaptive floor
 stores the actual value instead.
 
 **Recommendation: store N ranks and N supports.**
@@ -333,7 +333,122 @@ add.
 
 ---
 
-## 8. Compositing across parts
+## 8. Consuming: meshers and renderers
+
+The store is not a label map that a consumer re-derives; it is a **continuous field a
+consumer samples**. Two applications exercise that differently.
+
+### 8.1 SurfaceNets — sub-voxel placement
+
+For every cell edge where the margin changes sign, solve `t = m_A / (m_A - m_B)` and compare
+against the crossing computed from raw logits. Error in voxels (3 mm each):
+
+| structure | 2-plane median / p95 | full depth median / p95 |
+|---|---|---|
+| liver | 0.0006 / **0.214** | 0.0003 / **0.0052** |
+| lung_upper_lobe_left | 0.0011 / 0.336 | 0.0007 / 0.0317 |
+| lung_lower_lobe_left | 0.0008 / 0.270 | 0.0006 / 0.0253 |
+| autochthon_right | 0.0000 / 0.067 | 0.0000 / 0.0037 |
+
+**Two planes place the typical vertex exactly** — a median of ~0.001 voxel is ~3 um. That is
+the §3 identity at work: at a two-class boundary the reconstructed margin for `c` is its true
+margin on *both* sides, so the crossing is right.
+
+**But the tail is 0.21-0.34 voxels (0.6-1.0 mm)** against 0.005-0.04 at full depth. Those are
+the junction vertices, and a mesh shows them as local bumps or a ragged seam exactly where two
+organs abut. **Mesh quality is a tail property, so mesh from full depth.**
+
+### 8.2 Volume rendering — sample level 0, bound with max-pooling
+
+Sample `margin` trilinearly at ray positions: a signed field whose zero crossing is the
+surface, with a gradient for shading. Everything in §6 applies — margin for surfaces, ramp in
+**millimetres** (`m / |grad m|`) not logits, never interpolate a stored plane.
+
+Space skipping needs a **conservative** proxy: one that never reports empty where something
+is. The reduction matters, and the intuitive choice is wrong.
+
+| structure | level | avg-pool: blocks MISSED | max-pool: missed | max-pool bloat |
+|---|---|---|---|---|
+| liver | 1 | **808** | 0 | 0.0 % |
+| lung_upper_lobe_left | 1 | **631** | 0 | 0.0 % |
+| gallbladder | 1 | **66** | 0 | 0.0 % |
+
+⚠ **Average-pooling erodes, which is exactly hiding.** A ray using it skips regions that
+contain the structure and geometry is lost silently. Earlier drafts of this reasoning claimed
+coarse levels "err by eroding, so they cannot hide anything" — that is backwards.
+
+**Max-pooling is exactly conservative** by construction: `max(m) > 0` in a block iff some
+voxel in it is inside. Zero missed, zero bloat, at every level.
+
+So the bound needs no coarse *values*, only "could this block contain `c`" — **one bit per
+structure per block**, which is the per-chunk presence index of §11 arriving from another
+direction. Consequently **a value pyramid is not needed at all**: its only justification was
+LOD shading, and §8.3 says do not shade from coarse levels.
+
+### 8.3 If you build a value pyramid anyway
+
+Decimating the margin field versus **re-encoding each level from the logits** (surface shift,
+median, and enclosed-volume change):
+
+| structure | level | decimate | re-encode |
+|---|---|---|---|
+| liver | 1 (6 mm) | 0.868 mm / -4.3 % | **0.524 mm / -2.8 %** |
+| lung_lower_lobe_left | 1 | 0.532 mm / -3.7 % | **0.406 mm / -1.4 %** |
+| gallbladder | 1 | 0.470 mm / -22.1 % | 1.101 mm / -20.3 % |
+| gallbladder | 2 (12 mm) | 2.306 mm / -65.9 % | **1.378 mm / -52.0 %** |
+
+Re-encoding is better for large structures and costs ~14 % (a pyramid *down* is `1 + 1/8 +
+1/64`). But **the erosion floor remains**: the gallbladder still loses half its volume at
+12 mm. That loss is not an encoding artifact — it is information genuinely absent at that
+resolution, since the model's own logits interpolated to 12 mm no longer put the structure
+ahead anywhere. **The pyramid's limit is resolution, not representation**, and no encoding
+fixes it. Record per level which structures reached zero voxels, so a renderer does not
+conclude a gallbladder is absent from the scan.
+
+### 8.4 Group fields: ~10 structures instead of 118
+
+A renderer usually wants composite structures, and grouping is a **decode-time** choice — the
+store keeps all classes.
+
+Build `d_S = max over members` and `d_notS = max over the rest` in one pass over the encoded
+planes (no K-channel stack), then `m_S = d_S - d_notS` is the union's margin field.
+
+**Internal boundaries vanish, which is the real win.** Of 1,413 adjacent voxel pairs where two
+lung lobes abut, `m_S` crosses zero at **exactly zero** of them. Rendering five lobes as five
+fields puts a surface at all 1,413 — five shells pressed together, with cracks, z-fighting and
+doubled shading. The union is **one manifold**. And it is faithful: 99.9992 % identical to the
+OR of its member labels.
+
+**One field per group, not two.** Interpolation is linear, so
+`interp(d_S) > interp(d_notS)` and `interp(d_S - d_notS) > 0` are the same question. Measured
+bit-identical at 3, 1.5 and 1 mm, and **18x faster** at 1 mm (0.17 s vs 3.06 s) because it
+skips a channel of sampling and the argmax.
+
+Four rules for building it:
+
+- **Group at the model grid, then resample.** The `max` walks the planes once at model
+  resolution; only the single resulting field pays the target-resolution cost. Grouping after
+  resampling does the expensive part K times.
+- **Emit uint8 quantized margin**, not float32 — ten groups at 1 mm is 1.5 GB as float32 and
+  386 MB as uint8, which is what a GPU wants anyway (128 = the surface).
+- **Take membership from the label LUT**, never from name prefixes. `startswith("lung_")` is
+  the filename-semantics failure of §11 in another costume.
+- **A cross-part group is per-part.** Composite the resulting fields; do not merge them into
+  one field, which would require comparing margins across models.
+
+### 8.5 The decode reduces to one operation
+
+```
+decode(groups, spacing) -> one uint8 margin field per group
+```
+
+Grouping is a `max` while walking the rank planes; resolution is the target grid handed to
+`to_labels`. Neither is baked into the store, so the same bytes answer "118 classes at 3 mm",
+"ten groups at 1 mm", or "two groups at 6 mm" with no re-encoding — which is what lets a
+viewer toggle *show lobes separately* against *show lungs* as a half-second re-extraction
+rather than a different artifact.
+
+## 9. Compositing across parts
 
 The composite label map is **derived, and worth shipping**: 0.222 MB, 5.8 % of the store,
 89 % of the size of the five per-part maps it summarizes. It is the only thing most consumers
@@ -355,7 +470,7 @@ should not be materialized. A cached query result is not information.
 
 ---
 
-## 9. Rejected alternatives, with numbers
+## 10. Rejected alternatives, with numbers
 
 **Companding the support** (spending the 255 levels non-uniformly). Tested with the corrected
 `deficit` field across clips 16–40 and gammas 0.7–3.0. Uniform wins decisively:
@@ -401,7 +516,7 @@ Staged linear — wider support without the negative lobes — was worse than a 
 
 ---
 
-## 10. Storage layout
+## 11. Storage layout
 
 **A sharded zarr directory, not a zip.** Measured: 3.82 MB in 83 files versus 3.89 MB in one
 zip of 1067 entries. A zip entry costs ~127 bytes (local header, central directory record,
@@ -438,7 +553,7 @@ rather than names, so a part legitimately called `composite` collides with nothi
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
 - **Depth defaults.** Depth 3 + adaptive floor matches depth 6 at K = 118, and the parts
   converge sooner. The residual loop (§5) should set it per part; the fixed default should
@@ -454,5 +569,12 @@ rather than names, so a part legitimately called `composite` collides with nothi
 - **Region (sigmoid) heads** have no rank structure, so none of §3–§5 applies; `encode_regions`
   stores one margin plane per region and everything in §6 about *what* to interpolate still
   holds.
+- **A conservative bound is not implemented.** §8.2 needs a max-pooled, 1-bit-per-structure
+  hierarchy; the per-chunk presence index of §11 is the same object and is also unbuilt.
+- **Group extraction is not in the API.** `nnseg.ranked` exposes `margin` and `deficit` per
+  channel; the union field of §8.4 (`max` over members minus `max` over the rest, in one pass)
+  has only been written as a scratch function.
+- **Uint8 group output.** §8.4 wants quantized margin textures, not float32 volumes; the
+  quantization is the same as the store's but the API returns floats.
 - **All measurements are two cases.** The *shape* of every finding was consistent across ten
   segmentations, but absolute numbers will move.
