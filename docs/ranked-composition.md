@@ -19,8 +19,13 @@ unrelated questions are involved:
 - **Axis A — does the output fit the store?** A property of the output's *structure*.
 - **Axis B — can the computation be deferred?** A property of the *dependency graph*.
 
-A task can fail either independently. Cascades fail B while fitting A perfectly. Region heads
-fail A while being perfectly deferrable. Filing them in one list hides that.
+A task can fail either independently. Cascades fail B while fitting A perfectly; VoxTell fits
+A for any given prompt but fails B, because the prompt is an *input* and the catalog is
+unbounded. Filing them in one list hides that.
+
+⚠ Axis A is also more permissive than it first looks, and the instinct to sort by engine is
+what obscures it. FastSurfer seg and SynthStrip both fit; region heads fit in a different
+mode. The genuine Axis-A exclusion is narrow — outputs that are not voxel fields at all.
 
 ---
 
@@ -33,7 +38,7 @@ softmax**. Anything with that shape fits, whatever produced it.
 |---|---|---|
 | multi-class softmax over a partition | nnU-Net parts; FastSurfer seg; MONAI labelmap bundles; VoxTell for a fixed prompt | exactly |
 | single graded channel | SynthStrip SDT | yes — one layer |
-| overlapping sigmoid regions | BraTS tumor core / whole / enhancing | **no** |
+| overlapping sigmoid regions | BraTS tumor core / whole / enhancing | yes — different mode |
 | non-voxel | FastSurfer surfaces, thickness | out of scope |
 
 **FastSurfer seg is a first-class citizen**, not a special case. `engines/fastsurfer.py` already
@@ -54,10 +59,29 @@ One layer whose margin is already metric and whose threshold is still live. It w
 different codec from the ranked one — linear over a truncation band, far field coarse — but
 the same container. **Same store, different codec per layer type.**
 
-**Region heads are the real Axis-A failure.** Overlapping regions are not a partition, so there
-is no winner and no runner-up, and a margin does not mean what it means elsewhere.
-`ranked.encode_regions` exists separately for this; see `engines/monai_bundle.py:87`, which
-refuses to interpret them rather than guessing.
+**Region heads fit too, in a different mode — do not repeat the claim that they do not.**
+Overlapping regions are independent Bernoullis, so there is no winner and no runner-up, but
+the logit *is already* the margin: `encode_regions` stores `m_c = l_c - threshold`, one plane
+per region, positive inside. Folding the threshold in at encode time is what lets a consumer
+treat zero as the boundary **without knowing the head type**, so a renderer or mesher sampling
+margin fields works on them unchanged, and `margin()` / `probabilities()` carry explicit
+region branches.
+
+Compositing is in fact *simpler* here: with no competitor set, union is `max(m) > 0` and
+intersection `min(m) > 0`, both exact — none of the `d_S - d_notS` construction of §3 is
+needed.
+
+Three things genuinely do not carry over:
+
+- **Ranking.** §3–§5 of the companion (progressive refinement, adaptive floor, dynamic depth)
+  presuppose a rank order. `encode_regions` stores K full planes, no sentinel sparsity, no
+  truncation — fine at BraTS's K = 3, not a compression win at large K, though large-K region
+  heads are not a thing that exists.
+- **The labelmap view.** Overlapping regions cannot argmax to one label. That is a limit of the
+  output *view*, not of the representation.
+- **Automatic naming.** `engines/monai_bundle.py:87` refuses to interpret a bundle's region
+  `channel_def`, deliberately — read as a labelmap, brats reported its background as "Tumor
+  core: 6372 ml". An introspection gap, not a representation gap.
 
 ---
 
@@ -162,8 +186,6 @@ live because the SDT was stored graded rather than thresholded at inference.
 ## 6. What remains out
 
 - **Cascade inference** (Axis B). The box is derivable; the network still has to run.
-- **Region heads** (Axis A). Needs `encode_regions` and a different set of operations —
-  per-channel thresholding, not cross-class margins.
 - **Unbounded catalogs.** VoxTell's prompt is an *input*, so its output fits the store per
   prompt but the catalog cannot be precomputed.
 - **Non-voxel outputs.** Surfaces and thickness are a different kind of artifact.
