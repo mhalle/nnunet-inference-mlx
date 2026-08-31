@@ -799,11 +799,21 @@ recover accuracy monotonically — and loses anyway:
 | 2-plane @ 1.5 mm | 65,536 | 0.9950 |
 | 2-plane @ 0.5 mm | 1,769,472 | 0.9993 |
 
-216× the voxels to end up *behind* full depth at native. Upsampling adds no information — the
-network computed at 3 mm — it only reduces three-way junctions per voxel, which is exactly
-what the deeper planes encode directly and far more cheaply. Measured store cost of a 2×
-level: **6.8×** (0.373 → 2.555 MB), with `margin` growing 7.4× (quasi-continuous, nothing to
-collapse) against `labels` at 3.7×.
+216× the voxels to end up *behind* full depth at native. Re-encoding on a finer grid adds no
+information — the network computed at 3 mm — it only reduces three-way junctions per voxel,
+which is exactly what the deeper planes encode directly and far more cheaply. Measured store
+cost of a 2× level: **6.8×** (0.373 → 2.555 MB), with `margin` growing 7.4× (quasi-continuous,
+nothing to collapse) against `labels` at 3.7×.
+
+⚠ **This is about ENCODING, and does not say that resampling the field is pointless.** The
+opposite: the stored field is continuous and its zero level set locates a surface to
+**0.0006 voxels median** (§10's crossing table, ~1 µm at 1.5 mm), so the grid is a lossy
+quantization of the field rather than the field's limit. Resampling it is dequantization
+toward a real, hard-edged object, and against the alternatives a viewer actually has — a
+staircased nearest-neighbor labelmap, or a blur — it is closer to the truth, not merely
+smoother. It matters most on anisotropic acquisitions, where the native grid is blocky
+*differently per axis* and no viewer-side care removes that; the field has no preferred axis,
+so resampling to isotropic deletes an artifact instead of trading one for another.
 
 **Dropping the rank planes** (`labels` + `support[0]` + `support[1]`, no `ranks[1]`): 69.8 %
 against 94.7 %. See §3.
