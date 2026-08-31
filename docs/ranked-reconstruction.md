@@ -16,7 +16,7 @@ Both are contrast CT and both are **torsos**, which is a real limit on everythin
 
 | name | provenance | grid | coverage |
 |---|---|---|---|
-| `idc-torso1` | NCI Imaging Data Commons, CPTAC-3, patient `C3N-01524`, series `…426160`, Philips Brilliance 64, 2009-07-28. 709 DICOM instances. | 709 × 768 × 768 at 1.0 × 0.651 × 0.651 mm | lung apices through the kidneys and bowel |
+| `idc-torso1` | NCI Imaging Data Commons, `cptac_ccrcc`, patient `C3N-01524`, series `…426160`, Philips Brilliance 64, 2009-07-28. 709 DICOM instances. | 709 × 768 × 768 at 1.0 × 0.651 × 0.651 mm | lung apices through the kidneys and bowel |
 | `CT_Abdo` | 3D Slicer sample data, [CTA-cardio.nrrd](https://www.slicer.org/wiki/File:CTA-cardio.nrrd). No DICOM, no series UID, no patient identifier. | 256 × 178 × 255 at ≈ 1.49 mm | heart and lungs through the kidneys and bowel |
 
 `chest.nii` became `idc-torso1` on 2026-08-30 — 709 mm of coverage ending well below the
@@ -25,6 +25,15 @@ stays true. `CT_Abdo` keeps its filename, which likewise does not describe it: t
 2.5 L of lung and 497 mL of heart, and the upstream file is named for a cardiac angiogram whose
 coverage it does not match either. Treat both as labels, not descriptions — the provenance
 column is the part worth trusting, and each store carries those identifiers verbatim.
+
+ℹ **The demo set has since moved on; these numbers have not been re-measured.** `CT_Abdo` was
+replaced by `nlst-217076` (IDC, NLST-ACRIN, patient 217076, 249 contiguous 1.25 mm slices) —
+an IDC case with a resolvable identifier, a DOI, a licence, and an independently published
+TotalSegmentator v1.5.6 segmentation of the same series to check against, none of which
+`CT_Abdo` has. Every measurement below was taken on the two cases named above and is reported
+as such; re-measure rather than assume it carries to the current set. The demo stores also now
+come from CUDA rather than MPS, which moves labels by ~0.005 % — far below anything reported
+here, but not nothing.
 
 ⚠ **Two cases, one body region.** Nothing measured here touches pelvis, head and neck, or the
 extremities. Every per-structure result — the confidence slopes, the depth at which a part

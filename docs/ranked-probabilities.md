@@ -5,11 +5,12 @@ A labelmap answers *which class won*. This keeps the second answer — *by how m
 about a third of a byte per voxel, computed from the logits at the one moment they exist.
 
 Written 2026-08-29. Every number below was measured on real TotalSegmentator output, not
-estimated, on two contrast-CT torsos: **`idc-torso1`** (NCI Imaging Data Commons, CPTAC-3,
+estimated, on two contrast-CT torsos: **`idc-torso1`** (NCI Imaging Data Commons, `cptac_ccrcc`,
 patient `C3N-01524`, 709 instances at 1.0 × 0.651 mm) and **`CT_Abdo`** (3D Slicer
 sample data, ≈ 1.49 mm, no DICOM provenance). Both cover thorax and upper abdomen only —
 see [ranked-reconstruction.md §0](ranked-reconstruction.md#0-the-two-cases) for what that
-excludes.
+excludes, and for why `CT_Abdo` has since been replaced by `nlst-217076` in the demo set.
+Numbers here were measured on the cases named, and have not been re-taken.
 
 ## Why bother
 
