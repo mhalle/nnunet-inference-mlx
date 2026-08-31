@@ -1,0 +1,137 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["zarr>=3"]
+# ///
+"""Rename the IDC case to `idc-torso1` and record the provenance that makes the name checkable.
+
+`chest.nii` covers 709 mm ending well below the diaphragm - its study description is
+"06. Chest, Abdomen CE" - so the name described a body region the scan is not. It is now named
+after the archive it came from, which stays true.
+
+**CT_Abdo keeps its name.** It is also a torso rather than an abdomen (2.5 L of lung, 497 mL of
+heart, reaching colon and kidneys), and its upstream file is named for a cardiac angiogram it
+does not match either, but renaming it was not asked for. Its store still gains a provenance
+block, because recording what a case actually is costs nothing and is separate from naming it.
+
+Files keep working under their old names: the artifacts are renamed and the old names become
+symlinks, because ~19 files in the repo - including recorded benchmark logs and CLAUDE.md's
+established facts - refer to `chest.nii`, and those logs recorded a run against a file of that
+name. Rewriting them would falsify the record; dangling them would be worse.
+
+Idempotent: re-running after a `rebuild_duckn.py` re-emit restores the provenance blocks.
+"""
+import os
+import sys
+from pathlib import Path
+
+import zarr
+
+# The file renames below already ran once and are idempotent; DATA only matters if they have
+# not. DEMO is where the stores live and is the argument that actually gets used day to day.
+DATA = Path(os.environ.get("NNSEG_DEMO_DATA", "~/tmp/data")).expanduser()
+DEMO = Path(sys.argv[1] if len(sys.argv) > 1 else "duckn_demo")
+
+IDC = {
+    "case": "idc-torso1",
+    "archive": "NCI Imaging Data Commons",
+    "collection": "CPTAC-3",
+    "patient_id": "C3N-01524",
+    "study_description": "06. Chest, Abdomen CE",
+    "series_description": "NEPHROGENIC",
+    "study_date": "20090728",
+    "modality": "CT",
+    "manufacturer": "Philips",
+    "model": "Brilliance 64",
+    "slice_thickness_mm": 2.0,
+    "instances": 709,
+    "study_instance_uid":
+        "1.3.6.1.4.1.14519.5.2.1.2932.1975.277486652714623414151775226101",
+    "series_instance_uid":
+        "1.3.6.1.4.1.14519.5.2.1.2932.1975.255072988367557196694880426160",
+    "frame_of_reference_uid":
+        "1.3.6.1.4.1.14519.5.2.1.2932.1975.712737093675822540969939888973",
+}
+
+SLICER = {
+    "case": "CT_Abdo.nii.gz",
+    "archive": "3D Slicer sample data",
+    "source_url": "https://www.slicer.org/wiki/File:CTA-cardio.nrrd",
+    "modality": "CT",
+    "note": "Provenance is the NIfTI `descrip` / `ITK_FileNotes` fields only - no DICOM, no "
+            "series UID, no patient identifier, and NOT IDC-derived. The filename is a label, "
+            "not a description: the volume is a torso, and the upstream file is named for a "
+            "cardiac angiogram whose coverage it does not match either.",
+}
+
+OPENNEURO = {
+    "case": "ds000114_sub-01",
+    "archive": "OpenNeuro",
+    "dataset": "ds000114",
+    "dataset_doi": "10.18112/openneuro.ds000114.v1.0.1",
+    "dataset_name": "A test-retest fMRI dataset for motor, language and spatial "
+                    "attention functions.",
+    "path": "ds000114/sub-01/ses-test/anat/sub-01_ses-test_T1w.nii.gz",
+    "subject": "sub-01",
+    "session": "ses-test",
+    "modality": "MR",
+    "contrast": "T1w",
+    "license": "CC0",
+    "cite": "http://www.ncbi.nlm.nih.gov/pmc/articles/PMC3641991/",
+}
+
+RENAMES = [("chest.nii", "idc-torso1.nii"),
+           ("chest.zarr.zip", "idc-torso1.zarr.zip"),
+           ("chest_nnseg_1.5mm.zarr.zip", "idc-torso1_nnseg_1.5mm.zarr.zip"),
+           ("chest_dicom", "idc-torso1_dicom"),
+           ("chest.zmp", "idc-torso1.zmp")]
+
+print(f"data artifacts ({DATA})")
+for old, new in RENAMES:
+    o, n = DATA / old, DATA / new
+    if n.exists() and o.is_symlink():
+        print(f"  {old:<32} already renamed")
+        continue
+    if not o.exists():
+        print(f"  {old:<32} MISSING - skipped")
+        continue
+    o.rename(n)
+    os.symlink(new, o)                       # relative: the old path keeps resolving
+    print(f"  {old:<32} -> {new}   (old name kept as symlink)")
+
+
+def stamp(store_name, prov, new_name=None):
+    """Write the provenance block, renaming the store only if a new name is given."""
+    d = DEMO / store_name
+    if not d.exists():
+        print(f"  {store_name:<32} MISSING - skipped")
+        return
+    if new_name:
+        d.rename(DEMO / new_name)
+        d = DEMO / new_name
+    root = zarr.open_group(str(d), mode="r+")
+    a = dict(root.attrs.asdict()["duckn"])
+    ext = dict(a["extensions"])
+    ext["nnseg"] = dict(ext["nnseg"]) | {"case": prov["case"]}
+    ext["provenance"] = prov                 # the claim the name makes, in checkable form
+    a["extensions"] = ext
+    root.attrs["duckn"] = a
+    print(f"  {d.name:<32} case={prov['case']:<18} archive={prov['archive']}")
+
+
+print("\ndemo stores")
+for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("idc-torso1")):
+    stamp(_s, IDC)
+for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("CT_Abdo")):
+    stamp(_s, SLICER)
+for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("ds000114")):
+    stamp(_s, OPENNEURO)
+
+print("\nverify")
+for n in sorted(p.name for p in DEMO.iterdir()):
+    r = zarr.open_group(str(DEMO / n), mode="r")
+    e = r.attrs.asdict()["duckn"]["extensions"]
+    print(f"  {n}")
+    print(f"    nnseg.case      {e['nnseg']['case']}")
+    print(f"    provenance keys {sorted(e['provenance'])}")
+    print(f"    parts           {sorted(k for k, _ in r['parts'].groups())}")
+print(f"\n  {DATA/'chest.nii'} -> {os.readlink(DATA/'chest.nii')}")
