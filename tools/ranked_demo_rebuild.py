@@ -48,9 +48,12 @@ CASCADES = {"lung_vessels", "liver_vessels", "liver_segments", "abdominal_muscle
 CT_TASKS = ["total", "total_fast", "total_fastest", "body", "trunk_cavities",
             "vertebrae_body", "lung_vessels"]
 
-# `idc-torso1/total` predates the envelope=None convention: its five parts were computed on four
-# different body envelopes, so it is the one store that must be padded onto a shared grid.
-PAD = {("idc-torso1", "total")}
+# Nothing needs padding any more. `idc-torso1/total` used to: its five parts were computed on
+# four different body envelopes, so they had to be filled out onto a shared grid, which meant a
+# store containing voxels the network never produced. Re-emitting with envelope=None removed
+# both the step and the assertion - every part now IS the model grid. Kept as an empty set
+# rather than deleted, because a store built from an envelope-cropped emit would need it again.
+PAD: set[tuple[str, str]] = set()
 
 JOBS = [(s, t, "last" if t in CASCADES else "all", (s, t) in PAD)
         for s in ("idc-torso1", "nlst-217076") for t in CT_TASKS]
