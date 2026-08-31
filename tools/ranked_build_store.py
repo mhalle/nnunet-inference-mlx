@@ -298,6 +298,38 @@ def layout(shape):
     return chunks, tuple(int(np.ceil(s / c) * c) for s, c in zip(shape, chunks))
 
 
+def generator_steps(meta, items, engine):
+    """duckn `processing` steps: what ran, with what, and with which parameters.
+
+    Two steps, because they are genuinely separable and can fail independently - the network
+    produced a distribution, then this tool laid it out as a store. A reader debugging a wrong
+    store needs to know which of those to doubt.
+    """
+    first = dict(items)[next(iter(dict(items)))]
+    nnseg_v = first.get("nnseg")
+    models = [p.get("softmax", {}) for _n, p in items if p.get("softmax")]
+    seg = {"name": "Segmentation",
+           "description": f"{meta.get('task')} via the {engine} engine; the pre-argmax logit "
+                          "field was captured between the network and the restore",
+           "software": {"name": "nnseg", "version": nnseg_v,
+                        "url": "https://github.com/mhalle/nnunet-inference-mlx"},
+           "parameters": {"task": meta.get("task"), "engine": engine,
+                          "depth": meta.get("depth"), "clip": meta.get("clip"),
+                          "envelope_mm": meta.get("envelope_mm"),
+                          "device": meta.get("device")}}
+    if models:
+        seg["method"] = {"name": meta.get("task"),
+                         "version": ", ".join(sorted({str(m.get("version")) for m in models})),
+                         "models": models}
+    return [seg,
+            {"name": "Ranked encoding and store layout",
+             "description": "top-N ranks with quantized gaps, packed as zarr v3 with one shard "
+                            "per array and a per-brick occupancy index",
+             "software": {"name": "ranked_build_store.py", "version": nnseg_v},
+             "parameters": {"depth": meta.get("depth"), "clip": meta.get("clip"),
+                            "brick": [BRICK, BRICK, BRICK], "parts_kept": "all"}}]
+
+
 def build(src, out, case, parts="all", allow_unnamed=False):
     src, out = Path(src), Path(out)
     meta = json.loads((src / "meta.json").read_text())
@@ -338,6 +370,11 @@ def build(src, out, case, parts="all", allow_unnamed=False):
         if "convention" in part:                                   # nnunetv2 only
             block["resample_alignment"] = part["convention"]
             block["nominal_spacing"] = [float(v) for v in part["spacing_zyx"]]
+        if "softmax" in part:
+            # the identity of the normalization these classes competed in. Two parts share a
+            # softmax only if this matches; margins are not comparable otherwise. See the
+            # store README section 3.1.
+            block["softmax"] = part["softmax"]
         if "labels_note" in part:
             block["labels_note"] = part["labels_note"]
         if "target_grid" in part:                                  # fastsurfer: the input grid
@@ -425,6 +462,11 @@ def build(src, out, case, parts="all", allow_unnamed=False):
         "nnseg": {"nnseg_version": dict(items)[order[0]["name"]].get("nnseg"),
                   "engine": engine, "task": meta["task"], "case": case,
                   "source_file": Path(meta["image"]).name, "part_order": order},
+        # duckn specifies where "what produced this" goes: provenance.processing, each step
+        # naming its software. Writing it here rather than inventing a field means a duckn
+        # reader finds the generator in the place the spec says to look. `sources` and
+        # `attribution` are filled in per case by ranked_demo_provenance.py.
+        "provenance": {"version": "1.0", "processing": generator_steps(meta, items, engine)},
     }}})
     write_readme(out)
     mb = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) / 1e6

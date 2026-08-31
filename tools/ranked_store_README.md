@@ -118,6 +118,21 @@ constant to every logit changes nothing — so only *differences* are identifiab
 stored value is a comparison against the classes that competed. "Certainty about the liver" is
 always "certainty the liver beats whatever else is here."
 
+**Which softmax is recorded.** Each part's `ranked.softmax` names the normalization its classes
+competed in:
+
+```json
+"softmax": {"engine": "nnunetv2", "weights": "291", "classes": 25,
+            "version": "v2.0.4", "sha256": "...", "folder": "..."}
+```
+
+Two parts share a softmax **only if this matches**. Do not infer it from the task name — a task
+can be five models — nor from the folder name, which does not identify the weights version
+(`Dataset297` ships as both v2.0.0 and v2.0.4 and unpacks to the same folder). `version` may be
+`"unknown"` when the weights were installed by something other than nnseg and left no version
+sidecar; that is reported rather than guessed, because guessing is wrong in exactly the case
+versioning exists for.
+
 **Within one part** the classes partition the volume: every voxel has exactly one winner. So
 
 - a set `S` and its **complement** describe literally one surface — `m_S == -m_complement`,
@@ -267,6 +282,26 @@ extent reaches a face of the model grid is **truncated by the acquisition**, and
 area computed from it means anything. This is not a rare edge case — on a chest CT the liver,
 kidneys and gallbladder all reach the inferior face, and a structure that looks like it
 "disappeared" between two resolutions is usually one that was never wholly in the scan.
+
+---
+
+## 6.1 Where did this come from, and what made it?
+
+The root group carries duckn's `provenance` extension, which is the specified home for both
+questions — so a duckn reader finds them where the spec says to look rather than in a field of
+ours:
+
+- `sources` — one entry per input, with `identifier`, `doi`, `url`, `description`, `created`.
+- `processing` — the steps that produced this store, in order, each naming its `software` (name
+  and version) and the `parameters` it ran with. Segmentation and store layout are separate
+  steps because they fail independently: a reader doubting a store needs to know which to doubt.
+- `attribution` — licence and citation.
+
+duckn's `sources` schema is compact by design and has no slot for a study UID or a scanner
+model, so the fuller case record lives beside it under `nnseg.case_detail` — namespaced, rather
+than crammed into `note` or silently extending someone else's schema. Look there for DICOM
+identifiers, acquisition parameters, and any independent reference segmentation of the same
+series.
 
 ---
 

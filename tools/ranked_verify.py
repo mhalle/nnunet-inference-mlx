@@ -62,8 +62,16 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
     rep.check((path / "README.md").exists(), "no README.md - the format reference is missing")
     rep.check("seg" in ext, "no seg extension on the root group")
     rep.check("nnseg" in ext, "no nnseg block on the root group")
-    rep.check("provenance" in ext, "no provenance block - the case is unidentifiable",
+    pv = ext.get("provenance") or {}
+    rep.check(bool(pv), "no duckn provenance extension - nothing says where this came from")
+    rep.check(bool(pv.get("sources")), "provenance has no sources - the case is unidentifiable",
               warn_only=True)
+    steps = pv.get("processing") or []
+    rep.check(bool(steps), "provenance has no processing steps - nothing says what made this")
+    rep.check(all(s.get("software", {}).get("name") for s in steps),
+              "a processing step names no software")
+    rep.check(all(s.get("name") for s in steps),
+              "a processing step has no name (required by the extension)")
     order = ext.get("nnseg", {}).get("part_order", [])
     rep.check(bool(order), "empty part_order - paint order is external knowledge and must "
                            "be recorded")
@@ -87,6 +95,15 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
         rep.check(not miss, f"parts/{i}: ranked block missing {miss}")
         if miss:
             continue
+
+        soft = m.get("softmax") or {}
+        rep.check(bool(soft), f"parts/{i}: no softmax block - a reader cannot tell which "
+                              "normalization these classes competed in")
+        if soft:
+            rep.check(soft.get("classes") == m["classes"],
+                      f"parts/{i}: softmax.classes {soft.get('classes')} != classes "
+                      f"{m['classes']}")
+            rep.check(bool(soft.get("weights")), f"parts/{i}: softmax names no weights")
 
         K, smax, sent = m["classes"], m["support_max"], m["rank_sentinel"]
         rep.check(len(m["labels"]) == K,
@@ -184,6 +201,16 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
                 want = [int(v) for d in range(3) for v in (idx[d].min(), idx[d].max())]
                 rep.check(list(s["extent"]) == want,
                           f"parts/{i}: {s['name']} extent {s['extent']} != actual {want}")
+
+    softmaxes = [(r[f"parts/{i}"].attrs.asdict().get("duckn", {}).get("extensions", {})
+                  .get("ranked", {}).get("softmax") or {}).get("weights")
+                 for i, _ in enumerate(order) if f"parts/{i}" in r]
+    if len(order) > 1 and all(softmaxes):
+        rep.check(len(set(softmaxes)) == len(softmaxes)
+                  or len(set(softmaxes)) == 1,
+                  f"parts share weights inconsistently ({softmaxes}) - either every part is a "
+                  "distinct model or they are all one; a mix means the part split is wrong",
+                  warn_only=True)
 
     if len(order) > 1:
         rep.check(len(origins) == 1,

@@ -164,6 +164,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     out_grid = None
     frame: Frame | None = None
     cached = {}                                   # resample key -> ResampledGrid (NOT normalized)
+    identity = {}                                 # weights id -> what actually ran, for the store
 
     def load(wid):
         folder = store.resolve(wid, configuration=configuration)
@@ -174,6 +175,9 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         # v2.0.0 and v2.0.4 and both unpack to the same name - so read what fetch_one recorded
         from .weights_fetch import installed_version
         rec = installed_version(folder) or {}
+        identity[str(wid)] = {"weights": str(wid), "folder": folder.name,
+                              "version": rec.get("tag", "unknown"),
+                              "sha256": rec.get("sha256"), "classes": int(m.K)}
         prov["models"].append({"weights": str(wid), "folder": folder.name,
                                "version": rec.get("tag", "unknown"), "sha256": rec.get("sha256"),
                                "folds": list(available_folds(folder, folds)), "K": m.K,
@@ -234,7 +238,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         # a box that barely crops only re-tiles the window (churn, ~no speedup): run whole instead
         return worth_cropping(Envelope(tuple(start), tuple(stop), shape))
 
-    def emit_probabilities(model, logits, frame, env, *, lut, part):
+    def emit_probabilities(model, logits, frame, env, *, lut, part, weights=None):
         """Encode this part's output distribution while the logits are still here.
 
         Between the network and the restore is the only moment they exist, so this costs
@@ -250,8 +254,15 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         """
         from . import ranked
         t = time.perf_counter()
+        # WHICH softmax these logits came from. Margins are comparable only within one
+        # normalization, and a five-model task like `total` is five of them - so a reader
+        # composing across parts has to be able to tell. The folder name does not identify the
+        # weights (Dataset297 ships as both v2.0.0 and v2.0.4 and unpacks to the same name), so
+        # the installed version and checksum travel with it.
+        soft = dict(identity.get(str(weights), {"weights": str(weights)}))
+        soft["engine"] = "nnunetv2"
         ranked.emit(
-            probabilities, part, logits,
+            probabilities, part, logits, softmax=soft,
             part=part, task=spec.name, nnseg=_version(), engine="nnunetv2",
             spacing_zyx=[float(v) for v in model.spacing_zyx],
             envelope={"start": [int(v) for v in env.start],          # a range, both ends
@@ -262,7 +273,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             input_orientation=orientation, frame=frame.to_meta())
         T[f"probabilities:{part}"] = time.perf_counter() - t
 
-    def predict_into(model, x, frame, ogrid, env, *, lut, paint, out, part=""):
+    def predict_into(model, x, frame, ogrid, env, *, lut, paint, out, part="", weights=None):
         # tripwire: `x` must carry THIS model's normalization. Several models share one resample,
         # and feeding one model's normalization to another is silent and severe - the organs
         # model's CT clip at +276 HU flattens all bone for the parts that follow it.
@@ -275,7 +286,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         crop = x[(slice(None), *env.slices)] if not env.is_whole() else x
         logits = model.predict_logits(crop, report=report).to(device)
         if probabilities is not None:
-            emit_probabilities(model, logits, frame, env, lut=lut, part=part)
+            emit_probabilities(model, logits, frame, env, lut=lut, part=part, weights=weights)
         mapping = frame.mapping(ogrid)
         if not env.is_whole():
             mapping = mapping >> Mapping((1.0, 1.0, 1.0), tuple(-float(v) for v in env.start))
@@ -313,7 +324,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             t = time.perf_counter()
             report.stage("predict", pname)
             predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1,
-                         out=out, part=pname)
+                         out=out, part=pname, weights=wid)
             report.stage("restore", f"{'device' if model.accumulate_choice['on_device'] else 'host'} accumulator")
             T[f"network:{tag}:{pname}"] = time.perf_counter() - t
             models.release(model)
@@ -347,7 +358,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             out = torch.zeros(og.shape, dtype=torch.uint8, device=device)
             t = time.perf_counter()
             predict_into(model, x, fr, og, env, lut=np.arange(model.K, dtype=np.int32),
-                         paint=False, out=out, part=f"{tag}:s{i}")
+                         paint=False, out=out, part=f"{tag}:s{i}", weights=step.weights_id)
             T[f"network:{tag}:s{i}"] = time.perf_counter() - t
             if not last:
                 e = label_roi(out.cpu().numpy(), step.crop_to_classes,

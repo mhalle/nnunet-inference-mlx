@@ -142,8 +142,40 @@ for old, new in RENAMES:
     print(f"  {old:<32} -> {new}   (old name kept as symlink)")
 
 
+# duckn's `sources` schema is deliberately compact - type, format, path, url, doi, identifier,
+# description, created, note - with no slot for a study UID or a scanner model. So the standard
+# fields go there, where any duckn reader finds them, and the rest stays namespaced under
+# `nnseg.case` rather than being crammed into `note` or silently extending someone else's schema.
+DUCKN_SOURCE_KEYS = ("type", "format", "path", "url", "doi", "identifier", "description",
+                     "created", "note")
+
+
+def as_duckn_source(prov):
+    """The case block -> one duckn provenance source entry."""
+    src = {"type": "dataset", "format": prov.get("format", "DICOM"),
+           "description": prov.get("archive", "")}
+    for k in ("doi", "url", "note"):
+        if k in prov:
+            src[k] = prov[k]
+    if "source_url" in prov:
+        src["url"] = prov["source_url"]
+    if "source_doi" in prov:
+        src["doi"] = prov["source_doi"]
+    src["identifier"] = (prov.get("crdc_series_uuid") or prov.get("series_instance_uid")
+                         or prov.get("path") or prov["case"])
+    bits = [prov.get("archive"), prov.get("collection") or prov.get("dataset"),
+            f"patient {prov['patient_id']}" if "patient_id" in prov else None,
+            f"subject {prov['subject']}" if "subject" in prov else None,
+            prov.get("modality"), prov.get("study_description")]
+    src["description"] = ", ".join(b for b in bits if b)
+    if "study_date" in prov:
+        d = str(prov["study_date"])
+        src["created"] = f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
+    return {k: v for k, v in src.items() if k in DUCKN_SOURCE_KEYS and v not in (None, "")}
+
+
 def stamp(store_name, prov, new_name=None):
-    """Write the provenance block, renaming the store only if a new name is given."""
+    """Fill in the duckn provenance the builder left open, and the namespaced case detail."""
     d = DEMO / store_name
     if not d.exists():
         print(f"  {store_name:<32} MISSING - skipped")
@@ -154,11 +186,19 @@ def stamp(store_name, prov, new_name=None):
     root = zarr.open_group(str(d), mode="r+")
     a = dict(root.attrs.asdict()["duckn"])
     ext = dict(a["extensions"])
-    ext["nnseg"] = dict(ext["nnseg"]) | {"case": prov["case"]}
-    ext["provenance"] = prov                 # the claim the name makes, in checkable form
+    ext["nnseg"] = dict(ext["nnseg"]) | {"case": prov["case"], "case_detail": prov}
+    # the builder wrote `processing`; add the source and the licence without discarding it
+    pv = dict(ext.get("provenance") or {"version": "1.0"})
+    pv["sources"] = [as_duckn_source(prov)]
+    if prov.get("license"):
+        pv["attribution"] = {"license": prov["license"],
+                             **({"cite": prov["cite"]} if prov.get("cite") else {})}
+    ext["provenance"] = pv
     a["extensions"] = ext
     root.attrs["duckn"] = a
-    print(f"  {d.name:<32} case={prov['case']:<18} archive={prov['archive']}")
+    steps = len(pv.get("processing", []))
+    print(f"  {d.name:<26} case={prov['case']:<18} sources=1 processing={steps} "
+          f"archive={prov['archive']}")
 
 
 print("\ndemo stores")

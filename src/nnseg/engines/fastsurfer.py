@@ -320,8 +320,15 @@ def emit_probabilities(spec, logits, source_ref, target_ref, class_labels) -> No
 
     lg = logits if isinstance(logits, torch.Tensor) else torch.from_numpy(
         np.ascontiguousarray(np.moveaxis(np.asarray(logits), 3, 0)))
+    # which softmax produced these logits - see the nnU-Net path for why a reader needs it.
+    # FastSurfer bakes its checkpoints into the image, so the identity is a fixed version
+    # rather than an install sidecar.
+    ident = weights_installed()
     ranked.emit(
         spec, "brain", lg,
+        softmax={"engine": "fastsurfer", "classes": int(lg.shape[0]),
+                 "weights": ident[0].get("id", "fastsurfer") if ident else "fastsurfer",
+                 "version": ident[0].get("version") if ident else None},
         part="brain", engine="fastsurfer", nnseg=__version__,
         labels=[int(v) for v in np.asarray(class_labels).reshape(-1)],
         labels_note="channel -> aparc+aseg id; segment() additionally applies "
