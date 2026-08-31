@@ -36,15 +36,38 @@ def ranked_of(group):
 
 
 def start_stop(r):
-    """Tolerate both schema versions - the older builder wrote flat `envelope_start_zyx`."""
-    if "envelope" in r:
+    """Half-open (start, stop) from whichever serialized form is present.
+
+    `envelope` is duckn's inclusive `[min_i, max_i, ...]`; older stores carried a half-open
+    {start, stop} dict, and older still a flat `envelope_start_zyx`. Converted here rather than
+    at every use, so the rest of this file thinks in slices.
+    """
+    if isinstance(r.get("envelope"), list):                 # duckn extent, inclusive
+        e = r["envelope"]
+        return [e[0], e[2], e[4]], [e[1] + 1, e[3] + 1, e[5] + 1]
+    if isinstance(r.get("envelope"), dict):                 # earlier half-open form
         return list(r["envelope"]["start"]), list(r["envelope"]["stop"])
     start = list(r["envelope_start_zyx"])
-    grid = list(r.get("model_grid_zyx") or r["model_grid_full_zyx"])
+    grid = list(r.get("model_grid") or r.get("model_grid_zyx") or r["model_grid_full_zyx"])
     return start, grid
 
 
 FILL = {"ranks": None, "support": 0, "tail": 0}      # ranks handled per plane
+
+
+def _eff(sp):
+    return [float(np.linalg.norm(a["space_direction"]))
+            for a in sp["ranks"].attrs.asdict()["duckn"]["axes"] if a["kind"] == "space"]
+
+
+def _direction(sp):
+    """Unit direction cosines, recovered from the axes' world vectors."""
+    ax = [a for a in sp["ranks"].attrs.asdict()["duckn"]["axes"] if a["kind"] == "space"]
+    eff = _eff(sp)
+    D = np.zeros((3, 3))
+    for k, a in enumerate(ax):
+        D[:, 2 - k] = np.asarray(a["space_direction"], float) / eff[k]
+    return D.reshape(-1).tolist()
 
 
 def frame_origin(s, order):
@@ -86,11 +109,37 @@ def align(src, dst):
 
     order = s.attrs.asdict()["duckn"]["extensions"]["nnseg"]["part_order"]
     shared = frame_origin(s, order)
+
+    # Segment extents are in the CROPPED array's coordinates. Padding moves every voxel by that
+    # part's start offset, so an extent copied verbatim points at the wrong place - silently,
+    # since it stays a plausible box inside the grid. Shift them with the data.
+    starts = {i: start_stop(ranked_of(s[f"parts/{i}"]))[0] for i, _ in enumerate(order)}
+    a = dict(d.attrs.asdict()["duckn"])
+    ext_ = dict(a["extensions"])
+    seg_ = dict(ext_["seg"])
+    moved = 0
+    out_segs = []
+    for seg in seg_["segments"]:
+        seg = dict(seg)
+        if "extent" in seg and not isinstance(seg["label_value"], list):
+            off = starts.get(seg.get("layer", 0), [0, 0, 0])
+            if any(off):
+                e = seg["extent"]
+                seg["extent"] = [int(v) + off[k // 2] for k, v in enumerate(e)]
+                moved += 1
+        out_segs.append(seg)
+    seg_["segments"] = out_segs
+    ext_["seg"] = seg_
+    a["extensions"] = ext_
+    d.attrs["duckn"] = a
+    if moved:
+        print(f"  shifted {moved} segment extents into the padded grid", flush=True)
     for i, _ in enumerate(order):
         sp = s[f"parts/{i}"]
         r = ranked_of(sp)
         start, _stop = start_stop(r)
-        grid = list(r.get("model_grid_zyx") or r["model_grid_full_zyx"])
+        grid = list(r.get("model_grid") or r.get("model_grid_zyx")
+                    or r["model_grid_full_zyx"])
         dp = d.create_group(f"parts/{i}")
 
         origin = None
@@ -120,10 +169,25 @@ def align(src, dst):
             del a, full
 
         meta = dict(sp.attrs.asdict()["duckn"]["extensions"]["ranked"])
+        # the occupancy index must be REBUILT, not copied: padding changes which classes can
+        # be found in the edge bricks (background now wins there), so a copied index would
+        # under-report background and over-report nothing - conservative in the wrong direction
+        from ranked_build_store import BRICK, brick_geometry, occupancy
+        rk_p, su_p = np.asarray(dp["ranks"]), np.asarray(dp["support"])
+        occ, nb = occupancy(rk_p, su_p, len(r["labels"]), r["support_max"])
+        oz = dp.create_array("occupancy", shape=occ.shape, dtype=occ.dtype,
+                             chunks=occ.shape, shards=None,
+                             compressors=zarr.codecs.ZstdCodec(level=9),
+                             attributes=brick_geometry(_direction(sp), _eff(sp),
+                                                       shared, BRICK, nb))
+        oz[:] = occ
+        del rk_p, su_p, occ
+
         meta.pop("envelope_start_zyx", None)
-        meta["envelope"] = {"start": [0, 0, 0], "stop": [int(v) for v in grid]}
-        meta["model_grid_zyx"] = [int(v) for v in grid]
+        meta.pop("model_grid_zyx", None)
         meta.pop("model_grid_full_zyx", None)
+        meta["envelope"] = [v for n in grid for v in (0, int(n) - 1)]   # inclusive, duckn form
+        meta["model_grid"] = [int(v) for v in grid]
         # the array is no longer purely network output - say so
         meta["padded_from"] = {"start": [int(v) for v in start],
                                "fill": "background (ranks[0]=1, ranks[1:]=0, support=0, tail=0)"}

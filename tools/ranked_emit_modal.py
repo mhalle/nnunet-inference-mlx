@@ -20,6 +20,7 @@ Then build the store from the downloaded directory exactly as for a local emit:
   uv run python tools/ranked_build_store.py <out> <store>.duckn <subject> last
 """
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -67,11 +68,15 @@ def emit(crdc: str, task: str, depth: int = 6, clip: float = 8.0,
 
     work = Path(tempfile.mkdtemp())
     t = time.perf_counter()
-    # IDCSource.fetch makes <dest_dir>/series without parents=True, so dest_dir must exist
+    # IDCSource.fetch makes <dest_dir>/series without parents=True, so dest_dir must exist.
+    # This failed only remotely: locally the directory had been created by hand.
     (work / "in").mkdir(parents=True, exist_ok=True)
     series = IDCSource().fetch(crdc, work / "in")
-    n = len(list(Path(series).iterdir()))
-    print(f"fetched {n} instances in {time.perf_counter() - t:.0f}s", flush=True)
+    files = sorted(Path(series).iterdir())
+    if not files:
+        raise RuntimeError(f"IDC returned no instances for {crdc!r} - wrong uuid, or the "
+                           "series is not in a bucket this worker can reach")
+    print(f"fetched {len(files)} instances in {time.perf_counter() - t:.0f}s", flush=True)
 
     t = time.perf_counter()
     EcosystemCatalog(root=WEIGHTS_ROOT).prepare(task)     # provision into the shared volume
@@ -83,6 +88,10 @@ def emit(crdc: str, task: str, depth: int = 6, clip: float = 8.0,
     ranked_emit.main(str(series), task, str(out), depth, clip,
                      "none" if envelope_mm is None else envelope_mm)
 
+    # meta.json is what the builder tests for readiness, so it must be in the tar and it must
+    # be there because the run finished - not because a directory was created early.
+    if not (out / "meta.json").exists():
+        raise RuntimeError("emit produced no meta.json - refusing to return a partial result")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for f in sorted(out.iterdir()):
@@ -98,11 +107,20 @@ def main(crdc: str, task: str, out: str, depth: int = 6, clip: float = 8.0):
     import io
     import tarfile
 
+    # Unpack to a temporary sibling and rename only on success. The builder treats the
+    # presence of meta.json as "this emit is finished", so a half-written directory - or one
+    # created before the remote call returns - must never be visible under the real name.
     dest = Path(out)
-    dest.mkdir(parents=True, exist_ok=True)
+    staging = dest.with_name(dest.name + ".partial")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
     data = emit.remote(crdc, task, depth, clip, None)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        tf.extractall(dest)
+        tf.extractall(staging)
+    if not (staging / "meta.json").exists():
+        raise SystemExit("no meta.json in the returned archive - not publishing")
+    shutil.rmtree(dest, ignore_errors=True)
+    staging.rename(dest)
     got = sorted(p.name for p in dest.iterdir())
     print(f"\nunpacked {len(got)} files into {dest}:")
     for g in got:

@@ -23,7 +23,6 @@ four fifths of the task.
 """
 import json
 import shutil
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -75,20 +74,33 @@ def _fastsurfer_names():
     return out
 
 
-def names_for(engine, task):
+def names_for(engine, task, allow_unnamed=False):
     """Label id -> name. The engines do not share a label namespace: nnunetv2 parts carry the
     ecosystem's ids, FastSurfer carries FreeSurfer aparc+aseg ids.
 
-    Both lookups need the corresponding package/catalog installed, and each lives in its own
-    environment - so a miss is expected, not exceptional, and degrades to `label_<id>` rather
-    than failing the build.
+    RAISES by default when the lookup fails. It degraded silently once - a changed FastSurfer
+    LUT path renamed all 78 brain segments to `label_<id>` while the build reported success -
+    and an unnamed store is not a smaller store, it is a wrong one that looks finished. Pass
+    `allow_unnamed` to build anyway, deliberately.
     """
     try:
-        return _fastsurfer_names() if engine == "fastsurfer" else _ts_names(task)
+        names = _fastsurfer_names() if engine == "fastsurfer" else _ts_names(task)
     except Exception as exc:                       # noqa: BLE001 - any import/catalog problem
-        print(f"  ! no label names for engine={engine!r} task={task!r} ({exc.__class__.__name__}"
-              f": {exc}); segments will be named label_<id>", flush=True)
+        msg = (f"no label names for engine={engine!r} task={task!r} "
+               f"({exc.__class__.__name__}: {exc})")
+        if not allow_unnamed:
+            raise SystemExit(
+                f"{msg}\n  The catalog or engine package is not importable from this "
+                f"environment.\n  Fix the environment, or pass --allow-unnamed to accept "
+                f"label_<id> segment names.") from exc
+        print(f"  ! {msg}; segments will be named label_<id>", flush=True)
         return {}
+    if not names:
+        if not allow_unnamed:
+            raise SystemExit(f"label map for {task!r} is empty - refusing to build a store "
+                             "whose segments would all be label_<id>")
+        print(f"  ! empty label map for {task!r}", flush=True)
+    return names
 
 
 def geometry(part):
@@ -115,13 +127,116 @@ def geometry(part):
 
 
 def extent(part):
-    """(model grid, envelope start, stop) - FastSurfer has no envelope, so it is the whole grid."""
+    """(model grid, envelope start, stop) - FastSurfer has no envelope, so it is the whole grid.
+
+    Half-open internally, because that is what slices a numpy array. The serialized form is
+    duckn's inclusive `extent`; see :func:`as_extent`.
+    """
     if "source_grid" in part:
         g = [int(v) for v in part["source_grid"]["shape_zyx"]]
         return g, [0, 0, 0], g
     return ([int(v) for v in part["model_grid"]],
             [int(v) for v in part["envelope"]["start"]],
             [int(v) for v in part["envelope"]["stop"]])
+
+
+def as_extent(start, stop):
+    """Half-open (start, stop) -> duckn's `[min_i, max_i, min_j, max_j, min_k, max_k]`.
+
+    duckn has exactly one vocabulary for a voxel range and it is INCLUSIVE on both ends, from
+    the `.seg.nrrd` Extent field it converts. Carrying a second, half-open convention in the
+    same file is how off-by-one errors get written: a reader would have to remember which key
+    means which. Python slices stay half-open in code, where they index arrays; only the stored
+    form is converted.
+    """
+    return [int(v) for a, b in zip(start, stop) for v in (a, b - 1)]
+
+
+def duckn_grid(rec):
+    """A `grid_record` dict -> duckn's own geometry vocabulary.
+
+    The internal record names axis order in its keys (`shape_zyx` beside `origin_xyz`) because
+    it packs array-order and world-order quantities together. duckn does not need that: `axes`
+    is positional and each entry carries a world `space_direction`, so the order is structural.
+    Emitting the duckn form means a reader that can parse an array's geometry can parse a
+    referenced grid's with the same code.
+    """
+    sp, D = rec["spacing_zyx"], np.asarray(rec["direction_xyz"], float).reshape(3, 3)
+    cols = [D[:, 2], D[:, 1], D[:, 0]]                             # array axes 0,1,2
+    return {"space": "left-posterior-superior",
+            "space_origin": [round(float(v), 6) for v in rec["origin_xyz"]],
+            "samples": [int(v) for v in rec["shape_zyx"]],
+            "axes": [{"kind": "space", "centering": "cell", "unit": "mm",
+                      "space_direction": [round(float(v), 9) for v in (c * s)]}
+                     for c, s in zip(cols, sp)]}
+
+
+BRICK = 32
+
+
+def occupancy(ranks, support, K, smax, brick=BRICK):
+    """``(K, Zb, Yb, Xb)`` uint8: the brick-max of each class's support-encoded deficit.
+
+    Answers "can this brick be skipped for class c" without reading the brick. Two decisions
+    keep it from being brittle:
+
+    THE BRICK IS DECLARED, NOT INHERITED. Indexing per zarr chunk or per shard would couple this
+    to the storage layout, so a rechunk or reshard would silently invalidate it. A declared
+    spatial factor cannot: if it happens to align with the chunk grid the skipping is maximally
+    efficient, and if it does not the index is still correct, only coarser.
+
+    IT STORES THE BRICK-MAX, NOT A BOOLEAN. A boolean answers one question. The max, in the same
+    encoding `support` already uses, answers every threshold question - class c wins somewhere in
+    the brick iff the max is ``support_max``, and comes within tau of the winner iff
+    ``gap(max) <= tau`` - at the same size and with no new convention.
+
+    Conservative by construction: a max can only over-report presence, never miss it.
+    """
+    shape = ranks.shape[1:]
+    nb = tuple(int(np.ceil(s / brick)) for s in shape)
+    idx = np.zeros((K,) + nb, np.uint8)
+    bz, by, bx = (np.arange(s) // brick for s in shape)
+    flat = (bz[:, None, None] * nb[1] * nb[2]
+            + by[None, :, None] * nb[2] + bx[None, None, :]).ravel()
+    flatidx = idx.reshape(K, -1)
+    for j in range(ranks.shape[0]):
+        val = np.full(shape, smax, np.uint8) if j == 0 else support[j - 1]
+        ok = (ranks[j] != 0).ravel()
+        cls = (ranks[j].astype(np.int64) - 1).ravel()[ok]
+        np.maximum.at(flatidx, (cls, flat[ok]), val.ravel()[ok])
+    return idx, nb
+
+
+def brick_geometry(direction, eff, origin, brick, nb):
+    """duckn block for the coarse grid: cell-centred bricks, one `list` axis for the class.
+
+    The last brick along an axis is partial when the shape is not a multiple of `brick`, so its
+    true centre is nearer than this uniform grid says. That is left as-is deliberately: the
+    array is a conservative index, not a measurement, and declaring a uniform grid keeps it a
+    readable duckn array rather than a private layout.
+    """
+    D = np.asarray(direction, float).reshape(3, 3)
+    cols = [D[:, 2], D[:, 1], D[:, 0]]
+    off = np.asarray([(brick - 1) / 2 * eff[2], (brick - 1) / 2 * eff[1],
+                      (brick - 1) / 2 * eff[0]], float)
+    o = np.asarray(origin, float) + D @ off
+    return {"duckn": {"version": "1.0", "space": "left-posterior-superior",
+                      "space_origin": [round(float(v), 6) for v in o],
+                      "axes": [{"kind": "list"}] + [
+                          {"kind": "space", "centering": "cell", "unit": "mm",
+                           "space_direction": [round(float(v), 9) for v in (c * s * brick)]}
+                          for c, s in zip(cols, eff)]}}
+
+
+def segment_extents(labels_zyx, values):
+    """duckn `extent` per label: inclusive bbox in the array's storage order, one pass."""
+    from scipy import ndimage as ndi
+    out = {}
+    for v, sl in zip(range(1, int(labels_zyx.max()) + 1), ndi.find_objects(labels_zyx)):
+        if sl is None or v not in values:
+            continue
+        out[v] = [int(x) for s in sl for x in (s.start, s.stop - 1)]
+    return out
 
 
 def axes(direction_xyz, eff_zyx, list_axis):
@@ -183,7 +298,7 @@ def layout(shape):
     return chunks, tuple(int(np.ceil(s / c) * c) for s, c in zip(shape, chunks))
 
 
-def build(src, out, case, parts="all"):
+def build(src, out, case, parts="all", allow_unnamed=False):
     src, out = Path(src), Path(out)
     meta = json.loads((src / "meta.json").read_text())
     shutil.rmtree(out, ignore_errors=True)
@@ -192,7 +307,7 @@ def build(src, out, case, parts="all"):
     segs, order = [], []
 
     engine = next(iter(meta["parts"].values())).get("engine", "nnunetv2")
-    NAMES = names_for(engine, meta.get("task"))
+    NAMES = names_for(engine, meta.get("task"), allow_unnamed)
 
     items = list(meta["parts"].items())
     if parts == "last" and len(items) > 1:
@@ -211,18 +326,22 @@ def build(src, out, case, parts="all"):
         grid, start, stop = extent(part)
         g = root.create_group(f"parts/{i}")
         lut = [int(v) for v in part["labels"]]
+        # Axis order is not spelled in these keys. duckn states it structurally - `axes` is
+        # positional, one entry per array axis - so a per-axis list here is in array order by
+        # the same rule, and a `_zyx` suffix would be our vocabulary, not the format's.
         block = {"version": "0.1",
                  **{k: part[k] for k in CODEC if k in part},
-                 "model_grid_zyx": grid,
-                 "envelope": {"start": start, "stop": stop},       # a range, both ends
+                 "model_grid": grid,
+                 "envelope": as_extent(start, stop),               # inclusive, like duckn
                  "labels": lut, "part": name,
                  "task": part.get("task", meta.get("task"))}
         if "convention" in part:                                   # nnunetv2 only
             block["resample_alignment"] = part["convention"]
-            block["nominal_spacing_zyx"] = [float(v) for v in part["spacing_zyx"]]
-        for k in ("labels_note", "target_grid"):                   # fastsurfer carries these
-            if k in part:
-                block[k] = part[k]
+            block["nominal_spacing"] = [float(v) for v in part["spacing_zyx"]]
+        if "labels_note" in part:
+            block["labels_note"] = part["labels_note"]
+        if "target_grid" in part:                                  # fastsurfer: the input grid
+            block["target_grid"] = duckn_grid(part["target_grid"])
         g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": block}}})
 
         for arr_name in ("ranks", "support", "tail"):
@@ -239,10 +358,34 @@ def build(src, out, case, parts="all"):
             z[:] = a
             del a
 
+        # occupancy index: which bricks a class can possibly be in, so a reader after one
+        # structure skips the rest without opening it
+        rk_all = np.asarray(np.load(src / f"{name}_ranks.npy", mmap_mode="r"))
+        su_all = np.asarray(np.load(src / f"{name}_support.npy", mmap_mode="r"))
+        occ, nb = occupancy(rk_all, su_all, len(lut), part["support_max"])
+        oz = g.create_array("occupancy", shape=occ.shape, dtype=occ.dtype,
+                            chunks=occ.shape, shards=None,
+                            compressors=zarr.codecs.ZstdCodec(level=9),
+                            attributes=brick_geometry(direction, eff, origin, BRICK, nb))
+        oz[:] = occ
+        block["brick"] = [BRICK, BRICK, BRICK]
+        g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": block}}})
+        del su_all, occ
+
+        # duckn's own per-segment bounding box. Worth writing rather than leaving None: with it,
+        # "is this structure truncated by the field of view" is answerable by any reader - the
+        # question that made a gallbladder look like it vanished between resolutions.
+        wins = rk_all[0].astype(np.int64)
+        del rk_all
+        boxes = segment_extents(np.asarray(lut)[wins - 1], {int(x) for x in lut} - {0})
         for v in sorted({int(x) for x in lut} - {0}):
             if not any(s["label_value"] == v for s in segs):
-                segs.append({"id": f"c{v}", "name": NAMES.get(v, f"label_{v}"),
-                             "label_value": v, "layer": i})
+                seg = {"id": f"c{v}", "name": NAMES.get(v, f"label_{v}"),
+                       "label_value": v, "layer": i}
+                if v in boxes:
+                    seg["extent"] = boxes[v]
+                segs.append(seg)
+        del wins
         order.append({"index": i, "name": name})
         print(f"  parts/{i} {name:<12} grid {tuple(grid)} crop {tuple(start)} "
               f"eff {[round(v, 6) for v in eff]}", flush=True)
@@ -290,4 +433,13 @@ def build(src, out, case, parts="all"):
 
 
 if __name__ == "__main__":
-    build(*sys.argv[1:5])
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("ranked_dir")
+    ap.add_argument("out")
+    ap.add_argument("case")
+    ap.add_argument("parts", nargs="?", default="all", choices=["all", "last"])
+    ap.add_argument("--allow-unnamed", action="store_true",
+                    help="build even if segment names cannot be resolved")
+    a = ap.parse_args()
+    build(a.ranked_dir, a.out, a.case, a.parts, a.allow_unnamed)

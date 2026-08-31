@@ -19,7 +19,12 @@ parts/
       ranks/               (N, Z, Y, X)  uint8 or uint16
       support/             (N-1, Z, Y, X) uint8
       tail/                (Z, Y, X)     uint8   (may be absent)
+      occupancy/           (K, Zb, Yb, Xb) uint8  a skip index; see §7.1 (may be absent)
 ```
+
+**A part is one softmax, and that is the unit that matters.** The classes within a part competed
+in a single normalization; classes in different parts did not. This is not the same as "one
+task" — a five-model task like `total` is five separate softmaxes. See §3.1.
 
 Parts are numbered, not named — a name lives in metadata (`part`). Some tasks are a single
 model (one part); some composite several models covering different structures.
@@ -30,6 +35,9 @@ It carries `classes`, `depth`, `clip`, `support_max`, `rank_sentinel`, `labels`,
 ---
 
 ## 2. The three arrays
+
+These three hold the data. `occupancy`, if present, is a derived skip index and carries no
+information of its own — see §7.1.
 
 Every array is indexed `[..., Z, Y, X]` in **array order** (slowest axis first).
 
@@ -100,6 +108,33 @@ with. `deficit` is flat zero throughout the interior and has no usable isosurfac
 argmax over margins looks correct — and then breaks once any interpolation stencil mixes voxels
 with different winners, because the lead is added to a *different* channel at each voxel.
 Nearest-neighbor resampling cannot expose this at all, which is how such a bug survives review.
+
+---
+
+### 3.1 A margin is scoped to one softmax
+
+There is no absolute confidence in a class to threshold. Softmax has a gauge freedom — adding a
+constant to every logit changes nothing — so only *differences* are identifiable, and every
+stored value is a comparison against the classes that competed. "Certainty about the liver" is
+always "certainty the liver beats whatever else is here."
+
+**Within one part** the classes partition the volume: every voxel has exactly one winner. So
+
+- a set `S` and its **complement** describe literally one surface — `m_S == -m_complement`,
+  exactly, verified to 0.0;
+- two disjoint sets never both claim a voxel, and where they touch there is no gap and no
+  double claim (though other classes may lie between them, so two *proper* subsets do not in
+  general share a surface).
+
+**Across parts nothing enforces any of that.** Each part places its own zero level set against
+its own competitors, in its own gauge. Two margins from different parts are not comparable
+numbers, so overlaps cannot be arbitrated by confidence — they are resolved by paint order,
+which is what `part_order` in the root metadata is for. Measured on a five-part task: 0.010 %
+of voxels claimed by two parts, none by three. Small, but it is not zero and nothing makes it
+zero.
+
+Practically: compose freely inside a part, and treat any composite spanning parts — or spanning
+tasks, which additionally means different grids — as needing an explicit resolution rule.
 
 ---
 
@@ -177,6 +212,14 @@ Human-readable names, when present, are in the root group's
 `attributes.duckn.extensions.seg.segments`, each with `label_value` and `name`. An entry whose
 `label_value` is a **list** is a group (a union of other segments), not a class.
 
+A segment may also carry:
+
+- `layer` — which part owns its voxels. Two segments with different `layer` values came from
+  different softmaxes; see §3.1 before comparing or compositing them.
+- `extent` — `[min_i, max_i, min_j, max_j, min_k, max_k]`, **inclusive**, in the array's storage
+  order, non-spatial axes not counted. Absent when the class does not appear. Use it to skip
+  straight to a structure, and to test truncation as described in §6.
+
 ---
 
 ## 6. Geometry
@@ -194,18 +237,36 @@ Each array carries a `duckn` block in its attributes:
 world = space_origin + sum(index[axis] * space_direction[axis] for spatial axes)
 ```
 
+**Axis order is never spelled in a key.** It is structural: `axes` has one entry per array
+axis, in array order, so any other per-axis list in this file is in that same order. A
+referenced grid (e.g. `target_grid`) is written in exactly this vocabulary too — `space`,
+`space_origin`, `samples`, `axes` — so one parser handles both.
+
 The part metadata also records the grid the model computed on:
 
-- `model_grid_zyx` — the full grid.
-- `envelope: {start, stop}` — the half-open sub-box actually stored. `start` is `[0,0,0]` when
-  the whole grid is present. **If `start` is non-zero, the array is a crop and its
-  `space_origin` already accounts for the offset** — do not apply it twice.
+- `model_grid` — the full grid, as a sample count per array axis.
+- `envelope` — the sub-box actually stored, as `[min_i, max_i, min_j, max_j, min_k, max_k]`
+  with **both bounds inclusive**, the same convention as a segment's `extent` below. It is
+  `[0, n_i-1, 0, n_j-1, 0, n_k-1]` when the whole grid is present. **If a minimum is non-zero
+  the array is a crop, and its `space_origin` already accounts for the offset** — do not apply
+  it twice.
+- `brick` — the edge of one occupancy brick, per axis. See §7.1.
 - `padded_from`, if present, means voxels outside the original computed region were **filled
   in, not inferred**; the field says what value was used. Those voxels are an assertion, not a
   model output.
 
-Do not trust a nominal spacing field (e.g. `nominal_spacing_zyx`) as the true grid spacing — it
-records what was *requested*. The `space_direction` vectors are the actual geometry.
+Do not trust a nominal spacing field (`nominal_spacing`) as the true grid spacing — it records
+what was *requested*. The `space_direction` vectors are the actual geometry; a request of 1.5 mm
+routinely lands at 1.504 mm.
+
+### Is a structure cut off by the field of view?
+
+Each segment carries duckn's `extent`, the inclusive bounding box of its voxels. Compare it
+against `model_grid` (mapping through `envelope` if the array is a crop): a structure whose
+extent reaches a face of the model grid is **truncated by the acquisition**, and no volume or
+area computed from it means anything. This is not a rare edge case — on a chest CT the liver,
+kidneys and gallbladder all reach the inferior face, and a structure that looks like it
+"disappeared" between two resolutions is usually one that was never wholly in the scan.
 
 ---
 
@@ -222,6 +283,38 @@ Consequences worth knowing:
   The leading chunk dimension of a 4-D array is `1`, so a chunk never spans the rank axis and
   reading `ranks[0]` alone touches only that plane's chunks.
 - Reading progressively deeper is reading more planes in order; a reader may stop early.
+
+### 7.1 `occupancy` — skipping bricks you do not need
+
+`occupancy[c, bz, by, bx]` is the **maximum** over that brick of class `c`'s support-encoded
+deficit. `brick` in the part metadata gives the brick edge in voxels.
+
+```
+class c wins somewhere in the brick   <->  occupancy[c] == support_max
+c comes within tau of the winner      <->  gap(occupancy[c]) <= tau
+```
+
+So a reader after one structure, or one confidence threshold, can skip every brick that fails
+the test without opening it. Measured: the median structure occupies **0.7 – 6 %** of bricks,
+and the index costs **0.05 – 0.4 %** of the store.
+
+Two properties are load-bearing:
+
+- **Conservative.** A maximum can over-report presence but never miss it, so skipping a brick
+  the index rejects is always safe. Verified across every store and structure: zero bricks
+  containing a class went unflagged.
+- **Independent of storage layout.** `brick` is a declared spatial factor, *not* the chunk or
+  shard shape. Rechunking or resharding the data cannot invalidate it. If the brick happens to
+  align with the chunk grid the skipping is maximally efficient; if not, the index is still
+  correct, only coarser.
+
+It is also a readable duckn array in its own right — a coarse occupancy map, with `space_origin`
+shifted by half a brick and `space_direction` scaled by it. One caveat: where the shape is not a
+multiple of `brick`, the last brick along that axis is partial, so its true centre is nearer than
+the uniform grid declares. That is accepted deliberately; this is a conservative index, not a
+measurement.
+
+The array is optional. A store without it is complete; a reader without it just does more IO.
 
 ---
 

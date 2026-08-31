@@ -92,6 +92,12 @@ for subject, task, parts, pad in JOBS:
 print("=== provenance")
 run("ranked_demo_provenance.py", str(DEMO))
 
+# Verify before reporting success. A build that "worked" has been wrong three times today -
+# a dropped argument, degraded names, an index copied instead of rebuilt - and each was only
+# visible against the spec. The cheap checks run always; --deep is a separate, slower pass.
+print("=== verify")
+run("ranked_verify.py", str(DEMO), "--all", "--quiet")
+
 print(f"\n{'subject':<18}{'task':<16}{'shards':>8}{'json':>6}{'size':>10}")
 tf = 0
 for subject, task, d in built:

@@ -18,7 +18,6 @@ are air, which compresses well but not to nothing).
 usage: uv run python tools/ranked_emit.py IMAGE TASK OUTDIR [depth] [clip] [envelope_mm|none]
 """
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -56,4 +55,17 @@ def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:7])
+    # argparse, not a positional slice. `main(*sys.argv[1:6])` silently dropped the sixth
+    # argument once, so `envelope_mm` kept its default and the run was quietly not the one
+    # asked for - visible only because meta.json records what was actually used.
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("image")
+    ap.add_argument("task")
+    ap.add_argument("outdir")
+    ap.add_argument("--depth", type=int, default=6)
+    ap.add_argument("--clip", type=float, default=8.0)
+    ap.add_argument("--envelope-mm", default="20.0",
+                    help='margin in mm, or "none" to run the full model grid')
+    a = ap.parse_args()
+    main(a.image, a.task, a.outdir, a.depth, a.clip, a.envelope_mm)

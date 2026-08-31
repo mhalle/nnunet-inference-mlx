@@ -19,7 +19,6 @@ is here because the alternative is duplicating the engine's conform contract.
 usage: .venvs/fastsurfer/bin/python tools/ranked_emit_fastsurfer.py T1 OUTDIR [depth] [clip] [device]
 """
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -79,4 +78,14 @@ def main(t1, outdir, depth=6, clip=8.0, device="mps"):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:6])
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("t1")
+    ap.add_argument("outdir")
+    ap.add_argument("--depth", type=int, default=6)
+    ap.add_argument("--clip", type=float, default=8.0)
+    ap.add_argument("--device", default="mps",
+                    help="MPS needs PYTORCH_ENABLE_MPS_FALLBACK=1: FastSurferVINN's decoder "
+                         "uses max_unpool2d, which MPS does not implement")
+    a = ap.parse_args()
+    main(a.t1, a.outdir, a.depth, a.clip, a.device)
