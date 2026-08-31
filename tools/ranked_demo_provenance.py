@@ -54,7 +54,7 @@ IDC = {
 }
 
 SLICER = {
-    "case": "CT_Abdo.nii.gz",
+    "case": "CT_Abdo",
     "archive": "3D Slicer sample data",
     "source_url": "https://www.slicer.org/wiki/File:CTA-cardio.nrrd",
     "modality": "CT",
@@ -62,6 +62,48 @@ SLICER = {
             "series UID, no patient identifier, and NOT IDC-derived. The filename is a label, "
             "not a description: the volume is a torso, and the upstream file is named for a "
             "cardiac angiogram whose coverage it does not match either.",
+}
+
+NLST = {
+    "case": "nlst-217076",
+    "archive": "NCI Imaging Data Commons",
+    "collection": "nlst",
+    "study_description": "NLST-ACRIN",
+    "patient_id": "217076",
+    "clinical_trial_subject_id": "12540",
+    "study_date": "20000102",
+    "modality": "CT",
+    "body_part_examined": "CHEST",
+    "manufacturer": "GE MEDICAL SYSTEMS",
+    "model": "LightSpeed QX/i",
+    "convolution_kernel": "STANDARD",
+    "kvp": 120,
+    "series_number": 3,
+    "instances": 249,
+    "slice_thickness_mm": 1.25,
+    "slice_spacing_mm": 1.25,          # contiguous: thickness == spacing, no gap or overlap
+    "pixel_spacing_mm": [0.625, 0.625],
+    "license": "CC BY 4.0",
+    "source_doi": "10.7937/tcia.hmq8-j677",
+    "crdc_series_uuid": "4682f41a-65d7-4a7b-8050-952f73abb746",
+    "study_instance_uid":
+        "1.3.6.1.4.1.14519.5.2.1.7009.9004.247519293920368460447871591111",
+    "series_instance_uid":
+        "1.3.6.1.4.1.14519.5.2.1.7009.9004.267775549148804835566347044610",
+    "frame_of_reference_uid":
+        "1.3.6.1.4.1.14519.5.2.1.7009.9004.318987458734756816915383525170",
+    # An independent reference segmentation of THIS series, already published in IDC. Recorded
+    # rather than fetched: it is 190 MB and nothing needs it yet, but a store that cannot say
+    # which reference applies to it is a store nobody can check later. The SEG names its source
+    # as "Series 3", which is this series.
+    "reference_segmentation": {
+        "producer": "TotalSegmentator v1.5.6",
+        "of_series_number": 3,
+        "segmentation_crdc_series_uuid": "0c3c5072-c8cc-4772-8f52-bca27b3972b8",
+        "shape_measurements_crdc_series_uuid": "20f36010-d22a-41d9-9957-44da1539cc19",
+        "firstorder_measurements_crdc_series_uuid":
+            "fd8bbfbf-3ac8-4765-8b23-d88865b39b52",
+    },
 }
 
 OPENNEURO = {
@@ -120,15 +162,18 @@ def stamp(store_name, prov, new_name=None):
 
 
 print("\ndemo stores")
-for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("idc-torso1")):
-    stamp(_s, IDC)
-for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("CT_Abdo")):
-    stamp(_s, SLICER)
-for _s in sorted(p.name for p in DEMO.iterdir() if p.name.startswith("ds000114")):
-    stamp(_s, OPENNEURO)
+BY_SUBJECT = {"idc-torso1": IDC, "nlst-217076": NLST, "CT_Abdo": SLICER,
+              "ds000114_sub-01": OPENNEURO}
+
+for _d in sorted(DEMO.glob("*/*.duckn")):
+    prov = BY_SUBJECT.get(_d.parent.name)
+    if prov is None:
+        print(f"  {_d.parent.name}/{_d.name}: no provenance registered - skipped")
+        continue
+    stamp(str(_d.relative_to(DEMO)), prov)
 
 print("\nverify")
-for n in sorted(p.name for p in DEMO.iterdir()):
+for n in sorted(str(p.relative_to(DEMO)) for p in DEMO.glob("*/*.duckn")):
     r = zarr.open_group(str(DEMO / n), mode="r")
     e = r.attrs.asdict()["duckn"]["extensions"]
     print(f"  {n}")
