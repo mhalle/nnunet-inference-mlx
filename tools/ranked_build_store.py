@@ -10,7 +10,16 @@ corner rule the grid actually lands at (n_src-1)*s_src/(n_model-1) - 1.504063 wh
 asked for, in one measured case. Using the nominal value misplaces the far edge by over a
 millimeter.
 
-usage: uv run python tools/ranked_build_store.py RANKED_DIR OUT.duckn CASE
+usage: uv run python tools/ranked_build_store.py RANKED_DIR OUT.duckn CASE [all|last]
+
+The last argument selects which emitted parts to keep, and matters only for CASCADE tasks. A
+cascade emits one part per stage: a coarse stage that finds the region of interest, then a fine
+stage that segments it. `last` keeps only the fine stage - what the task name actually denotes -
+and is the sensible default for a store meant to be read as "the X segmentation". `all` keeps
+every stage, which is what a cascade replay needs but makes, for example, a `lung_vessels` store
+that is mostly a 118-class copy of `total_fast`'s model. Multi-model (non-cascade) tasks are
+unaffected: their parts are complementary, not sequential, so `last` would silently discard
+four fifths of the task.
 """
 import json
 import shutil
@@ -174,17 +183,30 @@ def layout(shape):
     return chunks, tuple(int(np.ceil(s / c) * c) for s, c in zip(shape, chunks))
 
 
-def build(src, out, case):
+def build(src, out, case, parts="all"):
     src, out = Path(src), Path(out)
     meta = json.loads((src / "meta.json").read_text())
     shutil.rmtree(out, ignore_errors=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.create_group(store=str(out))
     segs, order = [], []
 
     engine = next(iter(meta["parts"].values())).get("engine", "nnunetv2")
     NAMES = names_for(engine, meta.get("task"))
 
-    for i, (name, part) in enumerate(meta["parts"].items()):
+    items = list(meta["parts"].items())
+    if parts == "last" and len(items) > 1:
+        # only meaningful for a cascade, whose part names are `<task>:s<i>`; refuse to drop
+        # parts of a multi-model task, where every part carries different structures
+        if all(":s" in n for n, _ in items):
+            dropped = [n for n, _ in items[:-1]]
+            print(f"  cascade: keeping {items[-1][0]} only, dropping {dropped}", flush=True)
+            items = items[-1:]
+        else:
+            print(f"  parts='last' ignored: {len(items)} complementary parts, not a cascade",
+                  flush=True)
+
+    for i, (name, part) in enumerate(items):
         eff, origin, direction = geometry(part)
         grid, start, stop = extent(part)
         g = root.create_group(f"parts/{i}")
@@ -257,7 +279,7 @@ def build(src, out, case):
             "name": "SNOMED CT", "url": "http://snomed.info/sct",
             "url_template": "http://snomed.info/id/{code}"}},
             "segments": segs + groups},
-        "nnseg": {"nnseg_version": meta["parts"][order[0]["name"]].get("nnseg"),
+        "nnseg": {"nnseg_version": dict(items)[order[0]["name"]].get("nnseg"),
                   "engine": engine, "task": meta["task"], "case": case,
                   "source_file": Path(meta["image"]).name, "part_order": order},
     }}})
@@ -268,4 +290,4 @@ def build(src, out, case):
 
 
 if __name__ == "__main__":
-    build(*sys.argv[1:4])
+    build(*sys.argv[1:5])
