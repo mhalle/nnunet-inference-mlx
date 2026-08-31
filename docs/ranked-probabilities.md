@@ -64,8 +64,28 @@ That is not merely tidier. It buys three things:
 
 > The reference implementation this format grew from took *probabilities* and immediately
 > applied `log()` to recover logits. That round trip existed only because its CLI consumed
-> saved `.npz` files. Inside a pipeline the logits are already in hand, and streaming from
-> them reproduces the reference stores **byte-for-byte** with no intermediate files.
+> saved `.npz` files. Inside a pipeline the logits are already in hand, so streaming from them
+> needs no intermediate files at all.
+
+⚠ **The two routes are not byte-identical, and the earlier claim that they were is wrong.**
+Measured on idc-torso1 `total_fast` (K = 118, depth 6), encoding the same run's probabilities
+via `log()` against encoding its logits directly:
+
+| array | differs | |
+|---|---|---|
+| `ranks[0]` (the label) | **0 / 3.98 M** | exact |
+| `ranks` (all 6 planes) | 3 086 / 23.9 M (0.013 %) | **99.9 % are clip-boundary flips** |
+| `support` | 20 018 / 19.9 M (0.101 %) | every one by exactly 1 quantum |
+| `tail` | 0 / 3.98 M | exact |
+
+The round trip perturbs a logit by ~1e-7 relative, which is enough to tip an entry sitting
+exactly on the `clip` boundary between "name this class" and "mark it absent". Both sides carry
+support 0 at those entries — they agree the class is at the clip and disagree only on whether to
+write its index — so nothing downstream can see it. Exactly 2 entries in 23.9 M are genuine
+reorderings.
+
+The practical consequence is not accuracy but **reproducibility**: only the direct route is a
+function of the run alone, so that is the one a store should be built from.
 
 ### 2. Zero means "nothing here", in every array
 
