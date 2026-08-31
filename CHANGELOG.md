@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+- **Volume and surface area measured from the field, not the mask (nnseg).** `nnseg.measure`
+  integrates the margin field over the cells between voxel centers — full cells exactly,
+  straddling cells by the plane their corners imply — so `V = int H(m)` and
+  `A = int delta(m)|grad m|` are evaluated on the interpolant the store already defines.
+  Area is the volume expression differentiated in the level, so the two cannot disagree
+  about where the surface is. Against closed-form phantom truth at 1.5 mm, counted area is
+  **+39 to +54 %** and does not converge (four grid refinements leave a sphere at +50.4,
+  +50.9, +49.3, +50.9, +50.7 %) where the field is within 0.3 % and converges at O(h^2). The
+  fair raster baseline is not face counting but SimpleITK's Crofton `ComputePerimeter`,
+  which is within a couple of percent on a smooth body; the field beats it 0.14 % vs 0.85 %
+  on sub-voxel stability, −4.5 % vs −16.6 % on a crease, converges monotonically where
+  Crofton bounces, and needs no raster at all. Meanwhile
+  counted volume swings −10.3 to +4.2 % across shapes where the field holds −0.6 to −0.1 %.
+  Under pure sub-voxel translation counting saws by 1.10 % of a sphere's volume and 2.69 %
+  of its area; the field by 0.00 % and 0.14 %. On real TotalSegmentator output the
+  count/field area ratio is 1.51–1.68 across six structures. **Pass
+  `clip=code.meta["clip"]`**: a straddling cell's far corners saturate wherever the margin
+  climbs faster than the clip over half a cell diagonal, which is 30–95 % of cells at real
+  gradients (3.0–7.2 logits/mm), and reading those bounds as values costs 1–5 % of the
+  surface. `nnseg.statistics` passes it. Full account, including what does *not* help
+  (subdivision, depth) and what is still biased (creases, −4.5 %), in
+  [`docs/ranked-measurement.md`](docs/ranked-measurement.md).
+
+- **`statistics.json` can carry both measurements (nnseg).** `compute_statistics` takes an
+  optional `ranked_code` and then reports `volume_ml_field` and `area_cm2_field` beside
+  `volume_ml`, with the field's own `field_grid_spacing_mm` — the code lives on the model
+  grid, the labelmap has been restored onto the input's, and an area must never be compared
+  across grids even where a volume may be. Without a code the output is byte-identical to
+  before, so both can ship until the comparison has run on a real cohort. **The server does
+  not pass one yet**: `artifact_overlap` computes from the in-RAM pair with no disk
+  dependence, so the served `statistics.json` and `.tsv` are unchanged for now.
+
+- **Analytic phantoms (nnseg).** `nnseg.phantoms` turns geometry with closed-form volume and
+  area into logits, so anything reading the ranked field can be scored against calculus
+  rather than against another measurement. A segmentation model cannot supply that — render
+  a synthetic image, run a network on it, and the ground truth evaporates, because the
+  decision surface is not the surface that was drawn. Sphere, ellipsoid, torus, shell, box,
+  rounded box, star and an n-sector partition; closed forms cross-checked against a
+  Gauss–Legendre × trapezoid rule with partials by autograd (the ellipsoid area agrees with
+  `scipy.special.elliprg` to 12 digits). `tools/field_vs_counting.py` is the standalone
+  comparison harness.
+
 - **Fixed: multi-model tasks ran on one model's normalization (nnseg).** `segment()`
   cached the preprocessed frame by spacing alone, but the cached tensor had nnU-Net's
   **per-model** normalization baked in, so any task running several models at one

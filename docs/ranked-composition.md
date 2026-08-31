@@ -2,7 +2,9 @@
 
 *Written 2026-08-30. Companion to [ranked-reconstruction.md](ranked-reconstruction.md), which
 covers getting things out of **one** store. This one is about several — across parts, across
-engines, and across cascade stages.*
+engines, and across cascade stages. See also
+[ranked-measurement.md](ranked-measurement.md), which reads volume and area off a store
+without getting anything out of it.*
 
 The premise is that a segmentation's stored output can be the **deliverable** rather than an
 intermediate, so that combining happens after inference instead of during it. That works, but

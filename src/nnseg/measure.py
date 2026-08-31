@@ -10,8 +10,15 @@ not depend on where the geometry happened to land against the grid.
 
 Measured against phantoms with closed-form truth (``nnseg.phantoms``, 1.5 mm):
 
-    surface area   counting +39 to +54 %       field  -0.3 to +0.1 %
-    volume         counting -10.3 to +4.2 %    field  -0.6 to -0.1 %
+    surface area   face counting +39 to +54 %   Crofton -0.0 to -2.1 %   field -0.2 to -0.3 %
+    volume         counting -10.3 to +4.2 %                              field -0.6 to -0.1 %
+
+The fair baseline for area is not face counting - it is SimpleITK's ``ComputePerimeter``,
+a Crofton estimator, which corrects the staircase and is within a couple of percent on a
+smooth body at one grid. The field beats it where it counts rather than everywhere: 0.14 %
+against 0.85 % spread under sub-voxel translation (the property longitudinal work needs),
+monotone convergence against a bouncing one, -4.5 % against -16.6 % on a crease, and no
+raster at all - Crofton consumes a labelmap, so it needs the restore this path skips.
 
 Counting's area does not converge - 4x refinement on a sphere leaves it at +50.4,
 +50.9, +49.3, +50.9, +50.7 % - because a staircase genuinely has more surface than

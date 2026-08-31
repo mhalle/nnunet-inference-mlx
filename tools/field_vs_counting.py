@@ -35,6 +35,7 @@ import sys
 import numpy as np
 import torch
 
+from nnseg import measure
 from nnseg import phantoms as ph
 from nnseg import ranked
 from nnseg.grid import Grid
@@ -135,6 +136,25 @@ def measure_field(margin, spacing, *, refine: int = 1):
     return volume, area
 
 
+def measure_crofton(margin, spacing):
+    """Surface area by SimpleITK's Crofton perimeter - the raster measure worth beating.
+
+    Proper stereology rather than face counting, and good: -0.02 to -2.1 % on smooth
+    bodies. It loses on the axes that need a second measurement to compare against -
+    0.85 % spread under sub-voxel translation against the field's 0.14 %, a bouncing
+    convergence rather than a monotone one, -16.6 % on a crease against -4.5 % - and it
+    needs the labelmap, so it cannot be computed without the restore.
+    """
+    import SimpleITK as sitk
+    sp = np.asarray(spacing, dtype=np.float64)
+    lab = sitk.GetImageFromArray((np.asarray(margin) > 0).astype(np.uint8))
+    lab.SetSpacing((float(sp[2]), float(sp[1]), float(sp[0])))
+    f = sitk.LabelShapeStatisticsImageFilter()
+    f.ComputePerimeterOn()
+    f.Execute(lab)
+    return f.GetPerimeter(1) if 1 in f.GetLabels() else 0.0
+
+
 def measure_counting(margin, spacing):
     """``(volume_mm3, area_mm2)`` the way a rasterized labelmap gives them up: count the
     voxels, then count the faces between inside and outside. The volume is what
@@ -161,8 +181,9 @@ def _grid(extent_mm, spacing):
 
 def _row(label, got, truth):
     v, a = got
-    return (f"  {label:<22s} {v:11.1f} {100*(v/truth[0]-1):+7.2f} %   "
-            f"{a:11.1f} {100*(a/truth[1]-1):+7.2f} %")
+    vs = ("          -         " if v != v          # Crofton is an area estimator only
+          else f"{v:11.1f} {100*(v/truth[0]-1):+7.2f} %")
+    return f"  {label:<22s} {vs}   {a:11.1f} {100*(a/truth[1]-1):+7.2f} %"
 
 
 def bodies():
@@ -184,11 +205,16 @@ def accuracy(spacing=1.5, refine=1):
         truth = (b.volume_mm3, b.area_mm2)
         m = ph.margins(p, g)[1]
         print(f"\n{label}   truth {truth[0]:.1f} mm3 / {truth[1]:.1f} mm2")
-        print(_row("counting", measure_counting(m, g.spacing), truth))
+        print(_row("counting (faces)", measure_counting(m, g.spacing), truth))
+        print(_row("Crofton (SITK)", (float("nan"), measure_crofton(m, g.spacing)), truth))
         print(_row("field (analytic)", measure_field(m, g.spacing, refine=refine), truth))
         code = ranked.encode(ph.logits(p, g), depth=2)
-        print(_row("field (through store)",
-                   measure_field(ranked.margin(code, 1), g.spacing, refine=refine), truth))
+        m_s = ranked.margin(code, 1)
+        print(_row("field (store, naive)",
+                   measure_field(m_s, g.spacing, refine=refine), truth))
+        # a stored field's straddling cells have corners AT the clip; those are bounds
+        print(_row("field (store, clip)",
+                   measure.volume_area(m_s, g.spacing, clip=ranked.CLIP), truth))
 
 
 def stability(spacing=1.5, refine=1):

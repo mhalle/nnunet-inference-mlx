@@ -2,7 +2,9 @@
 
 **How to get a segmentation back out of `nnseg.ranked`, at any grid.** The companion to
 [ranked-probabilities.md](ranked-probabilities.md), which covers what is stored and why.
-This document covers what a *reader* does with it.
+This document covers what a *reader* does with it. When the reader only wants a *number* —
+a volume or a surface area — it should not reconstruct at all; see
+[ranked-measurement.md](ranked-measurement.md).
 
 Written 2026-08-30. Every number was measured on real TotalSegmentator output — the five 1.5 mm
 `total` parts (K = 19–27) and the 3 mm `total_fast` model (K = 118) — on the two cases named
