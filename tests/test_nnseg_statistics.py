@@ -106,3 +106,83 @@ def test_statistics_tsv_sanitizes_names():
     assert len(lines) == 3                 # header + 2 rows, no split
     ncol = len(lines[0].split("\t"))
     assert all(len(ln.split("\t")) == ncol for ln in lines), [ln.count("\t") for ln in lines]
+
+
+# -- the field measurement, reported alongside the counted one -------------------
+
+def _phantom_case(tmp_path, radius=12.0, spacing=1.0):
+    """One sphere, as both a labelmap (what statistics reads) and a ranked code (what
+    the field path reads), on the SAME grid so the two are comparable here - which the
+    server's are not, and which is why the output carries two spacings."""
+    from nnseg import phantoms as ph, ranked
+    from nnseg.grid import Grid
+    n = 40
+    g = Grid(shape=(n,) * 3, spacing=(spacing,) * 3, origin=(-(n - 1) * spacing / 2,) * 3)
+    body = ph.sphere(radius)
+    p = ph.Phantom((body,))
+    lab = ph.labels(p, g).astype(np.uint16)
+    gray = (lab * 100).astype(np.int16)
+    gi, lp = _pair(gray, lab, {1: "sphere"}, tmp_path, spacing=(spacing,) * 3)
+    code = ranked.encode(ph.logits(p, g), depth=2)
+    code.meta.update(labels=[0, 1], spacing_zyx=[spacing] * 3)
+    return gi, lp, code, body
+
+
+def test_without_a_ranked_code_the_output_is_unchanged(tmp_path):
+    """The compatibility contract: every existing number and key survives, and no field
+    column appears. This is what makes it safe to ship the two side by side."""
+    gi, lp, code, _ = _phantom_case(tmp_path)
+    plain = json.loads(compute_statistics(gi, lp, tmp_path / "a.json").read_text())
+    assert plain["structures"], "the fixture produced no structures"
+    assert "field_grid_spacing_mm" not in plain
+    for row in plain["structures"]:
+        assert "volume_ml_field" not in row and "area_cm2_field" not in row
+    assert "volume_ml_field" not in statistics_tsv(plain).splitlines()[0]
+
+
+def test_the_field_columns_appear_and_beat_counting_on_a_known_sphere(tmp_path):
+    """Truth is closed form here, so this is not 'the two agree' - it is which one is
+    right. Counting has no area at all; the one the field reports is within a percent
+    of 4 pi r^2, where the labelmap's own face count would be about half again too big."""
+    gi, lp, code, body = _phantom_case(tmp_path)
+    out = json.loads(compute_statistics(gi, lp, tmp_path / "b.json",
+                                        ranked_code=code).read_text())
+    row = next(r for r in out["structures"] if r["label"] == 1)
+    assert out["field_grid_spacing_mm"] == [1.0, 1.0, 1.0]
+    assert out["units"]["area"] == "cm2"
+
+    counted, field = row["volume_ml"] * 1000.0, row["volume_ml_field"] * 1000.0
+    assert abs(field / body.volume_mm3 - 1) < 0.01
+    assert abs(field / body.volume_mm3 - 1) < abs(counted / body.volume_mm3 - 1)
+    assert abs(row["area_cm2_field"] * 100.0 / body.area_mm2 - 1) < 0.02
+
+    header, first = statistics_tsv(out).splitlines()[:2]
+    assert header.split("\t")[-2:] == ["volume_ml_field", "area_cm2_field"]
+    assert len(first.split("\t")) == len(header.split("\t"))
+
+
+def test_a_code_that_cannot_be_read_leaves_the_counted_numbers_alone(tmp_path):
+    """Best-effort by contract. A code with no channel->label map, or one that raises,
+    must cost the caller nothing - statistics never fails a job, and a half-written
+    artifact would be worse than an absent column."""
+    gi, lp, code, _ = _phantom_case(tmp_path)
+    ref = json.loads(compute_statistics(gi, lp, tmp_path / "c.json").read_text())
+    for broken in (object(), _no_labels(code), _raising(code)):
+        out = json.loads(compute_statistics(gi, lp, tmp_path / "d.json",
+                                            ranked_code=broken).read_text())
+        assert out["structures"] == ref["structures"]
+        assert "field_grid_spacing_mm" not in out
+
+
+def _no_labels(code):
+    import copy
+    c = copy.copy(code)
+    c.meta = {k: v for k, v in code.meta.items() if k != "labels"}
+    return c
+
+
+def _raising(code):
+    import copy
+    c = copy.copy(code)
+    c.meta = dict(code.meta, spacing_zyx=[0.0, 0.0, 0.0])   # measure() rejects this
+    return c

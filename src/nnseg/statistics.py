@@ -12,6 +12,22 @@ derived TSV's column names.
 Radiomics (texture features) is deliberately NOT here: its parameters change
 the numbers and therefore belong in the result key, as a separately planned
 artifact. Best-effort by contract - statistics must never fail a job.
+
+Volume is counted voxels. When the run's ranked code is passed as well, the
+field measurement (`nnseg.measure`) is reported ALONGSIDE it rather than
+instead of it - `volume_ml_field` and `area_cm2_field` next to `volume_ml` -
+because the two disagree and the counted one is what every existing number was
+made with. The field's is the better measurement (counting's area overstates a
+smooth surface by about half and does not converge; its volume depends on where
+the body sits against the grid), but "better" has to be shown on a real cohort
+before the published field changes, and it cannot be shown without both being
+recorded for a while.
+
+They are also not on the same grid. The code lives on the model grid; the
+labelmap has been restored onto the input's. So the field numbers carry their
+own spacing in `field_grid_spacing_mm`, and an AREA in particular must never be
+compared across grids - it is a first-derivative functional and genuinely
+depends on the sampling, unlike a volume.
 """
 import json
 from pathlib import Path
@@ -19,10 +35,20 @@ from pathlib import Path
 __all__ = ["compute_statistics", "statistics_tsv"]
 
 
-def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | None:
+def compute_statistics(image, labels_path, out_json, *, pair=None,
+                       ranked_code=None) -> Path | None:
     """Write per-structure first-order statistics as JSON; returns the path,
     or None if they could not be computed. ``pair`` shares one load with the
-    preview (see preview.load_oriented_pair)."""
+    preview (see preview.load_oriented_pair).
+
+    ``ranked_code`` is this run's :class:`~nnseg.ranked.RankedCode`, optional. Given
+    one, each structure also gets ``volume_ml_field`` and ``area_cm2_field`` measured
+    off the margin field on the model grid. Absent, the output is byte-identical to
+    what it has always been - so this can be turned on for a release and compared,
+    which is the only way the counted numbers ever get retired.
+
+    It costs a margin decode per structure, so it is opt-in rather than implied.
+    """
     try:
         import numpy as np
         import SimpleITK as sitk
@@ -134,14 +160,59 @@ def compute_statistics(image, labels_path, out_json, *, pair=None) -> Path | Non
                 "p10": round(float(p10), 3), "p90": round(float(p90), 3),
                 "centroid_ras_mm": [round(float(c), 2) for c in centroid_ras],
             })
-        out = {"units": {"intensity": unit, "volume": "ml", "centroid": "mm (RAS)"},
+        field = _field_measurements(ranked_code)
+        for row in structures:
+            got = field.get(row["label"])
+            if got is not None:
+                row["volume_ml_field"] = round(got[0] / 1000.0, 3)
+                row["area_cm2_field"] = round(got[1] / 100.0, 3)
+        out = {"units": {"intensity": unit, "volume": "ml", "area": "cm2",
+                         "centroid": "mm (RAS)"},
                "grid_spacing_mm": [round(float(s), 4) for s in sp],
                "structures": structures}
+        if field:
+            out["field_grid_spacing_mm"] = [
+                round(float(v), 4) for v in ranked_code.meta["spacing_zyx"]]
         path = Path(out_json)
         path.write_text(json.dumps(out, indent=1))
         return path
     except Exception:
         return None
+
+
+def _field_measurements(code) -> dict:
+    """``{label_value: (volume_mm3, area_mm2)}`` from a ranked code, or ``{}``.
+
+    Keyed by GLOBAL label value, not by channel, because that is what the segment
+    table and the rest of this file speak - ``meta["labels"]`` is the channel -> label
+    map the pipeline stamped for exactly this reason. Channel 0 is background and is
+    skipped; a code with no ``labels`` (an older file, or a region head) is skipped
+    whole rather than guessed at.
+
+    Best-effort like everything else here: a structure this fails on simply has no
+    field columns, and the counted ones are untouched.
+    """
+    if code is None:
+        return {}
+    try:
+        from . import measure, ranked
+        labels = code.meta.get("labels")
+        spacing = code.meta.get("spacing_zyx")
+        if not labels or not spacing:
+            return {}
+        out = {}
+        for channel, value in enumerate(labels):
+            if int(value) == 0:                  # background is not a structure
+                continue
+            try:
+                v, a = measure.volume_area(ranked.margin(code, channel), spacing)
+            except Exception:
+                continue
+            if v > 0.0:
+                out[int(value)] = (v, a)
+        return out
+    except Exception:
+        return {}
 
 
 def statistics_tsv(stats: dict) -> str:
@@ -158,7 +229,11 @@ def statistics_tsv(stats: dict) -> str:
             f"mean_{u}", f"std_{u}", f"min_{u}", f"max_{u}",
             f"median_{u}", f"p10_{u}", f"p90_{u}",
             "centroid_r_mm", "centroid_a_mm", "centroid_s_mm"]
-    lines = ["\t".join(cols)]
+    # only when the run recorded them, so a reader's column count does not change
+    # under it for a reason that has nothing to do with the case
+    extra = ([] if not any("volume_ml_field" in s for s in stats.get("structures", []))
+             else ["volume_ml_field", "area_cm2_field"])
+    lines = ["\t".join(cols + extra)]
     for s in stats.get("structures", []):
         c = list(s.get("centroid_ras_mm") or [])
         c = (c + ["", "", ""])[:3]         # tolerate a short/absent centroid
@@ -166,5 +241,6 @@ def statistics_tsv(stats: dict) -> str:
                s.get("volume_ml", ""), s.get("mean", ""), s.get("std", ""),
                s.get("min", ""), s.get("max", ""), s.get("median", ""),
                s.get("p10", ""), s.get("p90", ""), c[0], c[1], c[2]]
+        row += [s.get(k, "") for k in extra]
         lines.append("\t".join(_cell(x) for x in row))
     return "\n".join(lines) + "\n"
