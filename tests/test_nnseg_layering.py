@@ -23,7 +23,7 @@ def _package_dir() -> pathlib.Path:
 SRC = _package_dir()
 
 KERNEL = {"grid", "mapping", "tables", "restore", "resample", "reference", "shuffleup",
-          "ranked", "backends", "backends.metal", "backends.torch_gather", "backends.triton_gpu"}
+          "ranked", "phantoms", "backends", "backends.metal", "backends.torch_gather", "backends.triton_gpu"}
 PIPELINE = {"io", "preprocess", "frame", "network", "pipeline", "cli", "tasks", "values", "envelope",
             "weights_fetch", "trainers", "result", "cache", "segmenter", "weights", "progress", "job",
             "serve", "client", "modal_app", "sources", "ecosystems", "preview", "statistics",
