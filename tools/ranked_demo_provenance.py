@@ -35,8 +35,15 @@ DEMO = (Path(sys.argv[1]) if len(sys.argv) > 1
 IDC = {
     "case": "idc-torso1",
     "archive": "NCI Imaging Data Commons",
-    "collection": "CPTAC-3",
+    # `cptac_ccrcc` (clear cell renal cell carcinoma), read from the IDC index - NOT "CPTAC-3",
+    # which is a different designation and was recorded here in error. A wrong collection name
+    # sends anyone trying to locate the case to the wrong cohort.
+    "collection": "cptac_ccrcc",
     "patient_id": "C3N-01524",
+    "license": "CC BY 4.0",
+    "source_doi": "10.7937/k9/tcia.2018.oblamn27",
+    "crdc_series_uuid": "a05fb365-dfd2-4116-ab8e-a7262d2c169c",
+    "idc_version": 2,
     "study_description": "06. Chest, Abdomen CE",
     "series_description": "NEPHROGENIC",
     "study_date": "20090728",
