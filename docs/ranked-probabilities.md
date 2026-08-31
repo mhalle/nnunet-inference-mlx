@@ -4,8 +4,12 @@
 A labelmap answers *which class won*. This keeps the second answer — *by how much* — for
 about a third of a byte per voxel, computed from the logits at the one moment they exist.
 
-Written 2026-08-29. Every number below was measured on real TotalSegmentator output
-(chest.nii and CT_Abdo), not estimated.
+Written 2026-08-29. Every number below was measured on real TotalSegmentator output, not
+estimated, on two contrast-CT torsos: **`idc-torso1`** (NCI Imaging Data Commons, CPTAC-3,
+patient `C3N-01524`, 709 instances at 1.0 × 0.651 mm) and **`CT_Abdo`** (3D Slicer
+sample data, ≈ 1.49 mm, no DICOM provenance). Both cover thorax and upper abdomen only —
+see [ranked-reconstruction.md §0](ranked-reconstruction.md#0-the-two-cases) for what that
+excludes.
 
 ## Why bother
 
@@ -109,13 +113,13 @@ want different points on that curve.
 Because planes past the first few sit at the clip almost everywhere and mask away, raising
 the depth costs a few percent rather than a proportional amount:
 
-| depth | chest `total_fast` (K=118) | 5-part `total` |
+| depth | idc-torso1 `total_fast` (K=118) | 5-part `total` |
 |---|---|---|
 | 3 | 1.24 MB | 3.51 MB |
 | 4 | 1.30 MB | — |
 | 6 | 1.31 MB | 3.74 MB |
 
-Before the sentinel fix the same 3 → 6 step cost **2.5×** (chest) and **3.6×** (five-part).
+Before the sentinel fix the same 3 → 6 step cost **2.5×** (idc-torso1) and **3.6×** (five-part).
 After it, 6 % and 7 %. Depth was only ever expensive because of noise the sentinel removes.
 
 **Therefore the default is depth 6, not 3.** A depth-6 8-bit store is *smaller* than a
@@ -134,7 +138,7 @@ depth makes it redundant. At depth 6:
 | muscles | 0.004 |
 | cardiac | 0.000 |
 | ribs | 0.000 |
-| chest `total_fast` (K=118) | 0.002 |
+| idc-torso1 `total_fast` (K=118) | 0.002 |
 
 `max_tail` is a **worst-single-voxel** statistic, not a typical one: at depth 3 only 0.09 % of
 voxels have any nonzero tail at all. At depth 6, dropping the tail entirely would cost at most
@@ -341,20 +345,20 @@ Sizes are of the compressed store (blosc/zstd-5, 64³ chunks, empty chunks skipp
 | + zero sentinel | 4.90 MB | 5.26 MB |
 | + 8-bit | **3.51 MB** | **3.74 MB** |
 
-**chest.nii, `total`, 1.5 mm, 32.0 M voxels**: 181.50 MB → **7.00 MB** (0.219 B/voxel, 2230×).
+**idc-torso1, `total`, 1.5 mm, 32.0 M voxels**: 181.50 MB → **7.00 MB** (0.219 B/voxel, 2230×).
 
-**chest.nii, `total_fast`, 3 mm, K = 118, 3.98 M voxels**: 7.42 MB → **1.31 MB** at depth 6.
+**idc-torso1, `total_fast`, 3 mm, K = 118, 3.98 M voxels**: 7.42 MB → **1.31 MB** at depth 6.
 
 Two things worth noticing. Bytes per voxel converge to **0.22–0.33 across every case**, despite
 K ranging 19–118, depth 3–6, and 1.5 vs 3 mm grids — and the figure *falls* as volume grows
-(chest 0.219 vs CT_Abdo 0.326), because after masking, the only voxels that cost anything are a
+(idc-torso1 0.219 vs CT_Abdo 0.326), because after masking, the only voxels that cost anything are a
 shell around boundaries. Size tracks **boundary area**, not voxel count or class count. And the
 correctly-normalized store is *smaller* than the buggy one it replaced (19.4 vs 21.3 MB at
 depth 3) — correct normalization makes the models more confident, and confidence is what this
 compresses.
 
 For scale, on CT_Abdo: input CT 7.75 MB, labelmap 0.28 MB, this format 3.74 MB, a dense fp16 +
-zstd baseline 178 MB, fp32 5.59 GB. On the 32 M-voxel chest case the complete probabilistic
+zstd baseline 178 MB, fp32 5.59 GB. On the 32 M-voxel idc-torso1 case the complete probabilistic
 record of five models is **less than the input scan**.
 
 ### Time

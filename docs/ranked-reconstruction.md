@@ -4,9 +4,30 @@
 [ranked-probabilities.md](ranked-probabilities.md), which covers what is stored and why.
 This document covers what a *reader* does with it.
 
-Written 2026-08-30. Every number was measured on real TotalSegmentator output — CT_Abdo and
-chest.nii, the five 1.5 mm `total` parts (K = 19–27) and the 3 mm `total_fast` model
-(K = 118). Where a claim is an extrapolation it says so.
+Written 2026-08-30. Every number was measured on real TotalSegmentator output — the five 1.5 mm
+`total` parts (K = 19–27) and the 3 mm `total_fast` model (K = 118) — on the two cases named
+in [§0](#0-the-two-cases). Where a claim is an extrapolation it says so.
+
+## 0. The two cases
+
+Both are contrast CT and both are **torsos**, which is a real limit on everything below.
+
+| name | provenance | grid | coverage |
+|---|---|---|---|
+| `idc-torso1` | NCI Imaging Data Commons, CPTAC-3, patient `C3N-01524`, series `…426160`, Philips Brilliance 64, 2009-07-28. 709 DICOM instances. | 709 × 768 × 768 at 1.0 × 0.651 × 0.651 mm | lung apices through the kidneys and bowel |
+| `CT_Abdo` | 3D Slicer sample data, [CTA-cardio.nrrd](https://www.slicer.org/wiki/File:CTA-cardio.nrrd). No DICOM, no series UID, no patient identifier. | 256 × 178 × 255 at ≈ 1.49 mm | heart and lungs through the kidneys and bowel |
+
+`chest.nii` became `idc-torso1` on 2026-08-30 — 709 mm of coverage ending well below the
+diaphragm was never a chest, and naming the case after the archive it came from is a fact that
+stays true. `CT_Abdo` keeps its filename, which likewise does not describe it: the volume holds
+2.5 L of lung and 497 mL of heart, and the upstream file is named for a cardiac angiogram whose
+coverage it does not match either. Treat both as labels, not descriptions — the provenance
+column is the part worth trusting, and each store carries those identifiers verbatim.
+
+⚠ **Two cases, one body region.** Nothing measured here touches pelvis, head and neck, or the
+extremities. Every per-structure result — the confidence slopes, the depth at which a part
+converges, the clip saturation on thin structures — is sampled from thorax and upper abdomen.
+The vertebrae results are thoracic and lumbar; no cervical spine appears in either case.
 
 Several conclusions here **correct** earlier beliefs, including claims in the companion
 document and in shipped code. Those are marked ⚠ and explained rather than quietly amended,
@@ -133,10 +154,10 @@ flip), across **ten segmentations, two cases, six models**:
 | CT_Abdo / muscles | 24 | 71.97 | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
 | CT_Abdo / ribs | 27 | 71.93 | 95.86 | 95.86 | 100.00 | 100.00 | 100.00 |
 | CT_Abdo / total_fast | **118** | 63.61 | 84.47 | 84.47 | 98.48 | 98.48 | 99.92 |
-| chest.nii / organs | 25 | 70.31 | 98.36 | 98.36 | 100.00 | 100.00 | 100.00 |
-| chest.nii / vertebrae | 27 | 65.07 | 97.26 | 97.26 | 100.00 | 100.00 | 100.00 |
-| chest.nii / cardiac | 19 | 68.06 | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
-| chest.nii / muscles | 24 | 62.32 | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
+| idc-torso1 / organs | 25 | 70.31 | 98.36 | 98.36 | 100.00 | 100.00 | 100.00 |
+| idc-torso1 / vertebrae | 27 | 65.07 | 97.26 | 97.26 | 100.00 | 100.00 | 100.00 |
+| idc-torso1 / cardiac | 19 | 68.06 | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
+| idc-torso1 / muscles | 24 | 62.32 | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
 
 **A rank plane alone changes nothing** — columns 2→3 and 4→5 are identical to two decimals in
 every row. **A support plane alone is worse than useless** — dropping `ranks[1]` while keeping
@@ -352,8 +373,8 @@ Restoring to the input grid is an **upsample** in nearly every real case:
 
 | case | model | input | factor |
 |---|---|---|---|
-| chest.nii | `total_fast` 3 mm | 1.0 × 0.651 mm | 3.0 / 4.61× (**64× by volume**) |
-| chest.nii | `total` 1.5 mm | 1.0 × 0.651 mm | 1.5 / 2.3× |
+| idc-torso1 | `total_fast` 3 mm | 1.0 × 0.651 mm | 3.0 / 4.61× (**64× by volume**) |
+| idc-torso1 | `total` 1.5 mm | 1.0 × 0.651 mm | 1.5 / 2.3× |
 | CT_Abdo | `total_fast` 3 mm | 1.49 mm | 2.01× |
 | CT_Abdo | `total` 1.5 mm | 1.49 mm | 1.00× |
 
