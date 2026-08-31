@@ -7,3 +7,8 @@ dist/
 build/
 .pytest_cache/
 uv.lock
+
+# Generated data. Untracked deliberately: these are build products of tools/ranked_*.py, they
+# are megabytes of binary that would bloat history, and the repo lives in Dropbox - so they are
+# backed up without being versioned. Delete and rebuild rather than commit.
+data/

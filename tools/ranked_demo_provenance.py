@@ -29,7 +29,8 @@ import zarr
 # The file renames below already ran once and are idempotent; DATA only matters if they have
 # not. DEMO is where the stores live and is the argument that actually gets used day to day.
 DATA = Path(os.environ.get("NNSEG_DEMO_DATA", "~/tmp/data")).expanduser()
-DEMO = Path(sys.argv[1] if len(sys.argv) > 1 else "duckn_demo")
+DEMO = (Path(sys.argv[1]) if len(sys.argv) > 1
+        else Path(__file__).resolve().parent.parent / "data" / "duckn_demo")
 
 IDC = {
     "case": "idc-torso1",

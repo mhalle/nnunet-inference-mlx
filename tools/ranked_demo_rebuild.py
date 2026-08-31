@@ -12,10 +12,12 @@ produce. Converting stores in place would leave the next build disagreeing with 
 envelopes - the envelope is recomputed per model, because the body threshold depends on that
 model's normalization - so it is built and then padded onto the shared model grid.
 
-usage: uv run python tools/ranked_demo_rebuild.py [WORKDIR]
+usage: uv run python tools/ranked_demo_rebuild.py [WORKDIR] [STORE_DIR]
 
-WORKDIR holds the `ranked_*` emit directories and receives `duckn_demo/`; it defaults to the
-current directory. Nothing is read from the repo except the sibling tools.
+WORKDIR holds the `ranked_*` emit directories and defaults to the current directory - it is
+usually scratch, since the emit output is large and re-derivable. STORE_DIR receives the built
+stores and defaults to `data/duckn_demo` in the repo, which is gitignored but inside Dropbox:
+backed up without being versioned, since these are megabytes of rebuildable binary.
 """
 import shutil
 import subprocess
@@ -26,7 +28,7 @@ import numpy as np
 
 TOOLS = Path(__file__).resolve().parent
 WORK = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
-DEMO = WORK / "duckn_demo"
+DEMO = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else TOOLS.parent / "data" / "duckn_demo"
 
 # (emit dir, store name, case, needs padding onto the shared model grid)
 JOBS = [("ranked_idc_fast", "idc-torso1_total_fast.duckn", "idc-torso1", False),
