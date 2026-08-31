@@ -56,6 +56,11 @@ import numpy as np
 __all__ = ["counted_volume_area", "volume_area"]
 
 _CORNERS = [(i, j, k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+# psi = c + n . (p - 1/2) at the eight corners. Orthogonal, so the unweighted solve is
+# the face-mean difference the fast path uses - the weighted fit below generalizes it.
+_X = np.array([[1.0, i - 0.5, j - 0.5, k - 0.5] for i, j, k in _CORNERS])
+_XTX = _X.T @ _X                                  # diag(8, 2, 2, 2)
+_RIDGE = 0.02                                     # conditioning only; see _censored_fit
 
 
 def _cube_cut(n_abs, alpha):
@@ -97,7 +102,40 @@ def _cube_cut(n_abs, alpha):
     return np.clip(v, 0.0, 1.0), np.maximum(d, 0.0)
 
 
-def _sweep(block, sp):
+def _censored_fit(psi, clip, steps=2):
+    """Plane fit that reads a saturated corner as an inequality, not a measurement.
+
+    A cell's corners reach half a cell diagonal from the surface. Wherever the margin
+    climbs faster than ``clip`` over that distance the far corners are AT the clip, and
+    the plain fit averages them in as if they were values - which flattens the plane and
+    loses area. Real TotalSegmentator margins run 3-7 logits/mm against a 2.6 mm
+    diagonal at 1.5 mm, so 30-95 % of straddling cells have such a corner and the loss
+    is 2-5 % of the surface. This is the single largest error in the module.
+
+    Dropping those corners is not enough on its own: ``|psi| >= clip`` is information,
+    and a body with flat faces (a box, at a narrow band) has whole corner planes
+    censored, where an unconstrained fit rotates the normal freely and does far worse
+    than doing nothing. So the drop is one step of a censored regression - fit without
+    them, then reactivate any whose prediction lands back inside the band or on the
+    wrong side, which is exactly the constraint they carry. Two steps suffice; measured
+    against phantom truth over the band-to-diagonal range the real data spans, this
+    takes smooth bodies from -5.2 % to -1.0 % at the worst ratio and -3.6 % to -0.4 % in
+    the middle, and leaves a cube bit-for-bit where it was.
+    """
+    censored = np.abs(psi) >= clip - 1e-3
+    w = (~censored).astype(np.float64)
+    theta = None
+    for _ in range(steps):
+        M = np.einsum('in,ia,ib->nab', w, _X, _X) + _RIDGE * _XTX
+        rhs = np.einsum('in,ia,in->na', w, _X, psi) + _RIDGE * (_X.T @ psi).T
+        theta = np.linalg.solve(M, rhs[..., None])[..., 0]
+        pred = np.einsum('ia,na->in', _X, theta)
+        binding = censored & ((np.abs(pred) < clip) | (np.sign(pred) != np.sign(psi)))
+        w = np.where(censored, binding.astype(np.float64), 1.0)
+    return theta[:, 0], theta[:, 1:].T
+
+
+def _sweep(block, sp, clip=None):
     """``(volume, area)`` over the cells of one contiguous block, in mm."""
     cell = float(np.prod(sp))
     stack = np.stack([block[i:block.shape[0] - 1 + i,
@@ -110,17 +148,21 @@ def _sweep(block, sp):
         return volume, 0.0
 
     psi = [-c[straddle] for c in stack]               # inside is psi < 0: a lower set
-    n = np.stack([sum(p for p, cn in zip(psi, _CORNERS) if cn[ax] == 1) / 4.0
-                  - sum(p for p, cn in zip(psi, _CORNERS) if cn[ax] == 0) / 4.0
-                  for ax in range(3)])                # psi per cell, index space
+    if clip is None:
+        n = np.stack([sum(p for p, cn in zip(psi, _CORNERS) if cn[ax] == 1) / 4.0
+                      - sum(p for p, cn in zip(psi, _CORNERS) if cn[ax] == 0) / 4.0
+                      for ax in range(3)])            # psi per cell, index space
+        centre = sum(psi) / 8.0
+    else:
+        centre, n = _censored_fit(np.stack(psi).astype(np.float64), float(clip))
     a = np.abs(n)
-    alpha = 0.5 * a.sum(0) - sum(psi) / 8.0           # the sign folding collapses to this
+    alpha = 0.5 * a.sum(0) - centre                   # the sign folding collapses to this
     frac, dfrac = _cube_cut(a, alpha)
     grad = np.linalg.norm(n / sp[:, None], axis=0)    # physical |grad psi|
     return volume + float(frac.sum()) * cell, float((grad * dfrac).sum()) * cell
 
 
-def volume_area(margin, spacing, *, slab: int = 16) -> tuple[float, float]:
+def volume_area(margin, spacing, *, clip=None, slab: int = 16) -> tuple[float, float]:
     """``(volume_mm3, area_mm2)`` for ``{margin > 0}``, integrating the interpolant.
 
     ``margin`` is a signed field sampled at voxel CENTERS - :func:`nnseg.ranked.margin`
@@ -128,16 +170,21 @@ def volume_area(margin, spacing, *, slab: int = 16) -> tuple[float, float]:
     surface and the magnitude only has to be monotone through it, so clip and the uint8
     support cost the VOLUME nothing measurable (<= 0.03 % on every phantom).
 
-    They are not free for area: measured against the unquantized field, area comes out
-    0.3 to 1.1 % low, always in that direction, worst on the wiggliest body. Quantizing
-    a field is a low-pass filter and area is the functional that notices - the same
-    asymmetry that makes area grid-dependent. It is still an order of magnitude better
-    than counting, but an area from a store is a slight under-estimate by construction,
-    not a neutral one.
+    The CLIP is not free for area, and the uint8 quantization has nothing to do with it
+    (measured: clipping alone reproduces the whole loss to three decimals - round-to-
+    nearest is noise, and noise on a surface adds area rather than removing it). Pass
+    ``clip`` to correct it; see :func:`_censored_fit` for what goes wrong and why the
+    obvious repair is worse than the disease.
 
     The integration domain is the box the voxel centers span, which is half a voxel
     inside the array. A structure touching the array edge is therefore cut - real ones
     sit inside an envelope, and the phantoms refuse to be sampled that close.
+
+    **Pass ``clip``** - ``code.meta["clip"]`` - whenever the field came out of a store.
+    Without it the saturated corners of straddling cells are read as values rather than
+    as bounds, and area comes out 1-5 % low on real margin gradients (see
+    :func:`_censored_fit`). It is not the default only because a field that was never
+    clipped has no such corners and must not have them invented.
 
     Cropped to the structure's bounding box and streamed in z-slabs, because the
     obvious dense version allocates eight float64 copies of the volume: 3.3 GB for a
@@ -165,7 +212,7 @@ def volume_area(margin, spacing, *, slab: int = 16) -> tuple[float, float]:
     volume = area = 0.0
     for z0 in range(0, box.shape[0] - 1, max(1, int(slab))):
         z1 = min(z0 + max(1, int(slab)) + 1, box.shape[0])
-        v, a = _sweep(box[z0:z1], sp)
+        v, a = _sweep(box[z0:z1], sp, clip)
         volume += v
         area += a
     return volume, area

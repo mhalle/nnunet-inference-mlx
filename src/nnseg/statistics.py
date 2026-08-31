@@ -189,6 +189,10 @@ def _field_measurements(code) -> dict:
     skipped; a code with no ``labels`` (an older file, or a region head) is skipped
     whole rather than guessed at.
 
+    ``clip`` is passed on: the field came out of a store, so its straddling cells have
+    saturated corners, and reading those as values rather than as bounds costs 1-5 % of
+    the area. See :func:`nnseg.measure._censored_fit`.
+
     Best-effort like everything else here: a structure this fails on simply has no
     field columns, and the counted ones are untouched.
     """
@@ -205,7 +209,8 @@ def _field_measurements(code) -> dict:
             if int(value) == 0:                  # background is not a structure
                 continue
             try:
-                v, a = measure.volume_area(ranked.margin(code, channel), spacing)
+                v, a = measure.volume_area(ranked.margin(code, channel), spacing,
+                                           clip=code.meta.get("clip"))
             except Exception:
                 continue
             if v > 0.0:

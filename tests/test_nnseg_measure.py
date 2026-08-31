@@ -202,3 +202,75 @@ class TestMechanics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCensoredCorners(unittest.TestCase):
+    """A clipped field's straddling cells have corners AT the clip, and those are bounds
+    rather than values. Reading them as values is the largest error in the module, and
+    it gets worse the faster the margin climbs - which is set by the network, not by us.
+    These sweep the band-to-cell-diagonal ratio across the range measured on real
+    TotalSegmentator output (0.43 to 1.02) rather than testing one convenient point.
+    """
+
+    CLIP = 8.0
+    DIAG = 1.5 * math.sqrt(3.0)
+
+    def _clipped(self, body, grid, ratio):
+        """A field whose +/-clip band spans ``ratio`` cell diagonals."""
+        m = ph.margins(ph.Phantom((body,)), grid, gradient=self.CLIP / (ratio * self.DIAG))[1]
+        return np.clip(m, -self.CLIP, self.CLIP)
+
+    def test_ignoring_the_clip_loses_area_and_passing_it_recovers_most(self):
+        g = _grid()
+        for ratio in (0.4, 0.6, 0.8):
+            for b in (ph.sphere(20.0), ph.torus(26.0, 8.0), ph.star(20.0, 0.15, 4)):
+                with self.subTest(ratio=ratio, body=b.name):
+                    m = self._clipped(b, g, ratio)
+                    naive = measure.volume_area(m, g.spacing)[1] / b.area_mm2 - 1
+                    fixed = measure.volume_area(m, g.spacing, clip=self.CLIP)[1] / b.area_mm2 - 1
+                    self.assertLess(fixed, 0.0, "the correction must not overshoot")
+                    self.assertLess(abs(fixed), abs(naive) + 1e-9)
+                    self.assertLess(abs(fixed), 0.012)
+
+    def test_the_loss_is_worst_where_the_band_is_narrowest(self):
+        """The dose-response that identifies the cause. If this ever stops holding, the
+        error being corrected is not the one described."""
+        g, b = _grid(), ph.sphere(20.0)
+        naive = [abs(measure.volume_area(self._clipped(b, g, r), g.spacing)[1] / b.area_mm2 - 1)
+                 for r in (0.4, 0.6, 0.8, 1.2)]
+        self.assertTrue(all(x > y for x, y in zip(naive, naive[1:])), naive)
+        self.assertGreater(naive[0], 0.03, "a narrow band should cost several percent")
+        self.assertLess(naive[-1], 0.01, "a wide one should cost nearly nothing")
+
+    def test_a_flat_faced_body_is_not_made_worse(self):
+        """The reason the censored corners are reactivated rather than dropped. A cube at
+        a narrow band has whole corner planes at the clip; an unconstrained fit rotates
+        the normal freely and does far worse than doing nothing. The inequality they
+        carry is what prevents that, so this must come out unchanged, not merely close."""
+        g, b = _grid(), ph.box((14.0, 14.0, 14.0))
+        for ratio in (0.4, 0.6, 1.0):
+            with self.subTest(ratio=ratio):
+                m = self._clipped(b, g, ratio)
+                naive = measure.volume_area(m, g.spacing)[1]
+                fixed = measure.volume_area(m, g.spacing, clip=self.CLIP)[1]
+                self.assertAlmostEqual(fixed / naive, 1.0, places=6)
+
+    def test_an_unclipped_field_is_left_alone(self):
+        """No corner is at the clip, so there is nothing to reactivate and the two paths
+        must agree - otherwise the correction is inventing censoring where there is none."""
+        g, b = _grid(), ph.sphere(20.0)
+        m = ph.margins(ph.Phantom((b,)), g)[1]
+        a = measure.volume_area(m, g.spacing)
+        c = measure.volume_area(m, g.spacing, clip=1e6)
+        self.assertAlmostEqual(c[0] / a[0], 1.0, places=6)
+        self.assertAlmostEqual(c[1] / a[1], 1.0, places=4)
+
+    def test_volume_is_barely_moved_by_any_of_this(self):
+        """Clipping cost the volume nothing to begin with - the misplacement is symmetric
+        across the surface and cancels - so the correction must not disturb it either."""
+        g, b = _grid(), ph.sphere(20.0)
+        m = self._clipped(b, g, 0.5)
+        naive = measure.volume_area(m, g.spacing)[0]
+        fixed = measure.volume_area(m, g.spacing, clip=self.CLIP)[0]
+        for got in (naive, fixed):
+            self.assertLess(abs(got / b.volume_mm3 - 1), 0.01)
