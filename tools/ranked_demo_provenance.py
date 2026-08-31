@@ -157,6 +157,35 @@ DUCKN_SOURCE_KEYS = ("type", "format", "path", "url", "doi", "identifier", "desc
                      "created", "note")
 
 
+ACQUISITION = (
+    # Tags of the source acquisition. Dropped from the derived store per the duckn dicom
+    # extension section 10.3 - inheritance has no defined semantics, and a segmentation that
+    # advertises a reconstruction kernel is describing a scan it is not. A DICOM writer needs
+    # Patient and Study; section 10.4 says it takes them from the source, which
+    # provenance.sources names, rather than from a copy kept here.
+    "patient_id", "clinical_trial_subject_id", "study_instance_uid", "series_instance_uid",
+    "frame_of_reference_uid", "manufacturer", "model", "convolution_kernel", "kvp",
+    "slice_thickness_mm", "slice_spacing_mm", "pixel_spacing_mm", "series_number",
+    "instances", "body_part_examined", "series_description", "modality", "study_date",
+    "study_description", "collection", "dataset", "dataset_name", "subject", "session",
+    "contrast", "idc_version",
+)
+
+
+def keep_for_store(prov):
+    """What survives into the store: our own name, and cross-references that are not
+    inherited acquisition tags.
+
+    `reference_segmentation` stays because it is not a tag of the source - it points at an
+    INDEPENDENT derived artifact published beside it, which is the sort of thing nobody can
+    reconstruct from the source header and which a later comparison needs.
+    """
+    return {k: v for k, v in prov.items()
+            if k not in ACQUISITION and k not in ("license", "cite", "source_doi",
+                                                  "source_url", "dataset_doi", "path",
+                                                  "crdc_series_uuid", "archive", "note")}
+
+
 def as_duckn_source(prov):
     """The case block -> one duckn provenance source entry."""
     src = {"type": "dataset", "format": prov.get("format", "DICOM"),
@@ -193,7 +222,8 @@ def stamp(store_name, prov, new_name=None):
     root = zarr.open_group(str(d), mode="r+")
     a = dict(root.attrs.asdict()["duckn"])
     ext = dict(a["extensions"])
-    ext["nnseg"] = dict(ext["nnseg"]) | {"case": prov["case"], "case_detail": prov}
+    ext["nnseg"] = dict(ext["nnseg"]) | {"case": prov["case"],
+                                        "case_detail": keep_for_store(prov)}
     # the builder wrote `processing`; add the source and the licence without discarding it
     pv = dict(ext.get("provenance") or {"version": "1.0"})
     pv["sources"] = [as_duckn_source(prov)]

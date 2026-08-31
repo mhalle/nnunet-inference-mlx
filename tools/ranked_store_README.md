@@ -297,11 +297,30 @@ ours:
   steps because they fail independently: a reader doubting a store needs to know which to doubt.
 - `attribution` — licence and citation.
 
-duckn's `sources` schema is compact by design and has no slot for a study UID or a scanner
-model, so the fuller case record lives beside it under `nnseg.case_detail` — namespaced, rather
-than crammed into `note` or silently extending someone else's schema. Look there for DICOM
-identifiers, acquisition parameters, and any independent reference segmentation of the same
-series.
+### What this store deliberately does NOT carry
+
+**The source's DICOM tags.** No patient or study UID, no frame of reference, no manufacturer,
+kernel, kVp, slice thickness or pixel spacing. That is duckn's rule for a derived array
+(`dicom` extension §10.3) and it is a correctness rule, not tidiness: *this array was not
+acquired at 120 kVp with a soft-tissue reconstruction kernel — it was computed.* A segmentation
+advertising a reconstruction kernel is describing a scan it is not. Inheritance across a
+derivation has no defined semantics either: some attributes survive resampling, some are
+invalidated, and an array derived from several sources could inherit contradictory ones.
+
+So the store names its source and stops. `provenance.sources[].identifier` resolves in the
+archive it names — a `crdc_series_uuid` for IDC, a `ds<number>/<path>` for OpenNeuro — and that
+identifier is what the fetch tooling takes, so the input is re-obtainable from the store alone.
+
+**This costs nothing for a DICOM writer.** Producing a conformant SEG from one of these is a
+deliberate construction, not a metadata copy: it mints new instance and series identifiers,
+marks the result as derived, references the source instances through DICOM's own mechanisms,
+and carries forward Patient and Study — *from the source*, which it must have access to anyway,
+not from a stale copy of a header kept here (`dicom` extension §10.4).
+
+`nnseg.case_detail` therefore holds only what is not an inherited tag: the case name, and any
+cross-reference to an independent artifact — for example an existing published segmentation of
+the same source, which nobody could reconstruct from the source header and which a later
+comparison needs.
 
 ---
 
