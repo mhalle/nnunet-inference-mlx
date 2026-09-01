@@ -103,27 +103,51 @@ def names_for(engine, task, allow_unnamed=False):
     return names
 
 
+# nnseg names the forward resample by where it aligns samples; duckn names the same fact by
+# what a sample represents. They are one decision under two vocabularies, so the store derives
+# duckn's word from nnseg's rather than stating it twice and letting the two drift.
+CENTERING = {"corner": "node", "center": "cell"}
+
+
 def geometry(part):
-    """(true spacing zyx, first-voxel-center origin xyz, direction) of the stored array.
+    """(true spacing zyx, first-voxel-center origin xyz, direction, centering) of the array.
 
     Two engines record their geometry differently, because their grids arise differently.
     FastSurfer states its conformed grid outright - the logits are native to it, there is no
-    crop and the spacing is exactly 1 mm by construction. The nnU-Net path states a canonical
-    frame plus a requested spacing, so the grid it actually landed on has to be derived: under
-    the corner rule that is (n_src-1)*s_src/(n_model-1), not the nominal request.
+    crop and the spacing is exactly 1 mm by construction. That grid is an image grid, so its
+    samples are cell centres. The nnU-Net path states a canonical frame plus a requested
+    spacing, so the grid it actually landed on has to be derived, and HOW depends on which
+    convention the resample used:
+
+      corner (TotalSegmentator, scipy.zoom)  holds the first and last sample centres, so
+          spacing is (n_src-1)*s_src/(n_model-1) and voxel 0 does not move  -> duckn `node`
+      center (nnU-Net native, skimage)       holds the field of view, so spacing is
+          n_src*s_src/n_model and voxel 0 moves in by half the spacing change -> duckn `cell`
+
+    Neither is the nominal request. Declaring the nominal spacing, or declaring `cell` for a
+    corner-rule grid, misplaces the volume by up to half a voxel - silently, because the sample
+    values are unaffected and only the stated geometry is wrong.
     """
     if "source_grid" in part:                                      # fastsurfer
         g = part["source_grid"]
-        return list(g["spacing_zyx"]), tuple(g["origin_xyz"]), g["direction_xyz"]
+        return list(g["spacing_zyx"]), tuple(g["origin_xyz"]), g["direction_xyz"], "cell"
     c = part["frame"]["canonical"]
     model = [int(v) for v in part["model_grid"]]
     start = [int(v) for v in part["envelope"]["start"]]
-    eff = [(n_s - 1) * s / (n_m - 1) if n_m > 1 else s
-           for n_s, s, n_m in zip(c["shape_zyx"], c["spacing_zyx"], model)]
+    convention = part.get("convention", "corner")
+    centering = CENTERING[convention]
+    if centering == "node":
+        eff = [(n_s - 1) * s / (n_m - 1) if n_m > 1 else s
+               for n_s, s, n_m in zip(c["shape_zyx"], c["spacing_zyx"], model)]
+        shift = [0.0, 0.0, 0.0]                                    # voxel 0 stays put
+    else:
+        eff = [n_s * s / n_m for n_s, s, n_m in zip(c["shape_zyx"], c["spacing_zyx"], model)]
+        shift = [(e - s) / 2 for e, s in zip(eff, c["spacing_zyx"])]
     D = np.asarray(c["direction_xyz"], float).reshape(3, 3)
-    off_xyz = np.asarray([start[2] * eff[2], start[1] * eff[1], start[0] * eff[0]], float)
+    off_zyx = [sh + st * e for sh, st, e in zip(shift, start, eff)]  # centring, then the crop
+    off_xyz = np.asarray([off_zyx[2], off_zyx[1], off_zyx[0]], float)
     origin = np.asarray(c["origin_xyz"], float) + D @ off_xyz      # the crop moves voxel 0
-    return eff, tuple(float(v) for v in origin), c["direction_xyz"]
+    return eff, tuple(float(v) for v in origin), c["direction_xyz"], centering
 
 
 def extent(part):
@@ -152,7 +176,7 @@ def as_extent(start, stop):
     return [int(v) for a, b in zip(start, stop) for v in (a, b - 1)]
 
 
-def duckn_grid(rec):
+def duckn_grid(rec, centering="cell"):
     """A `grid_record` dict -> duckn's own geometry vocabulary.
 
     The internal record names axis order in its keys (`shape_zyx` beside `origin_xyz`) because
@@ -166,7 +190,7 @@ def duckn_grid(rec):
     return {"space": "left-posterior-superior",
             "space_origin": [round(float(v), 6) for v in rec["origin_xyz"]],
             "samples": [int(v) for v in rec["shape_zyx"]],
-            "axes": [{"kind": "space", "centering": "cell", "unit": "mm",
+            "axes": [{"kind": "space", "centering": centering, "unit": "mm",
                       "space_direction": [round(float(v), 9) for v in (c * s)]}
                      for c, s in zip(cols, sp)]}
 
@@ -239,19 +263,19 @@ def segment_extents(labels_zyx, values):
     return out
 
 
-def axes(direction_xyz, eff_zyx, list_axis):
+def axes(direction_xyz, eff_zyx, list_axis, centering):
     D = np.asarray(direction_xyz, float).reshape(3, 3)
     cols = [D[:, 2], D[:, 1], D[:, 0]]                             # array Z, Y, X
-    sp = [{"kind": "space", "centering": "cell", "unit": "mm",
+    sp = [{"kind": "space", "centering": centering, "unit": "mm",
            "space_direction": [round(float(v), 9) for v in (c * s)]}
           for c, s in zip(cols, eff_zyx)]
     return ([{"kind": "list"}] + sp) if list_axis else sp
 
 
-def attrs(direction, eff, origin, *, list_axis):
+def attrs(direction, eff, origin, *, list_axis, centering):
     return {"duckn": {"version": "1.0", "space": "left-posterior-superior",
                       "space_origin": [round(float(v), 6) for v in origin],
-                      "axes": axes(direction, eff, list_axis)}}
+                      "axes": axes(direction, eff, list_axis, centering)}}
 
 
 CODEC = ("mode", "classes", "depth", "clip", "support_max", "rank_sentinel",
@@ -354,7 +378,7 @@ def build(src, out, case, parts="all", allow_unnamed=False):
                   flush=True)
 
     for i, (name, part) in enumerate(items):
-        eff, origin, direction = geometry(part)
+        eff, origin, direction, centering = geometry(part)
         grid, start, stop = extent(part)
         g = root.create_group(f"parts/{i}")
         lut = [int(v) for v in part["labels"]]
@@ -391,7 +415,8 @@ def build(src, out, case, parts="all", allow_unnamed=False):
             z = g.create_array(arr_name, shape=a.shape, dtype=a.dtype,
                                chunks=chunks, shards=shards,
                                compressors=zarr.codecs.ZstdCodec(level=9),
-                               attributes=attrs(direction, eff, origin, list_axis=four))
+                               attributes=attrs(direction, eff, origin, list_axis=four,
+                                                centering=centering))
             z[:] = a
             del a
 

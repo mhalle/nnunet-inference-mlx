@@ -137,9 +137,25 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
         rep.check(m.get("exhaustive") or "tail" in g,
                   f"parts/{i}: not exhaustive but no tail array", warn_only=True)
 
+        # Centering is the sample-count-to-extent relationship, so it decides what a resampler
+        # holds fixed. It was hardcoded to "cell" on grids the corner rule produced, which is
+        # duckn's "node" - harmless while duckn's resample() ignored the field, a half-voxel
+        # shift now that it honors it. Restated here rather than imported: a verifier that
+        # imports the builder inherits the builder's mistakes.
+        want_data = {"corner": "node", "center": "cell"}.get(m.get("resample_alignment"))
         for nm in ("ranks", "support", "tail", "occupancy"):
             if nm not in g:
                 continue
+            ax = g[nm].attrs.asdict().get("duckn", {}).get("axes", [])
+            cen = {a.get("centering") for a in ax if a.get("space_direction")}
+            rep.check(len(cen) <= 1,
+                      f"parts/{i}/{nm}: spatial axes disagree on centering {cen}")
+            # occupancy is a brick summary whose samples do own a cell, whatever grid the
+            # data arrays landed on.
+            expect = "cell" if nm == "occupancy" else want_data
+            rep.check(expect is None or cen == {expect},
+                      f"parts/{i}/{nm}: centering {cen or 'unset'} but the grid is "
+                      f"{m.get('resample_alignment')!r}-aligned, which is {expect}")
             # a single-chunk array is already one file; sharding it would add an index for
             # nothing. Only multi-chunk arrays need it.
             nchunks = int(np.prod([int(np.ceil(s / c))

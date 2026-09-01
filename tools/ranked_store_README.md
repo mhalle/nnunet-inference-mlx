@@ -274,6 +274,38 @@ Do not trust a nominal spacing field (`nominal_spacing`) as the true grid spacin
 what was *requested*. The `space_direction` vectors are the actual geometry; a request of 1.5 mm
 routinely lands at 1.504 mm.
 
+### `centering` — what a sample owns, and what a resample must hold fixed
+
+Each spatial axis declares `centering`. It is **not** a statement about where the samples are:
+under either value a sample sits at `space_origin + index * space_direction`, and `space_origin`
+is the first sample's position either way. It states the array's **extent** — whether the
+footprint runs half a voxel past the outermost samples.
+
+| value | meaning | extent along an axis of `n` samples |
+|---|---|---|
+| `cell` | each sample owns a cell; its position is the cell center | `n * spacing` |
+| `node` | samples sit on the cell boundaries | `(n - 1) * spacing` |
+
+That is what a resampler holds fixed, so reading it wrong displaces the volume by half a voxel
+— silently, because the sample values are unaffected and only the stated geometry is wrong.
+
+In these stores:
+
+- **`ranks`, `support` and `tail` are `node`** whenever the part's `resample_alignment` is
+  `corner`, which is what nnU-Net / TotalSegmentator pipelines use: the forward resample held
+  the first and last sample centers, so the spacing is `(n_src - 1) * s_src / (n_model - 1)`
+  and voxel 0 did not move. A part aligned `center` is `cell` instead, with spacing
+  `n_src * s_src / n_model` and voxel 0 moved in by half the spacing change. An engine whose
+  logits are native to an acquired grid — FastSurfer's conformed volume — is `cell` and carries
+  no `resample_alignment`, because nothing was resampled.
+- **`occupancy` is always `cell`**, whatever the data arrays are. It is a brick summary and a
+  brick genuinely owns its box; its `space_origin` already sits at the first brick's center.
+
+`resample_alignment` and `centering` are one fact in two vocabularies — the pipeline's word for
+where it aligned samples, and duckn's word for what a sample represents. Both are derived from a
+single value when the store is built, so they cannot drift apart; if you ever find them
+disagreeing, the store is wrong and `resample_alignment` is the one to trust.
+
 ### Is a structure cut off by the field of view?
 
 Each segment carries duckn's `extent`, the inclusive bounding box of its voxels. Compare it
