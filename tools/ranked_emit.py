@@ -26,6 +26,48 @@ import numpy as np
 from nnseg.pipeline import segment
 from nnseg.ranked import RankedSpec
 
+DISTANCE_VOXELS = 2.0            # truncation of the emitted distance field, in voxels
+
+
+def _true_spacing(meta):
+    """The grid the part actually landed on, mirroring ranked_build_store.geometry().
+
+    `spacing_zyx` in the meta is the nominal request; under the corner rule the true spacing
+    is (n_src-1)*s_src/(n_model-1). A distance stated in millimetres has to use the grid the
+    samples are really on, not the one that was asked for.
+    """
+    c = meta["frame"]["canonical"]
+    model = [int(v) for v in meta["model_grid"]]
+    if meta.get("convention", "corner") == "corner":
+        return [(n_s - 1) * s / (n_m - 1) if n_m > 1 else s
+                for n_s, s, n_m in zip(c["shape_zyx"], c["spacing_zyx"], model)]
+    return [n_s * s / n_m for n_s, s, n_m in zip(c["shape_zyx"], c["spacing_zyx"], model)]
+
+
+def _emit_distance(part, code, out):
+    """The distance field, computed where the arrays already are - on the CUDA worker.
+
+    CUDA only, by measurement rather than principle: on MPS the dense torch kernel LOSES to
+    the optimized numpy band in the builder (6.4 s vs 2.8 s on a 52 Mvoxel part - dense does
+    ~40x the band's work and Apple bandwidth does not absorb it), so a local emit skips this
+    and the builder computes it at build time instead. Either way the store gets the field;
+    this only decides which machine pays.
+    """
+    import torch
+    if not torch.cuda.is_available() or "frame" not in code.meta:
+        return {}
+    from nnseg.ranked import distance_field
+    t = time.perf_counter()
+    eff = _true_spacing(code.meta)
+    truncation = DISTANCE_VOXELS * min(eff)
+    dist = distance_field(code.ranks, code.support, clip=float(code.meta["clip"]),
+                          spacing_zyx=eff, truncation=truncation, device="cuda")
+    np.save(out / f"{part}_distance.npy", dist)
+    print(f"  {part:<12} distance on {torch.cuda.get_device_name(0)} in "
+          f"{time.perf_counter() - t:.1f}s (T={truncation:.3f} mm)", flush=True)
+    return {"distance_truncation": round(truncation, 6), "distance_max": 255,
+            "distance_voxels": DISTANCE_VOXELS}
+
 
 def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):
     depth, clip = int(depth), float(clip)
@@ -39,7 +81,7 @@ def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):
         for name, arr in (("ranks", code.ranks), ("support", code.support), ("tail", code.tail)):
             if arr is not None:
                 np.save(out / f"{part}_{name}.npy", arr)
-        metas[part] = code.meta
+        metas[part] = {**code.meta, **_emit_distance(part, code, out)}
         print(f"  {part:<12} {code!r}  ->  {out.name}/{part}_*.npy", flush=True)
 
     seg = segment(image, task, probabilities=RankedSpec(sink=sink, depth=depth, clip=clip),

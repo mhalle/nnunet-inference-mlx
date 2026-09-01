@@ -37,7 +37,7 @@ It carries `classes`, `depth`, `clip`, `support_max`, `rank_sentinel`, `labels`,
 ## 2. The three arrays
 
 These three hold the data. `occupancy`, if present, is a derived skip index and carries no
-information of its own — see §7.1.
+information of its own — see §7.1; `distance`, if present, is a derived geometric view.
 
 Every array is indexed `[..., Z, Y, X]` in **array order** (slowest axis first).
 
@@ -77,10 +77,65 @@ Probabilities can be renormalized exactly with `Z = Z_top / (1 - tail)`.
 It is often all zeros at useful depths and may be **absent entirely** (`exhaustive: true`, i.e.
 `depth >= classes`, or the writer dropped it). Treat a missing `tail` as zero.
 
-### Zero means "nothing here" in all three
+### `distance` — where the nearest surface is, in millimetres (optional)
 
-That is deliberate and load-bearing: an unwritten chunk, a `calloc`'d buffer, a zero-cleared GPU
-texture, or a sparse default all decode to the **safe** answer. It is also why the arrays are
+Present only when the store was built with it. One 3-D field on the data grid, like `tail`: the
+distance from this voxel to the **nearest surface** — the nearest place the argmax changes,
+whichever pair of classes forms it. Two part-block fields decode it, and the array cannot be
+read without them:
+
+```python
+d_mm = (1 - distance / distance_max) * distance_truncation   # distance_max = on the surface
+```
+
+Like `support`, it counts **up** from the far end: `distance_max` is at the surface, `0` is at
+or beyond `distance_truncation`. No sign is stored — the field is unsigned magnitude, and
+`ranks[0]` already says which side of the surface a voxel is on. For a **selection** of
+structures, `ranks[0]` and `ranks[1]` together say whether the nearest surface is the
+selection's outer boundary (exactly one of the two classes is in the selection) or a boundary
+internal to it (both are).
+
+There is deliberately only one field. A second one keyed to the next *logit* rank was tried and
+dropped: it measures the level set where `l_winner = l_third`, and since the runner-up is by
+definition above the third class, that level set generically sits buried under it — a place no
+surface is drawn. Note also that logit order and distance order genuinely disagree, at 9–15 %
+of the voxels where both are close: the distance to a class's interface is its deficit divided
+by the steepness of that pair's transition, and ranking by deficit ignores the divisor. This
+field is immune, being found from the labelmap rather than from a rank.
+
+It is a **derived view, not a replacement for `support`**. Distance says where a surface is;
+it cannot say how confident the model was, what the alternatives were, or let you re-decide
+after the fact. Everything that needs those still reads the logits. What distance buys is a
+shared unit: margins are logits scoped to one softmax and are not comparable across parts, so a
+five-part composite can only be combined by paint order — millimetres let the same parts be
+combined by nearest surface, and make cross-part geometric questions answerable. It is stored
+rather than derived on read because the derivation is **non-local** (a neighbourhood of radius
+`distance_truncation`, so per-brick derivation needs halos and whole-volume derivation costs
+tens of seconds) and easy to get wrong in ways that render plausibly rather than raise.
+
+Three cautions if you compute your own:
+
+- **Find surfaces with the labelmap, not with a rank pair.** Watching the (winner, runner-up)
+  pair for a sign change misses every argmax change where the class that overtakes is not the
+  local runner-up. `ranks0[a] != ranks0[b]` across an edge is exact.
+- **Do not divide the winner's margin by its own gradient.** That field is *folded* — it falls
+  to zero at the surface and rises again beyond it — so a difference taken across the crossing
+  measures the fold, not the slope, and at a symmetric fold it measures zero. Interpolate the
+  *signed* field of the pair that actually swaps.
+- **Propagate with an Eikonal (Godunov) update, not min-plus sweeps.** `min(d, neighbour + h)`
+  measures a taxicab distance — up to √3 too large off-axis — and the error shades as facets.
+  A planar test cannot catch either of the last two; a sphere against its analytic distance
+  catches both.
+
+The truncation is set by reconstruction, not by storage: a central difference for a normal
+reaches 1.5 voxels and a trilinear corner reaches √3, so at `T` = 1 voxel neither can be
+evaluated from the stored field. Two voxels is the floor.
+
+### Zero means "nothing here" in every array
+
+That is deliberate and load-bearing — in `distance` too, where 0 means "no surface within the
+truncation": an unwritten chunk, a `calloc`'d buffer, a zero-cleared GPU texture, or a sparse
+default all decode to the **safe** answer. It is also why the arrays are
 tiny — regions where nothing is close to the winner (air, deep interiors) are uniformly zero and
 compress away, and empty chunks are not stored at all.
 

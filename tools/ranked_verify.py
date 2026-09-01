@@ -137,6 +137,21 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
         rep.check(m.get("exhaustive") or "tail" in g,
                   f"parts/{i}: not exhaustive but no tail array", warn_only=True)
 
+        if "distance" in g:
+            # The quantum is truncation/max, so without both the array is a uint8 with no
+            # scale - the same roles `clip`/`support_max` play for `support`.
+            rep.check("distance_truncation" in m,
+                      f"parts/{i}: distance array but no distance_truncation - "
+                      "the field cannot be decoded")
+            rep.check("distance_max" in m,
+                      f"parts/{i}: distance array but no distance_max - "
+                      "the field cannot be decoded")
+            rep.check(tuple(g["distance"].shape) == shape,
+                      f"parts/{i}: distance grid {tuple(g['distance'].shape)} "
+                      f"!= ranks {shape} - it must be ONE 3-D field, like tail")
+            t = m.get("distance_truncation")
+            rep.check(t is None or t > 0, f"parts/{i}: distance_truncation {t} is not positive")
+
         # Centering is the sample-count-to-extent relationship, so it decides what a resampler
         # holds fixed. It was hardcoded to "cell" on grids the corner rule produced, which is
         # duckn's "node" - harmless while duckn's resample() ignored the field, a half-voxel

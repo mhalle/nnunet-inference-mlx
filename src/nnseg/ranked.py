@@ -66,7 +66,8 @@ TAIL_MAX = 255
 DEFAULT_DEPTH = 6
 
 __all__ = ["CLIP", "DEFAULT_DEPTH", "RankedCode", "RankedSpec", "decode_groups", "deficit",
-           "emit", "encode", "encode_regions", "margin", "probabilities", "to_device"]
+           "distance_field", "emit", "encode", "encode_regions", "margin",
+           "probabilities", "to_device"]
 
 
 @dataclass(frozen=True)
@@ -494,3 +495,112 @@ def probabilities(code: RankedCode) -> tuple[np.ndarray, np.ndarray]:
     p = w / z
     p[ids < 0] = 0.0
     return ids, p
+
+
+def distance_field(ranks, support, *, clip: float, spacing_zyx, truncation: float,
+                   distance_max: int = 255, device=None) -> np.ndarray:
+    """``(Z, Y, X)`` uint8: distance in mm to the nearest surface, on a GPU when there is one.
+
+    The nearest surface is the nearest place the argmax changes, whichever class pair forms
+    it - found from ``ranks[0]``, never from a rank pair, and located sub-voxel by the two
+    deficits of the pair that actually swaps. Encoded counting up from the truncation
+    (``distance_max`` on the surface, 0 at or beyond ``truncation``) so zero stays the
+    sentinel and empty chunks elide. See docs/ranked-distance-gpu.md for the design and
+    tools/ranked_build_store.py for the numpy reference this must agree with to one quantum.
+
+    DENSE, DELIBERATELY. The numpy reference restricts the Godunov iteration to a dilated
+    band because CPUs are slow; a GPU covers the whole grid in milliseconds and the band
+    bookkeeping is the only part of that code that took thought to keep correct. Same math,
+    Jacobi form, no sweep ordering, no atomics: seeding is per-axis slice writes and
+    propagation is elementwise.
+
+    Everything is float32 (MPS has no float64; the reference is float32 already). GPU float
+    reassociation means agreement with the reference is bounded at one uint8 quantum, not
+    byte-identity - asserted in tests/test_ranked_distance.py.
+    """
+    from .resample import best_device
+
+    dev = torch.device(device) if device is not None else best_device()
+    as_t = (lambda a: a.to(dev) if isinstance(a, torch.Tensor)
+            else torch.from_numpy(np.ascontiguousarray(a)).to(dev))
+    rk = as_t(ranks)
+    su = as_t(support)
+    h = [float(v) for v in spacing_zyx]
+    T = float(truncation)
+    clip = float(clip)
+    big = T * 4.0
+    win = rk[0]
+    inf = torch.tensor(float("inf"), device=dev)
+
+    def deficit(rk_s, su_s, want):
+        """Logit deficit of class ``want`` under the slice's own winner (dense, on device)."""
+        d = torch.full(want.shape, clip, dtype=torch.float32, device=dev)
+        d = torch.where(rk_s[0] == want, torch.zeros((), device=dev), d)
+        for j in range(1, rk_s.shape[0]):
+            gap = (1.0 - su_s[j - 1].to(torch.float32) / 255.0) * clip
+            d = torch.where(rk_s[j] == want, gap, d)
+        return d
+
+    # ---- seed: argmax flips per axis, crossing interpolated from the swapping pair ----
+    d = torch.full(win.shape, float("inf"), dtype=torch.float32, device=dev)
+    for axis, step in enumerate(h):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[axis], hi[axis] = slice(0, -1), slice(1, None)
+        lo, hi = tuple(lo), tuple(hi)
+        flip = win[lo] != win[hi]
+        if not bool(flip.any()):
+            continue
+        dq_a = deficit(rk[(slice(None),) + lo], su[(slice(None),) + lo], win[hi])
+        dp_b = deficit(rk[(slice(None),) + hi], su[(slice(None),) + hi], win[lo])
+        denom = dq_a + dp_b
+        t = torch.where(denom > 1e-9, dq_a / denom, torch.full((), 0.5, device=dev))
+        d[lo] = torch.minimum(d[lo], torch.where(flip, t * step, inf))
+        d[hi] = torch.minimum(d[hi], torch.where(flip, (1.0 - t) * step, inf))
+
+    seed_mask = torch.isfinite(d)
+    if not bool(seed_mask.any()):
+        return np.zeros(win.shape, np.uint8)
+    seed_vals = torch.where(seed_mask, d, torch.full((), big, device=dev))
+    d = seed_vals.clone()
+
+    # ---- propagate: dense Jacobi Godunov, |grad d| = 1 ----
+    n_iter = int(np.ceil(T / min(h))) + 4
+    hs = [torch.full((), v, dtype=torch.float32, device=dev) for v in h]
+    for _ in range(n_iter):
+        p = torch.nn.functional.pad(d, (1, 1, 1, 1, 1, 1), value=big)
+        trip = [
+            (torch.minimum(p[:-2, 1:-1, 1:-1], p[2:, 1:-1, 1:-1]), hs[0]),
+            (torch.minimum(p[1:-1, :-2, 1:-1], p[1:-1, 2:, 1:-1]), hs[1]),
+            (torch.minimum(p[1:-1, 1:-1, :-2], p[1:-1, 1:-1, 2:]), hs[2]),
+        ]
+        for i, j in ((0, 1), (1, 2), (0, 1)):          # 3-element sort, h travels with its axis
+            ai, hi_v = trip[i]
+            aj, hj_v = trip[j]
+            swap = ai > aj
+            trip[i] = (torch.where(swap, aj, ai), torch.where(swap, hj_v, hi_v))
+            trip[j] = (torch.where(swap, ai, aj), torch.where(swap, hi_v, hj_v))
+        (a0, h0), (a1, h1), (a2, h2) = trip
+        w0, w1, w2 = 1.0 / (h0 * h0), 1.0 / (h1 * h1), 1.0 / (h2 * h2)
+
+        sol = a0 + h0                                          # one active axis
+        use2 = sol > a1
+        A2, B2 = w0 + w1, a0 * w0 + a1 * w1
+        C2 = a0 * a0 * w0 + a1 * a1 * w1
+        disc2 = B2 * B2 - A2 * (C2 - 1.0)
+        d2 = (B2 + torch.sqrt(torch.clamp(disc2, min=0.0))) / A2
+        ok2 = use2 & (disc2 >= 0) & (d2 <= a2)
+        sol = torch.where(ok2, d2, sol)
+        A3, B3 = A2 + w2, B2 + a2 * w2
+        C3 = C2 + a2 * a2 * w2
+        disc3 = B3 * B3 - A3 * (C3 - 1.0)
+        d3 = (B3 + torch.sqrt(torch.clamp(disc3, min=0.0))) / A3
+        sol = torch.where(use2 & ~ok2 & (disc3 >= 0), d3, sol)
+
+        d = torch.where(seed_mask, seed_vals,
+                        torch.minimum(d, torch.clamp(sol, max=big)))
+
+    q = torch.round((1.0 - d / T) * distance_max)
+    q = torch.where(d < T, torch.clamp(q, 0, distance_max),
+                    torch.zeros((), device=dev))
+    return q.to(torch.uint8).cpu().numpy()

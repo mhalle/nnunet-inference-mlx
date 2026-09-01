@@ -196,6 +196,206 @@ def duckn_grid(rec, centering="cell"):
 
 
 BRICK = 32
+DISTANCE_VOXELS = 2.0        # truncation, in voxels of the finest axis
+DISTANCE_MAX = 255           # on the surface; 0 is at or beyond the truncation
+
+
+def distance_field(ranks, support, clip, spacing, truncation):
+    """``(Z, Y, X)`` uint8: how far the nearest surface is, in millimetres.
+
+    ONE FIELD, NOT A STACK. It is the distance to the nearest place the argmax changes,
+    whichever pair of classes forms it. A second field keyed to the next LOGIT rank was tried
+    and dropped: it measures the ``l_winner = l_third`` level set, and since the runner-up is by
+    definition above the third class, that level set generically sits buried under it - a place
+    no surface is drawn. Note also that logit order and distance order genuinely disagree, at
+    9-15 % of the voxels where both are close, because the distance to a class's interface is
+    its deficit divided by the steepness of that pair's transition and ranking by deficit
+    ignores the divisor. This field is immune, being found from the labelmap rather than a rank.
+
+    WHY STORE IT, when it is derivable from `support` sitting beside it. Unlike decoding a
+    margin, which is pointwise, this is NON-LOCAL: it needs a neighbourhood of radius
+    `truncation`, so a client deriving it per brick needs halos, and one deriving it whole
+    spends ~53 s on a five-part 1.5 mm case before the first frame. It is also easy to get
+    wrong in ways that render plausibly rather than raise. It remains a derived VIEW, not a
+    replacement - `support` carries confidence, alternatives, and the ability to re-decide,
+    none of which survive the conversion to millimetres.
+
+    THE ENCODING COUNTS UP FROM THE TRUNCATION, mirroring `support` counting up from the clip:
+    `distance_max` is on the surface, 0 is at or beyond `distance_truncation`. That keeps "zero
+    means nothing here" true in this array too, which is not cosmetic - the band is a few per
+    cent of the volume, so whole chunks of zeros elide and cost nothing, and a reader can treat
+    a missing chunk as "no surface here" without decoding it.
+
+    No sign bit: the field is unsigned magnitude, and `ranks[0]` already says which side.
+
+    TRUNCATION IS SET BY RECONSTRUCTION, NOT BY STORAGE. One voxel is too tight to be usable -
+    it holds only the layer adjacent to the surface, while a central difference for a normal
+    reaches 1.5 voxels and a trilinear corner reaches sqrt(3), so neither can be evaluated from
+    the stored field. Two voxels is the floor, and it is expressed in voxels because the grid
+    spacing was itself chosen to match the anatomy.
+    """
+    d = _crossing_distance(ranks, support, clip, spacing, truncation)
+    q = np.rint((1.0 - d / truncation) * DISTANCE_MAX)
+    return np.where(d < truncation, np.clip(q, 0, DISTANCE_MAX), 0).astype(np.uint8)
+
+
+def _deficit_at(rank_cols, support_cols, want, clip):
+    """Logit deficit of class ``want`` at gathered positions.
+
+    ``rank_cols`` / ``support_cols`` are ``(planes, N)`` columns gathered at N voxels; a dense
+    per-voxel version of this ran full-volume comparisons for values discarded everywhere but
+    the crossings. Deficits are stated relative to each voxel's own winner, which is what makes
+    them subtractable: the reference cancels in a difference, so ``deficit(B) - deficit(A)`` is
+    ``l_A - l_B`` regardless of who wins where. A class absent from the rank list is no better
+    than the clip, which is the bound the encoding already guarantees.
+    """
+    d = np.full(want.shape, np.float32(clip))
+    d[rank_cols[0] == want] = 0.0
+    for j in range(1, rank_cols.shape[0]):
+        hit = rank_cols[j] == want
+        d[hit] = (1.0 - support_cols[j - 1][hit].astype(np.float32) / 255.0) * clip
+    return d
+
+
+def _crossing_distance(ranks, support, clip, spacing, truncation):
+    """Distance in mm to the nearest surface: where the argmax changes.
+
+    WHICH SURFACE IS FOUND BY THE LABELMAP, NOT BY A RANK PAIR. An earlier version watched the
+    (winner, runner-up) pair for a sign change, which misses an argmax change whenever the class
+    that overtakes is not the local runner-up - at one voxel l_A > l_B > l_D, at its neighbour
+    l_D > l_A > l_B: the winner changed and that pair never crossed. `win[a] != win[b]` has no
+    such gap, and it needs no logits at all.
+
+    WHERE IT SITS comes from the pair that actually swaps. Deficits are stated against each
+    voxel's own winner, so for P winning at `a` and Q winning at `b`, the signed field l_P - l_Q
+    is +deficit_Q(a) at one end and -deficit_P(b) at the other. It crosses zero once, and linear
+    interpolation puts the surface there - no divisor, and nothing to go wrong at a fold, which
+    is what ``m / |grad m|`` on the winner's margin got wrong (that field is folded: it falls to
+    zero at the interface and rises again beyond it, so a difference across the crossing measures
+    the fold, and at a symmetric fold it measures zero).
+
+    Everything beyond the seeded voxels is filled by propagation. Logits are gathered ONLY at
+    the flipped edges - a fraction of a per cent of the volume - not evaluated densely.
+    """
+    win = ranks[0]
+    d = np.full(win.shape, np.inf, np.float32)
+
+    for axis, step in enumerate(float(v) for v in spacing):
+        lo = [slice(None)] * win.ndim
+        hi = [slice(None)] * win.ndim
+        lo[axis], hi[axis] = slice(0, -1), slice(1, None)
+        lo, hi = tuple(lo), tuple(hi)
+        flip = win[lo] != win[hi]
+        if not flip.any():
+            continue
+        at = np.nonzero(flip)                          # `a` side of each flipped edge
+        bt = list(at)
+        bt[axis] = at[axis] + 1                        # `b` side, one step along the axis
+        bt = tuple(bt)
+        # deficit of the far winner here, and of the near winner there
+        dq_a = _deficit_at(ranks[(slice(None),) + at], support[(slice(None),) + at],
+                           win[bt], clip)
+        dp_b = _deficit_at(ranks[(slice(None),) + bt], support[(slice(None),) + bt],
+                           win[at], clip)
+        denom = dq_a + dp_b
+        # a tie splits the edge; it is the only sensible reading and it is rare
+        t = np.divide(dq_a, denom, out=np.full_like(dq_a, 0.5), where=denom > 1e-9)
+        np.minimum.at(d, at, t * step)
+        np.minimum.at(d, bt, (1.0 - t) * step)
+
+    return _eikonal(d, spacing, truncation)
+
+
+def _eikonal(d, spacing, truncation):
+    """Propagate seeded crossings outward by solving |grad d| = 1.
+
+    NOT a min-plus sweep. `d = min(d, neighbour + h)` along each axis in turn measures a taxicab
+    distance: a diagonal comes out as dx + dy rather than sqrt(dx^2 + dy^2), up to sqrt(2) too
+    large in 2-D and sqrt(3) in 3-D. Shading reads a gradient, so the error appears as facets on
+    every surface not aligned with an axis, and as |grad d| clustering near sqrt(2) instead of 1.
+
+    A PLANAR TEST CANNOT SEE THIS - along its own normal the two agree exactly, which is how it
+    survived one. tests/test_ranked_distance.py covers it with a sphere, measured
+    against its analytic distance -- |grad d| is NOT a discriminating statistic
+    here, because a narrow band is mostly clamped at the truncation.
+
+    The Godunov update solves the Eikonal equation: with the smaller neighbour a_i on each axis,
+    find d satisfying sum_i max(d - a_i, 0)^2 / h_i^2 = 1, trying one, two, then three active
+    axes. Seeded voxels keep their interpolated sub-voxel values.
+
+    ONLY THE BAND IS PROCESSED. A dense version of this update spent 34 s per 52 Mvoxel part
+    running full-volume iterations to move values on the ~1 % of voxels near a surface. Each
+    iteration advances influence by at most one voxel from a finite value, so dilating the seed
+    mask by the iteration count (Chebyshev) contains every voxel any iteration could touch, and
+    a band voxel's neighbours outside the band were never updated by the dense version either -
+    they hold the same `big` in both. Bit-identical by construction, and verified against the
+    dense implementation on a real 52 Mvoxel part.
+    """
+    h = np.asarray([float(v) for v in spacing], np.float32)
+    big = np.float32(truncation * 4.0)
+    n_iter = int(np.ceil(truncation / float(h.min()))) + 4
+
+    finite = np.isfinite(d)
+    if not finite.any():
+        return np.minimum(d, big).astype(np.float32)
+
+    # the reachable set: seeds dilated by n_iter voxels, separably, one voxel per pass
+    band = finite.copy()
+    for _ in range(n_iter):
+        for axis in range(d.ndim):
+            lo = [slice(None)] * d.ndim
+            hi = [slice(None)] * d.ndim
+            lo[axis], hi[axis] = slice(0, -1), slice(1, None)
+            lo, hi = tuple(lo), tuple(hi)
+            band[lo] |= band[hi]
+            band[hi] |= band[lo]
+
+    # pad by one voxel of `big` so neighbour gathers never leave the array
+    padded = np.full(tuple(n + 2 for n in d.shape), big, np.float32)
+    core = tuple(slice(1, -1) for _ in d.shape)
+    padded[core] = np.minimum(d, big)
+
+    bz, by, bx = np.nonzero(band)
+    ny, nx = padded.shape[1], padded.shape[2]
+    flat = ((bz + 1) * ny + (by + 1)) * nx + (bx + 1)
+    seed = finite[bz, by, bx]
+    strides = (ny * nx, nx, 1)
+
+    r = padded.ravel()
+    cur = r[flat]
+    axes = [(np.minimum, s, np.float32(hv)) for s, hv in zip(strides, h)]
+    for _ in range(n_iter):
+        # per-axis smaller neighbour, then a 3-element sort network carrying h alongside
+        # (anisotropic spacing travels with its axis through the swaps)
+        trip = [(np.minimum(r[flat - s], r[flat + s]), np.full(flat.shape, hv, np.float32))
+                for _, s, hv in axes]
+        for i, j in ((0, 1), (1, 2), (0, 1)):
+            ai, hi_v = trip[i]
+            aj, hj_v = trip[j]
+            swap = ai > aj
+            trip[i] = (np.where(swap, aj, ai), np.where(swap, hj_v, hi_v))
+            trip[j] = (np.where(swap, ai, aj), np.where(swap, hi_v, hj_v))
+        (a0, h0), (a1, h1), (a2, h2) = trip
+        w0, w1, w2 = 1.0 / (h0 * h0), 1.0 / (h1 * h1), 1.0 / (h2 * h2)
+
+        sol = a0 + h0                                          # one active axis
+        use2 = sol > a1
+        A2, B2 = w0 + w1, a0 * w0 + a1 * w1
+        C2 = a0 * a0 * w0 + a1 * a1 * w1
+        disc2 = B2 * B2 - A2 * (C2 - 1.0)
+        d2 = (B2 + np.sqrt(np.maximum(disc2, 0.0))) / A2       # two active axes
+        ok2 = use2 & (disc2 >= 0) & (d2 <= a2)
+        sol = np.where(ok2, d2, sol)
+        A3, B3 = A2 + w2, B2 + a2 * w2
+        C3 = C2 + a2 * a2 * w2
+        disc3 = B3 * B3 - A3 * (C3 - 1.0)
+        d3 = (B3 + np.sqrt(np.maximum(disc3, 0.0))) / A3       # three active axes
+        sol = np.where(use2 & ~ok2 & (disc3 >= 0), d3, sol)
+
+        cur = np.where(seed, cur, np.minimum(cur, np.minimum(sol, big)))
+        r[flat] = cur
+
+    return padded[core]
 
 
 def occupancy(ranks, support, K, smax, brick=BRICK):
@@ -354,7 +554,8 @@ def generator_steps(meta, items, engine):
                             "brick": [BRICK, BRICK, BRICK], "parts_kept": "all"}}]
 
 
-def build(src, out, case, parts="all", allow_unnamed=False):
+def build(src, out, case, parts="all", allow_unnamed=False,
+          distance_voxels=DISTANCE_VOXELS):
     src, out = Path(src), Path(out)
     meta = json.loads((src / "meta.json").read_text())
     shutil.rmtree(out, ignore_errors=True)
@@ -431,6 +632,36 @@ def build(src, out, case, parts="all", allow_unnamed=False):
                             attributes=brick_geometry(direction, eff, origin, BRICK, nb))
         oz[:] = occ
         block["brick"] = [BRICK, BRICK, BRICK]
+
+        if distance_voxels:
+            # An emit on a CUDA worker computes the field where the arrays already are and
+            # ships it alongside; use that when it answers the same request. The recorded
+            # truncation travels with the field - a precomputed array is only decodable
+            # against the truncation IT was quantized to.
+            pre = src / f"{name}_distance.npy"
+            if pre.exists() and part.get("distance_voxels") == float(distance_voxels):
+                dist = np.load(pre)
+                trunc = float(part["distance_truncation"])
+                print(f"    distance: precomputed at emit (T={trunc:.3f} mm)", flush=True)
+            else:
+                if pre.exists():
+                    print(f"    distance: emit used {part.get('distance_voxels')} voxels, "
+                          f"{distance_voxels} requested - recomputing", flush=True)
+                trunc = float(distance_voxels) * min(eff)
+                dist = distance_field(rk_all, su_all, part["clip"], eff, trunc)
+            chunks, shards = layout(dist.shape)
+            dz = g.create_array("distance", shape=dist.shape, dtype=dist.dtype,
+                                chunks=chunks, shards=shards,
+                                compressors=zarr.codecs.ZstdCodec(level=9),
+                                attributes=attrs(direction, eff, origin, list_axis=False,
+                                                 centering=centering))
+            dz[:] = dist
+            # Decode parameters, not descriptions: the quantum is truncation/max, so without
+            # them the array is a uint8 with no scale. They sit beside `clip`/`support_max`,
+            # which play exactly the same roles for `support`.
+            block["distance_truncation"] = round(trunc, 6)
+            block["distance_max"] = DISTANCE_MAX
+            del dist
         g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": block}}})
         del su_all, occ
 
@@ -508,5 +739,8 @@ if __name__ == "__main__":
     ap.add_argument("parts", nargs="?", default="all", choices=["all", "last"])
     ap.add_argument("--allow-unnamed", action="store_true",
                     help="build even if segment names cannot be resolved")
+    ap.add_argument("--distance-voxels", type=float, default=DISTANCE_VOXELS,
+                    help="truncation of the distance planes, in voxels "
+                         f"(default {DISTANCE_VOXELS}); 0 omits them")
     a = ap.parse_args()
-    build(a.ranked_dir, a.out, a.case, a.parts, a.allow_unnamed)
+    build(a.ranked_dir, a.out, a.case, a.parts, a.allow_unnamed, a.distance_voxels)
