@@ -92,7 +92,7 @@ def _fetch(source: str, identifier: str, dest):
     return got
 
 
-@app.function(gpu="L40S", timeout=7200, volumes={WEIGHTS_ROOT: weights_vol})
+@app.function(gpu=["L40S", "A100-40GB", "A10G"], timeout=7200, volumes={WEIGHTS_ROOT: weights_vol})
 def emit(identifier: str, tasks: list[str], depth: int = 6, clip: float = 8.0,
          envelope_mm=None, source: str = "idc") -> bytes:
     """Fetch once, run every task, return one gzipped tar with a directory per task.
@@ -166,7 +166,9 @@ def emit(identifier: str, tasks: list[str], depth: int = 6, clip: float = 8.0,
     return data
 
 
-@app.function(gpu="L40S", timeout=3600, image=fs_image)
+# A fallback list, not one type: a queued emit during an L40S capacity drought is worse than a
+# slightly slower GPU, and FastSurfer's 2.5-D networks are far from needing an L40S anyway.
+@app.function(gpu=["L40S", "A10G", "A100-40GB"], timeout=3600, image=fs_image)
 def emit_brain(identifier: str, depth: int = 6, clip: float = 8.0,
                source: str = "openneuro") -> bytes:
     """The FastSurfer engine, on its own image. Returns a tar with one `brain/` directory.
