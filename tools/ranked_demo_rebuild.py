@@ -46,7 +46,7 @@ CASCADES = {"lung_vessels", "liver_vessels", "liver_segments", "abdominal_muscle
             "heartchambers_highres", "coronary_arteries"}
 
 CT_TASKS = ["total", "total_fast", "total_fastest", "body", "trunk_cavities",
-            "vertebrae_body", "lung_vessels"]
+            "vertebrae_body", "lung_vessels", "liver_vessels", "liver_segments"]
 
 # Nothing needs padding any more. `idc-torso1/total` used to: its five parts were computed on
 # four different body envelopes, so they had to be filled out onto a shared grid, which meant a
