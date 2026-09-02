@@ -55,8 +55,15 @@ CT_TASKS = ["total", "total_fast", "total_fastest", "body", "trunk_cavities",
 # rather than deleted, because a store built from an envelope-cropped emit would need it again.
 PAD: set[tuple[str, str]] = set()
 
+# A task can be inapplicable to a subject. `liver_vessels` needs portal-venous contrast, and
+# nlst-217076 is a non-contrast low-dose screening CT: its store held ZERO vessel voxels and
+# one spurious 0.4 mL "tumor" blob, which is not a demo item but a misleading one (dropped
+# 2026-09-02, by decision). idc-torso1 is contrast-enhanced, though in the delayed nephrographic
+# phase rather than portal-venous, so its tree is sparse - kept, with that caveat.
+SKIP = {("nlst-217076", "liver_vessels")}
+
 JOBS = [(s, t, "last" if t in CASCADES else "all", (s, t) in PAD)
-        for s in ("idc-torso1", "nlst-217076") for t in CT_TASKS]
+        for s in ("idc-torso1", "nlst-217076") for t in CT_TASKS if (s, t) not in SKIP]
 JOBS.append(("ds000114_sub-01", "brain", "all", False))
 
 

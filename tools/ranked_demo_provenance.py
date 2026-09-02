@@ -210,6 +210,18 @@ def as_duckn_source(prov):
     return {k: v for k, v in src.items() if k in DUCKN_SOURCE_KEYS and v not in (None, "")}
 
 
+# A caveat about one task on one subject, written into that store's provenance `note`: what a
+# reader needs to know before trusting the labels, and could not learn from the arrays alone.
+CAVEATS = {
+    ("idc-torso1", "liver_vessels"):
+        "Sparse, fragmented vessel tree. The series is contrast-enhanced but in the delayed "
+        "NEPHROGENIC phase; the hepatic vessel model (MSD Task08) was trained on portal-venous "
+        "studies, in which the intrahepatic veins are far brighter. Main trunks are real; small "
+        "branches are largely missed. A non-contrast subject (nlst-217076) produced no vessels "
+        "at all and is deliberately not in this collection.",
+}
+
+
 def stamp(store_name, prov, new_name=None):
     """Fill in the duckn provenance the builder left open, and the namespaced case detail."""
     d = DEMO / store_name
@@ -230,6 +242,9 @@ def stamp(store_name, prov, new_name=None):
     if prov.get("license"):
         pv["attribution"] = {"license": prov["license"],
                              **({"cite": prov["cite"]} if prov.get("cite") else {})}
+    caveat = CAVEATS.get((prov["case"], d.name.removesuffix(".duckn")))
+    if caveat:
+        pv["note"] = caveat
     ext["provenance"] = pv
     a["extensions"] = ext
     root.attrs["duckn"] = a
