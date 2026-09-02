@@ -198,23 +198,25 @@ def _read_with_snapped_affine(p, itk_error, tol: float = 1e-3):
     return image
 
 
-def read(path, *, reorient: bool = True) -> tuple[np.ndarray, "Geometry", str]:
+def read(path, *, reorient: bool = True, target: str = CANONICAL) -> tuple[np.ndarray, "Geometry", str]:
     """Read any SimpleITK-supported image (or a DICOM series directory).
 
     Returns ``(array (Z, Y, X), geometry, original orientation code)``.
 
     With ``reorient=True`` (the default, and what TotalSegmentator does) the array comes back
-    in RAS; feeding a model LPS data mirrors left and right silently. But **nnU-Net's default
-    reader does not reorient**: ``SimpleITKIO`` hands the array over in its stored axis order,
-    and only the opt-in ``SimpleITKIOWithReorient`` / ``NibabelIOWithReorient`` canonicalize.
-    A model trained through the plain reader therefore expects its own acquisition orientation,
-    so pass ``reorient=False`` for those - see :func:`reader_reorients`.
+    in ``target`` - RAS unless a model's own packaging says otherwise (MRSegmentator's reader
+    forces LPS); feeding a model the mirror of what it saw in training mirrors left and right
+    silently. But **nnU-Net's default reader does not reorient**: ``SimpleITKIO`` hands the
+    array over in its stored axis order, and only the opt-in ``SimpleITKIOWithReorient`` /
+    ``NibabelIOWithReorient`` canonicalize. A model trained through the plain reader therefore
+    expects its own acquisition orientation, so pass ``reorient=False`` for those - see
+    :func:`reader_reorients`.
     """
     sitk = _sitk()
     image = read_image(path)
     original = orientation_of(image)
     if reorient:
-        image = sitk.DICOMOrient(image, CANONICAL)
+        image = sitk.DICOMOrient(image, target)
     return sitk.GetArrayFromImage(image), geometry_of(image), original
 
 

@@ -42,7 +42,7 @@ def test_short_name_collisions_resolve_by_prefix(tmp_path):
 
 def test_ts_and_moose_coexist_without_collisions():
     reg = registry(None)
-    assert set(reg) == {"ts", "moose"}
+    assert set(reg) == {"ts", "moose", "mrsegmentator"}
     assert "total_fast" in reg["ts"].tasks()
     assert "clin_ct_fast_organs" in reg["moose"].tasks()
 

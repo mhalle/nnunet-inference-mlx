@@ -54,6 +54,26 @@ def _lut(K: int, remap: dict | None) -> np.ndarray:
     return lut
 
 
+def canonical_orientation_for(spec, store, *, configuration: str | None = None) -> str | None:
+    """The orientation code the model must see, or None to keep the stored axis order.
+
+    Orientation follows the model's own reader. TS canonicalizes to RAS; nnU-Net's default
+    ``SimpleITKIO``/``NibabelIO`` do NOT - only the ``*WithReorient`` variants do - so a native
+    model expects its acquisition orientation, and reorienting it anyway mirrors left/right.
+    A spec may override the declared reader when the model's *packaging* reorients around it
+    (MRSegmentator's reader forces LPS on top of plans that say ``SimpleITKIO``); that
+    override is the ecosystem's statement about how the model was served, so it wins.
+    Factored out so the decision is testable without a network.
+    """
+    from . import io as nio
+    if spec.orientation is not None:
+        return str(spec.orientation)
+    if _uses_nnunet_preprocessing(spec) and spec.single is not None:
+        folder = store.resolve(spec.single, configuration=configuration)
+        return nio.CANONICAL if nio.reader_reorients(folder) else None
+    return nio.CANONICAL
+
+
 def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto", dtype: str = "fp16",
             grid="input", interp="linear", outside: str = "background", convention: str = "auto",
             folds=(0,), accumulate: str = "auto", resampling_order: int = 3, batch_size="auto",
@@ -137,26 +157,24 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
     if convention == "auto":
         convention = "center" if nnunet_preproc else "corner"
     crop_nonzero = nnunet_preproc
-    # Orientation follows the model's own reader. TS canonicalizes to RAS; nnU-Net's default
-    # SimpleITKIO/NibabelIO do NOT - only the *WithReorient variants do - so a native model
-    # expects its acquisition orientation. Reorienting it anyway mirrors left/right.
-    reorient = True
-    if nnunet_preproc and spec.single is not None:
-        reorient = nio.reader_reorients(store.resolve(spec.single, configuration=configuration))
+    canonical = canonical_orientation_for(spec, store, configuration=configuration)
+    reorient = canonical is not None
     schema = LabelSchema(names={int(k): str(v) for k, v in spec.label_map.items()})
     prov = {"task": spec.name, "lineage": spec.lineage, "device": device, "dtype": dtype,
-            "convention": convention, "reoriented_to_ras": reorient, "interp": interp,
+            "convention": convention, "reoriented_to_ras": canonical == nio.CANONICAL,
+            "canonical_orientation": canonical, "interp": interp,
             "envelope_mm": envelope_mm, "resampling_order": resampling_order, "models": [],
             "weights_store": store.describe(),
             "nnseg": _version()}
 
     if isinstance(image, (str, Path)):
-        data_zyx, geometry, orientation = nio.read(image, reorient=reorient)
+        data_zyx, geometry, orientation = nio.read(image, reorient=reorient,
+                                                   target=canonical or nio.CANONICAL)
     else:                                        # a SimpleITK image the caller already holds
         import SimpleITK as sitk
         orientation = nio.orientation_of(image)
         if reorient:
-            image = sitk.DICOMOrient(image, nio.CANONICAL)
+            image = sitk.DICOMOrient(image, canonical)
         data_zyx, geometry = sitk.GetArrayFromImage(image), nio.geometry_of(image)
     T["read+canonical"] = time.perf_counter() - t0
 
@@ -269,7 +287,8 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
                       "stop": [int(v) for v in env.stop]},
             model_grid=[int(v) for v in env.shape],
             labels=[int(v) for v in np.asarray(lut).reshape(-1)],   # channel -> global label
-            convention=convention, reoriented_to_ras=bool(reorient),
+            convention=convention, reoriented_to_ras=canonical == nio.CANONICAL,
+            canonical_orientation=canonical,
             input_orientation=orientation, frame=frame.to_meta())
         T[f"probabilities:{part}"] = time.perf_counter() - t
 

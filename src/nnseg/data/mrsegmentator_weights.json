@@ -1,0 +1,21 @@
+{
+ "source": "https://raw.githubusercontent.com/hhaentze/MRSegmentator/master/src/mrsegmentator/config.py MODEL_REGISTRY + each zip's own plans.json / version.json / fold_0 checkpoint",
+ "tasks": {
+  "base": {
+   "url": "https://github.com/hhaentze/MRSegmentator/releases/download/v1.2.0/weights.zip",
+   "sha256": "dd26c1b511908a1f2a752b7fe8f5ca9c5603fc3e69fa52f57bf3ccdd52ceb286",
+   "tag": "1.2",
+   "folder": "Dataset050_ukbb_inhouse_nako/nnUNetTrainerNoMirroring__nnUNetPlans__3d_fullres",
+   "release": "v1.2.0",
+   "structures": 40
+  },
+  "body_comp": {
+   "url": "https://zenodo.org/records/21211879/files/body_comp_weights.zip?download=1",
+   "sha256": "3ec490f641dd1aebdd4d2f497e69f8c9f2e4060a45c7d0d69c3ea0e74daf1550",
+   "tag": "1.0",
+   "folder": "Dataset047_GRE_HASTE_updated/nnUNetTrainerNoMirroring__nnUNetPlans__3d_fullres",
+   "release": "zenodo:21211879",
+   "structures": 10
+  }
+ }
+}

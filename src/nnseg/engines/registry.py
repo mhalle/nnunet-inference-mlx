@@ -1,11 +1,11 @@
 """The engine registry: which runtimes exist, and what each one is.
 
 **Ecosystem vs Engine.** An *ecosystem* is what the user selects - a catalog of
-tasks with the ``eco:task@version`` grammar (``ts``, ``moose``, ``custom``,
-``fastsurfer``, ``synthstrip``). An *engine* is the runtime that actually runs a
-task: its container image, its compute, its weights identity. **Many ecosystems
-map to one engine** - ``ts``, ``moose`` and ``custom`` are three catalogs of
-nnU-Net models, all run by the ``nnunetv2`` engine.
+tasks with the ``eco:task@version`` grammar (``ts``, ``moose``, ``mrsegmentator``,
+``custom``, ``fastsurfer``, ``synthstrip``). An *engine* is the runtime that actually
+runs a task: its container image, its compute, its weights identity. **Many
+ecosystems map to one engine** - ``ts``, ``moose``, ``mrsegmentator`` and ``custom``
+are four catalogs of nnU-Net models, all run by the ``nnunetv2`` engine.
 
 This module is the single source of truth for that mapping and for every fact
 that used to be spelled once per engine per call site: the enable flag, the
@@ -118,7 +118,7 @@ ENGINES: dict[str, Engine] = {
         # the only engine whose surrounding pipeline is ours, so the only one
         # where our processing knobs are real
         behavior=GRADED_RESTORE,
-        description="nnU-Net v2 networks (TotalSegmentator, MOOSE, and stock models)",
+        description="nnU-Net v2 networks (TotalSegmentator, MOOSE, MRSegmentator, and stock models)",
     ),
     "fastsurfer": Engine(
         name="fastsurfer",

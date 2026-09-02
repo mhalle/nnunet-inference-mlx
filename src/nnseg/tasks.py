@@ -71,6 +71,12 @@ class TaskSpec:
     union: tuple[UnionPart, ...] = ()
     cascade: tuple[CascadeStep, ...] = ()
     label_map: Mapping[int, str] = field(default_factory=dict)
+    #: The orientation the model must see, when its *packaging* reorients rather
+    #: than its declared nnU-Net reader: MRSegmentator wraps stock checkpoints in
+    #: a reader that forces LPS, so the plans' ``SimpleITKIO`` (no reorientation)
+    #: is not the truth. None (the default) follows the declared reader - RAS for
+    #: the TotalSegmentator lineage, the stored order for a plain nnU-Net model.
+    orientation: str | None = None
 
     @classmethod
     def from_model_folder(cls, folder, *, name: str | None = None) -> "TaskSpec":
@@ -147,7 +153,7 @@ class TaskCatalog:
             self._specs[d["name"]] = TaskSpec(
                 name=d["name"], lineage=d.get("lineage", "ts"), modality=d.get("modality", "CT"),
                 shape=d.get("shape", "single"), single=d.get("single"), union=union,
-                cascade=cascade,
+                cascade=cascade, orientation=d.get("orientation"),
                 label_map={int(k): str(v) for k, v in (d.get("label_map") or {}).items()})
 
     def get(self, name) -> TaskSpec:

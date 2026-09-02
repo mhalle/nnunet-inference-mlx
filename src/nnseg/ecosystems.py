@@ -9,7 +9,7 @@ cannot know (where to download it, and how to compose multiple models).
 
 **An ecosystem is a catalog, not a runtime.** What runs a task is an *engine*
 (:mod:`nnseg.engines.registry`), named by ``ModelEcosystem.engine``; many
-ecosystems map to one engine. The three nnU-Net catalogs below all run on
+ecosystems map to one engine. The four nnU-Net catalogs below all run on
 ``nnunetv2``; FastSurfer and SynthStrip each bring a catalog *and* an engine.
 
 The nnU-Net catalogs:
@@ -20,6 +20,9 @@ The nnU-Net catalogs:
 - ``moose`` - MOOSE/moosez models. Bare, self-describing nnU-Net checkpoints
   on public release assets: the manifest holds name -> url + folder, and the
   spec is read from the installed checkpoint's own dataset.json.
+- ``mrsegmentator`` - MRSegmentator's two whole-body MRI models, the same
+  shape as ``moose`` (bare checkpoints, manifest of url + folder + version)
+  with one fact the checkpoint cannot know: its packaging forces LPS.
 - ``custom`` - local model folders the operator registers explicitly.
 
 Engine catalogs (present only where their engine is enabled, so the catalog can
@@ -54,6 +57,7 @@ from .errors import InputError, ModelNotFound, UnsupportedModel
 from .tasks import TaskCatalog, TaskSpec
 
 MOOSE_MANIFEST = Path(__file__).parent / "data" / "moose_weights.json"
+MRSEGMENTATOR_MANIFEST = Path(__file__).parent / "data" / "mrsegmentator_weights.json"
 
 
 class ModelEcosystem:
@@ -293,6 +297,136 @@ class MooseEcosystem(ModelEcosystem):
         if "modality" not in out and m:
             out["modality"] = m.group(2).upper().replace("FDG_PT", "PT").replace("PT_FDG", "PT")
         out["tag"] = self._entries.get(task, {}).get("tag")
+        return out
+
+
+class MRSegmentatorEcosystem(ModelEcosystem):
+    """MRSegmentator (Haentze et al., Charite; Apache-2.0): two stock nnU-Net v2
+    checkpoints for abdominal / pelvic / thoracic MRI - ``base`` (40 structures,
+    also usable on CT) and ``body_comp`` (10 body-composition classes).
+
+    Same shape as :class:`MooseEcosystem` - bare checkpoints on public assets,
+    labels read from each installed checkpoint's own dataset.json - with two
+    differences that are properties of the *packaging*, not of the checkpoint:
+
+    - **The zips are flat.** ``dataset.json``, ``plans.json``, ``version.json``
+      and ``fold_0..4/`` sit at the top level, so the unit that must land
+      atomically is the *configuration* folder, not a ``Dataset*`` parent. Each
+      model is installed under ``<root>/mrsegmentator/<Dataset>/<trainer>__
+      <plans>__<config>/`` (the names come from the checkpoint itself - see
+      tools/gen_mrsegmentator_manifest.py) via a staging directory and one
+      rename, and ``materialized()`` looks only at that folder.
+    - **The reader forces LPS.** MRSegmentator replaces nnU-Net's reader with one
+      that ``DICOMOrient``s every input to LPS before the network, while the plans
+      still declare ``SimpleITKIO`` (no reorientation). Both models were trained
+      without mirroring, so left/right is a real fact to the network, and following
+      the declared reader would feed it acquisition order instead. The spec
+      therefore carries ``orientation="LPS"`` - the one line the checkpoint cannot
+      say about itself.
+
+    The manifest tag is upstream's own ``weights_version`` (the number inside each
+    zip's ``version.json``), so a pinned install is checked against the bytes on
+    disk twice: the install sidecar, and the version file the zip itself carries.
+
+    Folds: upstream's default is the five-fold ensemble with mirroring TTA; its
+    ``--fast`` runs fold 0 alone with no mirroring. nnseg's default (fold 0, no
+    mirroring, step 0.5) is the latter; pass ``folds=[0, 1, 2, 3, 4]`` for the
+    ensemble.
+    """
+
+    name = "mrsegmentator"
+    description = "MRSegmentator whole-body MRI models"
+    modality = "MR"
+    _BUCKET = "mrsegmentator"
+
+    def __init__(self, manifest=None):
+        raw = json.loads(Path(manifest or MRSEGMENTATOR_MANIFEST).read_text())
+        self._entries = raw["tasks"] if isinstance(raw, dict) else raw
+
+    def tasks(self) -> list:
+        return sorted(self._entries)
+
+    def _folder(self, task: str, root) -> Path:
+        return Path(root).expanduser() / self._BUCKET / self._entries[task]["folder"]
+
+    def materialized(self, task: str, root) -> bool:
+        if task not in self._entries:
+            return False
+        return (self._folder(task, root) / "dataset.json").is_file()
+
+    @staticmethod
+    def _installed_weights_version(folder: Path) -> str | None:
+        """What the zip's own ``version.json`` says is installed here, if anything."""
+        vf = Path(folder) / "version.json"
+        if not vf.is_file():
+            return None
+        try:
+            v = json.loads(vf.read_text()).get("weights_version")
+        except (json.JSONDecodeError, OSError):
+            return None
+        return None if v is None else str(v)
+
+    def ensure(self, task: str, root, progress=None, version=None) -> None:
+        import os
+        from .weights_fetch import _write_sidecar, installed_version
+        entry = self._entries[task]
+        folder = self._folder(task, root)
+        if version is not None:
+            # the INSTALLED bytes decide, never the manifest (see MooseEcosystem)
+            rec = installed_version(folder) or {}
+            if rec.get("tag") == version:
+                return
+            if self.materialized(task, root):
+                have = rec.get("tag") or self._installed_weights_version(folder) \
+                    or "unknown (no version sidecar)"
+                raise ModelNotFound(
+                    f"{task}@{version}: installed at version {have!r} - remove "
+                    f"{folder} to install the pinned version")
+            if version != entry.get("tag"):
+                raise ModelNotFound(
+                    f"{task}@{version}: this manifest offers version "
+                    f"{entry.get('tag')!r} only")
+        if self.materialized(task, root):
+            return
+        # A flat zip: extract into a staging sibling, then ONE rename makes the
+        # configuration folder appear whole - never a dataset.json without folds.
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(dir=folder.parent, prefix=".install-"))
+        try:
+            _download_and_extract_zip(entry["url"], staging, progress=progress,
+                                      sha256=entry.get("sha256"))
+            if not (staging / "dataset.json").is_file() or not any(staging.glob("fold_*")):
+                raise ModelNotFound(
+                    f"mrsegmentator asset for {task!r} did not unpack to a flat nnU-Net "
+                    "configuration folder (dataset.json + fold_*) - the manifest may be "
+                    "stale; regenerate it with tools/gen_mrsegmentator_manifest.py")
+            have = self._installed_weights_version(staging)
+            if have is not None and have != str(entry.get("tag")):
+                raise ModelNotFound(
+                    f"mrsegmentator asset for {task!r} carries weights_version {have!r} but "
+                    f"the manifest says {entry.get('tag')!r} - regenerate the manifest")
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+            os.replace(staging, folder)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        _write_sidecar(folder, task, str(entry.get("tag", "unknown")), {"url": entry["url"]},
+                       entry.get("sha256"))
+
+    def spec(self, task: str, root) -> TaskSpec:
+        import dataclasses
+        if not self.materialized(task, root):
+            raise ModelNotFound(
+                f"mrsegmentator task {task!r} is not installed under {root}; prepare it "
+                "first (weights install on demand when the task runs)")
+        spec = TaskSpec.from_model_folder(self._folder(task, root), name=task)
+        return dataclasses.replace(spec, orientation="LPS")
+
+    def info(self, task: str, root) -> dict:
+        out = super().info(task, root)
+        entry = self._entries.get(task, {})
+        out["tag"] = entry.get("tag")
+        out["orientation"] = "LPS"
         return out
 
 
@@ -778,7 +912,7 @@ def default_ecosystems() -> list:
     """The catalogs this deployment serves: the nnU-Net ones, plus one per
     enabled engine. Enablement is the registry's answer (read from the
     environment per call), so the catalog and the workers cannot disagree."""
-    ecos = [TSEcosystem(), MooseEcosystem()]
+    ecos = [TSEcosystem(), MooseEcosystem(), MRSegmentatorEcosystem()]
     ecos += [cls() for engine, cls in _ENGINE_ECOSYSTEMS.items()
              if _registry.enabled(engine)]
     return ecos

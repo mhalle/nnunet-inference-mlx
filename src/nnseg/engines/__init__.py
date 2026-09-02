@@ -10,7 +10,7 @@ is what lets a family be added without touching the scheduler:
   image, a compute entry point, and a weights identity. It owns nothing the user
   names.
 
-**Many ecosystems map to one engine.** ``ts``, ``moose`` and ``custom`` are three
+**Many ecosystems map to one engine.** ``ts``, ``moose``, ``mrsegmentator`` and ``custom`` are four
 catalogs of nnU-Net models, all run by the ``nnunetv2`` engine. FastSurfer and
 SynthStrip each bring a catalog *and* an engine, because their networks are not
 nnU-Net at all.

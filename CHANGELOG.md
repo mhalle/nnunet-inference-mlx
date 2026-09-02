@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **MRSegmentator ecosystem (nnseg).** `mrsegmentator:base` (40 abdominal / pelvic / thoracic
+  structures on MRI, also usable on CT) and `mrsegmentator:body_comp` (10 body-composition
+  classes) join the catalog as a fourth nnU-Net ecosystem beside `ts`, `moose` and `custom` -
+  the same shape as MOOSE (bare checkpoints on public assets, labels read from each installed
+  checkpoint's own `dataset.json`, `@version` pins checked against the bytes on disk), and
+  `nnseg serve` lists and installs them through the existing prepare path with no worker change.
+  Two things are properties of upstream's *packaging* rather than of the checkpoints, and both
+  are recorded in the manifest / spec rather than guessed: the zips are **flat** (a
+  configuration folder with no `Dataset*` parent), so each one is installed under
+  `<root>/mrsegmentator/<Dataset>/<trainer>__<plans>__<config>/` through a staging directory
+  and one rename, with the zip's own `version.json` checked against the manifest tag; and
+  MRSegmentator's reader **forces LPS** on top of plans that declare the non-reorienting
+  `SimpleITKIO`, so the spec carries `orientation="LPS"`. That needed one small generalization:
+  `TaskSpec.orientation` (None = follow the declared reader, as before), `io.read(target=...)`,
+  and `pipeline.canonical_orientation_for()`, the one place the decision is made; provenance
+  and ranked-store metadata gain `canonical_orientation` beside the unchanged
+  `reoriented_to_ras`. Existing tasks are byte-for-byte unaffected (RAS for `ts`, stored order
+  for plain nnU-Net models). `tools/gen_mrsegmentator_manifest.py` regenerates the manifest
+  from upstream's `MODEL_REGISTRY` and reads dataset name, trainer and version out of each 1.1
+  GB zip by Range request (a few MB, no download). nnseg's default fold policy (fold 0, no
+  mirroring) matches upstream's `--fast`; pass `folds=[0,1,2,3,4]` for its default ensemble.
+  **Not yet validated against MRSegmentator's own output on an abdominal MRI** - the same
+  oracle comparison the knee model got is still owed.
+
 - **Volume and surface area measured from the field, not the mask (nnseg).** `nnseg.measure`
   integrates the margin field over the cells between voxel centers — full cells exactly,
   straddling cells by the plane their corners imply — so `V = int H(m)` and

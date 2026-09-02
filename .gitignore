@@ -12,3 +12,7 @@ uv.lock
 # are megabytes of binary that would bloat history, and the repo lives in Dropbox - so they are
 # backed up without being versioned. Delete and rebuild rather than commit.
 data/
+
+# the package manifests are code, not data: the data/ rule above must not swallow them
+!src/nnseg/data/
+!src/nnseg/data/*.json
