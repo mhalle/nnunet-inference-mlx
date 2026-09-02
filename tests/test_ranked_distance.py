@@ -217,3 +217,45 @@ def test_torch_matches_the_numpy_reference_within_one_quantum(name):
         f"{name} differs from the numpy reference by up to {diff.max()} quanta "
         f"at {int((diff > 1).sum())} voxels")
     assert (a > 0).mean() > 0.01, "vacuous: the band is empty"
+
+
+def test_baked_distances_reproduce_deficit_crossings():
+    """The reseed shortcut: t = d_a/(d_a+d_b) from the BAKED field matches deficit-derived
+    crossings wherever the surface is locally planar (the along-edge cosine cancels in the
+    ratio). This is what lets a client reseed selections from ranks[0]+distance alone.
+    Validated on real stores at median 3-4 um; here the sphere pins it synthetically.
+    """
+    rbs = _load_tools()
+    n, radius = 64, 15.0
+    centre = (n - 1) / 2.0 * SP[0]
+    g = np.meshgrid(*[np.arange(n) * SP[0] for _ in range(3)], indexing="ij")
+    rad = np.sqrt(sum((c - centre) ** 2 for c in g))
+    ranks, support = _encode(radius - rad)
+    T = 2.0 * min(SP)
+    q = rbs.distance_field(ranks, support, CLIP, SP, T)
+    dmm = np.where(q > 0, (1.0 - q.astype(np.float32) / 255.0) * T, T)
+
+    inside = ranks[0] == 1
+    errs = []
+    for axis, step in enumerate(SP):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[axis], hi[axis] = slice(0, -1), slice(1, None)
+        lo, hi = tuple(lo), tuple(hi)
+        flip = inside[lo] != inside[hi]
+        if not flip.any():
+            continue
+        at = np.nonzero(flip)
+        bt = list(at)
+        bt[axis] = at[axis] + 1
+        bt = tuple(bt)
+        dq_a = rbs._deficit_at(ranks[(slice(None),) + at], support[(slice(None),) + at],
+                               ranks[0][bt], CLIP)
+        dp_b = rbs._deficit_at(ranks[(slice(None),) + bt], support[(slice(None),) + bt],
+                               ranks[0][at], CLIP)
+        t_ref = dq_a / (dq_a + dp_b)
+        t_baked = dmm[at] / (dmm[at] + dmm[bt])
+        errs.append(np.abs(t_baked - t_ref) * step)
+    e = np.concatenate(errs)
+    assert np.median(e) < 0.02, f"median {1e3 * np.median(e):.1f} um"     # mm
+    assert np.percentile(e, 99) < 0.15 * min(SP), "tail beyond a sixth of a voxel"

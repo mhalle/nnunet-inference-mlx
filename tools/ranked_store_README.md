@@ -90,10 +90,28 @@ d_mm = (1 - distance / distance_max) * distance_truncation   # distance_max = on
 
 Like `support`, it counts **up** from the far end: `distance_max` is at the surface, `0` is at
 or beyond `distance_truncation`. No sign is stored — the field is unsigned magnitude, and
-`ranks[0]` already says which side of the surface a voxel is on. For a **selection** of
-structures, `ranks[0]` and `ranks[1]` together say whether the nearest surface is the
-selection's outer boundary (exactly one of the two classes is in the selection) or a boundary
-internal to it (both are).
+`ranks[0]` already says which side of the surface a voxel is on.
+
+**Scope: this is the distance to the nearest surface of the whole labelmap.** It renders the
+whole scene, or any single structure, directly. For a **selection** of structures it is a
+preview, not the answer: its zero set includes surfaces internal to the selection and surfaces
+of everything else. `ranks[0]` and `ranks[1]` can classify the nearest surface (outer boundary
+iff exactly one side is selected) for an instant preview-grade mask — but do **not** gate a
+sub-voxel shell's opacity with any sampled membership mask: a voxel-quantized gate on a
+sub-voxel surface renders as stipple, and no amount of supersampling removes it. The quality
+path is to **re-seed**: on the fetched region, seed edges where selection membership flips,
+propagate with the Eikonal update, and render that field with no gates anywhere — it is zero
+exactly on the selection's boundary. Measured cost: about a second on a lungs-sized crop.
+
+The sub-voxel crossing positions come from this array itself: at a flip edge,
+`t = d_a / (d_a + d_b)` with the decoded distances on either side. For a locally planar
+surface that is exact — the perpendicular-versus-along-edge cosine cancels in the ratio — so
+the reseed needs only `ranks[0]` and `distance`. Measured against deficit-derived crossings
+on a real five-lobe selection: median 4 µm per edge, 1.4 % of the band moved more than a
+tenth of a voxel, and about 1 % of rendered pixels differ, confined to thin seams where a
+flip voxel's nearest surface is a different one (a fissure behind it). Seeding from the
+deficits (`t = deficit_far / (deficit_far + deficit_near)`, gathered from `ranks`+`support`)
+remains the exact option for those seams.
 
 There is deliberately only one field. A second one keyed to the next *logit* rank was tried and
 dropped: it measures the level set where `l_winner = l_third`, and since the runner-up is by
@@ -408,6 +426,46 @@ not from a stale copy of a header kept here (`dicom` extension §10.4).
 cross-reference to an independent artifact — for example an existing published segmentation of
 the same source, which nobody could reconstruct from the source header and which a later
 comparison needs.
+
+---
+
+## 6.2 The client renderer contract
+
+Eight rules, each purchased with a visible artifact. Reference implementations:
+`tools/ranked_render_selection.py` (selection reseed, shell, glass) and
+`tools/ranked_render_composite.py` (two stores, two grids, one ray).
+
+1. **No labelmap is ever an opacity mask.** Ranks are addresses: sample nearest, use for
+   identity and sign. A membership mask multiplied into sub-voxel opacity renders as stipple
+   no supersampling removes.
+2. **Sign before you interpolate.** Build `s = member ? +d : -d` at voxel level, THEN
+   trilinear. The stored magnitude is folded; interpolating it across a surface erases the
+   crossing.
+3. **For a selection, reseed - never mask.** Seed edges where selection membership flips,
+   crossings from the baked distances (`t = d_a/(d_a+d_b)`), propagate with the Godunov
+   update (min-plus is taxicab and shades as facets). ~1 s on a lungs-sized crop; removes
+   every gate downstream.
+4. **Opacity by analytic per-segment integration.** Point-sampling a feature thinner than a
+   few steps makes each pixel's opacity depend on sample phase. The tent/ramp integral with
+   `s` linear per segment is closed-form; phase drops out exactly.
+5. **Normals from a separately smoothed copy.** Shading moves no geometry, so smooth its
+   field freely (bounded by half the thinnest structure); outward normal `-grad s`;
+   two-sided for shells.
+6. **Identity from a dilated colour map, nearest.** The outside half of a shell must know
+   which structure it wraps.
+7. **Compose across stores in millimetres, per sample, in the world frame the metadata
+   declares.** Never resample one store onto another's grid - that is what keeps native
+   trees intact inside coarse glass.
+8. **Style is functions of `s` and `n`.** Ramp width = antialiased edge; tent = shell;
+   Fresnel on `n.v` = glass; specular composited through transmittance but not gated by it,
+   normalized per surface. Set operations are field Booleans: union `max`, intersection
+   `min`, difference `min(s_A, -s_B)` - exact in sign everywhere, approximate in magnitude
+   near the other operand (reseed the composite boundary if magnitude matters). Margins
+   never combine across softmaxes.
+
+Marching step is bounded by anatomy, not by shell width: below half the thinnest structure
+you must not drop. And everything here reads `ranks[0]` + `distance` only; `support` enters
+for confidence-graded fill and exact-seam seeding, nothing else.
 
 ---
 
