@@ -36,11 +36,11 @@ jobs:
           uv pip install --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             torch nnunetv2 scipy scikit-image 'SimpleITK>=2.3' pytest \
-            fastapi httpx python-multipart matplotlib modal pydicom
+            fastapi httpx python-multipart matplotlib modal pydicom 'zarr>=3'
       - name: Run tests
         env:
           PYTHONPATH: src
         # --no-project is load-bearing: plain `uv run` re-syncs the project first, and
         # [tool.uv.sources] points nnunetv2 at ../upstream/nnUNet, a sibling checkout that
         # exists in the dev workspace but not in a CI clone.
-        run: uv run --no-project pytest tests/test_nnseg_*.py tests/kernel_test_*.py -m "not slow" -q
+        run: uv run --no-project pytest tests/test_nnseg_*.py tests/kernel_test_*.py tests/test_ranked_distance.py -m "not slow" -q
