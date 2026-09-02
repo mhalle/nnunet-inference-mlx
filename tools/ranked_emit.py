@@ -91,7 +91,8 @@ def _emit_junction(part, code, out, dist_meta):
     print(f"  {part:<12} junction on {torch.cuda.get_device_name(0)} in "
           f"{time.perf_counter() - t:.1f}s ({100.0 * np.count_nonzero(jn) / jn.size:.2f} % "
           "of voxels)", flush=True)
-    return {"junction_truncation": round(truncation, 6), "junction_max": 127}
+    return {"junction_truncation": round(truncation, 6), "junction_zero": 128,
+            "junction_span": 127}
 
 
 def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):

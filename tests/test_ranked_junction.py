@@ -21,7 +21,7 @@ import pytest
 TOOLS = Path(__file__).resolve().parent.parent / "tools" / "ranked_build_store.py"
 SP = [1.5, 1.5, 1.5]
 CLIP = 8.0
-JMAX = 127
+JZERO, JSPAN = 128, 127
 
 
 def _load_tools():
@@ -76,7 +76,7 @@ def _encode(logits):
 
 
 def _decode(q, truncation):
-    return (q.astype(np.float64) - 128.0) / JMAX * truncation
+    return (q.astype(np.float64) - JZERO) / JSPAN * truncation
 
 
 def _triple_line(n=40, k=0.4):
@@ -227,4 +227,5 @@ def test_in_place_tool_matches_the_dense_function(tmp_path):
     assert (got_j == want_j).all(), "the slab-wise tool differs from the dense function"
     assert (got_p == want_p).all()
     m = g.attrs.asdict()["duckn"]["extensions"]["ranked"]
-    assert m["junction_truncation"] == round(T, 6) and m["junction_max"] == rbs.JUNCTION_MAX
+    assert m["junction_truncation"] == round(T, 6)
+    assert m["junction_zero"] == rbs.JUNCTION_ZERO and m["junction_span"] == rbs.JUNCTION_SPAN

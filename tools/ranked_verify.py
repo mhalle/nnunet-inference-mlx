@@ -157,9 +157,9 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
             # with no scale without its truncation and half-range.
             rep.check("junction" in g and "junction_pair" in g,
                       f"parts/{i}: junction and junction_pair must travel together")
-            rep.check("junction_truncation" in m and "junction_max" in m,
-                      f"parts/{i}: junction array but no junction_truncation/junction_max - "
-                      "the field cannot be decoded")
+            rep.check("junction_truncation" in m and "junction_zero" in m and "junction_span" in m,
+                      f"parts/{i}: junction array but no junction_truncation/junction_zero/"
+                      "junction_span - the field cannot be decoded")
             if "junction" in g:
                 rep.check(tuple(g["junction"].shape) == shape,
                           f"parts/{i}: junction grid {tuple(g['junction'].shape)} != ranks {shape}")

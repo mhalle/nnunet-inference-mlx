@@ -606,7 +606,7 @@ def distance_field(ranks, support, *, clip: float, spacing_zyx, truncation: floa
 
 
 def junction_field(ranks, support, *, clip: float, spacing_zyx, truncation: float,
-                   reach: int | None = None, junction_max: int = 127,
+                   reach: int | None = None, junction_zero: int = 128, junction_span: int = 127,
                    device=None) -> tuple[np.ndarray, np.ndarray]:
     """``(junction, pair)``: the triple-line layer, on a GPU when there is one.
 
@@ -719,7 +719,7 @@ def junction_field(ranks, support, *, clip: float, spacing_zyx, truncation: floa
     s = torch.where(gmag > 1e-6, m0 / torch.where(gmag > 1e-6, gmag, torch.ones_like(gmag)),
                     torch.sign(m0) * T)
     s = torch.clamp(s, -T, T)
-    q = torch.clamp(torch.round(128.0 + s / T * junction_max), 1, 255).to(torch.uint8)
+    q = torch.clamp(torch.round(junction_zero + s / T * junction_span), 1, 255).to(torch.uint8)
     q = torch.where(have, q, torch.zeros((), dtype=torch.uint8, device=dev))
     junction[idx] = q
     zero = torch.zeros((), dtype=rk.dtype, device=dev)

@@ -151,14 +151,14 @@ evaluated from the stored field. Two voxels is the floor.
 
 ### `junction` — where two structures divide a shared surface (optional)
 
-Present only when the store was built with it, beside `distance`. Two arrays and two decode
+Present only when the store was built with it, beside `distance`. Two arrays and three decode
 fields in the part block, and the arrays cannot be read without them:
 
 ```
 junction        (Z, Y, X)     uint8    signed distance to the interface between the pair
 junction_pair   (2, Z, Y, X)  ranks'   the pair, as class + 1, lower class index first
 
-s_mm = (junction - 128) / junction_max * junction_truncation      # only where junction != 0
+s_mm = (junction - junction_zero) / junction_span * junction_truncation   # only where junction != 0
 ```
 
 **What it answers that `distance` cannot.** `distance` is the distance to the nearest surface,
@@ -509,9 +509,17 @@ Eight rules, each purchased with a visible artifact. Reference implementations:
    near the other operand (reseed the composite boundary if magnitude matters). Margins
    never combine across softmaxes.
 
+9. **Where two structures divide a surface they share, read `junction`, never a label.** Along a
+   triple line `distance` is silent, and a division decided per cell is the label staircase.
+   At the crossing keep the corners carrying the pair (either order; flip the sign for the
+   reversed one), renormalize, interpolate the signed distance, and filter it at the
+   *display's* width — the pixel's footprint at that depth — so the edge is sharp when close
+   and soft when far. Never blend at the voxel's width, which mixes materials no pixel
+   straddles.
+
 Marching step is bounded by anatomy, not by shell width: below half the thinnest structure
-you must not drop. And everything here reads `ranks[0]` + `distance` only; `support` enters
-for confidence-graded fill and exact-seam seeding, nothing else.
+you must not drop. And everything here reads `ranks[0]` + `distance` + `junction` only; `support`
+enters for confidence-graded fill and exact-seam seeding, nothing else.
 
 ---
 

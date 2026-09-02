@@ -198,7 +198,8 @@ def duckn_grid(rec, centering="cell"):
 BRICK = 32
 DISTANCE_VOXELS = 2.0        # truncation, in voxels of the finest axis
 DISTANCE_MAX = 255           # on the surface; 0 is at or beyond the truncation
-JUNCTION_MAX = 127           # half range of the signed byte; 128 is on the interface
+JUNCTION_ZERO = 128          # the byte ON the interface
+JUNCTION_SPAN = 127          # byte steps from the interface to the truncation, each way
 
 
 def distance_field(ranks, support, clip, spacing, truncation):
@@ -431,8 +432,8 @@ def junction_field(ranks, support, clip, spacing, truncation, reach=None):
     almost nothing. Along a two-structure interface away from any triple line it is 0 too: a
     reader's own pair field already places that interface exactly.
 
-    ENCODING. 128 is on the interface, 128 +- `junction_max` are +-`junction_truncation`, 0 is
-    absent. Zero is the sentinel here as in every other array. The sign lives in the byte
+    ENCODING. `junction_zero` (128) is on the interface, `junction_zero` +- `junction_span`
+    (127) are +-`junction_truncation`, 0 is absent. Zero is the sentinel here as in every other array. The sign lives in the byte
     because a sign is exactly what the main field lacks and this one exists to supply.
 
     COST. Cheap in time and, since it is computed SLAB BY SLAB, in memory too: the triple
@@ -592,7 +593,7 @@ def _junction_at(idx, read_planes, shape, clip, h, truncation, slab):
         # the sign of m is all that is known. Clamp to the truncation on that side.
         sgn = np.divide(m0, gmag, out=np.sign(m0) * np.float32(truncation), where=gmag > 1e-6)
         sgn = np.clip(sgn, -truncation, truncation)
-        byte = np.clip(np.rint(128.0 + sgn / truncation * JUNCTION_MAX), 1, 255).astype(np.uint8)
+        byte = np.clip(np.rint(JUNCTION_ZERO + sgn / truncation * JUNCTION_SPAN), 1, 255).astype(np.uint8)
         byte[~have] = 0
         q[s0:s1] = byte
         a_out[s0:s1] = np.where(have, a, 0)
@@ -640,7 +641,8 @@ def write_junction(g, idx, q, a, b, shape, dtype, attrs3, attrs4, truncation, bl
         pb[1, local] = b[s0:s1]
         pz[:, z0:z1] = pb.reshape(2, z1 - z0, Y, X)
     block["junction_truncation"] = round(float(truncation), 6)
-    block["junction_max"] = JUNCTION_MAX
+    block["junction_zero"] = JUNCTION_ZERO
+    block["junction_span"] = JUNCTION_SPAN
     return idx.size
 
 
@@ -794,10 +796,13 @@ def generator_steps(meta, items, engine):
     return [seg,
             {"name": "Ranked encoding and store layout",
              "description": "top-N ranks with quantized gaps, packed as zarr v3 with one shard "
-                            "per array and a per-brick occupancy index",
+                            "per array, plus the derived layers: a per-brick occupancy index, the "
+                            "nearest-surface distance field and the triple-line junction layer",
              "software": {"name": "ranked_build_store.py", "version": nnseg_v},
              "parameters": {"depth": meta.get("depth"), "clip": meta.get("clip"),
-                            "brick": [BRICK, BRICK, BRICK], "parts_kept": "all"}}]
+                            "brick": [BRICK, BRICK, BRICK], "parts_kept": "all",
+                            "derived_layers": ["occupancy", "distance", "junction"],
+                            "distance_voxels": DISTANCE_VOXELS}}]
 
 
 def build(src, out, case, parts="all", allow_unnamed=False,

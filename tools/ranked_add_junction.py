@@ -23,7 +23,8 @@ import numpy as np
 import zarr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ranked_build_store import junction_sparse, write_junction, write_readme  # noqa: E402
+from ranked_build_store import (JUNCTION_SPAN, JUNCTION_ZERO, junction_sparse,  # noqa: E402
+                                write_junction, write_readme)
 
 
 def _spacing(arr):
@@ -37,6 +38,32 @@ def _attrs_like(arr, list_axis):
     spatial = [a for a in axes if a.get("kind") != "list"]
     d["duckn"]["axes"] = ([{"kind": "list"}] + spatial) if list_axis else spatial
     return d
+
+
+def _record(root, trunc, n, shape):
+    """Append a processing step to the store's duckn provenance, where it has one.
+
+    An in-place addition is a processing step like any other, and a store whose provenance
+    says two steps ran when three did is wrong in the one place a reader looks to find out
+    what happened to it. One step per store, updated in place if this tool runs again.
+    """
+    attrs = root.attrs.asdict()
+    prov = attrs.get("duckn", {}).get("extensions", {}).get("provenance")
+    if prov is None:
+        return
+    steps = [s for s in prov.get("processing", []) if s.get("name") != "Triple-line junction layer"]
+    steps.append({
+        "name": "Triple-line junction layer",
+        "description": "signed distance to the interface between the two leading structures, "
+                       "from their logits, written in tubes around the lines where such an "
+                       "interface meets a third label; added to an existing store in place",
+        "software": {"name": "ranked_add_junction.py",
+                     "url": "https://github.com/mhalle/nnunet-inference-mlx"},
+        "parameters": {"junction_truncation": round(float(trunc), 6),
+                       "junction_zero": JUNCTION_ZERO, "junction_span": JUNCTION_SPAN,
+                       "voxels_written": int(n), "grid": [int(v) for v in shape]}})
+    prov["processing"] = steps
+    root.attrs.update(attrs)
 
 
 def add(store: Path, force=False):
@@ -63,6 +90,7 @@ def add(store: Path, force=False):
                            _attrs_like(ranks, list_axis=False), _attrs_like(ranks, list_axis=True),
                            trunc, block)
         g.attrs.update(attrs)
+        _record(root, trunc, n, shape)
         frac = 100.0 * n / float(np.prod(shape))
         print(f"  parts/{name}: junction {frac:.2f} % of {np.prod(shape) / 1e6:.1f} M voxels, "
               f"T = {trunc:.3f} mm, {time.perf_counter() - t0:.1f} s", flush=True)
