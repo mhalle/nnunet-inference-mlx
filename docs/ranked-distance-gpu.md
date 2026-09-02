@@ -1,16 +1,17 @@
 # The distance field on a GPU — plan (2026-09-01), built, and measured (2026-09-02)
 
-> **Status.** Built as `nnseg.ranked.distance_field` (torch; CUDA on the Modal worker, MPS or
-> CPU locally), byte-exact against the numpy reference on real stores. **The dense premise
-> below did not survive measurement on this hardware.** On part 0 of the 1.5 mm `total`
-> (52 Mvoxel, M2 Air): banded numpy reference **2.7 s**, dense torch **15.4 s on MPS, 11.6 s
-> on CPU**, agreeing to zero quanta. Dense work is memory traffic, and "under a second on an
-> M2" was wrong by more than an order of magnitude. The dense form still fits where the
-> arrays already live on a CUDA device with the bandwidth for it; locally the reference is the
-> fast path, and a *banded* torch version — the very bookkeeping the plan chose to drop — is
-> the obvious next step if the local GPU path ever matters. The `junction` layer (built
-> 2026-09-02, both implementations) took the other route from the start: it gathers only at
-> its tube voxels, so it is cheap on either device.
+> **Status.** Built as `nnseg.ranked.distance_field` (torch), byte-exact against the numpy
+> reference on real stores, and computed at emit time on the CUDA worker. **The dense premise
+> holds where it was aimed and nowhere else.** On an L40S a 52 Mvoxel part takes **0.5–0.6 s**,
+> five times the banded numpy reference on an M2 (2.7–2.8 s); on Apple hardware the same
+> dense kernel takes **15.4 s on MPS and 11.6 s on torch's CPU backend** (part 0 of the 1.5 mm
+> `total`, M2 Air; the emit's own earlier note measured 6.4 s on MPS), so "well under a second
+> on an M2" below was wrong by an order of magnitude. Dense work is memory traffic, and only
+> the CUDA part has the bandwidth for it. The emit therefore gates on CUDA and the builder
+> falls back to the reference, which is the fast local path; a *banded* torch version — the
+> bookkeeping the plan chose to drop — is the obvious next step if a local GPU path ever
+> matters. The `junction` layer (built 2026-09-02, both implementations) gathers only at its
+> tube voxels and is cheap everywhere: 0.8 s numpy, 1.4 s MPS, on the same part.
 
 
 The CPU implementation in `tools/ranked_build_store.py` (`distance_field`) computes the

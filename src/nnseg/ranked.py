@@ -508,19 +508,14 @@ def distance_field(ranks, support, *, clip: float, spacing_zyx, truncation: floa
     sentinel and empty chunks elide. See docs/ranked-distance-gpu.md for the design and
     tools/ranked_build_store.py for the numpy reference this must agree with to one quantum.
 
-    DENSE. Same math as the reference, Jacobi form, no sweep ordering, no atomics: seeding
-    is per-axis slice writes and propagation is elementwise over the whole grid, with none
-    of the band bookkeeping. That was chosen on the expectation that a GPU covers the grid in
-    milliseconds; measured on a 52 Mvoxel part (1.5 mm `total`, part 0, M2 Air) it does not:
-    the banded numpy reference takes 2.7 s, this takes 15.4 s on MPS and 11.6 s on CPU,
-    agreeing to zero quanta. Dense work is memory traffic, and six iterations of ~30 tensor
-    ops over 52 M voxels is tens of gigabytes of it. Use this where the arrays already live on
-    a CUDA device with the bandwidth to match (the Modal worker), and the reference
-    otherwise; a banded torch version is the obvious next step if the local path matters.
-
-    Everything is float32 (MPS has no float64; the reference is float32 already). GPU float
-    reassociation means agreement with the reference is bounded at one uint8 quantum, not
-    byte-identity - asserted in tests/test_ranked_distance.py.
+    DENSE, FOR CUDA. Same math as the reference, Jacobi form, no sweep ordering, no
+    atomics: seeding is per-axis slice writes and propagation is elementwise over the whole
+    grid, with none of the band bookkeeping. On an L40S a 52 Mvoxel part takes 0.5-0.6 s,
+    five times the banded numpy reference on an M2 (2.7 s), which is why the emit computes it
+    there. The same kernel does NOT transfer to Apple hardware: 15.4 s on MPS and 11.6 s on
+    torch's CPU backend for the same part (byte-identical results), because dense work is
+    memory traffic and only the CUDA part has the bandwidth for it. Locally the reference is
+    the path; a banded torch version is the obvious next step if a local GPU path matters.
     """
     from .resample import best_device
 
