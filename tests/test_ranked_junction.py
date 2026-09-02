@@ -188,3 +188,43 @@ def test_torch_matches_the_numpy_reference(name):
     assert ((jn_r > 0) == (jn_o > 0)).all(), "the tubes differ"
     diff = np.abs(jn_r.astype(int) - jn_o.astype(int))
     assert diff.max() <= 1, f"bytes differ by up to {diff.max()} quanta"
+
+
+def test_in_place_tool_matches_the_dense_function(tmp_path):
+    """The slab-wise, zarr-backed path of tools/ranked_add_junction.py must produce exactly the
+    arrays the dense function returns - the same tubes, bytes and pairs - and leave the store
+    decodable. Peak memory is the point of that path, so it must not buy it with a different
+    answer."""
+    zarr = pytest.importorskip("zarr")
+    rbs = _load_tools()
+    spec = importlib.util.spec_from_file_location(
+        "ranked_add_junction", TOOLS.parent / "ranked_add_junction.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    (ranks, support), *_ = _triple_line()
+    T = 2.0 * min(SP)
+    want_j, want_p = rbs.junction_field(ranks, support, CLIP, SP, T)
+
+    store = tmp_path / "t.duckn"
+    root = zarr.create_group(store=str(store))
+    g = root.create_group("parts/0")
+    axes = [{"kind": "space", "centering": "node", "unit": "mm",
+             "space_direction": [SP[i] if j == i else 0.0 for j in range(3)]} for i in range(3)]
+    attrs4 = {"duckn": {"version": "1.0", "space": "left-posterior-superior",
+                        "space_origin": [0.0, 0.0, 0.0], "axes": [{"kind": "list"}] + axes}}
+    for nm, arr in (("ranks", ranks), ("support", support)):
+        z = g.create_array(nm, shape=arr.shape, dtype=arr.dtype, chunks=(1, 16, 16, 16),
+                           attributes=attrs4)
+        z[:] = arr
+    g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": {
+        "clip": CLIP, "distance_truncation": T, "support_max": 255}}}})
+
+    tool.add(store)
+    g = zarr.open_group(str(store), mode="r")["parts/0"]
+    got_j = np.asarray(g["junction"][:])
+    got_p = np.asarray(g["junction_pair"][:])
+    assert (got_j == want_j).all(), "the slab-wise tool differs from the dense function"
+    assert (got_p == want_p).all()
+    m = g.attrs.asdict()["duckn"]["extensions"]["ranked"]
+    assert m["junction_truncation"] == round(T, 6) and m["junction_max"] == rbs.JUNCTION_MAX

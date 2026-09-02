@@ -529,6 +529,15 @@ Consequences worth knowing:
   reading `ranks[0]` alone touches only that plane's chunks.
 - Reading progressively deeper is reading more planes in order; a reader may stop early.
 
+### The two `junction` arrays are sharded per slab, not per array
+
+Every other array is one shard (see above). `junction` and `junction_pair` are sharded per
+**64-slice slab** along the first axis instead. A whole-array shard can only be written whole,
+which means materializing the dense volume; these arrays are almost entirely zero, and they
+are computed and written slab by slab precisely so that nothing dense is ever held. A reader
+sees no difference except a few more files: absent inner chunks are still absent from each
+slab's index, and a whole all-zero slab is not stored at all.
+
 ### 7.1 `occupancy` — skipping bricks you do not need
 
 `occupancy[c, bz, by, bx]` is the **maximum** over that brick of class `c`'s support-encoded

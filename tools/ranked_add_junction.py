@@ -2,9 +2,12 @@
 
 The builder writes the layer for new stores. This is for stores that already exist - the demo
 packages - where re-emitting to rebuild is not on: it reads `ranks` and `support` back out of
-the store, computes the layer with the same function the builder uses, writes the two arrays
-with the store's own layout and geometry, records the decode parameters in the part block, and
-refreshes the README so the store describes what it now contains.
+the store SLAB BY SLAB, computes the layer with the same functions the builder uses, writes
+the two arrays slab-wise with the store's own geometry, records the decode parameters in the
+part block, and refreshes the README so the store describes what it now contains.
+
+Memory is a slab plus the tube, whatever the store's size: a store whose planes are half a
+gigabyte is processed in a few tens of megabytes.
 
 usage: uv run python tools/ranked_add_junction.py STORE.duckn [STORE.duckn ...] [--force]
 
@@ -20,7 +23,7 @@ import numpy as np
 import zarr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ranked_build_store import JUNCTION_MAX, junction_field, layout, write_readme  # noqa: E402
+from ranked_build_store import junction_sparse, write_junction, write_readme  # noqa: E402
 
 
 def _spacing(arr):
@@ -48,30 +51,20 @@ def add(store: Path, force=False):
             print(f"  parts/{name}: junction present, skipping (--force to redo)", flush=True)
             continue
         t0 = time.perf_counter()
-        ranks = np.asarray(g["ranks"][:])
-        support = np.asarray(g["support"][:])
-        spacing = _spacing(g["ranks"])
+        ranks, support = g["ranks"], g["support"]
+        shape = tuple(ranks.shape[1:])
+        spacing = _spacing(ranks)
         trunc = float(block.get("distance_truncation") or 2.0 * min(spacing))
-        jn, jp = junction_field(ranks, support, block["clip"], spacing, trunc)
-        del ranks, support
-        for nm in ("junction", "junction_pair"):
-            if nm in g:
-                del g[nm]
-        chunks, shards = layout(jn.shape)
-        jz = g.create_array("junction", shape=jn.shape, dtype=jn.dtype, chunks=chunks,
-                            shards=shards, compressors=zarr.codecs.ZstdCodec(level=9),
-                            attributes=_attrs_like(g["ranks"], list_axis=False))
-        jz[:] = jn
-        chunks, shards = layout(jp.shape)
-        pz = g.create_array("junction_pair", shape=jp.shape, dtype=jp.dtype, chunks=chunks,
-                            shards=shards, compressors=zarr.codecs.ZstdCodec(level=9),
-                            attributes=_attrs_like(g["ranks"], list_axis=True))
-        pz[:] = jp
-        block["junction_truncation"] = round(trunc, 6)
-        block["junction_max"] = JUNCTION_MAX
+        idx, q, a, b = junction_sparse(
+            lambda z0, z1: ranks[0, z0:z1],
+            lambda z0, z1: (ranks[:, z0:z1], support[:, z0:z1]),
+            shape, block["clip"], spacing, trunc)
+        n = write_junction(g, idx, q, a, b, shape, ranks.dtype,
+                           _attrs_like(ranks, list_axis=False), _attrs_like(ranks, list_axis=True),
+                           trunc, block)
         g.attrs.update(attrs)
-        frac = 100.0 * np.count_nonzero(jn) / jn.size
-        print(f"  parts/{name}: junction {frac:.2f} % of {jn.size / 1e6:.1f} M voxels, "
+        frac = 100.0 * n / float(np.prod(shape))
+        print(f"  parts/{name}: junction {frac:.2f} % of {np.prod(shape) / 1e6:.1f} M voxels, "
               f"T = {trunc:.3f} mm, {time.perf_counter() - t0:.1f} s", flush=True)
     write_readme(store)
 

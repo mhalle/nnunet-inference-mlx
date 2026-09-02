@@ -435,100 +435,213 @@ def junction_field(ranks, support, clip, spacing, truncation, reach=None):
     absent. Zero is the sentinel here as in every other array. The sign lives in the byte
     because a sign is exactly what the main field lacks and this one exists to supply.
 
-    COST. Cheap, and dominated by the two full-volume passes rather than by the field itself:
-    on a 52 Mvoxel part, 0.26 s to find the triple cells, 0.18 s to dilate the tubes, and
-    0.4 s to gather deficits at the 0.3 % of voxels inside them - 0.8 s in all. The torch
-    twin in nnseg.ranked is byte-identical and takes 1.4 s on MPS; it is for the CUDA worker,
-    where the arrays already live.
+    COST. Cheap in time and, since it is computed SLAB BY SLAB, in memory too: the triple
+    cells and the tubes are found per slab of slices with a halo of `reach + 1`, the deficits
+    are gathered per slab with a halo of one, and nothing full-volume is ever allocated but
+    the dense outputs this wrapper returns. On a 52 Mvoxel part that is 0.8 s. The builder
+    and the in-place tool skip even the dense outputs: they take the sparse result and write
+    it slab-wise (see `write_junction`). The torch twin in nnseg.ranked is byte-identical and
+    takes 1.4 s on MPS; it is for the CUDA worker, where the arrays already live.
     """
-    win = ranks[0]
-    Z, Y, X = win.shape
+    shape = tuple(ranks.shape[1:])
+    idx, q, a, b = junction_sparse(lambda z0, z1: ranks[0, z0:z1],
+                                   lambda z0, z1: (ranks[:, z0:z1], support[:, z0:z1]),
+                                   shape, clip, spacing, truncation, reach)
+    junction = np.zeros(shape, np.uint8)
+    pair = np.zeros((2,) + shape, ranks.dtype)
+    junction.reshape(-1)[idx] = q
+    pair[0].reshape(-1)[idx] = a
+    pair[1].reshape(-1)[idx] = b
+    return junction, pair
+
+
+def junction_sparse(read_win, read_planes, shape, clip, spacing, truncation, reach=None,
+                    slab=32):
+    """The layer as ``(flat_index, byte, a, b)``, computed slab by slab from two readers.
+
+    ``read_win(z0, z1)`` returns the winner plane for slices ``[z0, z1)``; ``read_planes(z0,
+    z1)`` returns ``(ranks, support)`` for them, all planes. Either may slice arrays in memory
+    or read a zarr store, which is what lets the in-place tool run in a few tens of megabytes
+    on a store whose planes are half a gigabyte. Indices come out sorted.
+    """
+    Z, Y, X = shape
     h = np.asarray([float(v) for v in spacing], np.float32)
     if reach is None:
         reach = int(np.ceil(truncation / float(h.min()))) + 1
+    idx = _triple_tube(read_win, shape, reach, slab=max(slab, 2 * reach + 2))
+    if idx.size == 0:
+        return idx, np.zeros(0, np.uint8), np.zeros(0, np.uint8), np.zeros(0, np.uint8)
+    q, a, b = _junction_at(idx, read_planes, shape, clip, h, truncation, slab)
+    keep = q > 0
+    return idx[keep], q[keep], a[keep], b[keep]
 
-    # Triple-line cells: three or more distinct labels among a cell's eight corners. A cell
-    # with two labels is an ordinary interface; one with three is where a third region meets
-    # it. The renderer's own cells are these same cells.
-    corners = [win[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx]
-               for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
-    lo = corners[0]
-    hi = corners[0]
-    for c in corners[1:]:
-        lo = np.minimum(lo, c)
-        hi = np.maximum(hi, c)
-    third = np.zeros(lo.shape, bool)
-    for c in corners:
-        third |= (c != lo) & (c != hi)
-    tube = np.zeros(win.shape, bool)
-    for dz in (0, 1):
-        for dy in (0, 1):
-            for dx in (0, 1):
-                tube[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx] |= third
-    for _ in range(reach):
-        for axis in range(3):
-            a_ = [slice(None)] * 3
-            b_ = [slice(None)] * 3
-            a_[axis], b_[axis] = slice(0, -1), slice(1, None)
-            a_, b_ = tuple(a_), tuple(b_)
-            tube[a_] |= tube[b_]
-            tube[b_] |= tube[a_]
 
-    junction = np.zeros(win.shape, np.uint8)
-    pair = np.zeros((2,) + win.shape, ranks.dtype)
-    idx = np.nonzero(tube)
-    N = idx[0].size
-    if N == 0:
-        return junction, pair
+def _triple_tube(read_win, shape, reach, slab):
+    """Flat indices of every voxel within `reach` of a triple cell's corners, slab by slab.
 
-    # The pair: the first two real classes in each voxel's rank list. Background is class 0,
-    # which `ranks` holds as 1; the sentinel 0 is not a class.
-    cols = ranks[(slice(None),) + idx]
-    real = (cols != 1) & (cols != 0)
-    a = np.zeros(N, cols.dtype)
-    b = np.zeros(N, cols.dtype)
-    seen = np.zeros(N, np.int64)
-    for j in range(cols.shape[0]):
-        r = real[j]
-        first, second = r & (seen == 0), r & (seen == 1)
-        a[first] = cols[j][first]
-        b[second] = cols[j][second]
-        seen += r
-    have = seen >= 2
-    swap = have & (b < a)
-    a, b = np.where(swap, b, a), np.where(swap, a, b)
+    A slab carries a halo of `reach + 1` slices on each side: a cell one slice outside the halo
+    would put its corners `reach + 1` slices from the slab's interior, beyond the dilation, so
+    nothing that reaches the interior is missed and nothing full-volume is ever held.
+    """
+    Z, Y, X = shape
+    halo = reach + 1
+    found = []
+    for z0 in range(0, Z, slab):
+        z1 = min(z0 + slab, Z)
+        a0, b0 = max(z0 - halo, 0), min(z1 + halo, Z)
+        w = np.asarray(read_win(a0, b0))
+        n = w.shape[0]
+        if n < 2:
+            continue
+        corners = [w[dz:n - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx]
+                   for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
+        lo = corners[0]
+        hi = corners[0]
+        for c in corners[1:]:
+            lo = np.minimum(lo, c)
+            hi = np.maximum(hi, c)
+        third = np.zeros(lo.shape, bool)
+        for c in corners:
+            third |= (c != lo) & (c != hi)
+        if not third.any():
+            continue
+        tube = np.zeros(w.shape, bool)
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    tube[dz:n - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx] |= third
+        for _ in range(reach):
+            for axis in range(3):
+                lo_s = [slice(None)] * 3
+                hi_s = [slice(None)] * 3
+                lo_s[axis], hi_s[axis] = slice(0, -1), slice(1, None)
+                lo_s, hi_s = tuple(lo_s), tuple(hi_s)
+                tube[lo_s] |= tube[hi_s]
+                tube[hi_s] |= tube[lo_s]
+        interior = tube[z0 - a0:z0 - a0 + (z1 - z0)]
+        zz, yy, xx = np.nonzero(interior)
+        if zz.size:
+            found.append(((zz.astype(np.int64) + z0) * Y + yy) * X + xx)
+    if not found:
+        return np.zeros(0, np.int64)
+    return np.concatenate(found)
 
-    # m = l_a - l_b = deficit(b) - deficit(a), at the voxel and at its axis neighbours.
-    z, y, x = idx
 
-    def m_at(zz, yy, xx):
-        q = (zz, yy, xx)
-        rc = ranks[(slice(None),) + q]
-        sc = support[(slice(None),) + q]
-        return _deficit_at(rc, sc, b, clip) - _deficit_at(rc, sc, a, clip)
+def _junction_at(idx, read_planes, shape, clip, h, truncation, slab):
+    """The pair and the signed byte at sorted flat indices, gathering planes slab by slab."""
+    Z, Y, X = shape
+    N = idx.size
+    zs = idx // (Y * X)
+    ys = (idx // X) % Y
+    xs = idx % X
+    q = np.zeros(N, np.uint8)
+    a_out = None
+    b_out = None
+    starts = np.searchsorted(zs, np.arange(0, Z + slab, slab))
+    for k, z0 in enumerate(range(0, Z, slab)):
+        s0, s1 = starts[k], starts[k + 1]
+        if s1 <= s0:
+            continue
+        z1 = min(z0 + slab, Z)
+        a0, b0 = max(z0 - 1, 0), min(z1 + 1, Z)
+        rk, su = read_planes(a0, b0)
+        rk = np.asarray(rk)
+        su = np.asarray(su)
+        if a_out is None:
+            a_out = np.zeros(N, rk.dtype)
+            b_out = np.zeros(N, rk.dtype)
+        z, y, x = zs[s0:s1], ys[s0:s1], xs[s0:s1]
 
-    m0 = m_at(z, y, x)
-    grad2 = np.zeros(N, np.float32)
-    for axis, (arr, n) in enumerate(((z, Z), (y, Y), (x, X))):
-        plus = [z, y, x]
-        minus = [z, y, x]
-        plus[axis] = np.minimum(arr + 1, n - 1)
-        minus[axis] = np.maximum(arr - 1, 0)
-        span = (plus[axis] - minus[axis]).astype(np.float32) * h[axis]
-        diff = m_at(*plus) - m_at(*minus)
-        g = np.divide(diff, span, out=np.zeros_like(diff), where=span > 0)
-        grad2 += g * g
-    gmag = np.sqrt(grad2)
-    # Both classes saturated at the clip on every tap: the interface is beyond reach, and the
-    # sign of m is all that is known. Clamp to the truncation on that side.
-    s = np.divide(m0, gmag, out=np.sign(m0) * np.float32(truncation), where=gmag > 1e-6)
-    s = np.clip(s, -truncation, truncation)
-    q = np.clip(np.rint(128.0 + s / truncation * JUNCTION_MAX), 1, 255).astype(np.uint8)
-    q[~have] = 0
-    junction[idx] = q
-    pair[(0,) + idx] = np.where(have, a, 0).astype(ranks.dtype)
-    pair[(1,) + idx] = np.where(have, b, 0).astype(ranks.dtype)
-    return junction, pair
+        # The pair: the first two real classes in each voxel's rank list. Background is
+        # class 0, which `ranks` holds as 1; the sentinel 0 is not a class.
+        cols = rk[:, z - a0, y, x]
+        real = (cols != 1) & (cols != 0)
+        n = cols.shape[1]
+        a = np.zeros(n, cols.dtype)
+        b = np.zeros(n, cols.dtype)
+        seen = np.zeros(n, np.int64)
+        for j in range(cols.shape[0]):
+            r = real[j]
+            first, second = r & (seen == 0), r & (seen == 1)
+            a[first] = cols[j][first]
+            b[second] = cols[j][second]
+            seen += r
+        have = seen >= 2
+        swap = have & (b < a)
+        a, b = np.where(swap, b, a), np.where(swap, a, b)
+
+        # m = l_a - l_b = deficit(b) - deficit(a), at the voxel and its axis neighbours; the
+        # halo of one slice holds every neighbour a slab voxel has.
+        def m_at(zz, yy, xx):
+            loc = (slice(None), zz - a0, yy, xx)
+            return _deficit_at(rk[loc], su[loc], b, clip) - _deficit_at(rk[loc], su[loc], a, clip)
+
+        m0 = m_at(z, y, x)
+        grad2 = np.zeros(n, np.float32)
+        for axis, (arr, lim) in enumerate(((z, Z), (y, Y), (x, X))):
+            plus = [z, y, x]
+            minus = [z, y, x]
+            plus[axis] = np.minimum(arr + 1, lim - 1)
+            minus[axis] = np.maximum(arr - 1, 0)
+            span = (plus[axis] - minus[axis]).astype(np.float32) * h[axis]
+            diff = m_at(*plus) - m_at(*minus)
+            g = np.divide(diff, span, out=np.zeros_like(diff), where=span > 0)
+            grad2 += g * g
+        gmag = np.sqrt(grad2)
+        # Both classes saturated at the clip on every tap: the interface is beyond reach, and
+        # the sign of m is all that is known. Clamp to the truncation on that side.
+        sgn = np.divide(m0, gmag, out=np.sign(m0) * np.float32(truncation), where=gmag > 1e-6)
+        sgn = np.clip(sgn, -truncation, truncation)
+        byte = np.clip(np.rint(128.0 + sgn / truncation * JUNCTION_MAX), 1, 255).astype(np.uint8)
+        byte[~have] = 0
+        q[s0:s1] = byte
+        a_out[s0:s1] = np.where(have, a, 0)
+        b_out[s0:s1] = np.where(have, b, 0)
+    if a_out is None:
+        a_out = np.zeros(N, np.uint8)
+        b_out = np.zeros(N, np.uint8)
+    return q, a_out, b_out
+
+
+def write_junction(g, idx, q, a, b, shape, dtype, attrs3, attrs4, truncation, block,
+                   slab=64):
+    """Write the two junction arrays from the sparse result, slab by slab.
+
+    These arrays are sharded PER SLAB OF 64 SLICES rather than as one shard like the rest of
+    the store: a whole-array shard can only be written whole, which means materializing the
+    dense volume, and the point of a sparse layer is not to. A slab shard is written in one
+    piece from a slab-sized buffer, so peak memory is a slab, and a reader still finds every
+    inner chunk it does not need absent from the index.
+    """
+    Z, Y, X = shape
+    cy, cx = int(np.ceil(Y / 64) * 64), int(np.ceil(X / 64) * 64)
+    for nm in ("junction", "junction_pair"):
+        if nm in g:
+            del g[nm]
+    jz = g.create_array("junction", shape=shape, dtype=np.uint8, chunks=CHUNK3,
+                        shards=(64, cy, cx), compressors=zarr.codecs.ZstdCodec(level=9),
+                        attributes=attrs3)
+    pz = g.create_array("junction_pair", shape=(2,) + shape, dtype=dtype, chunks=CHUNK4,
+                        shards=(1, 64, cy, cx), compressors=zarr.codecs.ZstdCodec(level=9),
+                        attributes=attrs4)
+    zs = idx // (Y * X)
+    starts = np.searchsorted(zs, np.arange(0, Z + slab, slab))
+    for k, z0 in enumerate(range(0, Z, slab)):
+        s0, s1 = starts[k], starts[k + 1]
+        if s1 <= s0:
+            continue                      # an all-zero slab: nothing written, nothing stored
+        z1 = min(z0 + slab, Z)
+        local = idx[s0:s1] - z0 * Y * X
+        jb = np.zeros((z1 - z0) * Y * X, np.uint8)
+        jb[local] = q[s0:s1]
+        jz[z0:z1] = jb.reshape(z1 - z0, Y, X)
+        pb = np.zeros((2, (z1 - z0) * Y * X), dtype)
+        pb[0, local] = a[s0:s1]
+        pb[1, local] = b[s0:s1]
+        pz[:, z0:z1] = pb.reshape(2, z1 - z0, Y, X)
+    block["junction_truncation"] = round(float(truncation), 6)
+    block["junction_max"] = JUNCTION_MAX
+    return idx.size
 
 
 def occupancy(ranks, support, K, smax, brick=BRICK):
@@ -796,35 +909,32 @@ def build(src, out, case, parts="all", allow_unnamed=False,
             block["distance_max"] = DISTANCE_MAX
             del dist
             # The triple-line layer, at the same truncation: what `distance` cannot say about
-            # where two structures divide a shared surface. Thin tubes, so it costs nothing.
-            # An emit that computed it on the worker ships it alongside, like the distance.
+            # where two structures divide a shared surface. Thin tubes, written slab-wise. An
+            # emit that computed it on the worker ships it dense, and is read back sparse.
             pre_j = src / f"{name}_junction.npy"
             pre_p = src / f"{name}_junction_pair.npy"
             if (pre_j.exists() and pre_p.exists()
                     and part.get("junction_truncation") == round(trunc, 6)):
-                jn, jp = np.load(pre_j), np.load(pre_p)
+                jn = np.load(pre_j, mmap_mode="r")
+                jp = np.load(pre_p, mmap_mode="r")
+                jidx = np.flatnonzero(np.asarray(jn))
+                jq = np.asarray(jn).reshape(-1)[jidx]
+                ja = np.asarray(jp[0]).reshape(-1)[jidx]
+                jb = np.asarray(jp[1]).reshape(-1)[jidx]
                 print("    junction: precomputed at emit", flush=True)
             else:
-                jn, jp = junction_field(rk_all, su_all, part["clip"], eff, trunc)
-            chunks, shards = layout(jn.shape)
-            jz = g.create_array("junction", shape=jn.shape, dtype=jn.dtype,
-                                chunks=chunks, shards=shards,
-                                compressors=zarr.codecs.ZstdCodec(level=9),
-                                attributes=attrs(direction, eff, origin, list_axis=False,
-                                                 centering=centering))
-            jz[:] = jn
-            chunks, shards = layout(jp.shape)
-            pz = g.create_array("junction_pair", shape=jp.shape, dtype=jp.dtype,
-                                chunks=chunks, shards=shards,
-                                compressors=zarr.codecs.ZstdCodec(level=9),
-                                attributes=attrs(direction, eff, origin, list_axis=True,
-                                                 centering=centering))
-            pz[:] = jp
-            block["junction_truncation"] = round(trunc, 6)
-            block["junction_max"] = JUNCTION_MAX
-            print(f"    junction: {100.0 * np.count_nonzero(jn) / jn.size:.2f} % of voxels "
-                  f"in the triple-line tubes", flush=True)
-            del jn, jp
+                jidx, jq, ja, jb = junction_sparse(
+                    lambda z0, z1: rk_all[0, z0:z1],
+                    lambda z0, z1: (rk_all[:, z0:z1], su_all[:, z0:z1]),
+                    tuple(rk_all.shape[1:]), part["clip"], eff, trunc)
+            n_written = write_junction(
+                g, jidx, jq, ja, jb, tuple(rk_all.shape[1:]), rk_all.dtype,
+                attrs(direction, eff, origin, list_axis=False, centering=centering),
+                attrs(direction, eff, origin, list_axis=True, centering=centering),
+                trunc, block)
+            print(f"    junction: {100.0 * n_written / rk_all[0].size:.2f} % of voxels in "
+                  "the triple-line tubes", flush=True)
+            del jidx, jq, ja, jb
         g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": block}}})
         del su_all, occ
 
