@@ -69,6 +69,31 @@ def _emit_distance(part, code, out):
             "distance_voxels": DISTANCE_VOXELS}
 
 
+def _emit_junction(part, code, out, dist_meta):
+    """The triple-line layer, beside the distance field and at its truncation.
+
+    Same rule as the distance: computed on the worker only where a CUDA device holds the
+    arrays. Elsewhere the builder computes it, from the numpy reference, which on Apple
+    hardware is the fast path anyway (0.8 s against 1.4 s on MPS for a 52 Mvoxel part) -
+    the layer gathers only at its tube voxels, so neither device does much work.
+    """
+    import torch
+    if not dist_meta or not torch.cuda.is_available():
+        return {}
+    from nnseg.ranked import junction_field
+    t = time.perf_counter()
+    eff = _true_spacing(code.meta)
+    truncation = float(dist_meta["distance_truncation"])
+    jn, jp = junction_field(code.ranks, code.support, clip=float(code.meta["clip"]),
+                            spacing_zyx=eff, truncation=truncation, device="cuda")
+    np.save(out / f"{part}_junction.npy", jn)
+    np.save(out / f"{part}_junction_pair.npy", jp)
+    print(f"  {part:<12} junction on {torch.cuda.get_device_name(0)} in "
+          f"{time.perf_counter() - t:.1f}s ({100.0 * np.count_nonzero(jn) / jn.size:.2f} % "
+          "of voxels)", flush=True)
+    return {"junction_truncation": round(truncation, 6), "junction_max": 127}
+
+
 def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):
     depth, clip = int(depth), float(clip)
     envelope_mm = (None if str(envelope_mm).lower() in ("none", "null", "")
@@ -81,7 +106,8 @@ def main(image, task, outdir, depth=6, clip=8.0, envelope_mm=20.0):
         for name, arr in (("ranks", code.ranks), ("support", code.support), ("tail", code.tail)):
             if arr is not None:
                 np.save(out / f"{part}_{name}.npy", arr)
-        metas[part] = {**code.meta, **_emit_distance(part, code, out)}
+        dist_meta = _emit_distance(part, code, out)
+        metas[part] = {**code.meta, **dist_meta, **_emit_junction(part, code, out, dist_meta)}
         print(f"  {part:<12} {code!r}  ->  {out.name}/{part}_*.npy", flush=True)
 
     seg = segment(image, task, probabilities=RankedSpec(sink=sink, depth=depth, clip=clip),

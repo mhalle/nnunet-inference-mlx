@@ -1,4 +1,17 @@
-# The distance field on a GPU — plan (2026-09-01, not yet built)
+# The distance field on a GPU — plan (2026-09-01), built, and measured (2026-09-02)
+
+> **Status.** Built as `nnseg.ranked.distance_field` (torch; CUDA on the Modal worker, MPS or
+> CPU locally), byte-exact against the numpy reference on real stores. **The dense premise
+> below did not survive measurement on this hardware.** On part 0 of the 1.5 mm `total`
+> (52 Mvoxel, M2 Air): banded numpy reference **2.7 s**, dense torch **15.4 s on MPS, 11.6 s
+> on CPU**, agreeing to zero quanta. Dense work is memory traffic, and "under a second on an
+> M2" was wrong by more than an order of magnitude. The dense form still fits where the
+> arrays already live on a CUDA device with the bandwidth for it; locally the reference is the
+> fast path, and a *banded* torch version — the very bookkeeping the plan chose to drop — is
+> the obvious next step if the local GPU path ever matters. The `junction` layer (built
+> 2026-09-02, both implementations) took the other route from the start: it gathers only at
+> its tube voxels, so it is cheap on either device.
+
 
 The CPU implementation in `tools/ranked_build_store.py` (`distance_field`) computes the
 nearest-surface distance for a five-part `total` in **9.9 s** after band-restriction (53 s

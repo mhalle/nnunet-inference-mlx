@@ -508,11 +508,15 @@ def distance_field(ranks, support, *, clip: float, spacing_zyx, truncation: floa
     sentinel and empty chunks elide. See docs/ranked-distance-gpu.md for the design and
     tools/ranked_build_store.py for the numpy reference this must agree with to one quantum.
 
-    DENSE, DELIBERATELY. The numpy reference restricts the Godunov iteration to a dilated
-    band because CPUs are slow; a GPU covers the whole grid in milliseconds and the band
-    bookkeeping is the only part of that code that took thought to keep correct. Same math,
-    Jacobi form, no sweep ordering, no atomics: seeding is per-axis slice writes and
-    propagation is elementwise.
+    DENSE. Same math as the reference, Jacobi form, no sweep ordering, no atomics: seeding
+    is per-axis slice writes and propagation is elementwise over the whole grid, with none
+    of the band bookkeeping. That was chosen on the expectation that a GPU covers the grid in
+    milliseconds; measured on a 52 Mvoxel part (1.5 mm `total`, part 0, M2 Air) it does not:
+    the banded numpy reference takes 2.7 s, this takes 15.4 s on MPS and 11.6 s on CPU,
+    agreeing to zero quanta. Dense work is memory traffic, and six iterations of ~30 tensor
+    ops over 52 M voxels is tens of gigabytes of it. Use this where the arrays already live on
+    a CUDA device with the bandwidth to match (the Modal worker), and the reference
+    otherwise; a banded torch version is the obvious next step if the local path matters.
 
     Everything is float32 (MPS has no float64; the reference is float32 already). GPU float
     reassociation means agreement with the reference is bounded at one uint8 quantum, not
@@ -604,3 +608,127 @@ def distance_field(ranks, support, *, clip: float, spacing_zyx, truncation: floa
     q = torch.where(d < T, torch.clamp(q, 0, distance_max),
                     torch.zeros((), device=dev))
     return q.to(torch.uint8).cpu().numpy()
+
+
+def junction_field(ranks, support, *, clip: float, spacing_zyx, truncation: float,
+                   reach: int | None = None, junction_max: int = 127,
+                   device=None) -> tuple[np.ndarray, np.ndarray]:
+    """``(junction, pair)``: the triple-line layer, on a GPU when there is one.
+
+    The signed distance in mm to the level set where the two leading real classes' logits
+    tie, positive on the lower class's side, and which two they are - written only in tubes
+    around the triple lines, where such an interface meets a third label. It answers the one
+    question the distance field cannot: where two structures divide a surface they share. The
+    numpy reference in tools/ranked_build_store.py says why and how; this is the same
+    algorithm on tensors and must agree with it to one quantum (tests/test_ranked_junction.py).
+
+    Same shape of work as the reference: the triple cells are found densely (eight corner
+    gathers, elementwise), the tubes by `reach` dilations, and the deficits are gathered only
+    at the tube voxels - a fraction of a per cent of the volume - so the field is cheap on
+    either device. Measured on a 52 Mvoxel part (1.5 mm `total`, part 0, M2 Air): the numpy
+    reference 0.8 s, this 1.4 s on MPS and 10.7 s on torch's CPU backend, byte-identical.
+    So locally the reference is the path and this one belongs where the arrays already sit on
+    a CUDA device - the emit on the Modal worker, beside the distance field. A class absent
+    from a voxel's rank list is floored at the clip.
+    """
+    from .resample import best_device
+
+    dev = torch.device(device) if device is not None else best_device()
+    as_t = (lambda a: a.to(dev) if isinstance(a, torch.Tensor)
+            else torch.from_numpy(np.ascontiguousarray(a)).to(dev))
+    rk = as_t(ranks)
+    su = as_t(support)
+    h = [float(v) for v in spacing_zyx]
+    T = float(truncation)
+    clip = float(clip)
+    if reach is None:
+        reach = int(np.ceil(T / min(h))) + 1
+    win = rk[0]
+    Z, Y, X = win.shape
+
+    # ---- triple cells: three or more labels among a cell's eight corners ----
+    corners = [win[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx]
+               for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
+    lo = corners[0]
+    hi = corners[0]
+    for c in corners[1:]:
+        lo = torch.minimum(lo, c)
+        hi = torch.maximum(hi, c)
+    third = torch.zeros(lo.shape, dtype=torch.bool, device=dev)
+    for c in corners:
+        third |= (c != lo) & (c != hi)
+    tube = torch.zeros(win.shape, dtype=torch.bool, device=dev)
+    for dz in (0, 1):
+        for dy in (0, 1):
+            for dx in (0, 1):
+                tube[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx] |= third
+    # dilation: a 3x3x3 max-pool per voxel of reach, on a float view (pooling has no bool)
+    if reach > 0 and bool(tube.any()):
+        f = tube.to(torch.float32)[None, None]
+        for _ in range(reach):
+            f = torch.nn.functional.max_pool3d(f, kernel_size=3, stride=1, padding=1)
+        tube = f[0, 0] > 0.5
+
+    junction = torch.zeros(win.shape, dtype=torch.uint8, device=dev)
+    pair = torch.zeros((2,) + tuple(win.shape), dtype=rk.dtype, device=dev)
+    idx = torch.nonzero(tube, as_tuple=True)
+    N = idx[0].numel()
+    if N == 0:
+        return junction.cpu().numpy(), pair.cpu().numpy()
+
+    # ---- the pair: the first two real classes in each voxel's rank list ----
+    cols = rk[(slice(None),) + idx]                      # (planes, N)
+    real = (cols != 1) & (cols != 0)                     # background is class 0, held as 1
+    a = torch.zeros(N, dtype=rk.dtype, device=dev)
+    b = torch.zeros(N, dtype=rk.dtype, device=dev)
+    seen = torch.zeros(N, dtype=torch.int64, device=dev)
+    for j in range(cols.shape[0]):
+        r = real[j]
+        first, second = r & (seen == 0), r & (seen == 1)
+        a = torch.where(first, cols[j], a)
+        b = torch.where(second, cols[j], b)
+        seen += r.to(torch.int64)
+    have = seen >= 2
+    swap = have & (b < a)
+    a, b = torch.where(swap, b, a), torch.where(swap, a, b)
+
+    def deficit(rk_c, su_c, want):
+        d = torch.full(want.shape, clip, dtype=torch.float32, device=dev)
+        d = torch.where(rk_c[0] == want, torch.zeros((), device=dev), d)
+        for j in range(1, rk_c.shape[0]):
+            gap = (1.0 - su_c[j - 1].to(torch.float32) / 255.0) * clip
+            d = torch.where(rk_c[j] == want, gap, d)
+        return d
+
+    z, y, x = idx
+
+    def m_at(zz, yy, xx):
+        q = (zz, yy, xx)
+        rc = rk[(slice(None),) + q]
+        sc = su[(slice(None),) + q]
+        return deficit(rc, sc, b) - deficit(rc, sc, a)
+
+    m0 = m_at(z, y, x)
+    grad2 = torch.zeros(N, dtype=torch.float32, device=dev)
+    for axis, (arr, n) in enumerate(((z, Z), (y, Y), (x, X))):
+        plus = [z, y, x]
+        minus = [z, y, x]
+        plus[axis] = torch.clamp(arr + 1, max=n - 1)
+        minus[axis] = torch.clamp(arr - 1, min=0)
+        span = (plus[axis] - minus[axis]).to(torch.float32) * h[axis]
+        diff = m_at(*plus) - m_at(*minus)
+        g = torch.where(span > 0, diff / torch.where(span > 0, span, torch.ones_like(span)),
+                        torch.zeros_like(diff))
+        grad2 += g * g
+    gmag = torch.sqrt(grad2)
+    s = torch.where(gmag > 1e-6, m0 / torch.where(gmag > 1e-6, gmag, torch.ones_like(gmag)),
+                    torch.sign(m0) * T)
+    s = torch.clamp(s, -T, T)
+    q = torch.clamp(torch.round(128.0 + s / T * junction_max), 1, 255).to(torch.uint8)
+    q = torch.where(have, q, torch.zeros((), dtype=torch.uint8, device=dev))
+    junction[idx] = q
+    zero = torch.zeros((), dtype=rk.dtype, device=dev)
+    pair[(0,) + idx] = torch.where(have, a, zero)
+    pair[(1,) + idx] = torch.where(have, b, zero)
+    return junction.cpu().numpy(), pair.cpu().numpy()
+

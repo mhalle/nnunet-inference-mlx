@@ -434,6 +434,12 @@ def junction_field(ranks, support, clip, spacing, truncation, reach=None):
     ENCODING. 128 is on the interface, 128 +- `junction_max` are +-`junction_truncation`, 0 is
     absent. Zero is the sentinel here as in every other array. The sign lives in the byte
     because a sign is exactly what the main field lacks and this one exists to supply.
+
+    COST. Cheap, and dominated by the two full-volume passes rather than by the field itself:
+    on a 52 Mvoxel part, 0.26 s to find the triple cells, 0.18 s to dilate the tubes, and
+    0.4 s to gather deficits at the 0.3 % of voxels inside them - 0.8 s in all. The torch
+    twin in nnseg.ranked is byte-identical and takes 1.4 s on MPS; it is for the CUDA worker,
+    where the arrays already live.
     """
     win = ranks[0]
     Z, Y, X = win.shape
@@ -791,7 +797,15 @@ def build(src, out, case, parts="all", allow_unnamed=False,
             del dist
             # The triple-line layer, at the same truncation: what `distance` cannot say about
             # where two structures divide a shared surface. Thin tubes, so it costs nothing.
-            jn, jp = junction_field(rk_all, su_all, part["clip"], eff, trunc)
+            # An emit that computed it on the worker ships it alongside, like the distance.
+            pre_j = src / f"{name}_junction.npy"
+            pre_p = src / f"{name}_junction_pair.npy"
+            if (pre_j.exists() and pre_p.exists()
+                    and part.get("junction_truncation") == round(trunc, 6)):
+                jn, jp = np.load(pre_j), np.load(pre_p)
+                print("    junction: precomputed at emit", flush=True)
+            else:
+                jn, jp = junction_field(rk_all, su_all, part["clip"], eff, trunc)
             chunks, shards = layout(jn.shape)
             jz = g.create_array("junction", shape=jn.shape, dtype=jn.dtype,
                                 chunks=chunks, shards=shards,
