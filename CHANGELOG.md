@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Previews are radiological, and say so (nnseg).** The three-plane preview showed the
+  patient's right on the image right - not by decision but because the loader's RAS array
+  was handed to `imshow` as-is, and nothing stated a convention. Found while checking
+  MRSegmentator's left/right; confirmed on `ts:total_fast` from the same CT (liver plotted
+  at column 327 of 512). `preview.DISPLAY` now names the convention (`radiological`, 3D
+  Slicer's default: patient right on the image left in axial and coronal, sagittal viewed
+  from the patient's left so anterior is on the image left), `preview.display_planes()`
+  turns it into a per-panel orientation frame and gets there through
+  `io.orientation_transform` - the same DICOMOrient probe the pipeline trusts, applied as
+  a transpose+flip view, never a hand-written `[:, ::-1]` - and the R/L, A/P, S/I edge
+  letters are read back from the resulting direction cosines and drawn on every panel, so
+  a wrong convention is visible instead of silent. `neurological` remains available as a
+  named option. Tested on a laterality phantom stored in five axis orders and read back
+  from the PNG's pixels (`tests/test_nnseg_preview.py`). `load_oriented_pair` is
+  unchanged (statistics still read the RAS pair), and cache keys do not move; previews
+  already in a results cache keep their old appearance until regenerated.
+
 - **MRSegmentator ecosystem (nnseg).** `mrsegmentator:base` (40 abdominal / pelvic / thoracic
   structures on MRI, also usable on CT) and `mrsegmentator:body_comp` (10 body-composition
   classes) join the catalog as a fourth nnU-Net ecosystem beside `ts`, `moose` and `custom` -
