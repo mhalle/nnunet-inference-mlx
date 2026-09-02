@@ -149,6 +149,52 @@ The truncation is set by reconstruction, not by storage: a central difference fo
 reaches 1.5 voxels and a trilinear corner reaches √3, so at `T` = 1 voxel neither can be
 evaluated from the stored field. Two voxels is the floor.
 
+### `junction` — where two structures divide a shared surface (optional)
+
+Present only when the store was built with it, beside `distance`. Two arrays and two decode
+fields in the part block, and the arrays cannot be read without them:
+
+```
+junction        (Z, Y, X)     uint8    signed distance to the interface between the pair
+junction_pair   (2, Z, Y, X)  ranks'   the pair, as class + 1, lower class index first
+
+s_mm = (junction - 128) / junction_max * junction_truncation      # only where junction != 0
+```
+
+**What it answers that `distance` cannot.** `distance` is the distance to the nearest surface,
+whichever it is. Along a **triple line** — where the interface between two structures comes up
+to meet the surface against a third label, background included — the nearest surface is the
+outer one, so `distance` is silent about where the two structures divide it. A reader deciding
+which of the two owns a point on that shared surface then has only the labelmap, which is
+voxel-quantized, and draws the division as a staircase. The information exists in the logits:
+the margin between the two structures is continuous along the surface, its zero is the true
+division at sub-voxel precision, and it continues *past* the surface into the third region as
+a virtual sheet. `junction` is that sheet's signed distance, `(l_a - l_b) / |grad (l_a - l_b)|`,
+in millimetres, **positive on the side of `junction_pair[0]`**, the lower class index.
+
+**Where it is written.** Only within a few voxels of cells whose eight corners carry three or
+more labels — the triple lines. Everywhere else, including along a plain two-structure
+interface far from any third region, the byte is 0: there a reader's own pair field (the signed
+`distance` of one structure) already places the interface exactly. The array is a set of thin
+tubes and compresses to almost nothing.
+
+**How to read it at a surface point.** Take the eight corners of the cell, keep those whose
+`junction_pair` is the pair in question (in either order — flip the sign if the order is
+reversed), renormalize their trilinear weights, and interpolate `s`. Do *not* interpolate across
+corners carrying a different pair. The result is a signed distance along the surface to the
+division between the two structures, continuous through the third region, so it can be
+filtered at whatever width the display needs — one pixel's footprint — instead of being blended
+at the voxel's width, which is a blur when close and nothing when far.
+
+**Two cautions.**
+
+- It is a deficit *difference* over its own gradient, never the winner's margin over its
+  gradient: the winner's margin is folded and measures zero at a symmetric fold.
+- The gradient is taken from the same two classes at every tap of the stencil, each read from
+  that voxel's own rank list, whoever wins there. A class absent from a list is no better than
+  the clip, so far from the interface the field saturates at the truncation. That is the
+  intended reading: beyond the truncation there is nothing to divide.
+
 ### Zero means "nothing here" in every array
 
 That is deliberate and load-bearing — in `distance` too, where 0 means "no surface within the

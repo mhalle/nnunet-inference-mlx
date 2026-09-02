@@ -152,6 +152,42 @@ def verify(path: Path, deep: bool = False, quiet: bool = False) -> bool:
             t = m.get("distance_truncation")
             rep.check(t is None or t > 0, f"parts/{i}: distance_truncation {t} is not positive")
 
+        if "junction" in g or "junction_pair" in g:
+            # The pair is meaningless without the byte and vice versa, and the byte is a uint8
+            # with no scale without its truncation and half-range.
+            rep.check("junction" in g and "junction_pair" in g,
+                      f"parts/{i}: junction and junction_pair must travel together")
+            rep.check("junction_truncation" in m and "junction_max" in m,
+                      f"parts/{i}: junction array but no junction_truncation/junction_max - "
+                      "the field cannot be decoded")
+            if "junction" in g:
+                rep.check(tuple(g["junction"].shape) == shape,
+                          f"parts/{i}: junction grid {tuple(g['junction'].shape)} != ranks {shape}")
+            if "junction_pair" in g:
+                rep.check(tuple(g["junction_pair"].shape) == (2,) + shape,
+                          f"parts/{i}: junction_pair must be (2, Z, Y, X), got "
+                          f"{tuple(g['junction_pair'].shape)}")
+                rep.check(g["junction_pair"].dtype == ranks.dtype,
+                          f"parts/{i}: junction_pair dtype {g['junction_pair'].dtype} != "
+                          f"ranks {ranks.dtype} - it holds class + 1 like ranks")
+            if "junction" in g and "junction_pair" in g:
+                jn = np.asarray(g["junction"][:])
+                jp = np.asarray(g["junction_pair"][:])
+                present = jn > 0
+                rep.check(bool((jp[0][present] > 0).all() and (jp[1][present] > 0).all()),
+                          f"parts/{i}: junction byte present with an absent pair")
+                rep.check(bool((jp[0][~present] == 0).all() and (jp[1][~present] == 0).all()),
+                          f"parts/{i}: junction pair present where the byte is the sentinel")
+                rep.check(bool((jp[0][present] < jp[1][present]).all()),
+                          f"parts/{i}: junction_pair is not in canonical order (lower class first)")
+                rep.check(bool((jp[0][present] != 1).all()),
+                          f"parts/{i}: junction_pair names the background as a structure")
+                frac = present.mean()
+                rep.check(frac < 0.25,
+                          f"parts/{i}: junction written on {100 * frac:.1f} % of voxels - "
+                          "the layer is meant to be tubes around triple lines, not a band",
+                          warn_only=True)
+
         # Centering is the sample-count-to-extent relationship, so it decides what a resampler
         # holds fixed. It was hardcoded to "cell" on grids the corner rule produced, which is
         # duckn's "node" - harmless while duckn's resample() ignored the field, a half-voxel

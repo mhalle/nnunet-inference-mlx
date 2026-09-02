@@ -198,6 +198,7 @@ def duckn_grid(rec, centering="cell"):
 BRICK = 32
 DISTANCE_VOXELS = 2.0        # truncation, in voxels of the finest axis
 DISTANCE_MAX = 255           # on the surface; 0 is at or beyond the truncation
+JUNCTION_MAX = 127           # half range of the signed byte; 128 is on the interface
 
 
 def distance_field(ranks, support, clip, spacing, truncation):
@@ -396,6 +397,132 @@ def _eikonal(d, spacing, truncation):
         r[flat] = cur
 
     return padded[core]
+
+
+def junction_field(ranks, support, clip, spacing, truncation, reach=None):
+    """``(junction, pair)``: the signed distance to the interface between two structures, near
+    every TRIPLE LINE, and which two structures it is.
+
+    WHAT THE MAIN FIELD CANNOT SAY. `distance` is the distance to the nearest surface, whichever
+    surface that is. Along a triple line - where the interface between two structures comes up
+    to meet the surface against a third label, background included - the nearest surface is the
+    outer one, so the field is silent about where the two structures divide it. A renderer
+    deciding which of the two owns a point on that shared surface then has only the labelmap,
+    which is voxel-quantized, and draws the division as a staircase. The information exists in
+    the logits: the margin between the two structures is continuous along the surface, its zero
+    is the true division at sub-voxel precision, and it continues PAST the surface into the
+    third region as a virtual sheet - which is what makes it interpolable at the surface itself,
+    where half of any stencil lies in that third region.
+
+    ONE SIGNED FIELD PER VOXEL, FOR ONE PAIR. At each voxel of the tube around a triple line,
+    `pair` names the two leading real (non-background) classes in logit order, stored
+    canonically by class index, and `junction` is the signed distance in millimetres to the
+    level set where their logits are equal, positive on the first class's side:
+    (l_a - l_b) / |grad (l_a - l_b)|. That is the deficit DIFFERENCE over its own gradient -
+    never the winner's margin over its gradient, which is folded. The gradient is a central
+    difference of the same two classes' deficit difference at the six axis neighbours, each read
+    from that neighbour's own rank list (a class absent from a list is floored at the clip), so
+    the pair is evaluated consistently across the stencil whoever wins at each tap.
+
+    SPARSE BY CONSTRUCTION. Cells whose eight corners carry three or more labels are where a
+    third region meets a two-structure interface - the triple lines, background counting as a
+    label - and the field is written only within `reach` voxels of their corners. Everywhere
+    else the byte is 0, the sentinel, so the array is a set of thin tubes and compresses to
+    almost nothing. Along a two-structure interface away from any triple line it is 0 too: a
+    reader's own pair field already places that interface exactly.
+
+    ENCODING. 128 is on the interface, 128 +- `junction_max` are +-`junction_truncation`, 0 is
+    absent. Zero is the sentinel here as in every other array. The sign lives in the byte
+    because a sign is exactly what the main field lacks and this one exists to supply.
+    """
+    win = ranks[0]
+    Z, Y, X = win.shape
+    h = np.asarray([float(v) for v in spacing], np.float32)
+    if reach is None:
+        reach = int(np.ceil(truncation / float(h.min()))) + 1
+
+    # Triple-line cells: three or more distinct labels among a cell's eight corners. A cell
+    # with two labels is an ordinary interface; one with three is where a third region meets
+    # it. The renderer's own cells are these same cells.
+    corners = [win[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx]
+               for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
+    lo = corners[0]
+    hi = corners[0]
+    for c in corners[1:]:
+        lo = np.minimum(lo, c)
+        hi = np.maximum(hi, c)
+    third = np.zeros(lo.shape, bool)
+    for c in corners:
+        third |= (c != lo) & (c != hi)
+    tube = np.zeros(win.shape, bool)
+    for dz in (0, 1):
+        for dy in (0, 1):
+            for dx in (0, 1):
+                tube[dz:Z - 1 + dz, dy:Y - 1 + dy, dx:X - 1 + dx] |= third
+    for _ in range(reach):
+        for axis in range(3):
+            a_ = [slice(None)] * 3
+            b_ = [slice(None)] * 3
+            a_[axis], b_[axis] = slice(0, -1), slice(1, None)
+            a_, b_ = tuple(a_), tuple(b_)
+            tube[a_] |= tube[b_]
+            tube[b_] |= tube[a_]
+
+    junction = np.zeros(win.shape, np.uint8)
+    pair = np.zeros((2,) + win.shape, ranks.dtype)
+    idx = np.nonzero(tube)
+    N = idx[0].size
+    if N == 0:
+        return junction, pair
+
+    # The pair: the first two real classes in each voxel's rank list. Background is class 0,
+    # which `ranks` holds as 1; the sentinel 0 is not a class.
+    cols = ranks[(slice(None),) + idx]
+    real = (cols != 1) & (cols != 0)
+    a = np.zeros(N, cols.dtype)
+    b = np.zeros(N, cols.dtype)
+    seen = np.zeros(N, np.int64)
+    for j in range(cols.shape[0]):
+        r = real[j]
+        first, second = r & (seen == 0), r & (seen == 1)
+        a[first] = cols[j][first]
+        b[second] = cols[j][second]
+        seen += r
+    have = seen >= 2
+    swap = have & (b < a)
+    a, b = np.where(swap, b, a), np.where(swap, a, b)
+
+    # m = l_a - l_b = deficit(b) - deficit(a), at the voxel and at its axis neighbours.
+    z, y, x = idx
+
+    def m_at(zz, yy, xx):
+        q = (zz, yy, xx)
+        rc = ranks[(slice(None),) + q]
+        sc = support[(slice(None),) + q]
+        return _deficit_at(rc, sc, b, clip) - _deficit_at(rc, sc, a, clip)
+
+    m0 = m_at(z, y, x)
+    grad2 = np.zeros(N, np.float32)
+    for axis, (arr, n) in enumerate(((z, Z), (y, Y), (x, X))):
+        plus = [z, y, x]
+        minus = [z, y, x]
+        plus[axis] = np.minimum(arr + 1, n - 1)
+        minus[axis] = np.maximum(arr - 1, 0)
+        span = (plus[axis] - minus[axis]).astype(np.float32) * h[axis]
+        diff = m_at(*plus) - m_at(*minus)
+        g = np.divide(diff, span, out=np.zeros_like(diff), where=span > 0)
+        grad2 += g * g
+    gmag = np.sqrt(grad2)
+    # Both classes saturated at the clip on every tap: the interface is beyond reach, and the
+    # sign of m is all that is known. Clamp to the truncation on that side.
+    s = np.divide(m0, gmag, out=np.sign(m0) * np.float32(truncation), where=gmag > 1e-6)
+    s = np.clip(s, -truncation, truncation)
+    q = np.clip(np.rint(128.0 + s / truncation * JUNCTION_MAX), 1, 255).astype(np.uint8)
+    q[~have] = 0
+    junction[idx] = q
+    pair[(0,) + idx] = np.where(have, a, 0).astype(ranks.dtype)
+    pair[(1,) + idx] = np.where(have, b, 0).astype(ranks.dtype)
+    return junction, pair
 
 
 def occupancy(ranks, support, K, smax, brick=BRICK):
@@ -662,6 +789,28 @@ def build(src, out, case, parts="all", allow_unnamed=False,
             block["distance_truncation"] = round(trunc, 6)
             block["distance_max"] = DISTANCE_MAX
             del dist
+            # The triple-line layer, at the same truncation: what `distance` cannot say about
+            # where two structures divide a shared surface. Thin tubes, so it costs nothing.
+            jn, jp = junction_field(rk_all, su_all, part["clip"], eff, trunc)
+            chunks, shards = layout(jn.shape)
+            jz = g.create_array("junction", shape=jn.shape, dtype=jn.dtype,
+                                chunks=chunks, shards=shards,
+                                compressors=zarr.codecs.ZstdCodec(level=9),
+                                attributes=attrs(direction, eff, origin, list_axis=False,
+                                                 centering=centering))
+            jz[:] = jn
+            chunks, shards = layout(jp.shape)
+            pz = g.create_array("junction_pair", shape=jp.shape, dtype=jp.dtype,
+                                chunks=chunks, shards=shards,
+                                compressors=zarr.codecs.ZstdCodec(level=9),
+                                attributes=attrs(direction, eff, origin, list_axis=True,
+                                                 centering=centering))
+            pz[:] = jp
+            block["junction_truncation"] = round(trunc, 6)
+            block["junction_max"] = JUNCTION_MAX
+            print(f"    junction: {100.0 * np.count_nonzero(jn) / jn.size:.2f} % of voxels "
+                  f"in the triple-line tubes", flush=True)
+            del jn, jp
         g.attrs.update({"duckn": {"version": "1.0", "extensions": {"ranked": block}}})
         del su_all, occ
 
