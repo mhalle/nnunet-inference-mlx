@@ -80,15 +80,23 @@ def _fetch(source: str, identifier: str, dest):
     """Pull one input on the worker, by whichever nnseg source door names it.
 
     `idc` takes a crdc_series_uuid and yields a DICOM series directory; `openneuro` takes
-    `ds<number>/<path>` off the public S3 bucket and yields a single file. Both are same-cloud
-    transfers, which is the whole reason the input is never uploaded from here.
+    `ds<number>/<path>` off the public S3 bucket and yields a single file; `zenodo` takes
+    `<recid>/<file>[!member]` and reads one member out of a remote zip by Range. All are
+    cloud-to-cloud transfers, which is the whole reason the input is never uploaded from here.
     """
     from pathlib import Path as _P
     from nnseg import sources as _s
     dest = _P(dest)
     dest.mkdir(parents=True, exist_ok=True)      # IDCSource makes <dest>/series without parents
-    door = {"idc": _s.IDCSource(), "openneuro": _s.openneuro_source()}[source]
-    got = door.fetch(identifier, dest)
+    door = {"idc": _s.IDCSource(), "openneuro": _s.openneuro_source(),
+            "zenodo": _s.ZenodoSource()}[source]
+    got = _P(door.fetch(identifier, dest))
+    # An archive door lands a single NIfTI/NRRD member in a directory; the emitter wants
+    # the file itself, and only a DICOM series is a directory.
+    if got.is_dir():
+        files = [p for p in got.iterdir() if p.is_file() and not p.name.startswith(".")]
+        if len(files) == 1 and files[0].name.endswith((".nii", ".nii.gz", ".nrrd", ".nhdr", ".mha", ".mhd")):
+            got = files[0]
     return got
 
 

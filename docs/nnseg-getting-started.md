@@ -93,14 +93,15 @@ Useful options:
 
 What to expect on an M2 for `total_fast` on a 709 x 768 x 768 chest CT, one run per process:
 
-| Stage | First run on the machine | Later runs |
+| Stage | First run after install | Later runs |
 |---|---|---|
 | read + orientation | 8 s | 8 s |
 | model load (checkpoint, architecture, GPU upload) | 38 s | 5 s |
 | network (8 patches, fp16 MPS) | 19 s | 15 s |
 | total | 68 s | 30 s |
 
-The first run on a machine pays for Metal shader compilation, which the OS caches. The Python
+The first run after an install pays about 30 s once for compiling and caching (torch's MPS
+kernels, bytecode); the second run in the same environment loads the model in 5 s. The Python
 API and the server keep models resident, so a second case in the same process pays only the
 read and the network.
 
