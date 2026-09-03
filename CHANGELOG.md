@@ -40,8 +40,10 @@
   from upstream's `MODEL_REGISTRY` and reads dataset name, trainer and version out of each 1.1
   GB zip by Range request (a few MB, no download). nnseg's default fold policy (fold 0, no
   mirroring) matches upstream's `--fast`; pass `folds=[0,1,2,3,4]` for its default ensemble.
-  **Not yet validated against MRSegmentator's own output on an abdominal MRI** - the same
-  oracle comparison the knee model got is still owed.
+  Validated on three AMOS22 MRI cases against AMOS ground truth (fold 0): mean Dice 0.799 vs
+  TS `total_mr` 0.792 on the 13 shared organs, higher on 9, every paired structure on the
+  annotated side (`bench/results/mrseg_vs_tsmr_amos/` in the workspace). Still owed:
+  voxel-level parity against MRSegmentator's own package output.
 
 - **Volume and surface area measured from the field, not the mask (nnseg).** `nnseg.measure`
   integrates the margin field over the cells between voxel centers — full cells exactly,
