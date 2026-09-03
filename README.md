@@ -1,5 +1,11 @@
 # nnunet-inference-mlx
 
+> **Looking for `nnseg`, the PyTorch product (TotalSegmentator / MOOSE / MRSegmentator / stock
+> nnU-Net on MPS, CUDA or CPU, with a command line and a local REST server)?** It lives in this
+> repository as `src/nnseg` and installs from the `feature/nnseg` branch; start at
+> [docs/nnseg-getting-started.md](docs/nnseg-getting-started.md). The rest of this README is
+> the MLX package, which is now the reference implementation nnseg is checked against.
+
 MLX inference for [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) models on Apple Silicon. Runs trained nnU-Net checkpoints natively on Metal with no PyTorch dependency at runtime.
 
 [nnU-Net](https://github.com/MIC-DKFZ/nnUNet) is a self-configuring medical-image segmentation framework that consistently achieves state-of-the-art results across biomedical datasets. This package brings those trained models to Mac users with native Metal acceleration. It also integrates with [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) (the widely-used CT segmentation tool with ~117 anatomical classes).

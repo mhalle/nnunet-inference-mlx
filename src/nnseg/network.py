@@ -297,10 +297,20 @@ class TorchModel:
         self.accumulate_choice = None                       # set per volume in predict_logits
         from .trainers import ensure_trainer
         ensure_trainer(self.folder)                       # shim custom trainers (e.g. SkeletonRecall)
-        p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
-                            perform_everything_on_device=False, device=self.device, verbose=False, allow_tqdm=False)
-        p.initialize_from_trained_model_folder(str(self.folder), use_folds=available_folds(self.folder, folds),
-                                               checkpoint_name="checkpoint_final.pth")
+        # Quiet two things nnunetv2 says on every non-CUDA run that mean nothing here: it
+        # print()s "perform_everything_on_device=True is only supported for cuda devices" even
+        # when handed False (the accumulator placement is nnseg's own policy, `accumulate`),
+        # and warns "Detected old nnU-Net plans format" for every TotalSegmentator checkpoint,
+        # which it then reconstructs fine.
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Detected old nnU-Net plans format")
+            p = nnUNetPredictor(tile_step_size=step_size, use_gaussian=True, use_mirroring=False,
+                                perform_everything_on_device=False, device=self.device, verbose=False,
+                                allow_tqdm=False)
+            p.initialize_from_trained_model_folder(str(self.folder), use_folds=available_folds(self.folder, folds),
+                                                   checkpoint_name="checkpoint_final.pth")
         self.predictor = p
         self.plans = p.plans_manager.plans
         self.dataset_json = p.dataset_json

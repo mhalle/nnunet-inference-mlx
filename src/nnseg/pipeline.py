@@ -325,17 +325,22 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
         og = None
         out = None
         fr = None
+        # Timing keys: `load:<task>` for a one-model task, `load:<task>:<part>` for a union.
+        # A single task's only part is named after the task, and the old unconditional suffix
+        # printed `load:ts:total_fast:ts:total_fast`.
+        sfx = "" if len(parts) == 1 else None
         for i, (wid, remap, pname) in enumerate(parts):
+            key = f"{tag}{sfx if sfx is not None else ':' + pname}"
             t = time.perf_counter()
             report.enter_part(i, f"{pname} ({wid})")
             model = load(wid)
-            T[f"load:{tag}:{pname}"] = time.perf_counter() - t
+            T[f"load:{key}"] = time.perf_counter() - t
             t = time.perf_counter()
             x, fr = model_frame(model)
             env = crop_on_model_grid(model, x, fr, use_body=True, roi_mm=None)
             if not env.is_whole():
                 report.stage("preprocess", f"envelope {env.fraction * 100:.0f} % of the model grid")
-            T[f"preprocess:{tag}:{pname}"] = time.perf_counter() - t
+            T[f"preprocess:{key}"] = time.perf_counter() - t
             if og is None:
                 og = fr.resolve_grid(grid)
                 max_label = max((int(v) for v in spc.label_map), default=255)
@@ -345,7 +350,7 @@ def segment(image, task: str, *, catalog=None, weights=None, device: str = "auto
             predict_into(model, x, fr, og, env, lut=_lut(model.K, remap), paint=len(parts) > 1,
                          out=out, part=pname, weights=wid)
             report.stage("restore", f"{'device' if model.accumulate_choice['on_device'] else 'host'} accumulator")
-            T[f"network:{tag}:{pname}"] = time.perf_counter() - t
+            T[f"network:{key}"] = time.perf_counter() - t
             models.release(model)
         return out, fr, og
 

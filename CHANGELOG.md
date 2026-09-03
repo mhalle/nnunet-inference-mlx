@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **nnseg installs and runs from a clean Mac (2026-09-02).** Tried as an outsider would - fresh
+  venv, `uv pip install "...[torch] @ git+https://...@feature/nnseg"`, empty weights root - and
+  it failed twice before running anything. (1) uv applies `[tool.uv.sources]` to a git
+  install, and the `nnunetv2 = { path = "../upstream/nnUNet" }` convenience source pointed at a
+  path that exists only in the dev workspace; the source is gone (PyPI nnunetv2 2.8.1 is what
+  nnseg is written against - stock APIs only), and the checkout goes in by hand for upstream
+  work. (2) The wheel had no task catalog: hatch skips VCS-ignored files and the workspace
+  `.gitignore`'s `data/` rule covered `src/nnseg/data`, so every task lookup died on a missing
+  `ts_tasks.json`; `artifacts = ["src/nnseg/data/*.json"]` ships them regardless of gitignore
+  (verified by building from the pushed branch's tree). With both fixed, `total_fast` on the
+  chest CT ran on MPS in 68 s cold (38 s of it model load), 109/117 structures, 99.97 %
+  agreement with the recorded result; a `nnseg serve` job on the same Mac was voxel-identical
+  to the CLI. Around it: `nnseg tasks [--installed] [--json]` lists the catalog locally without
+  importing torch ("installed" asks the weights store, not `materialized`, which for TS only
+  says the spec is known); nnseg's own errors end as one `nnseg: <message>` line with status 2
+  instead of a traceback (the missing-serve-extra `InputError` was reaching the user as a raw
+  `ModuleNotFoundError`); single-model timing keys read `load:ts:total_fast`, not
+  `load:ts:total_fast:ts:total_fast`; nnunetv2's non-CUDA `print` and its old-plans-format
+  warning are silenced at the predictor. New: `docs/nnseg-getting-started.md`, the page a new
+  user reads (requirements, install, weights, CLI, API, local server), linked from the README.
+
 - **Previews are radiological, and say so (nnseg).** The three-plane preview showed the
   patient's right on the image right - not by decision but because the loader's RAS array
   was handed to `imshow` as-is, and nothing stated a convention. Found while checking

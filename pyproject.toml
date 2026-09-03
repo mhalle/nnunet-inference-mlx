@@ -101,6 +101,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nnunet_inference_mlx", "src/nnseg"]
+# The task catalogs ship whatever .gitignore says: hatch skips VCS-ignored files, and a
+# `data/` rule in the workspace .gitignore once swallowed src/nnseg/data - a wheel built from
+# the pushed branch had no catalog, and every `nnseg segment` died on a missing
+# ts_tasks.json (2026-09-02). `artifacts` (not force-include, which would add the files a
+# second time now that they are tracked) makes them part of the normal selection.
+artifacts = ["src/nnseg/data/*.json"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
@@ -122,9 +128,11 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-# Local convenience, not a pin: nnseg uses only stock nnunetv2 APIs, so a released nnunetv2
-# works too. The checkout is here anyway for upstream work.
-nnunetv2 = { path = "../upstream/nnUNet", editable = true }
+# nnunetv2 comes from PyPI: nnseg uses only stock nnunetv2 APIs (verified against 2.8.1). It
+# used to be a `path = "../upstream/nnUNet"` source here, but uv applies these sources to a
+# `git+https://...` install too, and that relative path exists only in the dev workspace - so
+# every outside install failed before downloading anything (2026-09-02). For upstream work
+# put the checkout in by hand: `uv pip install -e ../upstream/nnUNet`.
 # fastsurfer-lean = our slimmed FastSurfer fork (parcellation CNN only, packaging fixed).
 # Pinned to the slim branch's rev; import namespace stays FastSurferCNN.
 fastsurfer-lean = { git = "https://github.com/mhalle/fastsurfer-lean.git", rev = "041062008b1276b2fb21c886d6943f7bfc3bba6e" }

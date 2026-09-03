@@ -6,6 +6,17 @@ import sys
 
 
 def main(argv=None) -> int:
+    """Run the CLI. nnseg's own errors (bad input, missing weights, a missing extra) are
+    reported as one line on stderr with exit status 2; a traceback is for bugs."""
+    from .errors import NnsegError
+    try:
+        return _run(argv)
+    except NnsegError as e:
+        print(f"nnseg: {e}", file=sys.stderr)
+        return 2
+
+
+def _run(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="nnseg", description="nnU-Net-family segmentation on torch: fused logit restore onto any grid")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("segment", help="segment one NIfTI")
@@ -24,6 +35,11 @@ def main(argv=None) -> int:
                    help="restrict inference to the body's bounding box plus this margin in mm; 0 or negative = whole volume")
     s.add_argument("--model-root", default=None)
     s.add_argument("--quiet", action="store_true")
+
+    tl = sub.add_parser("tasks", help="list every task the catalog can segment")
+    tl.add_argument("--model-root", default=None)
+    tl.add_argument("--installed", action="store_true", help="only tasks whose weights are already on disk")
+    tl.add_argument("--json", action="store_true", help="the full per-task info records")
 
     w = sub.add_parser("weights", help="provision and maintain model weights")
     wsub = w.add_subparsers(dest="wcmd", required=True)
@@ -154,6 +170,43 @@ def main(argv=None) -> int:
             else:
                 print(f"job ended {final['state']}", file=sys.stderr)
                 return 1
+        return 0
+    if args.cmd == "tasks":
+        import json
+        from .ecosystems import EcosystemCatalog
+        from .weights import WeightsStore
+        store = WeightsStore(args.model_root, fetch=False)
+        cat = EcosystemCatalog(root=store.root)
+
+        def installed(info) -> bool:
+            # "materialized" is "the spec is answerable without installing" - for TS that is
+            # always true (the catalog ships the specs), so ask the store about the weights
+            # themselves. Never call cat.get() on an unmaterialized task: it would install.
+            if not info.get("materialized"):
+                return False
+            if not info.get("task_spec", True):
+                return True                         # an engine: weights come with its runtime
+            try:
+                return all(store.have(w) for w in cat.get(info["name"]).weights_ids)
+            except Exception:
+                return False
+
+        rows = []
+        for name in cat.names():
+            try:
+                info = cat.info(name)
+            except Exception as e:                      # one broken catalog entry must not hide the rest
+                info = {"name": name, "error": str(e)}
+            info["installed"] = installed(info)
+            if args.installed and not info["installed"]:
+                continue
+            rows.append(info)
+        if args.json:
+            print(json.dumps(rows, indent=2, default=str))
+        else:
+            for i in rows:
+                print(f"{i['name']:44s} {i.get('engine', ''):12s} {i.get('modality') or '':4s} "
+                      f"{'installed' if i['installed'] else ''}".rstrip())
         return 0
     if args.cmd == "segment":
         from .pipeline import segment
