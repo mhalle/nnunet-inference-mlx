@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **The distribution is nnseg only (2026-09-02).** The wheel ships `src/nnseg` and one
+  executable, `nnseg`. The MLX-era package and its three commands (`nnmlx`,
+  `TotalSegmentator`, `totalseg-mlx`) are no longer packaged, and the `mlx` extra is gone:
+  `uv tool install` had put all four commands on PATH, three of them crashing on `import mlx`
+  and one shadowing a user's real TotalSegmentator. The MLX source stays in the repository as
+  the oracle nnseg is checked against (its tests still run in the dev env with
+  `uv pip install mlx`); its README is preserved as `docs/mlx-oracle-README.md`. The README is
+  now nnseg's page (what was `docs/nnseg-getting-started.md`), with the venv, `uv tool
+  install` and `uvx` install forms - all three verified from the pushed branch.
+
 - **nnseg installs and runs from a clean Mac (2026-09-02).** Tried as an outsider would - fresh
   venv, `uv pip install "...[torch] @ git+https://...@feature/nnseg"`, empty weights root - and
   it failed twice before running anything. (1) uv applies `[tool.uv.sources]` to a git
@@ -20,8 +30,8 @@
   instead of a traceback (the missing-serve-extra `InputError` was reaching the user as a raw
   `ModuleNotFoundError`); single-model timing keys read `load:ts:total_fast`, not
   `load:ts:total_fast:ts:total_fast`; nnunetv2's non-CUDA `print` and its old-plans-format
-  warning are silenced at the predictor. New: `docs/nnseg-getting-started.md`, the page a new
-  user reads (requirements, install, weights, CLI, API, local server), linked from the README.
+  warning are silenced at the predictor. New: a getting-started page (requirements, install, weights, CLI, API, local server) -
+  now the README itself, see the entry above.
 
 - **Previews are radiological, and say so (nnseg).** The three-plane preview showed the
   patient's right on the image right - not by decision but because the loader's RAS array

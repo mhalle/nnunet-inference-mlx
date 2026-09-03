@@ -1,7 +1,7 @@
 [project]
 name = "nnunet-inference-mlx"
 version = "0.10.0"
-description = "nnU-Net inference on Apple Silicon via MLX"
+description = "nnseg: nnU-Net-family segmentation on torch (MPS, CUDA, CPU) with a CLI and a local REST server"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -26,20 +26,15 @@ dependencies = [
 # With mlx optional, core installs anywhere and uv-native `uv sync --extra <x>` works.
 
 [project.scripts]
-nnmlx = "nnunet_inference_mlx.cli:app"
-# TotalSegmentator-compatible CLI. Both names run the same drop-in front end;
-# `TotalSegmentator` lets existing command lines work verbatim under `uv run`.
-TotalSegmentator = "nnunet_inference_mlx.ts_cli:main"
-totalseg-mlx = "nnunet_inference_mlx.ts_cli:main"
+# nnseg is the only executable. The MLX-era commands (nnmlx, TotalSegmentator, totalseg-mlx)
+# are gone (2026-09-02): `uv tool install` put all four on PATH, three of them crashing
+# without mlx and one shadowing a real TotalSegmentator.
 nnseg = "nnseg.cli:main"
 
 [project.optional-dependencies]
-# The MLX oracle path (the `nnunet_inference_mlx` package + the nnmlx / TotalSegmentator /
-# totalseg-mlx scripts). Apple-Silicon only - mlx has no Linux/CUDA wheels, which is why it
-# is an extra, not a core dep: `nnseg` (the torch product) never imports it (enforced by
-# tests/test_nnseg_layering.py), so core stays installable everywhere. Run the oracle with
-# `uv sync --extra mlx` (or `pip install nnunet-inference-mlx[mlx]`).
-mlx = ["mlx>=0.25"]
+# There is no mlx extra: the distribution ships nnseg only (2026-09-02). The MLX oracle
+# source stays in src/nnunet_inference_mlx for its tests and fixtures but is not packaged;
+# running it in the dev env is `uv pip install mlx`.
 # Remote weight download (store.download / download_archive).
 remote = ["httpx"]
 # The REST job server (nnseg serve).
@@ -100,16 +95,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nnunet_inference_mlx", "src/nnseg"]
+packages = ["src/nnseg"]
 # The task catalogs ship whatever .gitignore says: hatch skips VCS-ignored files, and a
 # `data/` rule in the workspace .gitignore once swallowed src/nnseg/data - a wheel built from
 # the pushed branch had no catalog, and every `nnseg segment` died on a missing
 # ts_tasks.json (2026-09-02). `artifacts` (not force-include, which would add the files a
 # second time now that they are tracked) makes them part of the normal selection.
 artifacts = ["src/nnseg/data/*.json"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/nnunet_inference_mlx/data" = "nnunet_inference_mlx/data"
 
 [tool.uv]
 # Engines own their environments (docs: "one environment per engine"). An engine whose
